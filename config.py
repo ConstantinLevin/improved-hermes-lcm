@@ -18,9 +18,8 @@ def _parse_pattern_list(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-# Default lcm_recall RRF arm weights. Conservative down-weight of the weak FTS
-# arm (the LongMemEval harness will tune from here); summary/chunk vector arms
-# keep full say. See docs/retrieval-tools.md.
+# Default lcm_recall RRF arm weights: the FTS arm is down-weighted; the
+# summary/chunk vector arms keep full say.
 _DEFAULT_RECALL_ARM_WEIGHTS: dict[str, float] = {
     "fts": 0.5,
     "summary": 1.0,
