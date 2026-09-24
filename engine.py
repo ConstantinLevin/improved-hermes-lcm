@@ -2903,14 +2903,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             return hint.split("\n")[0].strip()
         return ""
 
-    # -- Backup paths ------------------------------------------------------
+    # -- Backup path -------------------------------------------------------
 
     def backup_dir(self) -> Path:
-        """Return the directory where LCM backup snapshots are written.
-
-        Centralized so the timestamped ``/lcm backup`` copies and the
-        single rolling slot share the same directory derivation.
-        """
+        """Return the directory where ``maintenance.backup_database`` writes."""
         db_path = Path(self._store.db_path)
         backup_root = (
             Path(self._hermes_home).expanduser()
@@ -2918,16 +2914,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             else db_path.parent
         )
         return backup_root / "backups" / "lcm"
-
-    def rotate_backup_path(self) -> Path:
-        """Return the single rolling backup slot for this engine's store.
-
-        Written only by ``maintenance.rotate_backup_database``, which has no
-        caller since ``/lcm rotate`` was removed; the automatic daily backup
-        is to be built on it.
-        """
-        db_path = Path(self._store.db_path)
-        return self.backup_dir() / f"{db_path.stem}-rotate-latest.sqlite3"
 
     # -- Lifecycle ---------------------------------------------------------
 

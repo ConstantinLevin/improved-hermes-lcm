@@ -1,10 +1,8 @@
 """Backup operations for the LCM store.
 
-``backup_database`` is the primitive behind ``/lcm backup``; it snapshots the
-store to a timestamped file. ``rotate_backup_database`` writes the single
-rolling slot and has no caller since ``/lcm rotate`` was removed; the
-automatic daily backup is to be built on it. Both flush the engine's SQLite
-connections first. They are pure functions that
+``backup_database`` is the primitive behind ``/lcm backup``; it flushes the
+engine's SQLite connections and snapshots the store to a timestamped file.
+It is a pure function that
 take the engine so the command layer (``command.py``) keeps only the text
 formatting, and the store/dag/lifecycle connection handling lives in one place.
 """
@@ -58,9 +56,7 @@ def _prepare_private_backup_directory(path: Path) -> None:
 def flush_engine_connections(engine) -> None:
     """Commit pending writes on every SQLite connection the engine owns.
 
-    Shared by ``backup_database`` (timestamped backup) and
-    ``rotate_backup_database`` (rolling backup) so the connection-flush
-    contract stays in one place.
+    Called by ``backup_database`` before it snapshots the store.
     """
     engine._store.commit()
     engine._dag._conn.commit()
@@ -97,65 +93,6 @@ def backup_database(engine) -> dict[str, Any]:
         return {
             "ok": False,
             "db_path": db_path,
-            "error": str(exc),
-        }
-
-    backup_size = backup_path.stat().st_size if backup_path.exists() else 0
-    return {
-        "ok": True,
-        "db_path": db_path,
-        "backup_path": backup_path,
-        "backup_size": backup_size,
-    }
-
-
-def rotate_backup_database(engine) -> dict[str, Any]:
-    """Write the single rolling SQLite snapshot of the LCM store.
-
-    Atomic via tmp-then-rename so the slot is never half-written. Unlike
-    ``backup_database`` which produces timestamped files, this overwrites a
-    single rolling slot so disk usage stays bounded across repeated runs.
-    """
-    db_path = Path(engine._store.db_path)
-    if not db_path.exists():
-        return {
-            "ok": False,
-            "db_path": db_path,
-            "error": "database file does not exist",
-        }
-
-    backup_path = engine.rotate_backup_path()
-    backup_dir = backup_path.parent
-    tmp_path = backup_path.with_name(backup_path.name + ".tmp")
-
-    try:
-        _prepare_private_backup_directory(backup_dir)
-        _restrict_existing_sqlite_artifacts(backup_path)
-        flush_engine_connections(engine)
-
-        if tmp_path.exists():
-            tmp_path.unlink()
-        _prepare_private_sqlite_file(tmp_path)
-        dest = sqlite3.connect(str(tmp_path))
-        try:
-            engine._store.backup(dest)
-        finally:
-            dest.close()
-        _restrict_existing_sqlite_artifacts(tmp_path)
-        # Atomic replace so the rolling slot is never half-written.
-        tmp_path.replace(backup_path)
-        _restrict_existing_sqlite_artifacts(backup_path)
-    except (OSError, sqlite3.Error) as exc:
-        # Best-effort cleanup of the tmp file if something failed midway.
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
-        return {
-            "ok": False,
-            "db_path": db_path,
-            "backup_path": backup_path,
             "error": str(exc),
         }
 
