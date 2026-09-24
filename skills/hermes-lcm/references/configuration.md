@@ -31,7 +31,7 @@ It refuses conflicting paths rather than overwriting an existing install.
 
 ## High-impact controls
 
-Use `docs/operator-guide.md` as the complete current source. Start with:
+Start with:
 
 - `LCM_CONTEXT_THRESHOLD`: when normal context pressure triggers compaction;
 - `LCM_FRESH_TAIL_COUNT`: newest messages kept raw;
