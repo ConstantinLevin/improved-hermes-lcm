@@ -1,8 +1,8 @@
 # Session lifecycle and rotate
 
-Hermes `/new` starts a new host session. Hermes-LCM binds that session to its own lifecycle row and may carry eligible higher-depth summaries into the new current-session context. Source eligibility and exact expansion still come from descendant raw messages; carried summaries do not rewrite source ownership.
+Hermes `/new` starts a new host session. Hermes-LCM binds that session to its own lifecycle row.
 
-Do not promise that `/new` deletes historical LCM data. Earlier rows remain in `lcm.db` unless an explicitly authorized cleanup removes them, and they remain available through bounded cross-session recall.
+Do not promise that `/new` deletes historical LCM data. The previous session's raw messages and summaries remain in `lcm.db`.
 
 ## `/lcm rotate`
 
@@ -17,6 +17,6 @@ Do not promise that `/new` deletes historical LCM data. Earlier rows remain in `
 
 Run normal compaction before rotate when older material must be represented in summary nodes. Without a summary, pre-tail raw rows remain in the store but no summary points at them.
 
-Rotate refuses ignored or stateless sessions. Repeating an already-satisfied rotate reports a no-op and preserves the previous known-good rolling backup.
+Rotate refuses stateless sessions. Repeating an already-satisfied rotate reports a no-op and preserves the previous known-good rolling backup.
 
 Use a separate session when the user wants a new active conversational boundary. Use rotate when the problem is active transcript/frontier size without changing identity.

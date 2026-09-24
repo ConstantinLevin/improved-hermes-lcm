@@ -5,7 +5,7 @@ description: Use, configure, diagnose, and retrieve exact evidence with the Herm
 
 # Hermes-LCM
 
-Use this skill when a task concerns Hermes-LCM setup, operation, compaction, diagnostics, session behavior, or recall from compacted and cross-conversation history.
+Use this skill when a task concerns Hermes-LCM setup, operation, compaction, diagnostics, session behavior, or recall from compacted history.
 
 Start here:
 
@@ -30,6 +30,5 @@ Working rules:
 - Prefer newer source-backed evidence when it conflicts with an older summary.
 - Start with the narrowest useful scope and expand only when exact detail is needed.
 - Do not infer exact commands, paths, timestamps, values, counts, or causal chains from summaries alone.
-- Keep current-session, cross-conversation, and Hermes history outside `lcm.db` distinct.
+- Keep current-session LCM history and Hermes history outside `lcm.db` distinct.
 - Do not treat open-cardinality results as complete without product-verifiable enumeration or coverage.
-- Keep default-off assertion, query-view, adaptive-retrieval, and destructive operator paths default-off unless the user explicitly asks to enable them.

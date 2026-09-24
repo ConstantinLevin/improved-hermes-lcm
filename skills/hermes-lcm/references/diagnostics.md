@@ -14,7 +14,7 @@ If optional slash commands are enabled, `/lcm status` and `/lcm doctor` expose t
 
 ## Safe mutation order
 
-For cleanup, repair, source normalization, or rotate:
+For repair or rotate:
 
 1. run the read-only preview;
 2. inspect exact candidates and paths;
@@ -22,12 +22,10 @@ For cleanup, repair, source normalization, or rotate:
 4. obtain user authorization for the specific apply operation;
 5. run one bounded apply and verify integrity afterward.
 
-Cleanup apply is separately feature-gated. Never infer permission to enable it from a diagnosis request.
-
 ## Common states
 
 - Unbound status after restart: send a normal message, then check again.
-- Database exists but stays empty: verify plugin enablement, `context.engine`, profile, database path, and ignore/stateless patterns.
-- Weak exact recall: verify source rows exist, query construction/scope is correct, summary health is sound, and embedding coverage/provenance matches the requested mode.
+- Database exists but stays empty: verify plugin enablement, `context.engine`, profile, and database path.
+- Weak exact recall: verify source rows exist, query construction/scope is correct, and summary health is sound.
 - Conflicting summary and raw evidence: prefer the newer exact raw evidence and inspect lineage.
 - Path B/context-engine schema log: expected on hosts where plugin-registry handlers do not receive active messages; context-engine schemas and dispatch remain the healthy route.
