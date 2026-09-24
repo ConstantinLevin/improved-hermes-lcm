@@ -42,7 +42,10 @@ jobs:
         run: ruff check .
 
       - name: Check shell syntax
-        run: bash -n scripts/install.sh scripts/update.sh
+        # One file per call: `bash -n a b` parses only `a` and passes `b` as an argument.
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/update.sh
 
   host-load:
     # Installs the plugin into a scratch Hermes home against the latest Hermes main and
