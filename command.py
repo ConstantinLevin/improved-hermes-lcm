@@ -22,7 +22,6 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     join_background_integrity_scans,
     load_integrity_failed,
-    remediate_interim_schema_stamp,
     repair_external_content_fts,
 )
 from .diagnostics import (
@@ -452,8 +451,6 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor clean lifecycle apply: backup-first cleanup of empty lifecycle rows only",
         "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
         "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
-        "- /lcm doctor repair schema-stamp: read-only scan for an interim-build schema_version stamp ahead of the actual v5 shape",
-        "- /lcm doctor repair schema-stamp apply: backup-first reset of an interim schema_version stamp back to the supported version",
         "- /lcm doctor source: read-only scan for legacy blank-source rows",
         "- /lcm doctor source apply: backup-first normalization of legacy blank-source rows to unknown",
         "- /lcm doctor retention: read-only retention analysis for stored session footprint and age",
@@ -1017,160 +1014,6 @@ def _doctor_repair_apply_text(engine) -> str:
         f"nodes_fts_triggers_recreated: {_fmt_bool(nodes_result['triggers_recreated'])}",
         f"nodes_fts_degraded: {_fmt_bool(nodes_result['degraded'])}",
         "note: backup created before repair apply",
-    ])
-
-
-def _classify_schema_stamp(db_path: Path) -> dict[str, Any]:
-    """Open the DB independently (read-only) and classify a too-new stamp.
-
-    Doctor must work even when the engine store refused to open the stamped DB,
-    so this uses a fresh read-only connection keyed on the path rather than the
-    engine's own connection.
-    """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        return remediate_interim_schema_stamp(conn, apply=False)
-    finally:
-        conn.close()
-
-
-def _schema_stamp_note(plan: dict[str, Any]) -> str:
-    status = plan["status"]
-    if status == "noop":
-        return f"note: schema_version is already v{plan['target_version']}; nothing to repair"
-    if status == "refused":
-        return (
-            "note: schema is genuinely newer than this build — refusing to "
-            "downgrade; restore a pre-upgrade backup (.db/-wal/-shm) instead"
-        )
-    return (
-        "note: use `/lcm doctor repair schema-stamp apply` to create a backup "
-        f"and reset the stamp to v{plan['target_version']}"
-    )
-
-
-def _schema_stamp_drop_lines(plan: dict[str, Any], *, applied: bool) -> list[str]:
-    """Per-early-feature-table lines: what was (or would be) dropped + why."""
-    verb = "dropped" if applied else "would_drop"
-    lines: list[str] = []
-    for family in plan.get("drop_plan") or []:
-        hint = family["rebuild_hint"]
-        for table in family["tables"]:
-            lines.append(f"{verb}: {table} ({hint})")
-    return lines
-
-
-def _doctor_repair_schema_stamp_text(engine) -> str:
-    db_path = Path(engine._store.db_path)
-    lines = ["LCM doctor repair schema-stamp"]
-    if not db_path.exists():
-        return "\n".join([
-            *lines,
-            "status: error",
-            f"database_path: {db_path}",
-            "error: database file does not exist",
-        ])
-    try:
-        plan = _classify_schema_stamp(db_path)
-    except sqlite3.Error as exc:  # pragma: no cover - defensive
-        return "\n".join([
-            *lines,
-            "status: error",
-            f"database_path: {db_path}",
-            f"error: schema-stamp scan failed: {exc}",
-        ])
-    status = "repair-needed" if plan["status"] == "dry-run" else plan["status"]
-    return "\n".join([
-        *lines,
-        f"status: {status}",
-        f"database_path: {db_path}",
-        f"stored_schema_version: {plan['current_version']}",
-        f"target_schema_version: {plan['target_version']}",
-        f"classification: {plan['classification'] or 'none'}",
-        *_schema_stamp_drop_lines(plan, applied=False),
-        "note: read-only scan only — no schema changes were made",
-        _schema_stamp_note(plan),
-    ])
-
-
-def _doctor_repair_schema_stamp_apply_text(engine) -> str:
-    db_path = Path(engine._store.db_path)
-    lines = ["LCM doctor repair schema-stamp apply"]
-    if not db_path.exists():
-        return "\n".join([
-            *lines,
-            "status: error",
-            f"database_path: {db_path}",
-            "error: database file does not exist",
-        ])
-
-    # Classify first so a genuinely-newer or already-current DB never triggers a
-    # pointless backup or any mutation.
-    try:
-        plan = _classify_schema_stamp(db_path)
-    except sqlite3.Error as exc:  # pragma: no cover - defensive
-        return "\n".join([
-            *lines,
-            "status: error",
-            f"database_path: {db_path}",
-            f"error: schema-stamp scan failed: {exc}",
-        ])
-    if plan["status"] != "dry-run":
-        return "\n".join([
-            *lines,
-            f"status: {plan['status']}",
-            f"database_path: {db_path}",
-            f"stored_schema_version: {plan['current_version']}",
-            f"target_schema_version: {plan['target_version']}",
-            f"classification: {plan['classification'] or 'none'}",
-            _schema_stamp_note(plan),
-        ])
-
-    backup = backup_database(engine)
-    if not backup["ok"]:
-        return "\n".join([
-            *lines,
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"error: backup failed: {backup['error']}",
-            "note: schema-stamp apply aborted before any schema change",
-        ])
-
-    conn = sqlite3.connect(str(db_path))
-    try:
-        result = remediate_interim_schema_stamp(conn, apply=True)
-    except sqlite3.Error as exc:
-        return "\n".join([
-            *lines,
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"backup_path: {backup['backup_path']}",
-            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-            f"error: schema-stamp reset failed: {exc}",
-            "note: backup was created before schema-stamp apply",
-        ])
-    finally:
-        conn.close()
-
-    dropped = result.get("dropped_tables") or []
-    return "\n".join([
-        *lines,
-        f"status: {result['status']}",
-        f"database_path: {backup['db_path']}",
-        f"backup_path: {backup['backup_path']}",
-        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-        f"stored_schema_version: {result['current_version']}",
-        f"schema_version_reset_to: {result['target_version']}",
-        f"classification: {result['classification']}",
-        f"applied: {_fmt_bool(bool(result['applied']))}",
-        f"dropped_feature_tables: {len(dropped)}",
-        *_schema_stamp_drop_lines(result, applied=True),
-        "note: backup created before schema-stamp apply",
-        *(
-            ["note: dropped tables are derived caches — rebuild them with the "
-             "commands above; no lossless message/summary data was affected"]
-            if dropped else []
-        ),
     ])
 
 
@@ -5023,18 +4866,9 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
             return _doctor_clean_lifecycle_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
             return _doctor_repair_apply_text(engine)
-        if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "schema-stamp":
-            return _doctor_repair_schema_stamp_text(engine)
-        if (
-            len(rest) == 3
-            and rest[0].lower() == "repair"
-            and rest[1].lower() == "schema-stamp"
-            and rest[2].lower() == "apply"
-        ):
-            return _doctor_repair_schema_stamp_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "source" and rest[1].lower() == "apply":
             return _doctor_source_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention` as extra subcommands.")
+        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention` as extra subcommands.")
 
     if head == "backup":
         if rest:
