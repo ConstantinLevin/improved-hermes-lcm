@@ -4,6 +4,13 @@
 # locally and in CI. It intentionally declares no [build-system] or project
 # metadata: the plugin is installed via scripts/install.sh, not pip.
 
+[tool.pyright]
+# The plugin imports the Hermes host (`agent.*`, `hermes_cli.*`, ...). For code navigation
+# the host source must be resolvable: a current checkout of
+# https://github.com/nousresearch/hermes-agent as a sibling directory of this repo, never the
+# live ~/.hermes install. See manifesto.md, "How this is done".
+extraPaths = ["../hermes-agent"]
+
 [tool.ruff]
 # Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.
 target-version = "py311"

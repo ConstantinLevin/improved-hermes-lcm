@@ -44,6 +44,5 @@ ENV/
 .env.local
 .env.*.local
 
-# Internal documentation
-internal docs/
-docs/plans/
+# Local language-server install (pyright)
+node_modules/
