@@ -227,29 +227,60 @@ class RecordStore:
             )
         }
 
-    def record_facts(self, handles: Iterable[str]) -> dict[str, tuple[Optional[str], str]]:
-        """handle -> (predecessor, raw)."""
+    def record_facts(self, handles: Iterable[str]) -> dict[str, tuple[Optional[str], str, str, int]]:
+        """handle -> (predecessor, raw, kind, order written)."""
         wanted = [h for h in set(handles) if h]
-        facts: dict[str, tuple[Optional[str], str]] = {}
+        facts: dict[str, tuple[Optional[str], str, str, int]] = {}
         for start in range(0, len(wanted), 500):
             chunk = wanted[start:start + 500]
             rows = self._q(
-                f"SELECT handle, predecessor, raw FROM records WHERE handle IN ({','.join('?' * len(chunk))})",
+                "SELECT handle, predecessor, raw, kind, rowid FROM records "
+                f"WHERE handle IN ({','.join('?' * len(chunk))})",
                 chunk,
             )
-            facts.update({str(h): (p, str(r)) for h, p, r in rows})
+            facts.update({str(h): (p, str(r), str(k), int(o)) for h, p, r, k, o in rows})
         return facts
 
+    def beside(self, handles: Iterable[str]) -> dict[str, bool]:
+        """Whether each record stands beside the chain (F8): a host insertion, or a
+        revision none of whose record sources is on the chain (a rewritten summary, a
+        rewritten host insertion)."""
+        result: dict[str, bool] = {}
+
+        def visit(handle: str, depth: int = 0) -> bool:
+            if handle in result:
+                return result[handle]
+            kind_rows = self._q("SELECT kind FROM records WHERE handle = ?", (handle,))
+            kind = str(kind_rows[0][0]) if kind_rows else "transcript"
+            if kind == "host_insertion":
+                value = True
+            elif kind == "revision" and depth < 32:
+                sources = [s for (s,) in self._q(
+                    "SELECT source_record FROM revision_sources WHERE revision = ? AND source_record IS NOT NULL",
+                    (handle,),
+                )]
+                value = all(visit(str(s), depth + 1) for s in sources)
+            else:
+                value = False
+            result[handle] = value
+            return value
+
+        for handle in set(handles):
+            if handle:
+                visit(handle)
+        return result
+
     def chain_end(self, compaction: Optional[int]) -> Optional[str]:
-        """The record of the last input entry of a compaction that has one."""
+        """The record of the last input entry of a compaction that is on the chain."""
         if compaction is None:
             return None
-        rows = self._q(
+        rows = [str(r) for (r,) in self._q(
             "SELECT record FROM compaction_inputs WHERE compaction = ? AND record IS NOT NULL "
-            "ORDER BY position DESC LIMIT 1",
+            "ORDER BY position DESC",
             (compaction,),
-        )
-        return str(rows[0][0]) if rows else None
+        )]
+        side = self.beside(rows)
+        return next((r for r in rows if not side.get(r)), None)
 
     def bound_rows(self, compaction: int) -> dict[int, int]:
         """host_row_id -> returned position, for the returned entries."""
@@ -368,8 +399,20 @@ class RecordStore:
                                     "source_position) VALUES (?, ?, ?, ?)",
                                     (handle, ordinal, source[1], source[2]),
                                 )
+                        # Calls the sources already hold keep their handles; only the
+                        # revision's new calls are written, as for a new record.
+                        source_records = [s[1] for s in entry.sources if s[0] == "record"]
+                        known = {
+                            str(call_id)
+                            for (call_id,) in conn.execute(
+                                "SELECT tool_call_id FROM tool_calls WHERE tool_call_id IS NOT NULL AND record IN "
+                                f"({','.join('?' * len(source_records))})",
+                                source_records,
+                            ).fetchall()
+                        } if source_records else set()
+                        written.append((handle, message, known))
                     else:
-                        written.append((handle, message))
+                        written.append((handle, message, set()))
                 conn.execute(
                     "INSERT INTO compaction_inputs(compaction, position, host_row_id, record) VALUES (?, ?, ?, ?)",
                     (cid, entry.position, entry.host_row_id, records.get(entry.position)),
@@ -377,21 +420,30 @@ class RecordStore:
             self._write_tool_calls(conn, session, cid, written)
         return int(cid), records
 
-    def _write_tool_calls(self, conn: sqlite3.Connection, session: str, cid: int, written: list[tuple[str, dict]]) -> None:
+    def _write_tool_calls(
+        self,
+        conn: sqlite3.Connection,
+        session: str,
+        cid: int,
+        written: list[tuple[str, dict, set]],
+    ) -> None:
         """One row per tool call, pointing into its assistant record by position; a
         result recorded in the same compaction is its ``result_record``, one recorded
-        by a later compaction is linked through ``tool_results``."""
+        by a later compaction is linked through ``tool_results``. Each entry carries
+        the call ids that already have a handle (a revision's sources) and are skipped."""
         results_by_call_id: dict[str, list[str]] = {}
-        for handle, message in written:
+        for handle, message, _known in written:
             if message.get("role") == "tool" and message.get("tool_call_id"):
                 results_by_call_id.setdefault(str(message["tool_call_id"]), []).append(handle)
         claimed: set[str] = set()
-        for handle, message in written:
+        for handle, message, known in written:
             calls = message.get("tool_calls") or []
             if message.get("role") != "assistant" or not isinstance(calls, list):
                 continue
             for index, call in enumerate(calls):
                 call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
+                if call_id and call_id in known:
+                    continue
                 result = None
                 for candidate in results_by_call_id.get(call_id, []):
                     if candidate not in claimed:

@@ -266,19 +266,29 @@ class RecordWriteMixin:
                  "the list carries no identity for it (see ask A1)")
             return None
 
-        # 2. Returned rows the host merged into another (its sequence repair records
-        # the absorbed ids on the survivor, in memory only).
-        absorbed_into: Dict[int, int] = {}  # returned position -> survivor's list index
-        position_by_row = {row_id: position for row_id, position in bound.items()}
+        # 2. Known rows the host merged into another: its sequence repair records the
+        # absorbed ids on the survivor, in memory only. An absorbed id names a returned
+        # row (by its binding) or a row an unconfirmed attempt recorded (reusable).
+        absorbed_positions: set = set()
+        absorbed_records: Dict[int, List[str]] = {}  # survivor's list index -> originals
         for index, message in enumerate(messages):
             for row_id in message.get("_absorbed_row_ids") or ():
-                if isinstance(row_id, int) and row_id in position_by_row:
-                    absorbed_into[position_by_row[row_id]] = index
+                if not isinstance(row_id, int):
+                    continue
+                if row_id in bound:
+                    position = bound[row_id]
+                    absorbed_positions.add(position)
+                    record = returned[position][1] if returned[position][0] == "record" else None
+                else:
+                    record = reusable.get(row_id)
+                if record:
+                    absorbed_records.setdefault(index, []).append(record)
 
         # 3. What is missing: a summary is an error; a record is a revert only as a
-        # suffix of the return, anything else is an error.
-        present = set(at_position)
-        missing = sorted(p for p in returned if p not in present and p not in absorbed_into)
+        # suffix of the return, anything else is an error. A row merged into a survivor
+        # stands in the list through it, so it counts as present.
+        present = set(at_position) | absorbed_positions
+        missing = sorted(p for p in returned if p not in present)
         for position in missing:
             kind = returned[position][0]
             if kind == "summary":
@@ -298,9 +308,13 @@ class RecordWriteMixin:
                 fail("unbound_summary_row", {"index": index, "host_row_id": message.get("_row_id")})
                 return None
 
-        # 5. Facts about the records the comparisons and predecessors need.
+        # 5. Facts about the records the comparisons and predecessors need, and which
+        # of them stand beside the chain (F8: a host insertion never becomes a
+        # predecessor, whenever it is met again).
         wanted = [returned[p][1] for p in returned if returned[p][1]] + list(reusable.values())
+        wanted += [r for records in absorbed_records.values() for r in records]
         facts = store.record_facts(wanted)
+        side = store.beside(wanted)
 
         def predecessor_of(record: Optional[str]) -> Optional[tuple]:
             if record is None or record not in facts:
@@ -308,8 +322,23 @@ class RecordWriteMixin:
             pred = facts[record][0]
             return ("record", pred) if pred else None
 
+        def earliest(records: List[str]) -> str:
+            return min(records, key=lambda r: facts[r][3] if r in facts else 1 << 62)
+
+        def current(record: Optional[str], row_id: Optional[int]) -> Optional[str]:
+            """What the store already holds for a row: an unconfirmed attempt's record
+            for it (a revision it wrote, W2 step 8) comes before the returned one."""
+            if row_id is not None and row_id in reusable:
+                return reusable[row_id]
+            return record
+
         last_bound_index = max(found) if found else -1
-        surviving = [returned[found[i]][1] for i in sorted(found) if returned[found[i]][0] == "record"]
+        surviving = [
+            current(returned[found[i]][1], messages[i].get("_row_id") if isinstance(messages[i].get("_row_id"), int)
+                    else None)
+            for i in sorted(found) if returned[found[i]][0] == "record"
+        ]
+        surviving = [r for r in surviving if r and not side.get(r)]
         if surviving:
             fallback: Optional[tuple] = ("record", surviving[-1])
         elif reverted:
@@ -323,58 +352,63 @@ class RecordWriteMixin:
         # branch) move the chain; host insertions and summary revisions stand beside it.
         entries: List[InputEntry] = []
         chain: Optional[tuple] = None
+
+        def known_row(index: int, row_id: Optional[int], message: Dict[str, Any], base: str,
+                      merged: List[str]) -> None:
+            """A row the store already holds as ``base``: referenced when unchanged,
+            else revised. A record beside the chain keeps its revisions beside it."""
+            nonlocal chain
+            beside_chain = side.get(base, False) and all(side.get(r, False) for r in merged)
+            if merged or (base in facts and rewritten(message, facts[base][1])):
+                originals = [base] + [r for r in merged if r != base]
+                pred = (chain if chain is not None else fallback) if beside_chain \
+                    else predecessor_of(earliest(originals))
+                entries.append(InputEntry(index, row_id, "revision", message=message, pred=pred,
+                                          sources=[("record", r) for r in originals]))
+                if not beside_chain:
+                    chain = ("entry", index)
+            else:
+                entries.append(InputEntry(index, row_id, "reused", record=base))
+                if not beside_chain:
+                    chain = ("record", base)
+
         for index, message in enumerate(messages):
             row_id = message.get("_row_id")
             row_id = row_id if isinstance(row_id, int) else None
-            merged = sorted(p for p, survivor in absorbed_into.items() if survivor == index)
-            merged_records = [returned[p][1] for p in merged if returned[p][0] == "record" and returned[p][1]]
+            merged = absorbed_records.get(index, [])
             beside = chain if chain is not None else fallback
             if index in found:
                 position = found[index]
                 kind, record, _derivation, raw = returned[position]
                 if kind == "summary":
-                    if merged_records or (raw is not None and rewritten(message, raw)):
+                    prior = current(None, row_id)
+                    if prior is not None:
+                        known_row(index, row_id, message, prior, merged)
+                    elif merged or (raw is not None and rewritten(message, raw)):
                         entries.append(InputEntry(
                             index, row_id, "revision", message=message, pred=beside,
-                            sources=[("return", effective, position)] + [("record", r) for r in merged_records]))
+                            sources=[("return", effective, position)] + [("record", r) for r in merged]))
                     else:
                         entries.append(InputEntry(index, row_id, "bound_summary"))
                     continue
-                if merged_records or (record in facts and rewritten(message, facts[record][1])):
-                    originals = [record] + merged_records if record else merged_records
-                    earliest = min(originals, key=lambda r: next(
-                        (p for p, e in returned.items() if e[1] == r), 1 << 30))
-                    entries.append(InputEntry(
-                        index, row_id, "revision", message=message, pred=predecessor_of(earliest),
-                        sources=[("record", r) for r in originals]))
-                    chain = ("entry", index)
-                else:
-                    entries.append(InputEntry(index, row_id, "bound", record=record))
-                    chain = ("record", record) if record else chain
+                known_row(index, row_id, message, current(record, row_id), merged)
                 continue
             if index == 0 and message.get("role") == "system":
                 entries.append(InputEntry(index, row_id, "system"))
             elif row_id is not None and row_id in insertions:
                 entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
             elif row_id is not None and row_id in reusable:
-                record = reusable[row_id]
-                if merged_records or (record in facts and rewritten(message, facts[record][1])):
-                    entries.append(InputEntry(
-                        index, row_id, "revision", message=message, pred=predecessor_of(record),
-                        sources=[("record", record)] + [("record", r) for r in merged_records]))
-                    chain = ("entry", index)
-                else:
-                    entries.append(InputEntry(index, row_id, "reused", record=record))
-                    chain = ("record", record)
+                known_row(index, row_id, message, reusable[row_id], merged)
             elif index < last_bound_index:
                 entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
-            elif merged_records:
-                # A new row that absorbed a returned row: it holds that row's content.
-                earliest = merged_records[0]
-                entries.append(InputEntry(
-                    index, row_id, "revision", message=message, pred=predecessor_of(earliest),
-                    sources=[("record", r) for r in merged_records]))
-                chain = ("entry", index)
+            elif merged:
+                # A new row that absorbed known rows: it holds their content.
+                beside_chain = all(side.get(r, False) for r in merged)
+                pred = beside if beside_chain else predecessor_of(earliest(merged))
+                entries.append(InputEntry(index, row_id, "revision", message=message, pred=pred,
+                                          sources=[("record", r) for r in merged]))
+                if not beside_chain:
+                    chain = ("entry", index)
             else:
                 entries.append(InputEntry(index, row_id, "transcript", message=message, pred=beside))
                 chain = ("entry", index)
