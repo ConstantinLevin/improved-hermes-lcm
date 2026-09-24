@@ -269,6 +269,9 @@ class CompactionMixin:
             return messages
         if self._attempt_is_current(attempt):
             self._apply_attempt_outcome(attempt)
+            if attempt.compacted:
+                # After the outcome is applied, so the telemetry reads this attempt's.
+                self._record_compaction_telemetry()
         return result
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
@@ -517,8 +520,9 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
-            # A cancelled attempt starts no further summariser call (#29 W2 step 2).
-            if attempt is not None and attempt.cancelled():
+            # A cancelled or no longer current attempt starts no further summariser
+            # call (#29 W2 step 2; #33 D12).
+            if not self._live_write_allowed(attempt):
                 raise AttemptCancelled()
             shadow_chunk = None
             if attempt is not None:
@@ -596,6 +600,10 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
+            # Live state: the DAG node, the in-process marker and the persisted
+            # frontier. A cancelled or no longer current attempt writes none of them;
+            # its summary is in the shadow as a derivation only.
+            self._require_live_write()
             self._dag.add_node(node)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             self._persist_frontier_marker()
@@ -669,8 +677,7 @@ class CompactionMixin:
         # condenses after the eligible raw prefix has been drained, and shares
         # the same total pass/deadline budget as its leaf work.
         condensation_passes = 0
-        if attempt is not None and attempt.cancelled():
-            raise AttemptCancelled()
+        self._require_live_write()
         if threshold_full_sweep_active:
             if sweep_raw_drained:
                 remaining_passes = max(
@@ -775,25 +782,19 @@ class CompactionMixin:
                 "budget_exhausted": final_stop_reason
                 in {"pass_budget_exhausted", "time_budget_exhausted"},
             })
+        # The last live writes and the return fence on the captured check: a
+        # cancelled or no longer current attempt writes neither and hands the host
+        # its input (#29 W2 steps 2 and 6).
+        self._require_live_write()
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(compressed)
         )
         self._write_generated_ignored_placeholder_hash_ordinals(
             self._generated_placeholder_digest_ordinals_for_active_replay(compressed)
         )
-        record_successful_compaction = getattr(
-            self,
-            "_record_successful_compaction_telemetry",
-            None,
-        )
-        if callable(record_successful_compaction):
-            record_successful_compaction()
-
-        # The return fences on the captured check: a cancelled attempt writes no
-        # return and hands the host its input (#29 W2 steps 2 and 6).
         if attempt is not None:
-            if attempt.cancelled():
-                raise AttemptCancelled()
             self._shadow_returns(attempt, compressed)
+        else:
+            self._record_compaction_telemetry()
 
         return compressed

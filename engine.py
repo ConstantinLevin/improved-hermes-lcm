@@ -159,9 +159,13 @@ class LCMEngine(
         # own bind_session_state() and on_session_start(). Nothing else names it:
         # not a hook's session id, not a turn id, not another copy's session.
         self._plugin_session: str = ""
-        # This copy's attempts whose return is written, by compaction id, until the
-        # host confirms or rejects them; binding reads the returned dicts from here.
+        # This copy's attempts whose return is written, by compaction id, until all
+        # their returned entries are bound; confirmation and binding read the
+        # returned dicts from here. The attempt that returned last, for a rejection;
+        # a confirmation whose compaction the next list must name.
         self._returned_attempts: dict = {}
+        self._last_returned_attempt = None
+        self._pending_confirmation = None
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -405,6 +409,8 @@ class LCMEngine(
         self._conversation_id = ""
         self._plugin_session = ""
         self._returned_attempts = {}
+        self._last_returned_attempt = None
+        self._pending_confirmation = None
         self._clear_pending_reset_boundary()
         self._reset_session_scoped_runtime_state()
 
@@ -2353,6 +2359,7 @@ class LCMEngine(
         depth = nodes[0].depth
         if any(node.depth != depth for node in nodes):
             raise ValueError("condensation requires same-depth summary nodes")
+        self._require_live_write()
         combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
@@ -2399,6 +2406,7 @@ class LCMEngine(
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
         )
+        self._require_live_write()
         self._dag.add_node(condensed_node)
         return source_tokens, summary_tokens, level
 

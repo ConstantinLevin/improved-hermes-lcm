@@ -155,6 +155,7 @@ INSERT_ONLY_TABLES = (
     "compaction_returns",
     "confirmations",
     "rejections",
+    "adoptions",
     "bindings",
     "store_events",
 )
@@ -307,13 +308,23 @@ CREATE TABLE rejections (
     at REAL NOT NULL
 );
 
+CREATE TABLE adoptions (
+    compaction INTEGER NOT NULL UNIQUE REFERENCES compactions(compaction_id),
+    evidence TEXT NOT NULL,
+    at REAL NOT NULL
+);
+
 CREATE TABLE bindings (
     compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
-    position INTEGER NOT NULL,
     host_row_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('return', 'host_insertion')),
+    position INTEGER,
+    committed_index INTEGER,
     at REAL NOT NULL,
-    PRIMARY KEY (compaction, position)
+    PRIMARY KEY (compaction, host_row_id),
+    CHECK ((kind = 'return') = (position IS NOT NULL))
 );
+CREATE UNIQUE INDEX idx_bindings_position ON bindings(compaction, position) WHERE position IS NOT NULL;
 CREATE INDEX idx_bindings_row ON bindings(host_row_id);
 
 CREATE TABLE store_events (

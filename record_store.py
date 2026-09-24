@@ -83,6 +83,7 @@ class RecordStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._lock = threading.RLock()
+        self._pending_events: list[tuple] = []
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
@@ -104,15 +105,28 @@ class RecordStore:
 
     @contextlib.contextmanager
     def _tx(self):
+        """One short write transaction. It never stays open: when the body or the
+        COMMIT fails (in rollback-journal mode a COMMIT can fail on the busy timeout
+        while a reader holds its shared lock), the transaction is rolled back before
+        the error is raised, so that no lock of the shadow ever blocks a live write."""
         with self._lock:
             conn = self._conn
             conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
+                conn.execute("COMMIT")
             except BaseException:
-                conn.execute("ROLLBACK")
+                self._rollback(conn)
                 raise
-            conn.execute("COMMIT")
+            self._flush_events()
+
+    def _rollback(self, conn: sqlite3.Connection) -> None:
+        if not conn.in_transaction:
+            return
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            logger.error("LCM could not roll back a shadow transaction in %s", self.db_path, exc_info=True)
 
     def _q(self, sql: str, args: Sequence[Any] = ()) -> list:
         with self._lock:
@@ -130,30 +144,67 @@ class RecordStore:
     ) -> None:
         """Record something the plugin could not do, or a fact about its health.
 
-        It never raises: a failed event write is logged at ERROR instead.
+        It never raises. An event that cannot be written now (the store is locked by
+        the same cause as the failure it reports) is logged at ERROR, kept in this
+        process, and written with the next shadow transaction that commits.
         """
         text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
         logger.warning("LCM store event %s (session=%s compaction=%s): %s", kind, session, compaction, text)
-        try:
-            with self._tx() as conn:
-                conn.execute(
-                    "INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
-                    (time.time(), kind, session, compaction, text),
+        with self._lock:
+            self._pending_events.append((time.time(), kind, session, compaction, text))
+            self._flush_events()
+
+    def _flush_events(self) -> None:
+        """Write the events not written yet, in their own short transaction."""
+        with self._lock:
+            if not self._pending_events or self._conn is None:
+                return
+            conn = self._conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.executemany(
+                        "INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
+                        self._pending_events,
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    self._rollback(conn)
+                    raise
+            except Exception:
+                logger.error(
+                    "LCM could not record %d store event(s) in %s yet: %s",
+                    len(self._pending_events),
+                    self.db_path,
+                    ", ".join(event[1] for event in self._pending_events),
+                    exc_info=True,
                 )
-        except Exception:
-            logger.error("LCM could not record the store event %s in %s", kind, self.db_path, exc_info=True)
+                return
+            self._pending_events = []
 
     # --- Reading ------------------------------------------------------------------
 
     def effective_compaction(self, session: str) -> Optional[int]:
-        """The session's latest compaction the host confirmed and did not reject."""
+        """The session's latest compaction that took effect and was not rejected: the
+        host confirmed it, or its return was found adopted without a confirmation."""
         rows = self._q(
-            "SELECT c.compaction_id FROM compactions c JOIN confirmations f ON f.compaction = c.compaction_id "
-            "WHERE c.session = ? AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.compaction = c.compaction_id) "
+            "SELECT c.compaction_id FROM compactions c WHERE c.session = ? "
+            "AND (EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
+            "OR EXISTS (SELECT 1 FROM adoptions a WHERE a.compaction = c.compaction_id)) "
+            "AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.compaction = c.compaction_id) "
             "ORDER BY c.compaction_id DESC LIMIT 1",
             (session,),
         )
         return int(rows[0][0]) if rows else None
+
+    def is_settled(self, compaction: int) -> bool:
+        """Confirmed, adopted or rejected: the host's handling of it is known."""
+        return bool(self._q(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM confirmations WHERE compaction = ?) "
+            "OR EXISTS (SELECT 1 FROM adoptions WHERE compaction = ?) "
+            "OR EXISTS (SELECT 1 FROM rejections WHERE compaction = ?)",
+            (compaction, compaction, compaction),
+        ))
 
     def compaction_session(self, compaction: int) -> Optional[str]:
         rows = self._q("SELECT session FROM compactions WHERE compaction_id = ?", (compaction,))
@@ -169,11 +220,21 @@ class RecordStore:
         }
 
     def bound_rows(self, compaction: int) -> dict[int, int]:
-        """host_row_id -> returned position."""
+        """host_row_id -> returned position, for the returned entries."""
         return {
             int(row_id): int(pos)
             for pos, row_id in self._q(
-                "SELECT position, host_row_id FROM bindings WHERE compaction = ?",
+                "SELECT position, host_row_id FROM bindings WHERE compaction = ? AND kind = 'return'",
+                (compaction,),
+            )
+        }
+
+    def bound_insertions(self, compaction: int) -> set[int]:
+        """host_row_ids the host inserted into the committed list of a compaction."""
+        return {
+            int(row_id)
+            for (row_id,) in self._q(
+                "SELECT host_row_id FROM bindings WHERE compaction = ? AND kind = 'host_insertion'",
                 (compaction,),
             )
         }
@@ -187,6 +248,7 @@ class RecordStore:
             "ON c.compaction_id = i.compaction WHERE c.session = ? AND c.compaction_id > ? "
             "AND i.host_row_id IS NOT NULL AND i.record IS NOT NULL "
             "AND NOT EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
+            "AND NOT EXISTS (SELECT 1 FROM adoptions a WHERE a.compaction = c.compaction_id) "
             "AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.compaction = c.compaction_id) "
             "ORDER BY c.compaction_id ASC",
             (session, after or 0),
@@ -203,18 +265,6 @@ class RecordStore:
             (compaction,),
         )
         return str(rows[0][0]) if rows else None
-
-    def latest_pending(self, session: str) -> Optional[int]:
-        """The session's latest compaction with a return and no confirmation or rejection."""
-        rows = self._q(
-            "SELECT c.compaction_id FROM compactions c WHERE c.session = ? "
-            "AND EXISTS (SELECT 1 FROM compaction_returns r WHERE r.compaction = c.compaction_id) "
-            "AND NOT EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
-            "AND NOT EXISTS (SELECT 1 FROM rejections j WHERE j.compaction = c.compaction_id) "
-            "ORDER BY c.compaction_id DESC LIMIT 1",
-            (session,),
-        )
-        return int(rows[0][0]) if rows else None
 
     # --- Writing ------------------------------------------------------------------
 
@@ -382,11 +432,21 @@ class RecordStore:
                 [(compaction, pos, kind, record, derivation) for pos, kind, record, derivation in entries],
             )
 
-    def confirm(self, compaction: int, *, host_session_before: Optional[str], host_session_after: str) -> None:
+    def confirm(
+        self,
+        compaction: int,
+        *,
+        host_session_before: Optional[str],
+        host_session_after: str,
+        at: Optional[float] = None,
+    ) -> None:
+        """The record line: the host's identifiers before and after, at the time the
+        host's signal arrived (``at``, when it is written once the next list has named
+        the compaction the signal was for)."""
         with self._tx() as conn:
             conn.execute(
                 "INSERT INTO confirmations(compaction, host_session_before, host_session_after, at) VALUES (?, ?, ?, ?)",
-                (compaction, host_session_before or None, host_session_after, time.time()),
+                (compaction, host_session_before or None, host_session_after, at if at is not None else time.time()),
             )
 
     def reject(self, compaction: int, *, how: str) -> None:
@@ -396,20 +456,49 @@ class RecordStore:
                 (compaction, how, time.time()),
             )
 
-    def bind(self, compaction: int, pairs: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
-        """Write (position, host_row_id) bindings not written yet; return those written."""
-        written: list[tuple[int, int]] = []
+    def adopt(self, compaction: int, *, evidence: str) -> None:
+        """The return took effect without a confirmation (a host without a session
+        database uses the list as returned). Its own kind, never a confirmation."""
         with self._tx() as conn:
-            for position, row_id in pairs:
+            conn.execute(
+                "INSERT INTO adoptions(compaction, evidence, at) VALUES (?, ?, ?)",
+                (compaction, evidence, time.time()),
+            )
+
+    def bind(
+        self,
+        compaction: int,
+        returns: Iterable[tuple[int, int, Optional[int]]] = (),
+        insertions: Iterable[tuple[int, Optional[int]]] = (),
+    ) -> list[int]:
+        """Write bindings not written yet: returned entries as (position, host_row_id,
+        committed_index), host insertions as (host_row_id, committed_index). A position
+        or a row id already bound is left as it is. Returns the positions written."""
+        written: list[int] = []
+        with self._tx() as conn:
+            for position, row_id, index in returns:
                 exists = conn.execute(
-                    "SELECT 1 FROM bindings WHERE compaction = ? AND position = ?",
-                    (compaction, position),
+                    "SELECT 1 FROM bindings WHERE compaction = ? AND (position = ? OR host_row_id = ?)",
+                    (compaction, position, int(row_id)),
                 ).fetchone()
                 if exists:
                     continue
                 conn.execute(
-                    "INSERT INTO bindings(compaction, position, host_row_id, at) VALUES (?, ?, ?, ?)",
-                    (compaction, position, int(row_id), time.time()),
+                    "INSERT INTO bindings(compaction, host_row_id, kind, position, committed_index, at) "
+                    "VALUES (?, ?, 'return', ?, ?, ?)",
+                    (compaction, int(row_id), position, index, time.time()),
                 )
-                written.append((position, int(row_id)))
+                written.append(position)
+            for row_id, index in insertions:
+                exists = conn.execute(
+                    "SELECT 1 FROM bindings WHERE compaction = ? AND host_row_id = ?",
+                    (compaction, int(row_id)),
+                ).fetchone()
+                if exists:
+                    continue
+                conn.execute(
+                    "INSERT INTO bindings(compaction, host_row_id, kind, position, committed_index, at) "
+                    "VALUES (?, ?, 'host_insertion', NULL, ?, ?)",
+                    (compaction, int(row_id), index, time.time()),
+                )
         return written
