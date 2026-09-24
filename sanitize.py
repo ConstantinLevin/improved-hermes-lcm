@@ -2,8 +2,7 @@
 
 Pure functions that shape the active replay context emitted back to providers:
 strip internal/reasoning content from assistant messages, decide whether an
-assistant message still has visible content, and detect sensitive-redaction
-markers. Raw store and DAG history stay lossless -- these only sanitize the
+assistant message still has visible content. Raw store and DAG history stay lossless -- these only sanitize the
 active context, never stored rows.
 
 Extracted verbatim from ``LCMEngine`` (WS5 seam 2). These depend only on
@@ -29,20 +28,6 @@ _INTERNAL_ASSISTANT_PART_TYPES = {
     "thought",
     "thinking",
 }
-
-
-def _contains_sensitive_redaction(value: Any) -> bool:
-    if isinstance(value, str):
-        return "[LCM sensitive redaction:" in value
-    if isinstance(value, dict):
-        return any(
-            _contains_sensitive_redaction(item)
-            for pair in value.items()
-            for item in pair
-        )
-    if isinstance(value, list):
-        return any(_contains_sensitive_redaction(item) for item in value)
-    return False
 
 
 def _structured_part_text(part: Dict[str, Any]) -> str:

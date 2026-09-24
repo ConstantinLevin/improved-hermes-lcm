@@ -438,12 +438,12 @@ class BypassMixin:
             )
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = f"LCM bypassed below threshold: {reason}"
-            return self._redact_active_replay_messages(messages)
+            return self._copy_active_replay_messages_preserving_generated_ids(messages)
 
         logger.debug("LCM delegating compaction for bypassed %s %s", reason, session_id)
         self._last_compression_status = "host_fallback"
         self._last_compression_noop_reason = f"LCM bypassed: {reason}"
-        safe_messages = self._redact_active_replay_messages(messages)
+        safe_messages = self._copy_active_replay_messages_preserving_generated_ids(messages)
         target_tokens = self._bypass_compaction_target_tokens(
             observed_tokens=observed_tokens,
             messages=safe_messages,

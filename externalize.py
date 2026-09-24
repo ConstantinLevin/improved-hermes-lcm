@@ -346,28 +346,14 @@ def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None
     return entry
 
 
-def _persisted_output_marker_entries(
-    payload: Dict[str, Any],
-    *,
-    include_legacy_preview_prefix: bool = False,
-) -> list[Dict[str, Any]]:
+def _persisted_output_marker_entries(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     entries: list[Dict[str, Any]] = []
-    seen: set[tuple[str, int, str, str, int | None, int | None, int | None]] = set()
-    try:
-        from .ingest_protection import _has_lossy_sensitive_redaction
-    except Exception:
-        _has_lossy_sensitive_redaction = None  # type: ignore[assignment]
-    payload_content_has_lossy_redaction = bool(
-        _has_lossy_sensitive_redaction
-        and _has_lossy_sensitive_redaction(str(payload.get("content") or ""))
-    )
+    seen: set[tuple[str, int, str, int | None, int | None, int | None]] = set()
 
     def add(
         source_path: Any,
         expected_chars: Any,
-        preview_prefix: Any = None,
         preview_sha256: Any = None,
-        redacted_preview_sha256: Any = None,
         file_size: Any = None,
         file_mtime_ns: Any = None,
         file_ctime_ns: Any = None,
@@ -381,10 +367,7 @@ def _persisted_output_marker_entries(
         source = str(source_path)
         if not source:
             return
-        preview_digest = "" if payload_content_has_lossy_redaction else str(preview_sha256 or "")
-        if not preview_digest and preview_prefix and not payload_content_has_lossy_redaction:
-            preview_digest = _preview_sha256(preview_prefix)
-        redacted_preview_digest = str(redacted_preview_sha256 or "")
+        preview_digest = str(preview_sha256 or "")
         try:
             size = int(file_size) if file_size is not None else None
         except (TypeError, ValueError):
@@ -397,31 +380,25 @@ def _persisted_output_marker_entries(
             ctime_ns = int(file_ctime_ns) if file_ctime_ns is not None else None
         except (TypeError, ValueError):
             ctime_ns = None
-        key = (source, chars, preview_digest, redacted_preview_digest, size, mtime_ns, ctime_ns)
+        key = (source, chars, preview_digest, size, mtime_ns, ctime_ns)
         if key in seen:
             return
         seen.add(key)
         entry = {"source_path": source, "expected_chars": chars}
         if preview_digest:
             entry["preview_sha256"] = preview_digest
-        if redacted_preview_digest:
-            entry["redacted_preview_sha256"] = redacted_preview_digest
         if size is not None:
             entry["file_size"] = size
         if mtime_ns is not None:
             entry["file_mtime_ns"] = mtime_ns
         if ctime_ns is not None:
             entry["file_ctime_ns"] = ctime_ns
-        if include_legacy_preview_prefix and preview_prefix:
-            entry["legacy_preview_prefix"] = str(preview_prefix)
         entries.append(entry)
 
     add(
         payload.get("persisted_output_source_path"),
         payload.get("persisted_output_expected_chars"),
-        payload.get("persisted_output_preview_prefix"),
         payload.get("persisted_output_preview_sha256"),
-        payload.get("persisted_output_redacted_preview_sha256"),
         payload.get("persisted_output_file_size"),
         payload.get("persisted_output_file_mtime_ns"),
         payload.get("persisted_output_file_ctime_ns"),
@@ -434,9 +411,7 @@ def _persisted_output_marker_entries(
             add(
                 marker.get("source_path"),
                 marker.get("expected_chars"),
-                marker.get("preview_prefix"),
                 marker.get("preview_sha256"),
-                marker.get("redacted_preview_sha256"),
                 marker.get("file_size"),
                 marker.get("file_mtime_ns"),
                 marker.get("file_ctime_ns"),
@@ -463,42 +438,6 @@ def _safe_persisted_output_metadata(metadata: Dict[str, Any] | None) -> Dict[str
     if marker.get("file_ctime_ns") is not None:
         safe["persisted_output_file_ctime_ns"] = marker["file_ctime_ns"]
     return safe
-
-
-def _redacted_legacy_preview_sha256(marker: Dict[str, Any], config) -> str:
-    legacy_preview_prefix = marker.get("legacy_preview_prefix")
-    if not legacy_preview_prefix:
-        return ""
-    try:
-        from .ingest_protection import _has_lossy_sensitive_redaction, redact_sensitive_value
-    except Exception:
-        return ""
-    redacted_preview = redact_sensitive_value(
-        str(legacy_preview_prefix),
-        config,
-        parse_json_strings=False,
-    )
-    if _has_lossy_sensitive_redaction(str(redacted_preview)):
-        return ""
-    return _preview_sha256(redacted_preview)
-
-
-def _persisted_output_marker_matches_preview_digest(
-    marker: Dict[str, Any],
-    preview_sha256: str,
-    *,
-    config,
-    allow_redacted_preview_match: bool = True,
-) -> bool:
-    if not preview_sha256:
-        return False
-    if preview_sha256 == str(marker.get("preview_sha256") or ""):
-        return True
-    if not allow_redacted_preview_match:
-        return False
-    if preview_sha256 == str(marker.get("redacted_preview_sha256") or ""):
-        return True
-    return preview_sha256 == _redacted_legacy_preview_sha256(marker, config)
 
 
 def _marker_file_not_newer_than_payload(marker: Dict[str, Any], payload: Dict[str, Any]) -> bool:
@@ -1933,7 +1872,6 @@ def find_externalized_tool_result_content_for_call(
     persisted_output_source_path: str | None = None,
     persisted_output_preview_sha256: str | None = None,
     require_persisted_output_file_not_newer: bool = False,
-    allow_redacted_preview_match: bool = True,
     require_missing_file_generation_metadata: bool = False,
     persisted_output_file_size: int | None = None,
     persisted_output_file_mtime_ns: int | None = None,
@@ -1946,8 +1884,7 @@ def find_externalized_tool_result_content_for_call(
     This is used only for replay identity recovery when Hermes' temporary
     persisted-output file has already been cleaned up but LCM previously stored
     the recovered full tool output durably. A reused tool-call id alone is not
-    sufficient proof; marker-specific metadata captured before redaction must
-    match when provided.
+    sufficient proof; marker-specific metadata must match when provided.
     """
     if not tool_call_id:
         return None
@@ -1980,7 +1917,7 @@ def find_externalized_tool_result_content_for_call(
             or require_persisted_output_file_not_newer
         ):
             marker_matches = False
-            for marker in _persisted_output_marker_entries(payload, include_legacy_preview_prefix=True):
+            for marker in _persisted_output_marker_entries(payload):
                 if expected_chars is not None and marker.get("expected_chars") != expected_chars:
                     continue
                 if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
@@ -1999,12 +1936,7 @@ def find_externalized_tool_result_content_for_call(
                     continue
                 if (
                     persisted_output_preview_sha256
-                    and not _persisted_output_marker_matches_preview_digest(
-                        marker,
-                        persisted_output_preview_sha256,
-                        config=config,
-                        allow_redacted_preview_match=allow_redacted_preview_match,
-                    )
+                    and persisted_output_preview_sha256 != str(marker.get("preview_sha256") or "")
                 ):
                     continue
                 if require_persisted_output_file_not_newer and not _marker_file_not_newer_than_payload(marker, payload):

@@ -38,7 +38,6 @@ from .ingest_protection import (
     restore_ingest_payload_placeholders,
     scan_externalized_payload_integrity,
     scan_sqlite_payload_risks,
-    sensitive_pattern_status,
 )
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
@@ -292,7 +291,6 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         "compaction",
         "dag",
         "externalized_refs",
-        "ingest_protection",
         "filters",
         "limit_clamped_from",
     ]
@@ -2276,7 +2274,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "error": "No active session",
             "read_only": True,
             "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
-            "ingest_protection": full_status.get("ingest_protection"),
         })
 
     full_status = engine.get_status()
@@ -2402,7 +2399,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "latest_nodes": latest_nodes,
         },
         "externalized_refs": _inspect_externalized_refs(engine, session_id, limit),
-        "ingest_protection": full_status.get("ingest_protection"),
         "filters": {
             "session_keys": session_keys,
             "ignored": engine.current_session_ignored,
@@ -2553,7 +2549,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             ),
         },
         "source_lineage": source_lineage,
-        "ingest_protection": full_status.get("ingest_protection", sensitive_pattern_status(engine._config)),
         "preset_suggestion": preset_status_payload(engine),
         "ingest_reconciliation": ingest_reconciliation,
         "runtime_identity": runtime_identity,
@@ -2731,25 +2726,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "payload_storage",
-            "status": "fail",
-            "detail": str(e),
-        })
-
-    try:
-        protection = sensitive_pattern_status(engine._config)
-        protection_status = "pass"
-        if protection["enabled"] and not protection["active_patterns"]:
-            protection_status = "warn"
-        elif protection["unknown_patterns"]:
-            protection_status = "warn"
-        checks.append({
-            "check": "sensitive_pattern_handling",
-            "status": protection_status,
-            "detail": protection,
-        })
-    except Exception as e:
-        checks.append({
-            "check": "sensitive_pattern_handling",
             "status": "fail",
             "detail": str(e),
         })

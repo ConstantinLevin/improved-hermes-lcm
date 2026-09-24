@@ -25,7 +25,6 @@ from .ingest_protection import (
     externalized_payload_stats,
     scan_externalized_payload_integrity,
     scan_sqlite_payload_risks,
-    sensitive_pattern_status,
 )
 from .dag import SummaryDAG, build_nodes_fts_spec
 from .presets import (
@@ -106,7 +105,6 @@ def _status_text(engine) -> str:
         "effective_unknown_messages": int(source_stats.get("effective_unknown_messages", 0) or 0),
         **({"error": source_stats.get("error")} if source_stats.get("error") else {}),
     }
-    protection = status.get("ingest_protection") or sensitive_pattern_status(engine._config)
     config_sources = status.get("config_sources") or {}
     config_source_warnings = status.get("config_source_warnings") or []
     ignored_config_yaml_lcm_keys = status.get("ignored_config_yaml_lcm_keys") or []
@@ -162,9 +160,6 @@ def _status_text(engine) -> str:
         f"last_cache_write_tokens: {status.get('last_cache_write_tokens', 0)}",
         f"last_reasoning_tokens: {status.get('last_reasoning_tokens', 0)}",
         f"cache_read_ratio: {float(status.get('cache_read_ratio', 0.0) or 0.0) * 100:.1f}%",
-        f"sensitive_patterns_enabled: {_fmt_bool(protection.get('enabled'))}",
-        f"sensitive_patterns: {', '.join(protection.get('patterns') or []) or '(none)'}",
-        f"sensitive_patterns_source: {protection.get('source', 'default')}",
         # Filter classification for current_session_id (the foreground view).
         # When a side channel is in flight, get_status() reports the bound
         # session's flags; we read the engine properties instead so this row
@@ -1047,22 +1042,6 @@ def _doctor_text(engine) -> str:
             f"protected_sessions: skipped {clean_scan['protected_count']} currently bound session(s) from cleanup candidates"
         )
 
-    protection = sensitive_pattern_status(engine._config)
-    if protection["enabled"] and protection["active_patterns"]:
-        observations.append(
-            "sensitive_pattern_handling: enabled; matching raw secret values are replaced before SQLite, FTS, summaries, active replay, and externalized payloads"
-        )
-    elif protection["enabled"]:
-        observations.append("sensitive_pattern_handling: enabled but no active known patterns are configured")
-        recommended_actions.append("set LCM_SENSITIVE_PATTERNS to one or more known names, or disable sensitive handling")
-    else:
-        observations.append("sensitive_pattern_handling: disabled")
-    if protection["unknown_patterns"]:
-        issues.append("sensitive_pattern_config")
-        recommended_actions.append(
-            "remove unknown LCM_SENSITIVE_PATTERNS entries or replace them with supported names"
-        )
-
     if store_fts_failed_flag:
         observations.append(
             "messages_fts_integrity: a background integrity scan flagged corruption "
@@ -1126,8 +1105,6 @@ def _doctor_text(engine) -> str:
             "status": "fail" if payload_storage_error else "warn",
             "detail": detail,
         })
-    if (protection["enabled"] and not protection["active_patterns"]) or protection["unknown_patterns"]:
-        triage_checks.append({"check": "sensitive_pattern_handling", "status": "warn", "detail": protection})
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
     if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
@@ -1174,10 +1151,6 @@ def _doctor_text(engine) -> str:
         f"quarantined_assistant_rows: {payload_risks['quarantined_assistant_rows']}",
         f"suspicious_repetitive_assistant_rows: {payload_risks['suspicious_repetitive_assistant_rows']}",
         f"heartbeat_noise_rows: {payload_risks['heartbeat_noise_rows']}",
-        f"sensitive_patterns_enabled: {_fmt_bool(protection.get('enabled'))}",
-        f"sensitive_patterns: {', '.join(protection.get('patterns') or []) or '(none)'}",
-        f"sensitive_patterns_source: {protection.get('source', 'default')}",
-        f"sensitive_patterns_unknown: {', '.join(protection.get('unknown_patterns') or []) or '(none)'}",
         f"externalized_payload_dir: {externalized_stats['externalized_payload_dir']}",
         f"externalized_payload_count: {externalized_stats['externalized_payload_count']}",
         f"externalized_payload_bytes: {externalized_stats['externalized_payload_bytes']}",

@@ -54,7 +54,6 @@ from .extraction import (
 )
 from .ingest_protection import (
     _expected_persisted_output_chars,
-    _has_lossy_sensitive_redaction,
     _contains_media_payload,
     _is_hermes_persisted_output_marker,
     _persisted_output_inline_preview_sha256,
@@ -67,10 +66,7 @@ from .ingest_protection import (
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
     recover_hermes_persisted_output_with_file_stat,
-    redact_sensitive_text,
-    redact_sensitive_value,
     restore_ingest_payload_placeholders,
-    sensitive_pattern_status,
 )
 from .runtime_identity import (
     _PLUGIN_ROOT,
@@ -2546,11 +2542,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             (message or {}).get("content"),
             session_id=session_id,
         )
-        content = redact_sensitive_value(
-            content,
-            self._config,
-            parse_json_strings=False,
-        )
         return normalize_content_value(content)
 
     def _session_end_prefix_compare_tool_calls(
@@ -2562,11 +2553,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tool_calls = self._session_end_prefix_compare_value(
             (message or {}).get("tool_calls"),
             session_id=session_id,
-        )
-        tool_calls = redact_sensitive_value(
-            tool_calls,
-            self._config,
-            parse_json_strings=True,
         )
         if tool_calls is None or tool_calls == [] or tool_calls == {}:
             tool_calls = None
@@ -3421,7 +3407,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         status["total_compactions_scope"] = _TOTAL_COMPACTIONS_SCOPE
         status["engine"] = "lcm"
         status["runtime_identity"] = self.get_runtime_identity()
-        status["ingest_protection"] = sensitive_pattern_status(self._config)
         try:
             status["source_lineage"] = self._store.get_source_stats(session_id or None)
         except Exception as exc:  # pragma: no cover - defensive
@@ -3845,38 +3830,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def _recovered_content_matches_durable_identity(self, recovered_content: str, durable_content: str) -> bool:
-        recovered_identity_content = normalize_content_value(
-            redact_sensitive_value(
-                recovered_content,
-                self._config,
-                parse_json_strings=False,
-            )
-        )
-        if recovered_identity_content == durable_content:
-            return True
-        redaction_names = sorted(set(re.findall(r"\[LCM sensitive redaction: name=([^;\]]+)", durable_content)))
-        if not redaction_names or bool(getattr(self._config, "sensitive_patterns_enabled", False)):
-            return False
-        compat_config = copy.copy(self._config)
-        compat_config.sensitive_patterns_enabled = True
-        compat_config.sensitive_patterns = redaction_names
-        compat_identity_content = normalize_content_value(
-            redact_sensitive_value(
-                recovered_content,
-                compat_config,
-                parse_json_strings=False,
-            )
-        )
-        return compat_identity_content == durable_content
+        return normalize_content_value(recovered_content) == durable_content
 
     @staticmethod
-    def _persisted_output_marker_replay_proof(content: str) -> tuple[str | None, bool]:
-        inline_preview_sha256 = _persisted_output_inline_preview_sha256(content)
-        preview_sha256 = inline_preview_sha256 or _persisted_output_preview_prefix_digest(content)
-        if not preview_sha256:
-            return None, False
-        allow_redacted_preview_match = inline_preview_sha256 is None and not _has_lossy_sensitive_redaction(content)
-        return preview_sha256, allow_redacted_preview_match
+    def _persisted_output_marker_replay_proof(content: str) -> str | None:
+        preview_sha256 = _persisted_output_inline_preview_sha256(content) or _persisted_output_preview_prefix_digest(content)
+        return preview_sha256 or None
 
     def _has_any_durable_persisted_output_payload_for_marker(self, msg: Dict[str, Any]) -> bool:
         role = str(msg.get("role") or "unknown")
@@ -3885,7 +3844,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
         expected_chars = _expected_persisted_output_chars(content)
         persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
+        persisted_output_preview_sha256 = self._persisted_output_marker_replay_proof(content)
         if expected_chars is None or not persisted_output_source_path or not persisted_output_preview_sha256:
             return False
         if recover_hermes_persisted_output_with_file_stat(content) is None:
@@ -3896,7 +3855,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             expected_chars=expected_chars,
             persisted_output_source_path=persisted_output_source_path,
             persisted_output_preview_sha256=persisted_output_preview_sha256,
-            allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
         )
@@ -3929,33 +3887,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         content = normalize_content_value(msg.get("content")) or ""
         return assistant_output_quarantine_reason(content) is not None
 
-    def _redact_active_replay_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        redacted_replay_messages: list[Dict[str, Any]] = []
-        generated_message_ids = getattr(
-            self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
-        )
-        for message in messages:
-            redacted_message = dict(message)
-            if "content" in redacted_message:
-                redacted_content = redact_sensitive_value(
-                    redacted_message.get("content"),
-                    self._config,
-                    parse_json_strings=False,
-                )
-                redacted_message["content"] = redacted_content
-
-            if "tool_calls" in redacted_message:
-                redacted_message["tool_calls"] = redact_sensitive_value(
-                    redacted_message.get("tool_calls"),
-                    self._config,
-                    parse_json_strings=True,
-                )
-            if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(redacted_message))
-            redacted_replay_messages.append(redacted_message)
-        return redacted_replay_messages
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
@@ -3972,7 +3903,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
-            return self._redact_active_replay_messages(messages)
+            return self._copy_active_replay_messages_preserving_generated_ids(messages)
 
         if self._session_ignored or self._session_stateless:
             logger.debug(
@@ -3980,7 +3911,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "ignored" if self._session_ignored else "stateless",
                 self._session_id,
             )
-            return self._redact_active_replay_messages(messages)
+            return self._copy_active_replay_messages_preserving_generated_ids(messages)
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
@@ -4012,7 +3943,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             externalize=externalize_messages,
             prefer_existing_externalized=prefer_existing_externalized,
         )
-        replay_messages = self._redact_active_replay_messages(replay_messages)
+        replay_messages = self._copy_active_replay_messages_preserving_generated_ids(replay_messages)
         replay_messages = self._apply_ignored_active_replay_placeholders(
             messages,
             replay_messages,
@@ -4448,11 +4379,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
-            content = redact_sensitive_value(
-                msg.get("content") or "",
-                self._config,
-                parse_json_strings=False,
-            )
+            content = msg.get("content") or ""
             if role == "tool":
                 tool_id = str(msg.get("tool_call_id") or "").strip()
                 externalized = maybe_externalize_tool_output(
@@ -4492,11 +4419,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
                             args = fn.get("arguments", "")
-                            args = redact_sensitive_value(
-                                args,
-                                self._config,
-                                parse_json_strings=True,
-                            )
                             args = sanitize_pre_compaction_tool_arguments(args)
                             if len(args) > 500:
                                 args = args[:400] + "..."
@@ -5523,16 +5445,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         and empty turns).  Returns a brief text block suitable for injection
         into the summarizer prompt as ``focus_topic``.
 
-        IMPORTANT: The ``messages`` parameter must be ``working_messages``
-        (output of ``_ingest_messages``), not raw messages.  ``working_messages``
-        has already been redacted by ``_redact_active_replay_messages``.
-
-        As an additional safety layer, text extracted by
-        ``text_content_for_pattern_matching`` is run through
-        ``redact_sensitive_text`` with the active config.  This covers
-        sensitive values that ``_redact_active_replay_messages`` misses
-        (e.g., dict/JSON token content deserialized into text,
-        bearer-style auth text that survived structured-content flattening).
+        The ``messages`` parameter must be ``working_messages`` (output of
+        ``_ingest_messages``), not raw messages.
 
         Mirrors Hermes upstream ``ContextCompressor._derive_auto_focus_topic``
         from ``fix/compression-auto-focus-topic``.
@@ -5553,13 +5467,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 text,
             ) or self._is_ignored_active_replay_placeholder(msg, text):
                 continue
-            # Additional redaction safety net: run extracted text through the
-            # configured redaction path.  _redact_active_replay_messages uses
-            # parse_json_strings=False for content, so structured content
-            # (dict/JSON tokens, bearer-style auth text) may not be fully
-            # covered.  This extra pass ensures the same redaction rules apply
-            # to whatever text is extracted for the focus topic.
-            text = redact_sensitive_text(text, self._config)
             if not text:
                 continue
             text = " ".join(text.split())

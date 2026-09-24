@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
-from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -222,16 +221,6 @@ class CompactionMixin:
                     return True
                 if replay_text.startswith("[LCM active replay placeholder: message ignored;"):
                     return True
-                if "[LCM sensitive redaction:" in replay_text:
-                    return True
-            if original_msg.get("content") != replay_msg.get("content") and _contains_sensitive_redaction(
-                replay_msg.get("content")
-            ):
-                return True
-            if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and _contains_sensitive_redaction(
-                replay_msg.get("tool_calls")
-            ):
-                return True
         return False
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:

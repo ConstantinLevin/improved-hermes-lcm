@@ -34,13 +34,11 @@ from .ingest_protection import (
     _add_inline_persisted_output_identity_metadata,
     _expected_persisted_output_chars,
     _has_inline_persisted_output_generation_metadata,
-    _has_lossy_sensitive_redaction,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
     _persisted_output_marker_identity_digest,
     _persisted_output_saved_path,
     recover_hermes_persisted_output_with_file_stat,
-    redact_sensitive_value,
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
@@ -94,7 +92,7 @@ class ReconcileMixin:
             return False
         expected_chars = _expected_persisted_output_chars(content)
         persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
+        persisted_output_preview_sha256 = self._persisted_output_marker_replay_proof(content)
         if (
             expected_chars is None
             or not persisted_output_source_path
@@ -112,7 +110,6 @@ class ReconcileMixin:
             persisted_output_source_path=persisted_output_source_path,
             persisted_output_preview_sha256=persisted_output_preview_sha256,
             require_persisted_output_file_not_newer=require_live_file_freshness,
-            allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
         )
@@ -134,19 +131,10 @@ class ReconcileMixin:
         ):
             expected_chars = _expected_persisted_output_chars(content)
             persisted_output_source_path = _persisted_output_saved_path(content)
-            persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
+            persisted_output_preview_sha256 = self._persisted_output_marker_replay_proof(content)
             durable_content = None
             recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content) if not stored_row else None
             recovered_content = recovered_with_stat[0] if recovered_with_stat is not None else None
-            recovered_identity_content = None
-            if recovered_content is not None:
-                recovered_identity_content = normalize_content_value(
-                    redact_sensitive_value(
-                        recovered_content,
-                        self._config,
-                        parse_json_strings=False,
-                    )
-                )
             require_live_file_freshness = recovered_with_stat is not None
 
             def live_file_generation_identity() -> str:
@@ -179,7 +167,6 @@ class ReconcileMixin:
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
                     require_persisted_output_file_not_newer=require_live_file_freshness,
-                    allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
@@ -194,15 +181,12 @@ class ReconcileMixin:
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
-                    allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
                 if (
                     stale_durable_content is not None
                     and self._recovered_content_matches_durable_identity(recovered_content, stale_durable_content)
-                    and not _has_lossy_sensitive_redaction(stale_durable_content)
-                    and not _has_lossy_sensitive_redaction(recovered_identity_content)
                 ):
                     content = stale_durable_content
                 elif stale_durable_content is not None:
@@ -215,8 +199,8 @@ class ReconcileMixin:
                         ),
                         recovered_with_stat[1],
                     )
-                elif recovered_identity_content is not None:
-                    content = recovered_identity_content
+                elif recovered_content is not None:
+                    content = normalize_content_value(recovered_content)
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")

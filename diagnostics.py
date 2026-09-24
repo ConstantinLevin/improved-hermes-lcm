@@ -121,8 +121,6 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
                 rationale = "payload warnings may represent preserved user/tool data"
             else:
                 rationale = "payload diagnostic failures mean doctor could not read storage risk state reliably"
-    elif name == "sensitive_pattern_handling":
-        command = "inspect LCM_SENSITIVE_PATTERNS settings; remove unknown names or configure supported catalog entries"
     elif name == "orphaned_dag_nodes":
         command = "inspect affected DAG/source IDs; do not auto-delete summaries without confirming recall impact"
         if status == "warn":
