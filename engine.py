@@ -3489,86 +3489,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         retain = self._config.new_session_retain_depth
         if self._session_id and retain != -1:
             if retain == 0:
-                self._dag.delete_session_nodes(
-                    self._session_id,
-                    on_deleted_batch=self._purge_embeddings_for_nodes,
-                )
+                self._dag.delete_session_nodes(self._session_id)
             else:
-                self._dag.delete_below_depth(
-                    self._session_id,
-                    retain,
-                    on_deleted_batch=self._purge_embeddings_for_nodes,
-                )
+                self._dag.delete_below_depth(self._session_id, retain)
 
-    def _purge_embeddings_for_nodes(
-        self,
-        node_ids: "list[int]",
-        *,
-        connection: "sqlite3.Connection | None" = None,
-    ) -> None:
-        """Purge stored embeddings for deleted summary nodes (best effort).
-
-        No-op unless embeddings are enabled. Opens a short-lived VectorStore on
-        the shared DB; any failure is swallowed so a purge problem never breaks
-        session reset — the summary_nodes join still keeps orphaned vectors out
-        of ranking.
-        """
-        if not node_ids:
-            return
-        if not bool(getattr(self._config, "embeddings_enabled", False)):
-            return
-        try:
-            from .vector_store import VectorStore
-
-            if connection is not None:
-                VectorStore.purge_embedding_batch_on_connection(connection, node_ids)
-                return
-            store = VectorStore(self._store.db_path, config=self._config)
-            try:
-                store.purge_embeddings_for_nodes(node_ids)
-            finally:
-                store.close()
-        except Exception:  # pragma: no cover - defensive; purge is best-effort
-            logger.debug(
-                "LCM embedding purge for deleted nodes failed", exc_info=True
-            )
-
-    def _archive_chunks_for_messages(
-        self,
-        store_ids: "list[int]",
-        *,
-        connection: "sqlite3.Connection | None" = None,
-    ) -> None:
-        """Soft-archive raw-history chunks for purged/GC'd messages (best effort).
-
-        Mirrors ``_purge_embeddings_for_nodes`` but for the chunk corpus: when a
-        message is deleted or its content is GC-rewritten, its chunks no longer
-        map to live content, so they are archived (dropped from ranking, rows
-        retained). No-op unless embeddings are enabled; any failure is swallowed
-        so a chunk-archive problem never breaks purge/GC.
-        """
-        if not store_ids:
-            return
-        if not bool(getattr(self._config, "embeddings_enabled", False)):
-            return
-        try:
-            from .vector_store import VectorStore
-
-            if connection is not None:
-                for offset in range(0, len(store_ids), 256):
-                    VectorStore.archive_chunks_for_messages_on_connection(
-                        connection, store_ids[offset:offset + 256]
-                    )
-                return
-            store = VectorStore(self._store.db_path, config=self._config)
-            try:
-                store.archive_chunks_for_messages(store_ids)
-            finally:
-                store.close()
-        except Exception:  # pragma: no cover - defensive; archive is best-effort
-            logger.debug(
-                "LCM chunk archive for purged messages failed", exc_info=True
-            )
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
         """Move retained summaries from the old session into the new one.
@@ -4823,13 +4747,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         stored_by_id = self._store.get_batch(source_store_ids)
 
-        def _archive_in_rewrite_txn(conn: "sqlite3.Connection", sid: int) -> None:
-            # Runs inside gc_externalized_tool_result's write transaction, right
-            # after the content rewrite and before its commit: archive this row's
-            # now-stale chunks ATOMICALLY with the rewrite so a recall can never
-            # slice the new (short) content at the old chunk offsets (F2).
-            self._archive_chunks_for_messages([sid], connection=conn)
-
         for store_id in source_store_ids:
             stored = stored_by_id.get(store_id)
             if not stored or stored.get("session_id") != self._session_id:
@@ -4856,9 +4773,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
                     placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(
-                        store_id, placeholder, before_commit=_archive_in_rewrite_txn
-                    )
+                    self._store.gc_externalized_tool_result(store_id, placeholder)
                     continue
 
             lookup_candidates = []
@@ -4882,9 +4797,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(
-                store_id, placeholder, before_commit=_archive_in_rewrite_txn
-            )
+            self._store.gc_externalized_tool_result(store_id, placeholder)
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
