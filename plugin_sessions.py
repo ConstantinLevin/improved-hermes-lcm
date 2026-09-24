@@ -6,8 +6,9 @@ engine, so (ruling 1):
 
 - a host session id this store has not seen names a new plugin session, with the
   signal recorded as it was received and no kind unless the signal itself carries one;
-- a host session id it has seen continues the plugin session that began at it. Until
-  the record line exists, that is the session whose beginning carried the id;
+- a host session id it has seen continues the plugin session whose record line ends
+  at it: the session that began at it, or the session a confirmed compaction carried
+  to it (the host's identifier after the compaction);
 - explicit signals about a session that already exists are appended as facts;
 - a platform a signal states is the fact ``platform``, appended when it differs from
   the session's last platform fact.
@@ -59,6 +60,13 @@ class PluginSessions:
     def find(self, host_session_id: str) -> Optional[str]:
         row = self._conn.execute(
             "SELECT handle FROM sessions WHERE host_session_id = ?",
+            (host_session_id,),
+        ).fetchone()
+        if row:
+            return str(row[0])
+        row = self._conn.execute(
+            "SELECT c.session FROM confirmations f JOIN compactions c ON c.compaction_id = f.compaction "
+            "WHERE f.host_session_after = ? ORDER BY f.compaction DESC LIMIT 1",
             (host_session_id,),
         ).fetchone()
         return str(row[0]) if row else None

@@ -11,9 +11,14 @@ from __future__ import annotations
 import base64
 import secrets
 
-# The kind letters in use. ``n`` names a plugin session.
+# The kind letters: a message record, a tool call, a chunk, a summary or another
+# derivation, and a plugin session.
+MESSAGE = "m"
+TOOL_CALL = "t"
+CHUNK = "c"
+DERIVATION = "s"
 SESSION = "n"
-_KINDS = frozenset({SESSION})
+_KINDS = frozenset({MESSAGE, TOOL_CALL, CHUNK, DERIVATION, SESSION})
 
 
 def new_handle(kind: str) -> str:

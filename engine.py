@@ -76,6 +76,8 @@ from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .lifecycle_state import LifecycleStateStore
 from .plugin_sessions import PluginSessions
+from .record_store import RecordStore
+from .record_write import RecordWriteMixin
 from .message_content import (
     normalize_content_value,
     text_content_for_pattern_matching,
@@ -118,7 +120,14 @@ def _normalize_total_compactions(value: Any) -> int:
     return value
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLedgerMixin, ContextEngine):
+class LCMEngine(
+    CompactionMixin,
+    RecordWriteMixin,
+    ResetStateMixin,
+    ReconcileMixin,
+    PlaceholderLedgerMixin,
+    ContextEngine,
+):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -150,6 +159,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         # own bind_session_state() and on_session_start(). Nothing else names it:
         # not a hook's session id, not a turn id, not another copy's session.
         self._plugin_session: str = ""
+        # This copy's attempts whose return is written, by compaction id, until all
+        # their returned entries are bound; confirmation and binding read the
+        # returned dicts from here. The attempt that returned last, for a rejection;
+        # a confirmation whose compaction the next list must name.
+        self._returned_attempts: dict = {}
+        self._last_returned_attempt = None
+        self._pending_confirmation = None
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -362,6 +378,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             self._dag = SummaryDAG(db_path)
             self._lifecycle = LifecycleStateStore(db_path)
             self._sessions = PluginSessions(db_path)
+            self._records = RecordStore(db_path)
         except Exception:
             self._close_storage()
             raise
@@ -373,6 +390,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             "_dag",
             "_lifecycle",
             "_sessions",
+            "_records",
         ):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
@@ -390,6 +408,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         self._session_platform = ""
         self._conversation_id = ""
         self._plugin_session = ""
+        self._returned_attempts = {}
+        self._last_returned_attempt = None
+        self._pending_confirmation = None
         self._clear_pending_reset_boundary()
         self._reset_session_scoped_runtime_state()
 
@@ -1479,6 +1500,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
+        if boundary_reason == "compression":
+            # The host committed a compaction: the record line (#20, #29 W2 step 7).
+            self._record_confirmation(old_session_id, session_id)
         previous_session_id = self._session_id
         previous_conversation_id = self._conversation_id
         requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
@@ -2335,6 +2359,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         depth = nodes[0].depth
         if any(node.depth != depth for node in nodes):
             raise ValueError("condensation requires same-depth summary nodes")
+        self._require_live_write()
         combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
@@ -2381,6 +2406,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
         )
+        self._require_live_write()
         self._dag.add_node(condensed_node)
         return source_tokens, summary_tokens, level
 
@@ -2568,7 +2594,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
-        include_lcm_note: bool = True,
     ) -> List[Dict[str, Any]]:
         """Build the active context from DAG summaries + fresh tail.
 
@@ -2587,7 +2612,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             if (
                 leading_msg.get("role") == "system"
                 and self.compression_count == 0
-                and include_lcm_note
             ):
                 leading_msg["content"] = self._append_lcm_note_to_content(
                     leading_msg.get("content", "")
@@ -2683,7 +2707,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                # The host's own field for "this row is a summary, not the user's
+                # words" (#29, Decided); it also lets the plugin know its row by flag.
+                result.append({"role": summary_role, "content": combined, "_compressed_summary": True})
 
         # Fresh tail
         result.extend(tail_selected)
@@ -2718,6 +2744,41 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
 
         return result
 
+    def _untouched_return(
+        self,
+        messages: List[Dict[str, Any]],
+        assembled: List[Dict[str, Any]],
+        working_tail: List[Dict[str, Any]],
+        *,
+        has_system: bool,
+        index_by_working: Optional[Dict[int, int]],
+    ) -> List[Dict[str, Any]]:
+        """The context returned at a compaction.
+
+        The host's system row in place (ruling 12), the summary row the assembly made,
+        and the fresh tail as the host's own dicts, untouched: no sanitiser, no copy
+        (ruling 5; #29 W3 finds them again by the key they carry). When the working
+        copies cannot be mapped back to the host's entries, the assembled list is
+        returned and the event recorded.
+        """
+        if index_by_working is None:
+            return assembled
+        positions = [index_by_working.get(id(message)) for message in working_tail]
+        system_ok = not has_system or (bool(messages) and messages[0].get("role") == "system")
+        if any(position is None for position in positions) or not system_ok:
+            self._records.event(
+                "untouched_return_unavailable",
+                session=self._plugin_session or None,
+                detail={"unmapped_tail_entries": sum(1 for p in positions if p is None), "system_ok": system_ok},
+            )
+            return assembled
+        summaries = [
+            message for message in assembled
+            if isinstance(message, dict) and message.get("_compressed_summary") is True
+        ]
+        head = [messages[0]] if has_system else []
+        return head + summaries + [messages[position] for position in positions]
+
     def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:
         """Return whether an over-budget tail message may be evicted.
 
@@ -2735,46 +2796,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         if _PRESERVED_OBJECTIVE_CONTEXT_PREFIX in content:
             return False
         return True
-
-    def _finalize_forced_overflow_result(
-        self,
-        original_messages: List[Dict[str, Any]],
-        compressed: List[Dict[str, Any]],
-        assembly_cap_override: Optional[int] = None,
-        ingest_cleanup_changed_active_context: bool = False,
-    ) -> List[Dict[str, Any]]:
-        if compressed != original_messages or ingest_cleanup_changed_active_context:
-            self._last_compression_status = "overflow_recovery"
-            self._last_compression_noop_reason = ""
-            self._ingest_cursor = len(compressed)
-            self._ingest_cursor_needs_reconcile = False
-            logger.info(
-                "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
-                len(original_messages),
-                len(compressed),
-            )
-        else:
-            self._last_compression_status = "noop"
-            self._last_compression_noop_reason = (
-                "forced overflow recovery found no droppable active-context messages"
-            )
-
-        effective_cap = (
-            assembly_cap_override
-            if assembly_cap_override is not None
-            else self._effective_assembly_token_cap()
-        )
-        if effective_cap is None:
-            self._last_overflow_recovery_failed = False
-        else:
-            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > effective_cap
-            if self._last_overflow_recovery_failed:
-                logger.warning(
-                    "LCM overflow recovery could not get under cap=%d; returning best-effort context (%d tokens)",
-                    effective_cap,
-                    count_messages_tokens(compressed),
-                )
-        return compressed
 
     def _should_force_overflow_recovery(
         self,
@@ -2851,53 +2872,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         return max(1, min(caps))
 
     # -- Internal: helpers -------------------------------------------------
-
-    def _assemble_overflow_recovery_context(
-        self,
-        system_msg: Optional[Dict[str, Any]],
-        tail_messages: List[Dict[str, Any]],
-        assembly_cap_override: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        if tail_messages:
-            first = tail_messages[0]
-            content = first.get("content") or ""
-            role = first.get("role") or ""
-            if role == "assistant" and self._looks_like_active_summary_blob(content):
-                candidate = self._assemble_context(
-                    system_msg,
-                    tail_messages[1:],
-                    assembly_cap_override=assembly_cap_override,
-                    include_lcm_note=False,
-                )
-                if any(
-                    (msg.get("content") or "") == content
-                    for msg in (candidate[1:] if system_msg is not None else candidate)
-                ):
-                    return candidate
-
-        candidate = self._assemble_context(
-            system_msg,
-            tail_messages,
-            assembly_cap_override=assembly_cap_override,
-            include_lcm_note=False,
-        )
-        minimum_candidate_len = 1 if system_msg is not None else 0
-        if len(candidate) == minimum_candidate_len and tail_messages:
-            fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
-            return self._sanitize_active_context_messages(fallback)
-        return candidate
-
-    @staticmethod
-    def _looks_like_active_summary_blob(content: str) -> bool:
-        if not isinstance(content, str) or not content:
-            return False
-        block = (
-            r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]\n"
-            r".*?\n"
-            r"\[Expand for details: .*?\]"
-        )
-        pattern = rf"^{block}(?:\n\n---\n\n{block})*$"
-        return re.fullmatch(pattern, content, flags=re.DOTALL) is not None
 
     def _derive_auto_focus_topic(
         self,
