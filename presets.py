@@ -20,7 +20,7 @@ class LCMPreset:
     name: str
     family: str
     description: str
-    policy_path: str
+    policy_path: str | None
     policy_version: str
     runtime_env: Mapping[str, Any]
     unsupported_runtime_fields: Mapping[str, Any] = dataclass_field(default_factory=dict)
@@ -51,7 +51,7 @@ _CODEX_GPT_LONG_CONTEXT = LCMPreset(
     name="codex_gpt_long_context",
     family="GPT/Codex long-context",
     description="Benchmark-backed candidate for GPT/Codex-style long-context routes.",
-    policy_path="benchmarks/policies/codex_gpt_long_context.yaml",
+    policy_path=None,
     policy_version="1",
     runtime_env={
         "context_threshold": 0.75,
@@ -98,7 +98,7 @@ _CODEX_SPARK_CONTEXT = LCMPreset(
     name="codex_spark_context",
     family="GPT/Codex Spark 128k",
     description="Benchmark-backed candidate for GPT-5.3 Codex Spark / 128k Codex-style routes.",
-    policy_path="benchmarks/policies/codex_spark_context.yaml",
+    policy_path=None,
     policy_version="1",
     runtime_env={
         "context_threshold": 0.75,
