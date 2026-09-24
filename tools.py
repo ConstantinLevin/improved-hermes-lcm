@@ -27,7 +27,7 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     load_integrity_failed,
 )
-from .ingest_protection import extract_ingest_externalized_refs
+from .ingest_protection import _QUARANTINED_ASSISTANT_KIND, extract_ingest_externalized_refs
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 from .presets import preset_status_payload
@@ -426,6 +426,7 @@ def _expand_message_sources(
     source_offset: int = 0,
     source_limit: int | None = None,
     content_offset: int = 0,
+    hydrate_externalized_content: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -460,11 +461,24 @@ def _expand_message_sources(
             next_content_offset = 0
             has_more = next_source_offset < total_sources
             continue
-        content = stored.get("content", "")
-        ingest_refs = extract_ingest_externalized_refs(content)
+        transcript_content = stored.get("content", "")
+        content = transcript_content
+        content_source = "message"
+        ingest_refs = extract_ingest_externalized_refs(transcript_content)
         ref = ingest_refs[0] if ingest_refs else None
+        if hydrate_externalized_content and ref:
+            # The query model gets quarantined assistant output from its side
+            # file; base64 ingest payloads stay as their placeholder.
+            ref_payload = _get_externalized_payload(
+                engine,
+                ref,
+                allowed_session_ids={engine.current_session_id, stored.get("session_id", "")},
+            )
+            if ref_payload is not None and ref_payload.get("kind") == _QUARANTINED_ASSISTANT_KIND:
+                content = ref_payload.get("content", "")
+                content_source = "externalized_payload"
         effective_content_offset = content_offset if source_index == source_offset else 0
-        if _is_compact_externalized_marker(content, ref):
+        if not hydrate_externalized_content and _is_compact_externalized_marker(content, ref):
             sliced = _full_content_slice(content, effective_content_offset)
         else:
             sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset)
@@ -481,8 +495,10 @@ def _expand_message_sources(
             "content_returned_chars": sliced["content_returned_chars"],
             "content_truncated": sliced["content_truncated"],
             "next_content_offset": sliced["next_content_offset"],
-            "content_source": "message",
+            "content_source": content_source,
         }
+        if content_source == "externalized_payload":
+            expanded["transcript_content"] = transcript_content
         messages.append(expanded)
         budget_used += count_tokens(sliced["content"])
         if sliced["has_more"]:
@@ -600,6 +616,7 @@ def _collect_descendant_evidence_blocks(
     node,
     max_tokens: int,
     *,
+    hydrate_externalized_content: bool = False,
     visited_node_ids: set[int] | None = None,
     source_path: list[dict[str, int]] | None = None,
     remaining_node_visits: list[int] | None = None,
@@ -648,6 +665,7 @@ def _collect_descendant_evidence_blocks(
                 engine,
                 child,
                 max_tokens=remaining_tokens,
+                hydrate_externalized_content=hydrate_externalized_content,
             )
             if messages or pagination.get("has_more"):
                 block = {
@@ -688,6 +706,8 @@ def _collect_context_blocks_for_node(
     engine: "LCMEngine",
     node,
     max_tokens: int,
+    *,
+    hydrate_externalized_content: bool = False,
 ) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -710,6 +730,7 @@ def _collect_context_blocks_for_node(
             engine,
             node,
             max_tokens=remaining_tokens,
+            hydrate_externalized_content=hydrate_externalized_content,
         )
         if messages or pagination.get("has_more"):
             block = {
@@ -738,6 +759,7 @@ def _collect_context_blocks_for_node(
                     engine,
                     node,
                     max_tokens=descendant_tokens,
+                    hydrate_externalized_content=hydrate_externalized_content,
                 )
             )
 
@@ -1355,6 +1377,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             engine,
             node,
             max_tokens=remaining_context_tokens,
+            hydrate_externalized_content=True,
         )
         context_blocks.extend(node_blocks)
         context_budget_used += _context_content_token_count(node_blocks)
