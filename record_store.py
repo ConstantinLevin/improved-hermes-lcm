@@ -26,7 +26,7 @@ import logging
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -65,18 +65,25 @@ def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
 
 @dataclass
 class InputEntry:
-    """One entry of the list the host handed to ``compress()``, classified (W3)."""
+    """One entry of the list the host handed to ``compress()``, classified (W3, W4)."""
 
     position: int
     host_row_id: Optional[int]
     # "system": the host's system row, not recorded (ruling 12)
-    # "bound": the return of the previous effective compaction, known by binding or key
+    # "bound": a returned record of the effective compaction, known by binding or key
+    # "bound_summary": a returned summary of it; the mechanism's layer, no record
     # "reused": a row an unconfirmed attempt already recorded, known by its _row_id
-    # "host_insertion": unbound and before the last bound entry
+    # "host_insertion": the host's insertion, known by binding or by its place
     # "transcript": unbound and after the last bound entry
+    # "revision": a known row the host rewrote or merged; a new record
     klass: str
     record: Optional[str] = None
     message: Optional[dict] = None
+    # For a new record: its predecessor, ("entry", position of an earlier entry of this
+    # list), ("record", handle) or None; for a revision: what it revises, each
+    # ("record", handle) or ("return", compaction, position).
+    pred: Optional[tuple] = None
+    sources: list = field(default_factory=list)
 
 
 class RecordStore:
@@ -210,14 +217,39 @@ class RecordStore:
         rows = self._q("SELECT session FROM compactions WHERE compaction_id = ?", (compaction,))
         return str(rows[0][0]) if rows else None
 
-    def return_entries(self, compaction: int) -> dict[int, tuple[str, Optional[str], Optional[str]]]:
+    def return_entries(self, compaction: int) -> dict[int, tuple[str, Optional[str], Optional[str], Optional[str]]]:
+        """position -> (kind, record, derivation, raw of a returned summary)."""
         return {
-            int(pos): (str(kind), record, derivation)
-            for pos, kind, record, derivation in self._q(
-                "SELECT position, kind, record, derivation FROM compaction_returns WHERE compaction = ?",
+            int(pos): (str(kind), record, derivation, raw)
+            for pos, kind, record, derivation, raw in self._q(
+                "SELECT position, kind, record, derivation, raw FROM compaction_returns WHERE compaction = ?",
                 (compaction,),
             )
         }
+
+    def record_facts(self, handles: Iterable[str]) -> dict[str, tuple[Optional[str], str]]:
+        """handle -> (predecessor, raw)."""
+        wanted = [h for h in set(handles) if h]
+        facts: dict[str, tuple[Optional[str], str]] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            rows = self._q(
+                f"SELECT handle, predecessor, raw FROM records WHERE handle IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+            facts.update({str(h): (p, str(r)) for h, p, r in rows})
+        return facts
+
+    def chain_end(self, compaction: Optional[int]) -> Optional[str]:
+        """The record of the last input entry of a compaction that has one."""
+        if compaction is None:
+            return None
+        rows = self._q(
+            "SELECT record FROM compaction_inputs WHERE compaction = ? AND record IS NOT NULL "
+            "ORDER BY position DESC LIMIT 1",
+            (compaction,),
+        )
+        return str(rows[0][0]) if rows else None
 
     def bound_rows(self, compaction: int) -> dict[int, int]:
         """host_row_id -> returned position, for the returned entries."""
@@ -255,17 +287,6 @@ class RecordStore:
         )
         return {int(row_id): str(record) for row_id, record in rows}
 
-    def head(self, compaction: Optional[int]) -> Optional[str]:
-        """The last record entry in a compaction's return."""
-        if compaction is None:
-            return None
-        rows = self._q(
-            "SELECT record FROM compaction_returns WHERE compaction = ? AND kind = 'record' "
-            "AND record IS NOT NULL ORDER BY position DESC LIMIT 1",
-            (compaction,),
-        )
-        return str(rows[0][0]) if rows else None
-
     # --- Writing ------------------------------------------------------------------
 
     @staticmethod
@@ -289,13 +310,14 @@ class RecordStore:
         host_session_before: Optional[str],
         attempt_generation: Optional[int],
         entries: Sequence[InputEntry],
-        head: Optional[str],
     ) -> tuple[int, dict[int, str]]:
         """Transaction 1: the compaction, its inputs, the new records and their tool calls.
 
         Returns the compaction id and the record of every input position that has one.
-        A record's predecessor is the record of the nearest entry before it in the list
-        that has one, else the session's head, else none (the session's first record).
+        Each new record takes the predecessor its entry names (the classification
+        decides it, #29 W3/W4); a revision also gets its ``revision_sources``. Tool
+        calls are written for new transcript and host insertions; a revision keeps
+        its original's calls.
         """
         records: dict[int, str] = {}
         with self._tx() as conn:
@@ -304,23 +326,26 @@ class RecordStore:
                 "VALUES (?, ?, ?, ?, ?)",
                 (session, kind, host_session_before, attempt_generation, time.time()),
             ).lastrowid
-            previous = head
             written: list[tuple[str, dict]] = []
             for entry in entries:
                 if entry.klass in ("bound", "reused"):
                     if entry.record is not None:
                         records[entry.position] = entry.record
-                        previous = entry.record
-                elif entry.klass in ("transcript", "host_insertion"):
+                elif entry.klass in ("transcript", "host_insertion", "revision"):
                     message = entry.message or {}
+                    predecessor = None
+                    if entry.pred is not None and entry.pred[0] == "entry":
+                        predecessor = records[entry.pred[1]]
+                    elif entry.pred is not None:
+                        predecessor = entry.pred[1]
                     handle = self._insert_with_handle(
                         conn,
                         MESSAGE,
-                        "INSERT INTO records(handle, session, predecessor, compaction, kind, revises, raw, "
-                        "role, tool_call_id, text) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                        "INSERT INTO records(handle, session, predecessor, compaction, kind, raw, "
+                        "role, tool_call_id, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             session,
-                            previous,
+                            predecessor,
                             cid,
                             entry.klass,
                             raw_json(message),
@@ -330,8 +355,21 @@ class RecordStore:
                         ),
                     )
                     records[entry.position] = handle
-                    previous = handle
-                    written.append((handle, message))
+                    if entry.klass == "revision":
+                        for ordinal, source in enumerate(entry.sources):
+                            if source[0] == "record":
+                                conn.execute(
+                                    "INSERT INTO revision_sources(revision, ordinal, source_record) VALUES (?, ?, ?)",
+                                    (handle, ordinal, source[1]),
+                                )
+                            else:
+                                conn.execute(
+                                    "INSERT INTO revision_sources(revision, ordinal, source_compaction, "
+                                    "source_position) VALUES (?, ?, ?, ?)",
+                                    (handle, ordinal, source[1], source[2]),
+                                )
+                    else:
+                        written.append((handle, message))
                 conn.execute(
                     "INSERT INTO compaction_inputs(compaction, position, host_row_id, record) VALUES (?, ?, ?, ?)",
                     (cid, entry.position, entry.host_row_id, records.get(entry.position)),
@@ -425,11 +463,18 @@ class RecordStore:
             )
         return handle
 
-    def write_returns(self, compaction: int, entries: Iterable[tuple[int, str, Optional[str], Optional[str]]]) -> None:
+    def write_returns(
+        self,
+        compaction: int,
+        entries: Iterable[tuple[int, str, Optional[str], Optional[str], Optional[str]]],
+    ) -> None:
+        """(position, kind, record, derivation, raw): a returned summary keeps its dict
+        as returned, verbatim, since it is what the agent's context held."""
         with self._tx() as conn:
             conn.executemany(
-                "INSERT INTO compaction_returns(compaction, position, kind, record, derivation) VALUES (?, ?, ?, ?, ?)",
-                [(compaction, pos, kind, record, derivation) for pos, kind, record, derivation in entries],
+                "INSERT INTO compaction_returns(compaction, position, kind, record, derivation, raw) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(compaction, pos, kind, record, derivation, raw) for pos, kind, record, derivation, raw in entries],
             )
 
     def confirm(

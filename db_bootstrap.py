@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # The layout this build writes. A store with any other format is refused.
-STORE_FORMAT = "ihl-store/2"
+STORE_FORMAT = "ihl-store/3"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -153,6 +153,7 @@ INSERT_ONLY_TABLES = (
     "derivations",
     "derivation_sources",
     "compaction_returns",
+    "revision_sources",
     "confirmations",
     "rejections",
     "adoptions",
@@ -212,7 +213,6 @@ CREATE TABLE records (
     predecessor TEXT REFERENCES records(handle),
     compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
     kind TEXT NOT NULL CHECK (kind IN ('transcript', 'host_insertion', 'revision')),
-    revises TEXT REFERENCES records(handle),
     raw TEXT NOT NULL,
     role TEXT,
     tool_call_id TEXT,
@@ -291,7 +291,22 @@ CREATE TABLE compaction_returns (
     kind TEXT NOT NULL CHECK (kind IN ('summary', 'record', 'reinsertion')),
     record TEXT REFERENCES records(handle),
     derivation TEXT REFERENCES derivations(handle),
-    PRIMARY KEY (compaction, position)
+    raw TEXT,
+    PRIMARY KEY (compaction, position),
+    CHECK ((kind = 'summary') = (raw IS NOT NULL))
+);
+
+CREATE TABLE revision_sources (
+    revision TEXT NOT NULL REFERENCES records(handle),
+    ordinal INTEGER NOT NULL,
+    source_record TEXT REFERENCES records(handle),
+    source_compaction INTEGER,
+    source_position INTEGER,
+    PRIMARY KEY (revision, ordinal),
+    FOREIGN KEY (source_compaction, source_position) REFERENCES compaction_returns(compaction, position),
+    CHECK ((source_record IS NOT NULL)
+           != (source_compaction IS NOT NULL AND source_position IS NOT NULL)),
+    CHECK ((source_compaction IS NULL) = (source_position IS NULL))
 );
 
 CREATE TABLE confirmations (
