@@ -5,12 +5,9 @@ with a DAG-based summarization system that preserves every message.
 """
 
 import copy
-import hashlib
 import json
 import logging
 import re
-import sqlite3
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -25,7 +22,6 @@ from .codex_routing import (
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .db_bootstrap import STORE_FILENAME, StoreRefusedError
-from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
     _ACTIVE_ENGINES_BY_CONVERSATION_ID,
@@ -74,20 +70,14 @@ from .message_analysis import (
     _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
-from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
-from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
     normalize_content_value,
     text_content_for_pattern_matching,
-)
-from .sqlite_util import (
-    _is_sqlite_locked_error,
-    _temporary_sqlite_busy_timeout,
 )
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -96,7 +86,6 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 
-_SESSION_END_BUSY_TIMEOUT_MS = 50
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "current_conversation"
 
@@ -108,7 +97,6 @@ _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
-_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
 def _normalize_total_compactions(value: Any) -> int:
@@ -118,7 +106,7 @@ def _normalize_total_compactions(value: Any) -> int:
     return value
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
+class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLedgerMixin, ContextEngine):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -145,26 +133,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         self._session_id: str = ""
         self._session_platform: str = ""
-        # Tracks the most recent non-stateless binding so that
-        # user-facing tools (lcm_status, lcm_grep, lcm_expand_query,
-        # lcm_doctor) keep showing the foreground session
-        # even while a side-channel session temporarily owns the
-        # engine's _session_id binding. Updated alongside _session_id only
-        # when _refresh_session_filters classifies the new session as a real
-        # foreground (not stateless). Read via the
-        # `current_session_id` / `current_session_platform` properties and
-        # `current_session_stateless` / `side_channel_active` companion
-        # predicates.
-        self._foreground_session_id: str = ""
-        self._foreground_session_platform: str = ""
-        self._foreground_conversation_id: str = ""
-        self._foreground_rebind_session_id: str = ""
-        self._foreground_rebind_previous_session_id: str = ""
-        self._foreground_rebind_previous_platform: str = ""
-        self._foreground_rebind_previous_conversation_id: str = ""
-        self._foreground_rebind_parent_session_id: str = ""
         self._conversation_id: str = ""
-        self._session_stateless = False
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -290,34 +259,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
-        self._thread_context = threading.local()
-        self._auxiliary_session_ids: set[str] = set()
-        self._auxiliary_lineage_session_ids: set[str] = set()
-        self._auxiliary_last_prompt_tokens: dict[str, int] = {}
-        self._auxiliary_session_generations: dict[str, int] = {}
-        self._auxiliary_generation_tokens: dict[int, tuple[Any, int]] = {}
-        self._auxiliary_next_generation_token = 0
-        self._auxiliary_direct_end_guard_session_ids: set[str] = set()
-        self._auxiliary_handoff_parent_session_ids: dict[str, str] = {}
-        self._auxiliary_retired_session_generations: dict[str, set[int]] = {}
-        self._auxiliary_foreground_reused_session_ids: set[str] = set()
-        self._lcm_bypass_lineage_session_ids: set[str] = set()
-        self._lcm_bypass_lineage_platforms: dict[str, set[str]] = {}
-        self._lcm_non_bypass_platforms: dict[str, set[str]] = {}
-        self._lcm_session_last_platform: dict[str, str] = {}
-        self._lcm_session_last_normal_platform: dict[str, str] = {}
-        self._lcm_session_last_bypassed: dict[str, bool] = {}
-        self._lcm_session_last_conversation_id: dict[str, str] = {}
-        self._lcm_session_last_normal_conversation_id: dict[str, str] = {}
-        self._lcm_bypass_message_prefix_fingerprints: dict[
-            str, list[tuple[list[str], bool]]
-        ] = {}
-        self._lcm_normal_message_prefix_fingerprints: dict[tuple[str, str], list[str]] = {}
-        self._lcm_current_start_allows_bypass_lineage = False
-        self._auxiliary_session_lock = threading.RLock()
-        self._host_fallback_compressor: Any = None
-        self._host_fallback_session_id = ""
-        self._host_fallback_import_warning_logged = False
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -362,7 +303,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # before binding it; hosts that bind only through on_session_start()
         # must still be able to replace the copied prototype route.
         clone._update_model_pending_session_start = False
-        clone._lcm_current_start_allows_bypass_lineage = False
         return clone
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
@@ -430,39 +370,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._unregister_active_engine_binding()
         self._session_id = ""
         self._session_platform = ""
-        self._foreground_session_id = ""
-        self._foreground_session_platform = ""
-        self._foreground_conversation_id = ""
-        self._clear_foreground_rebind_candidate()
         self._conversation_id = ""
-        self._session_stateless = False
         self._clear_pending_reset_boundary()
-        with self._auxiliary_session_lock:
-            self._auxiliary_session_ids.clear()
-            self._auxiliary_lineage_session_ids.clear()
-            self._auxiliary_last_prompt_tokens.clear()
-            self._auxiliary_session_generations.clear()
-            self._auxiliary_generation_tokens.clear()
-            self._auxiliary_next_generation_token = 0
-            self._auxiliary_direct_end_guard_session_ids.clear()
-            self._auxiliary_handoff_parent_session_ids.clear()
-            self._auxiliary_retired_session_generations.clear()
-            self._auxiliary_foreground_reused_session_ids.clear()
-            self._lcm_bypass_lineage_session_ids.clear()
-            self._lcm_bypass_lineage_platforms.clear()
-            self._lcm_non_bypass_platforms.clear()
-            self._lcm_session_last_platform.clear()
-            self._lcm_session_last_normal_platform.clear()
-            self._lcm_session_last_bypassed.clear()
-            self._lcm_session_last_conversation_id.clear()
-            self._lcm_session_last_normal_conversation_id.clear()
-            self._lcm_bypass_message_prefix_fingerprints.clear()
-            self._lcm_normal_message_prefix_fingerprints.clear()
-        self._lcm_current_start_allows_bypass_lineage = False
-        self._host_fallback_compressor = None
-        self._host_fallback_session_id = ""
-        self._host_fallback_import_warning_logged = False
-        self._clear_thread_context_stateless()
         self._reset_session_scoped_runtime_state()
 
     def _rebind_storage_for_home(self, hermes_home: str = "") -> bool:
@@ -648,132 +557,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     @property
     def bound_session_id(self) -> str:
-        """Session id this engine is actively servicing for ingest/lifecycle.
-
-        This differs from ``current_session_id`` while a side-channel session is
-        bound but operator-facing tools should keep showing the foreground
-        session. Host lifecycle hooks must compare against this value before
-        deciding whether a post-turn ingest needs to rebind the engine.
-        """
+        """The host session identifier this engine copy is bound to."""
         return self._session_id
 
     @property
     def current_session_id(self) -> str:
-        """User-facing "current session" id surfaced by LCM tools.
-
-        Returns the most recent foreground binding (the last session id that
-        ``_refresh_session_filters`` did not classify as stateless). Falls back to ``_session_id`` when no foreground has
-        ever been bound, so unattended cron-only or stateless-only processes
-        remain observable via ``lcm_status``.
-
-        Lifecycle paths (compress, ingest, on_session_end, etc.) must keep
-        reading ``_session_id`` directly because those paths must follow the
-        binding the engine is actually servicing. Only tool-surface code
-        paths that report a "current session" view to operators should read
-        this property.
-        """
-        return self._foreground_session_id or self._session_id
+        """The session this engine copy serves; the tools read this one."""
+        return self._session_id
 
     @property
     def current_session_platform(self) -> str:
         """Platform string paired with ``current_session_id``."""
-        if self._foreground_session_id:
-            return self._foreground_session_platform
         return self._session_platform
 
     @property
     def current_conversation_id(self) -> str:
         """Conversation id paired with ``current_session_id``."""
-        if self._foreground_session_id:
-            return self._foreground_conversation_id
         return self._conversation_id
-
-    @property
-    def side_channel_active(self) -> bool:
-        """True when a stateless session has temporarily rebound
-        ``_session_id`` while a real foreground binding still exists.
-
-        Operators reading lcm_status during this window see the foreground
-        session id and counts (because tools read ``current_session_id``)
-        but the engine itself is servicing the side channel. This predicate
-        lets diagnostic surfaces (lcm_status, /lcm command) make the
-        divergence explicit without recomputing the underlying invariant.
-        """
-        return bool(self._foreground_session_id) and self._foreground_session_id != self._session_id
-
-
-    @property
-    def current_session_stateless(self) -> bool:
-        """``_session_stateless`` reported for ``current_session_id``.
-
-        When a side channel is in flight the foreground is by definition
-        non-stateless; otherwise this is the bound session's stateless flag.
-        """
-        if self.side_channel_active:
-            return False
-        return self._session_stateless
 
     # -- ContextEngine required methods ------------------------------------
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
-        if self._thread_context_stateless():
-            auxiliary_session_id = self._thread_context_session_id()
-            if auxiliary_session_id:
-                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-                caller_generation = self._in_process_auxiliary_caller_generation(
-                    auxiliary_session_id
-                )
-                with self._auxiliary_session_lock:
-                    if auxiliary_session_id not in self._auxiliary_session_ids:
-                        return
-                    if self._auxiliary_generation_is_retired(
-                        auxiliary_session_id,
-                        caller_generation,
-                    ):
-                        return
-                    active_generation = self._auxiliary_session_generations.get(
-                        auxiliary_session_id
-                    )
-                    if active_generation is None and caller_generation:
-                        expected_parent = self._auxiliary_handoff_parent_session_ids.get(
-                            auxiliary_session_id
-                        )
-                        if expected_parent and self._in_process_parent_session_id(
-                            {},
-                            session_id=auxiliary_session_id,
-                            include_explicit=False,
-                        ) != expected_parent:
-                            return
-                        if auxiliary_session_id in self._auxiliary_last_prompt_tokens:
-                            self._auxiliary_direct_end_guard_session_ids.add(
-                                auxiliary_session_id
-                            )
-                        self._auxiliary_last_prompt_tokens.pop(auxiliary_session_id, None)
-                        if self._host_fallback_session_id == auxiliary_session_id:
-                            self._end_host_fallback_compressor_for_session(
-                                auxiliary_session_id,
-                                [],
-                                current_session_bypasses=True,
-                            )
-                        self._auxiliary_session_generations[
-                            auxiliary_session_id
-                        ] = caller_generation
-                        active_generation = caller_generation
-                    stack = self._thread_context_auxiliary_stack()
-                    stack_marks_current_session = bool(
-                        active_generation is not None
-                        and caller_generation == 0
-                        and stack
-                        and stack[-1] == auxiliary_session_id
-                    )
-                    generation_matches = (
-                        caller_generation == 0
-                        if active_generation is None
-                        else caller_generation == active_generation or stack_marks_current_session
-                    )
-                    if generation_matches:
-                        self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
-            return
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
@@ -1006,211 +810,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         else:
             logger.warning(message, *args)
 
-    def _clear_foreground_rebind_candidate(self) -> None:
-        self._foreground_rebind_session_id = ""
-        self._foreground_rebind_previous_session_id = ""
-        self._foreground_rebind_previous_platform = ""
-        self._foreground_rebind_previous_conversation_id = ""
-        self._foreground_rebind_parent_session_id = ""
-
-    def _clear_foreground_rebind_candidate_if_bound_session_confirmed(self) -> None:
-        if self._foreground_rebind_session_id == self._session_id:
-            self._clear_foreground_rebind_candidate()
-
-    def _session_has_foreground_branch_marker(
-        self,
-        session_id: str,
-        parent_session_id: str,
-    ) -> bool:
-        """Return True when Hermes state.db records ``session_id`` as a real branch.
-
-        An un-ingested foreground branch and a provisional late-marked auxiliary
-        child can both expose the same in-process parent id before either has
-        durable LCM rows. The canonical host signal for real foreground branches
-        is the ``sessions.model_config._branched_from`` marker in state.db; use
-        it to decide whether a displaced un-ingested candidate is safe to restore.
-        """
-        session_id = str(session_id or "")
-        parent_session_id = str(parent_session_id or "")
-        if not session_id or not parent_session_id:
-            return False
-        path = self._state_db_path()
-        if not path.exists():
-            return False
-        try:
-            uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            try:
-                row = conn.execute(
-                    """
-                    SELECT parent_session_id, model_config
-                    FROM sessions
-                    WHERE id = ?
-                    LIMIT 1
-                    """,
-                    (session_id,),
-                ).fetchone()
-            finally:
-                conn.close()
-        except Exception:
-            logger.debug("LCM foreground branch marker probe failed", exc_info=True)
-            return False
-        if not row:
-            return False
-        row_parent_id = str(row[0] or "")
-        if row_parent_id != parent_session_id:
-            return False
-        try:
-            model_config = json.loads(row[1] or "{}")
-        except (TypeError, ValueError):
-            return False
-        if not isinstance(model_config, dict):
-            return False
-        return str(model_config.get("_branched_from") or "") == parent_session_id
-
-    def _remember_foreground_rebind_candidate(self, session_id: str) -> None:
-        """Remember the foreground view displaced by a provisional normal bind.
-
-        Bind-time auxiliary detection can miss background-review children when
-        the host seeds its marker late. If that happens, ``on_session_start``
-        temporarily classifies the child as a normal foreground and overwrites
-        the operator-facing foreground pointer. The first-ingest recheck may
-        later prove the child is auxiliary; this snapshot lets that recovery
-        restore the parent foreground instead of falling back to the child.
-        """
-        session_id = str(session_id or "")
-        if not session_id:
-            self._clear_foreground_rebind_candidate()
-            return
-        if self._foreground_rebind_session_id == session_id:
-            return
-        if (
-            self._foreground_rebind_session_id
-            and self._foreground_rebind_previous_session_id
-            and self._foreground_session_id == self._foreground_rebind_session_id
-        ):
-            parent_session_id = self._in_process_parent_session_id(
-                {},
-                session_id=session_id,
-                include_explicit=False,
-                require_auxiliary_frame=False,
-            )
-            rebind_candidate_is_foreground_branch = bool(
-                self._foreground_rebind_parent_session_id
-                and self._session_has_foreground_branch_marker(
-                    self._foreground_rebind_session_id,
-                    self._foreground_rebind_parent_session_id,
-                )
-            )
-            if (
-                (
-                    parent_session_id == self._foreground_rebind_session_id
-                    and (
-                        not self._foreground_rebind_parent_session_id
-                        or rebind_candidate_is_foreground_branch
-                    )
-                )
-                or (parent_session_id and not self._foreground_rebind_parent_session_id)
-                or (
-                    parent_session_id
-                    and parent_session_id == self._foreground_rebind_parent_session_id
-                    and rebind_candidate_is_foreground_branch
-                )
-            ):
-                self._foreground_rebind_previous_session_id = self._foreground_session_id
-                self._foreground_rebind_previous_platform = self._foreground_session_platform
-                self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
-            self._foreground_rebind_session_id = session_id
-            self._foreground_rebind_parent_session_id = parent_session_id
-            return
-        if self._foreground_session_id and self._foreground_session_id != session_id:
-            parent_session_id = self._in_process_parent_session_id(
-                {},
-                session_id=session_id,
-                include_explicit=False,
-                require_auxiliary_frame=False,
-            )
-            self._foreground_rebind_session_id = session_id
-            self._foreground_rebind_previous_session_id = self._foreground_session_id
-            self._foreground_rebind_previous_platform = self._foreground_session_platform
-            self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
-            self._foreground_rebind_parent_session_id = parent_session_id
-            return
-        self._clear_foreground_rebind_candidate()
-
-    def _restore_foreground_after_late_auxiliary_reclassification(self, session_id: str) -> None:
-        if self._foreground_session_id != session_id:
-            if self._foreground_rebind_session_id == session_id:
-                self._clear_foreground_rebind_candidate()
-            return
-        if (
-            self._foreground_rebind_session_id == session_id
-            and self._foreground_rebind_previous_session_id
-        ):
-            parent_session_id = self._in_process_parent_session_id(
-                {},
-                session_id=session_id,
-                include_explicit=False,
-            )
-            if (
-                parent_session_id
-                and parent_session_id != session_id
-                and parent_session_id == self._foreground_rebind_previous_session_id
-                and self._lcm_session_last_normal_conversation_id.get(parent_session_id)
-            ):
-                self._foreground_session_id = parent_session_id
-                self._foreground_session_platform = self._lcm_session_last_normal_platform.get(
-                    parent_session_id,
-                    self._foreground_rebind_previous_platform,
-                )
-                self._foreground_conversation_id = self._lcm_session_last_normal_conversation_id[
-                    parent_session_id
-                ]
-            else:
-                self._foreground_session_id = self._foreground_rebind_previous_session_id
-                self._foreground_session_platform = self._foreground_rebind_previous_platform
-                self._foreground_conversation_id = self._foreground_rebind_previous_conversation_id
-        else:
-            self._foreground_session_id = ""
-            self._foreground_session_platform = ""
-            self._foreground_conversation_id = ""
-        self._clear_foreground_rebind_candidate()
-
-    def _maybe_reclassify_current_session_as_auxiliary_before_message_ingest(self) -> bool:
-        """Defense-in-depth for host markers that arrive after session binding.
-
-        Older Hermes Agent background-review forks seed ``_memory_write_origin``
-        too late for ``on_session_start`` frame-walk detection. By the first
-        message-writing entry point the marker is present on the running agent
-        frame, so re-check only while the bound session is still empty. That
-        keeps normal foreground session starts/resets writable and avoids
-        reclassifying sessions after real data has already been stored.
-        """
-        session_id = str(self._session_id or "")
-        if not session_id:
-            return False
-        if self._session_stateless or self._thread_context_stateless():
-            return False
-        if self._ingest_cursor > 0:
-            return False
-        try:
-            stored_count = self._store.get_session_count(session_id)
-        except Exception:
-            logger.debug("LCM first-ingest auxiliary recheck count probe failed", exc_info=True)
-            return False
-        if stored_count != 0:
-            return False
-        if not self._in_process_auxiliary_caller_generation(session_id):
-            return False
-
-        self._mark_thread_context_stateless(session_id)
-        self._restore_foreground_after_late_auxiliary_reclassification(session_id)
-        logger.info(
-            "LCM reclassified session %s as auxiliary at first ingest after bind-time detection missed",
-            session_id,
-        )
-        return True
-
     def ingest(self, messages: List[Dict[str, Any]]) -> None:
         """Persist messages to the durable store every turn.
 
@@ -1224,22 +823,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         compression runs later the same turn, already-ingested messages
         are skipped (no duplicates).
         """
-        if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            return
-        if self._bypasses_lcm_context_management():
-            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            return
         if self._session_id and messages:
             try:
-                self._remember_lcm_normal_message_prefix(
-                    self._session_id,
-                    messages,
-                    conversation_id=self._conversation_id,
-                )
                 self._ingest_messages(messages)
                 self._record_ingest_success()
-                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
@@ -1367,15 +954,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> None:
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
-        self._lcm_session_last_conversation_id[session_id] = state.conversation_id
         self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
-        if not self._session_stateless:
-            self._remember_foreground_rebind_candidate(session_id)
-            self._lcm_session_last_normal_conversation_id[session_id] = state.conversation_id
-            self._foreground_session_id = session_id
-            self._foreground_session_platform = self._session_platform
-            self._foreground_conversation_id = state.conversation_id
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -1403,67 +983,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._conversation_id,
             self._session_id,
             self._last_compacted_store_id,
-        )
-
-    def _has_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> bool:
-        with self._auxiliary_session_lock:
-            if session_id not in self._lcm_bypass_lineage_session_ids:
-                return False
-            if platform is None:
-                return True
-            platforms = self._lcm_bypass_lineage_platforms.get(session_id) or set()
-            return not platforms or platform in platforms
-
-    def _mark_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> None:
-        if not session_id:
-            return
-        platform = self._session_platform if platform is None else str(platform or "")
-        with self._auxiliary_session_lock:
-            self._lcm_bypass_lineage_session_ids.add(session_id)
-            self._lcm_bypass_lineage_platforms.setdefault(session_id, set()).add(platform)
-            self._lcm_session_last_platform[session_id] = platform
-            self._lcm_session_last_bypassed[session_id] = True
-
-
-    def _handoff_lcm_bypass_lineage(
-        self,
-        old_session_id: str,
-        new_session_id: str,
-        *,
-        new_platform: str = "",
-    ) -> None:
-        with self._auxiliary_session_lock:
-            if old_session_id:
-                self._lcm_bypass_lineage_session_ids.add(old_session_id)
-            if new_session_id:
-                new_platform = str(new_platform or "")
-                self._lcm_bypass_lineage_session_ids.add(new_session_id)
-                self._lcm_bypass_lineage_platforms.setdefault(new_session_id, set()).add(new_platform)
-                self._lcm_session_last_platform[new_session_id] = new_platform
-                self._lcm_session_last_bypassed[new_session_id] = True
-
-    def _compression_boundary_from_lcm_bypassed_session(self, old_session_id: str) -> bool:
-        if not old_session_id:
-            return False
-        if old_session_id in self._lcm_session_last_bypassed:
-            return bool(self._lcm_session_last_bypassed.get(old_session_id))
-        if old_session_id == self._session_id:
-            return bool(self._bypasses_lcm_context_management())
-        return bool(self._has_lcm_bypass_lineage_session(old_session_id))
-
-
-    def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
-        kwargs = kwargs or {}
-        hermes_home = str(kwargs.get("hermes_home") or self._hermes_home or "")
-        if hermes_home:
-            return _enforce_state_db_containment(
-                Path(hermes_home) / "state.db",
-                description=f"hermes_home {hermes_home}",
-            )
-        db_path = Path(self._store.db_path)
-        return _enforce_state_db_containment(
-            db_path.parent / "state.db",
-            description=f"state database fallback from LCM database {db_path}",
         )
 
     def _clear_pending_reset_boundary(self) -> None:
@@ -1661,17 +1180,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
-        self._refresh_session_filters()
-        # Hold the foreground view stable when the new binding is a side
-        # channel. Tools that report "current session" to operators must keep
-        # pointing at the real foreground rather than the stateless session
-        # that just stole _session_id. Lifecycle paths still read _session_id
-        # directly so compress short-circuits correctly via the
-        # _session_stateless gate.
-        if not self._session_stateless:
-            self._remember_foreground_rebind_candidate(session_id)
-            self._foreground_session_id = session_id
-            self._foreground_session_platform = self._session_platform
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
 
@@ -2034,14 +1542,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 session_id,
                 conversation_id=kwargs.get("conversation_id"),
             )
-            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             self._schedule_ingest_cursor_reconciliation()
             self._clear_pending_reset_boundary()
             return
 
         self._apply_session_start_metadata(session_id, kwargs)
         self._bind_lifecycle_state(session_id, conversation_id=conversation_id)
-        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         if frontier > 0:
             state = self._lifecycle.advance_frontier(
                 self._conversation_id,
@@ -2061,248 +1567,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         previous_session_id = self._session_id
         previous_conversation_id = self._conversation_id
         requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
-        self._lcm_current_start_allows_bypass_lineage = False
-        requested_platform = str(kwargs.get("platform") or self._session_platform or "")
-        pre_reset_preserve_ambiguous_no_frame_old_session = False
+        # Every session is an ordinary session: a delegate, a background fork or
+        # a cron agent is bound and compacted like any other. The host's
+        # compaction boundary under a new identifier is followed below; every
+        # other start binds the session it names.
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
-            old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
-                old_session_id
-            )
-            new_session_auxiliary_parent = self._in_process_parent_session_id(
-                {},
-                session_id=session_id,
-                include_explicit=False,
-            )
-            new_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(session_id)
-            with self._auxiliary_session_lock:
-                active_old_auxiliary_generation = self._auxiliary_session_generations.get(
-                    old_session_id
-                )
-                old_session_auxiliary_generation_is_stale = bool(
-                    (
-                        old_session_auxiliary_generation
-                        and self._auxiliary_generation_is_retired(
-                            old_session_id,
-                            old_session_auxiliary_generation,
-                        )
-                    )
-                    or (
-                        new_session_auxiliary_generation
-                        and self._auxiliary_generation_is_retired(
-                            session_id,
-                            new_session_auxiliary_generation,
-                        )
-                    )
-                    or (
-                        active_old_auxiliary_generation is not None
-                        and (
-                            (
-                                old_session_auxiliary_generation
-                                and active_old_auxiliary_generation != old_session_auxiliary_generation
-                            )
-                        )
-                    )
-                )
-                old_session_has_retired_generation = bool(
-                    self._auxiliary_retired_session_generations.get(old_session_id)
-                )
-            if old_session_auxiliary_generation_is_stale:
-                logger.info(
-                    "LCM ignored stale auxiliary compression boundary from %s to %s",
-                    old_session_id,
-                    session_id,
-                )
-                return
-            pre_reset_preserve_ambiguous_no_frame_old_session = bool(
-                active_old_auxiliary_generation is not None
-                and not old_session_auxiliary_generation
-                and old_session_id != self._session_id
-                and old_session_has_retired_generation
-                and old_session_id not in self._auxiliary_direct_end_guard_session_ids
-                and new_session_auxiliary_parent != old_session_id
-            )
-        if self._host_fallback_compressor is not None and (
-            self._host_fallback_session_id != session_id or requested_platform != self._session_platform
-        ) and not (
-            pre_reset_preserve_ambiguous_no_frame_old_session
-            and self._host_fallback_session_id == old_session_id
-        ):
-            compressor = self._host_fallback_compressor
-            fallback_session_id = self._host_fallback_session_id or previous_session_id
-            on_session_end = getattr(compressor, "on_session_end", None)
-            if callable(on_session_end) and fallback_session_id:
-                try:
-                    on_session_end(fallback_session_id, [])
-                except Exception:
-                    logger.debug("LCM host fallback compressor session-start reset failed", exc_info=True)
-            on_session_reset = getattr(compressor, "on_session_reset", None)
-            if callable(on_session_reset):
-                try:
-                    on_session_reset()
-                except Exception:
-                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
-            self._host_fallback_compressor = None
-            self._host_fallback_session_id = ""
-        if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
-            old_session_is_suppressed_foreground = self._auxiliary_lineage_suppressed_as_foreground(
-                old_session_id
-            )
-            old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
-                old_session_id
-            )
-            new_session_auxiliary_parent = self._in_process_parent_session_id(
-                {},
-                session_id=session_id,
-                include_explicit=False,
-            )
-            new_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(session_id)
-            with self._auxiliary_session_lock:
-                active_old_auxiliary_generation = self._auxiliary_session_generations.get(
-                    old_session_id
-                )
-                old_session_auxiliary_generation_is_stale = bool(
-                    (
-                        old_session_auxiliary_generation
-                        and self._auxiliary_generation_is_retired(
-                            old_session_id,
-                            old_session_auxiliary_generation,
-                        )
-                    )
-                    or (
-                        new_session_auxiliary_generation
-                        and self._auxiliary_generation_is_retired(
-                            session_id,
-                            new_session_auxiliary_generation,
-                        )
-                    )
-                    or (
-                        active_old_auxiliary_generation is not None
-                        and (
-                            (
-                                old_session_auxiliary_generation
-                                and active_old_auxiliary_generation != old_session_auxiliary_generation
-                            )
-                        )
-                    )
-                )
-                old_session_has_retired_generation = bool(
-                    self._auxiliary_retired_session_generations.get(old_session_id)
-                )
-            new_session_auxiliary_parent = self._in_process_parent_session_id(
-                {},
-                session_id=session_id,
-                include_explicit=False,
-            )
-            new_session_is_auxiliary_continuation = new_session_auxiliary_parent == old_session_id
-            preserve_ambiguous_no_frame_old_session = bool(
-                active_old_auxiliary_generation is not None
-                and not old_session_auxiliary_generation
-                and old_session_id != self._session_id
-                and old_session_has_retired_generation
-                and old_session_id not in self._auxiliary_direct_end_guard_session_ids
-                and not new_session_is_auxiliary_continuation
-            )
-            if old_session_auxiliary_generation_is_stale:
-                logger.info(
-                    "LCM ignored stale auxiliary compression boundary from %s to %s",
-                    old_session_id,
-                    session_id,
-                )
-                return
-            if (
-                self._has_auxiliary_lineage_session(old_session_id)
-                and not old_session_auxiliary_generation_is_stale
-                and (
-                    old_session_id != self._session_id
-                    or old_session_auxiliary_generation
-                    or new_session_is_auxiliary_continuation
-                )
-                and (
-                    not old_session_is_suppressed_foreground
-                    or old_session_auxiliary_generation
-                    or new_session_is_auxiliary_continuation
-                )
-            ):
-                self._handoff_auxiliary_session(
-                    old_session_id,
-                    session_id,
-                    preserve_old_session=(
-                        old_session_id == self._session_id
-                        or preserve_ambiguous_no_frame_old_session
-                    ),
-                    preserve_old_foreground_marker=old_session_is_suppressed_foreground,
-                )
-                logger.info(
-                    "LCM auxiliary session %s compressed to %s — keeping boundary stateless",
-                    old_session_id,
-                    session_id,
-                )
-                return
-            if self._compression_boundary_from_lcm_bypassed_session(old_session_id):
-                self._handoff_lcm_bypass_lineage(
-                    old_session_id,
-                    session_id,
-                    new_platform=str(kwargs.get("platform") or ""),
-                )
-                self._clear_thread_context_stateless()
-                if previous_session_id and previous_session_id != session_id:
-                    self._finalize_pending_reset_boundary(previous_session_id)
-                    self._reset_session_scoped_runtime_state()
-                else:
-                    self._clear_pending_reset_boundary()
-                    self._ingest_cursor = 0
-                    self._last_compacted_store_id = 0
-                    self._last_overflow_recovery_failed = False
-                    self._last_condensation_suppressed_reason = ""
-                self._lcm_current_start_allows_bypass_lineage = True
-                self._apply_session_start_metadata(session_id, kwargs)
-                self._bind_lifecycle_state(
-                    session_id,
-                    conversation_id=kwargs.get("conversation_id"),
-                )
-                self._schedule_ingest_cursor_reconciliation()
-                logger.info(
-                    "LCM compression boundary %s -> %s stayed stateless because the source session bypasses LCM storage",
-                    old_session_id,
-                    session_id,
-                )
-                return
-            self._clear_thread_context_stateless()
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
-        if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
-            explicit_parent_id = str(kwargs.get("parent_session_id") or "")
-            preserve_foreground_reuse_marker = bool(
-                (
-                    explicit_parent_id
-                    and self._lcm_session_last_bypassed.get(explicit_parent_id)
-                )
-                or self._lcm_session_last_normal_conversation_id.get(session_id)
-            )
-            if preserve_foreground_reuse_marker:
-                if self._lcm_session_last_normal_conversation_id.get(session_id):
-                    with self._auxiliary_session_lock:
-                        self._auxiliary_foreground_reused_session_ids.add(session_id)
-                self._mark_thread_context_stateless(
-                    session_id,
-                    preserve_foreground_reuse_marker=True,
-                )
-            else:
-                self._register_auxiliary_session(session_id)
-            logger.info(
-                "LCM session %s is a live child of bound session %s — treating it as auxiliary/stateless",
-                session_id,
-                previous_session_id,
-            )
-            return
-        start_platform = str(kwargs.get("platform") or "")
-        side_channel_rebind = self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
-        self._unmark_thread_context_auxiliary_session(
-            session_id,
-            suppress_as_foreground_reuse=not side_channel_rebind,
-        )
-        self._clear_thread_context_stateless()
         if previous_session_id and previous_session_id != session_id:
             self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
@@ -2324,621 +1596,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._schedule_ingest_cursor_reconciliation()
 
-    def _session_end_matches_current_store_prefix(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-    ) -> bool:
-        prefix_count = self._session_end_store_prefix_count(session_id, messages)
-        return prefix_count is not None and prefix_count > 0
-
-    def _session_end_prefix_compare_value(self, value: Any, *, session_id: str) -> Any:
-        if isinstance(value, dict):
-            return {
-                key: self._session_end_prefix_compare_value(child, session_id=session_id)
-                for key, child in value.items()
-            }
-        if isinstance(value, list):
-            return [
-                self._session_end_prefix_compare_value(child, session_id=session_id)
-                for child in value
-            ]
-        if not isinstance(value, str):
-            return value
-
-        text = restore_ingest_payload_placeholders(
-            value,
-            config=self._config,
-            hermes_home=self._hermes_home,
-            session_id=session_id,
-        )
-        stripped = text.strip()
-        ingest_refs = extract_ingest_externalized_refs(stripped)
-        if (
-            len(ingest_refs) == 1
-            and stripped.startswith("[Externalized LCM ingest payload:")
-            and stripped.endswith("]")
-        ):
-            payload = load_externalized_payload(
-                ingest_refs[0],
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-            if payload is not None:
-                payload_session_id = str(payload.get("session_id") or "")
-                if not session_id or not payload_session_id or payload_session_id == session_id:
-                    content = payload.get("content")
-                    if isinstance(content, str):
-                        return content
-        return text
-
-    def _session_end_prefix_compare_content(
-        self,
-        message: Dict[str, Any],
-        *,
-        session_id: str,
-    ) -> str:
-        content = self._session_end_prefix_compare_value(
-            (message or {}).get("content"),
-            session_id=session_id,
-        )
-        return normalize_content_value(content)
-
-    def _session_end_prefix_compare_tool_calls(
-        self,
-        message: Dict[str, Any],
-        *,
-        session_id: str,
-    ) -> str:
-        tool_calls = self._session_end_prefix_compare_value(
-            (message or {}).get("tool_calls"),
-            session_id=session_id,
-        )
-        if tool_calls is None or tool_calls == [] or tool_calls == {}:
-            tool_calls = None
-        return json.dumps(
-            tool_calls,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-
-    def _session_end_prefix_compare_identity(
-        self,
-        message: Dict[str, Any],
-        *,
-        session_id: str,
-    ) -> tuple[str, str, str, str, str]:
-        return (
-            str((message or {}).get("role") or ""),
-            self._session_end_prefix_compare_content(message, session_id=session_id),
-            str((message or {}).get("tool_call_id") or ""),
-            str((message or {}).get("tool_name") or ""),
-            self._session_end_prefix_compare_tool_calls(message, session_id=session_id),
-        )
-
-    def _session_end_store_prefix_count(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        *,
-        conversation_id: str | None = None,
-    ) -> Optional[int]:
-        try:
-            stored_messages = self._store.get_range(
-                session_id,
-                limit=max(1, len(messages)),
-                conversation_id=conversation_id,
-            )
-        except Exception:
-            logger.debug("LCM session-end prefix check failed", exc_info=True)
-            return None
-        if not stored_messages:
-            return 0
-        if len(messages) < len(stored_messages):
-            return None
-        for idx, stored_msg in enumerate(stored_messages):
-            msg = messages[idx]
-            try:
-                message_identity = self._session_end_prefix_compare_identity(
-                    msg,
-                    session_id=session_id,
-                )
-                stored_identity = self._session_end_prefix_compare_identity(
-                    stored_msg,
-                    session_id=session_id,
-                )
-            except Exception:
-                logger.debug("LCM session-end prefix compare normalization failed", exc_info=True)
-                return None
-            if message_identity != stored_identity:
-                return None
-        return len(stored_messages)
-
-    @staticmethod
-    def _lcm_bypass_message_fingerprint(message: Dict[str, Any]) -> str:
-        tool_calls = message.get("tool_calls")
-        if tool_calls is None or tool_calls == [] or tool_calls == {}:
-            tool_calls = None
-        payload = {
-            "role": message.get("role"),
-            "content": normalize_content_value(message.get("content")),
-            "tool_call_id": message.get("tool_call_id"),
-            "tool_calls": tool_calls,
-        }
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-        return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
-
-    def _remember_lcm_bypass_message_prefix(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-    ) -> None:
-        if not session_id or not messages:
-            return
-        fingerprints = [
-            self._lcm_bypass_message_fingerprint(msg)
-            for msg in messages[:_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT]
-        ]
-        if fingerprints:
-            remembered = self._lcm_bypass_message_prefix_fingerprints.setdefault(session_id, [])
-            truncated = len(messages) > _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT
-            retained: list[tuple[list[str], bool]] = []
-            for existing_fingerprints, existing_truncated in remembered:
-                if existing_fingerprints == fingerprints:
-                    truncated = truncated or bool(existing_truncated)
-                    continue
-                retained.append((existing_fingerprints, existing_truncated))
-            retained.append((fingerprints, truncated))
-            remembered[:] = retained
-
-    def _remember_lcm_normal_message_prefix(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        *,
-        conversation_id: str | None = None,
-    ) -> None:
-        if not session_id or not messages:
-            return
-        fingerprints = [
-            self._lcm_bypass_message_fingerprint(msg)
-            for msg in messages[:_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT]
-        ]
-        if fingerprints:
-            self._lcm_normal_message_prefix_fingerprints[
-                self._lcm_normal_prefix_key(session_id, conversation_id=conversation_id)
-            ] = fingerprints
-
-    def _lcm_normal_prefix_key(
-        self,
-        session_id: str,
-        *,
-        conversation_id: str | None = None,
-    ) -> tuple[str, str]:
-        return (
-            session_id,
-            str(
-                conversation_id
-                or self._lcm_session_last_normal_conversation_id.get(session_id)
-                or ""
-            ),
-        )
-
-
-    def _matching_fingerprint_prefix_count(
-        self,
-        fingerprints: list[str],
-        messages: List[Dict[str, Any]],
-    ) -> int:
-        if not fingerprints or not messages:
-            return 0
-        compare_count = min(len(fingerprints), len(messages))
-        if compare_count <= 0:
-            return 0
-        candidate = [self._lcm_bypass_message_fingerprint(msg) for msg in messages[:compare_count]]
-        if candidate == fingerprints[:compare_count]:
-            return compare_count
-        return 0
-
-
-    def _matching_lcm_bypass_prefix_evidence(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-    ) -> tuple[int, bool]:
-        best_count = 0
-        best_truncated = False
-        for fingerprints, truncated in self._lcm_bypass_message_prefix_fingerprints.get(session_id, []):
-            count = self._matching_fingerprint_prefix_count(fingerprints, messages)
-            count_truncated = bool(truncated and count > 0 and count == len(fingerprints))
-            if count > best_count:
-                best_count = count
-                best_truncated = count_truncated
-            elif count == best_count:
-                best_truncated = best_truncated or count_truncated
-        return best_count, best_truncated
-
-
-    def _matching_lcm_normal_prefix_count(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        *,
-        conversation_id: str | None = None,
-    ) -> int:
-        return self._matching_fingerprint_prefix_count(
-            self._lcm_normal_message_prefix_fingerprints.get(
-                self._lcm_normal_prefix_key(session_id, conversation_id=conversation_id)
-            ) or [],
-            messages,
-        )
-
-    def _append_off_current_session_end_suffix(
-        self,
-        session_id: str,
-        suffix: List[Dict[str, Any]],
-        *,
-        source: str,
-        conversation_id: str,
-    ) -> list[int]:
-        if not session_id or not suffix:
-            return []
-        protected_messages = protect_messages_for_ingest(
-            suffix,
-            session_id=session_id,
-            config=self._config,
-            hermes_home=self._hermes_home,
-        )
-        return self._store._append_protected_batch(
-            session_id,
-            protected_messages,
-            [count_message_tokens(msg) for msg in protected_messages],
-            source=source,
-            conversation_id=conversation_id,
-        )
-
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        ended_generation = self._in_process_auxiliary_caller_generation(session_id)
-        active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
-        if (
-            self._has_auxiliary_lineage_session(session_id)
-            and session_id != self._session_id
-            and (
-                active_auxiliary_end
-                or not self._auxiliary_lineage_suppressed_as_foreground(session_id)
-                or ended_generation
-                or (
-                    session_id in self._auxiliary_last_prompt_tokens
-                    and not self._auxiliary_lineage_suppressed_as_foreground(session_id)
-                )
-            )
-        ):
-            current_thread_session_id = self._thread_context_session_id()
-            deactivated = self._deactivate_auxiliary_session(
-                session_id,
-                generation=ended_generation,
-            )
-            if deactivated:
-                if current_thread_session_id == session_id or active_auxiliary_end:
-                    self._remember_lcm_bypass_message_prefix(session_id, messages)
-                self._end_host_fallback_compressor_for_session(
-                    session_id,
-                    messages,
-                    current_session_bypasses=False,
-                )
-                if current_thread_session_id == session_id:
-                    self._clear_thread_context_stateless(session_id)
-            return
-        current_session_bypasses = session_id == self._session_id and self._bypasses_lcm_context_management()
-        ended_session_directly_bypasses = self._ended_session_directly_bypasses_lcm(session_id)
-        direct_bypass_normal_conversation_id = self._lcm_session_last_normal_conversation_id.get(session_id)
-        direct_bypass_normal_prefix_count = None
-        if (
-            session_id != self._session_id
-            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
-            and direct_bypass_normal_conversation_id
-            and not ended_generation
-        ):
-            direct_bypass_normal_prefix_count = self._session_end_store_prefix_count(
-                session_id,
-                messages,
-                conversation_id=direct_bypass_normal_conversation_id,
-            )
-        direct_bypass_is_suppressed_reused_normal = (
-            session_id != self._session_id
-            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
-            and bool(direct_bypass_normal_conversation_id)
-            and not ended_generation
-            and session_id != self._thread_context_session_id()
-            and direct_bypass_normal_prefix_count is not None
-            and direct_bypass_normal_prefix_count > 0
-        )
-        if ended_session_directly_bypasses and not direct_bypass_is_suppressed_reused_normal:
-            self._remember_lcm_bypass_message_prefix(session_id, messages)
-            self._end_host_fallback_compressor_for_session(
-                session_id,
-                messages,
-                current_session_bypasses=current_session_bypasses,
-            )
-            if session_id == self._thread_context_session_id():
-                self._deactivate_auxiliary_session(session_id, generation=ended_generation)
-                self._clear_thread_context_stateless(session_id)
-            return
-        same_id_has_bypass_lineage = (
-            session_id == self._session_id
-            and not current_session_bypasses
-            and self._has_lcm_bypass_lineage_session(session_id)
-        )
-        same_id_normal_prefix_count = None
-        same_id_recorded_normal_prefix_count = 0
-        same_id_bypass_prefix_count = 0
-        same_id_bypass_prefix_truncated = False
-        if same_id_has_bypass_lineage:
-            same_id_conversation_id = (
-                self._conversation_id
-                or self._lcm_session_last_normal_conversation_id.get(session_id)
-                or None
-            )
-            (
-                same_id_bypass_prefix_count,
-                same_id_bypass_prefix_truncated,
-            ) = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
-            same_id_normal_prefix_count = self._session_end_store_prefix_count(
-                session_id,
-                messages,
-                conversation_id=same_id_conversation_id,
-            )
-            same_id_recorded_normal_prefix_count = self._matching_lcm_normal_prefix_count(
-                session_id,
-                messages,
-                conversation_id=same_id_conversation_id,
-            )
-        same_id_store_prefix_positive = (
-            same_id_normal_prefix_count is not None
-            and same_id_normal_prefix_count > 0
-        )
-        same_id_strongest_normal_prefix_count = max(
-            same_id_recorded_normal_prefix_count,
-            same_id_normal_prefix_count if same_id_store_prefix_positive else 0,
-        )
-        same_id_truncated_bypass_prefix_ambiguous = (
-            same_id_bypass_prefix_truncated
-            and same_id_bypass_prefix_count > 0
-            and same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
-            and len(messages) > same_id_bypass_prefix_count
-        )
-        same_id_matches_stronger_normal_prefix = (
-            same_id_strongest_normal_prefix_count > 0
-            and not same_id_truncated_bypass_prefix_ambiguous
-            and (
-                same_id_bypass_prefix_count <= 0
-                or same_id_strongest_normal_prefix_count >= same_id_bypass_prefix_count
-            )
-        )
-        off_current_auxiliary_reused_normal = (
-            session_id != self._session_id
-            and self._auxiliary_lineage_suppressed_as_foreground(session_id)
-            and bool(direct_bypass_normal_conversation_id)
-            and not ended_generation
-        )
-        off_current_lineage = (
-            session_id != self._session_id
-            and (
-                self._has_lcm_bypass_lineage_session(session_id)
-                or off_current_auxiliary_reused_normal
-            )
-        )
-        off_current_normal_conversation_id = (
-            self._lcm_session_last_normal_conversation_id.get(session_id)
-            if off_current_lineage
-            else ""
-        )
-        off_current_store_prefix_count = None
-        off_current_recorded_prefix_count = 0
-        off_current_bypass_prefix_count = 0
-        off_current_bypass_prefix_truncated = False
-        if off_current_lineage:
-            (
-                off_current_bypass_prefix_count,
-                off_current_bypass_prefix_truncated,
-            ) = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
-        if off_current_lineage and off_current_normal_conversation_id:
-            off_current_store_prefix_count = self._session_end_store_prefix_count(
-                session_id,
-                messages,
-                conversation_id=off_current_normal_conversation_id,
-            )
-            off_current_recorded_prefix_count = self._matching_lcm_normal_prefix_count(
-                session_id,
-                messages,
-                conversation_id=off_current_normal_conversation_id,
-            )
-        off_current_prefix_count = None
-        off_current_store_prefix_positive = (
-            off_current_store_prefix_count is not None
-            and off_current_store_prefix_count > 0
-        )
-        off_current_store_prefix_for_append = int(off_current_store_prefix_count or 0)
-        off_current_recorded_prefix_for_append = 0
-        if off_current_recorded_prefix_count > 0 and off_current_normal_conversation_id:
-            try:
-                stored_normal_rows = self._store.get_range(
-                    session_id,
-                    limit=off_current_recorded_prefix_count + 1,
-                    conversation_id=off_current_normal_conversation_id,
-                )
-            except Exception:
-                logger.debug("LCM off-current recorded-prefix row-count probe failed", exc_info=True)
-                stored_normal_rows = []
-            if len(stored_normal_rows) == off_current_recorded_prefix_count:
-                off_current_recorded_prefix_for_append = off_current_recorded_prefix_count
-        off_current_strongest_normal_prefix_count = max(
-            off_current_store_prefix_for_append if off_current_store_prefix_positive else 0,
-            off_current_recorded_prefix_for_append,
-        )
-        off_current_truncated_bypass_prefix_ambiguous = (
-            off_current_bypass_prefix_truncated
-            and off_current_bypass_prefix_count > 0
-            and off_current_strongest_normal_prefix_count >= off_current_bypass_prefix_count
-            and len(messages) > off_current_bypass_prefix_count
-        )
-        if (
-            off_current_store_prefix_positive
-            and not off_current_truncated_bypass_prefix_ambiguous
-            and (
-                off_current_bypass_prefix_count <= 0
-                or off_current_store_prefix_for_append > off_current_bypass_prefix_count
-            )
-        ):
-            off_current_prefix_count = off_current_store_prefix_for_append
-        elif (
-            off_current_recorded_prefix_for_append > 0
-            and not off_current_truncated_bypass_prefix_ambiguous
-            and (
-                off_current_bypass_prefix_count <= 0
-                or off_current_recorded_prefix_for_append > off_current_bypass_prefix_count
-            )
-        ):
-            off_current_prefix_count = off_current_recorded_prefix_for_append
-        if (
-            off_current_lineage
-            and not off_current_auxiliary_reused_normal
-            and off_current_normal_conversation_id
-            and off_current_store_prefix_count == 0
-            and off_current_bypass_prefix_count <= 0
-            and self._lcm_session_last_bypassed.get(session_id) is False
-        ):
-            off_current_prefix_count = 0
-        same_id_should_bypass = (
-            same_id_has_bypass_lineage
-            and same_id_bypass_prefix_count > 0
-            and not same_id_matches_stronger_normal_prefix
-        )
-        off_current_matches_bypass_prefix = (
-            session_id != self._session_id
-            and self._has_lcm_bypass_lineage_session(session_id)
-            and off_current_bypass_prefix_count > 0
-            and off_current_prefix_count is None
-        )
-        ended_lineage_bypasses = (
-            session_id != self._session_id
-            and self._has_lcm_bypass_lineage_session(session_id)
-            and bool(self._lcm_session_last_bypassed.get(session_id))
-            and not self._session_end_matches_current_store_prefix(session_id, messages)
-        )
-        off_current_should_bypass = off_current_lineage and off_current_prefix_count is None
-        if off_current_prefix_count is not None:
-            prefix_count = off_current_prefix_count
-            suffix = messages[prefix_count:]
-            if suffix:
-                self._append_off_current_session_end_suffix(
-                    session_id,
-                    suffix,
-                    source=(
-                        self._lcm_session_last_normal_platform.get(session_id)
-                        or self._lcm_session_last_platform.get(session_id, self._session_platform)
-                    ),
-                    conversation_id=off_current_normal_conversation_id,
-                )
-            try:
-                state = self._lifecycle.get_by_conversation(off_current_normal_conversation_id)
-                frontier_store_id = state.current_frontier_store_id if state is not None else 0
-                self._lifecycle.finalize_session(
-                    off_current_normal_conversation_id,
-                    session_id,
-                    frontier_store_id=frontier_store_id,
-                )
-            except Exception:
-                logger.debug("LCM off-current session-end lifecycle finalization failed", exc_info=True)
-            return
-        if (
-            current_session_bypasses
-            or same_id_should_bypass
-            or off_current_should_bypass
-            or off_current_matches_bypass_prefix
-            or ended_lineage_bypasses
-        ):
-            self._end_host_fallback_compressor_for_session(
-                session_id,
-                messages,
-                current_session_bypasses=current_session_bypasses,
-            )
-            return
-        try:
-            with _temporary_sqlite_busy_timeout(
-                [
-                    getattr(self._store, "_conn", None),
-                    getattr(self._lifecycle, "_conn", None),
-                ],
-                _SESSION_END_BUSY_TIMEOUT_MS,
-            ):
-                try:
-                    # Best-effort final flush. Keep this path bounded because
-                    # host gateways call session-end hooks from lifecycle paths
-                    # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
-                except KeyboardInterrupt:
-                    logger.warning(
-                        "LCM session-end raw-message ingest interrupted; "
-                        "final messages may be absent from the plugin-local store"
-                    )
-                    return
-                except Exception as exc:
-                    if _is_sqlite_locked_error(exc):
-                        logger.warning(
-                            "LCM session-end raw-message ingest skipped due to SQLite lock after short wait; "
-                            "final messages may be absent from the plugin-local store: %s",
-                            exc,
-                        )
-                        return
-                    raise
+        """Not a session boundary, and nothing is written here.
 
-                try:
-                    self._lifecycle.finalize_session(
-                        self._conversation_id,
-                        session_id,
-                        frontier_store_id=self._last_compacted_store_id,
-                    )
-                except KeyboardInterrupt:
-                    logger.warning(
-                        "LCM session-end lifecycle finalization interrupted; "
-                        "raw messages may be ingested but lifecycle state may be finalized later"
-                    )
-                    return
-                except Exception as exc:
-                    if _is_sqlite_locked_error(exc):
-                        logger.warning(
-                            "LCM session-end lifecycle finalization skipped due to SQLite lock after short wait; "
-                            "raw messages were ingested but lifecycle state may be finalized later: %s",
-                            exc,
-                        )
-                        return
-                    raise
-        except KeyboardInterrupt:
-            logger.warning("LCM session-end ingest/finalize interrupted before bounded flush completed")
-            return
-        except Exception as exc:
-            if _is_sqlite_locked_error(exc):
-                logger.warning(
-                    "LCM session-end ingest/finalize skipped due to SQLite lock before bounded flush: %s",
-                    exc,
-                )
-                return
-            raise
+        The host calls this inside every compaction it commits (with the list as
+        it was before), and at the real ends of a session late or not at all
+        (#20). The plugin draws no boundary from it and flushes nothing.
+        """
+        return None
 
     def on_session_reset(self) -> None:
-        if self._host_fallback_compressor is not None:
-            compressor = self._host_fallback_compressor
-            on_session_reset = getattr(compressor, "on_session_reset", None)
-            if callable(on_session_reset):
-                try:
-                    on_session_reset()
-                except Exception:
-                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
-            self._host_fallback_compressor = None
-            self._host_fallback_session_id = ""
         self._pending_reset_session_id = self._session_id
         self._pending_reset_conversation_id = self._conversation_id
         self._pending_reset_frontier_store_id = self._last_compacted_store_id
@@ -2973,15 +1640,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages = kwargs.get("messages")
 
         if name != "lcm_inspect" and messages and self._session_id:
-            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            elif not (self._session_stateless or self._thread_context_stateless()):
-                try:
-                    self._ingest_messages(messages)
-                    self._record_ingest_success()
-                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                except Exception as e:
-                    self._record_ingest_failure("tool-call ingest", e)
+            try:
+                self._ingest_messages(messages)
+                self._record_ingest_success()
+            except Exception as e:
+                self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
@@ -3004,12 +1667,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return "default_home"
 
     def get_runtime_identity(self) -> Dict[str, Any]:
-        """Return operator-facing identity for the loaded LCM runtime.
-
-        The public identity follows the same foreground-session view as
-        ``lcm_status`` and other tools. When a side-channel session is bound,
-        the bound session details are still exposed separately for diagnostics.
-        """
+        """Return operator-facing identity for the loaded LCM runtime."""
         metadata = _plugin_metadata()
         git_identity = _git_runtime_identity(_PLUGIN_ROOT)
         session_id = self.current_session_id
@@ -3038,12 +1696,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "lifecycle_current_session_id": "",
             "lifecycle_last_finalized_session_id": "",
         }
-        if self.side_channel_active:
-            identity.update({
-                "bound_session_id": self._session_id,
-                "bound_session_platform": self._session_platform,
-                "bound_conversation_id": self._conversation_id,
-            })
         identity.update(git_identity)
         if lifecycle_state is not None:
             identity.update({
@@ -3118,12 +1770,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except Exception as exc:  # pragma: no cover - defensive
             status["source_lineage"] = {"error": str(exc)}
         try:
-            status["lifecycle_fragmentation"] = self._lifecycle.get_fragmentation_stats(
-                state_db_path=self._state_db_path()
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            status["lifecycle_fragmentation"] = {"error": str(exc), "read_only": True}
-        try:
             rotate_backup_path = self.rotate_backup_path()
             status["rotate_backup_path"] = str(rotate_backup_path)
             # Single stat() to avoid a TOCTOU window where the rolling slot
@@ -3147,7 +1793,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             status["store_messages"] = self._store.get_session_count(session_id)
             status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
-            status["session_stateless"] = self.current_session_stateless
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
@@ -3200,13 +1845,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
                      api_mode: str = "") -> None:
-        parent_session_id = self._in_process_parent_session_id({})
-        if parent_session_id:
-            logger.debug(
-                "LCM model update ignored for auxiliary child of %s",
-                parent_session_id,
-            )
-            return
         self.model = str(model or "")
         self.base_url = str(base_url or "")
         self.api_key = str(api_key or "")
@@ -3215,27 +1853,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._set_context_length(context_length, source="update_model")
         self._update_model_pending_session_start = True
 
-    def _refresh_session_filters(self) -> None:
-        self._session_stateless = bool(
-            self._lcm_current_start_allows_bypass_lineage
-            and self._has_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
-        )
-        if self._session_id:
-            self._lcm_session_last_platform[self._session_id] = self._session_platform
-            self._lcm_session_last_bypassed[self._session_id] = self._session_stateless
-            if not self._session_stateless:
-                self._lcm_non_bypass_platforms.setdefault(self._session_id, set()).add(self._session_platform)
-                self._lcm_session_last_normal_platform[self._session_id] = self._session_platform
-        if self._session_stateless:
-            self._mark_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
-
-
     # -- Internal: message ingestion ---------------------------------------
 
     def _schedule_ingest_cursor_reconciliation(self) -> None:
         """Mark existing-session rebinds for cursor repair on next ingest."""
         self._ingest_cursor_needs_reconcile = False
-        if not self._session_id or self._session_stateless:
+        if not self._session_id:
             return
         try:
             self._ingest_cursor_needs_reconcile = self._store.get_session_count(self._session_id) > 0
@@ -3378,10 +2001,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             logger.debug("Ingest skipped: no session_id")
             return self._copy_active_replay_messages(messages)
 
-        if self._session_stateless:
-            logger.debug("Ingest skipped for stateless session %s", self._session_id)
-            return self._copy_active_replay_messages(messages)
-
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
@@ -3429,7 +2048,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not new_messages:
             cached_replay = self._cached_active_replay_messages(messages)
-            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
@@ -3471,7 +2089,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
-            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             return self._remember_active_replay_messages(messages, replay_messages)
 
         protected_messages = protect_messages_for_ingest(
@@ -3490,7 +2107,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._ingest_cursor = n
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
-        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         # ``protected_messages`` changes are storage-only: inline media and
         # data/base64 substrings stay provider-usable in active replay.
         return self._remember_active_replay_messages(messages, replay_messages)
@@ -4458,7 +3074,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         into active context on subsequent bootstrap. Raw messages remain in
         the SQLite store and are reachable through ``lcm_expand(store_id=...)``.
 
-        Refuses on sessions that are unbound, ignored, or stateless.
+        Refuses on sessions that are unbound.
 
         Two frontier markers are intentionally kept separate:
 
@@ -4484,7 +3100,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         Refusal/no-op reason codes (returned as ``reason``):
 
         - ``no_active_session``: engine has no bound session or conversation.
-        - ``session_stateless``: the bound session bypasses LCM storage.
         - ``no_pre_tail_content``: no stored messages precede the resolved
           count/token-bounded fresh tail; nothing to rotate.
         - ``empty_tail``: tail query returned no rows despite a non-zero
@@ -4500,8 +3115,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not session_id or not conversation_id:
             return {"ok": False, "reason": "no_active_session"}
-        if self._session_stateless:
-            return {"ok": False, "reason": "session_stateless", "session_id": session_id}
 
         fresh_tail_count = max(1, int(self._config.fresh_tail_count))
         total_count = int(self._store.get_session_count(session_id))

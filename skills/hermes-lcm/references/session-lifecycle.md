@@ -17,6 +17,6 @@ Do not promise that `/new` deletes historical LCM data. The previous session's r
 
 Run normal compaction before rotate when older material must be represented in summary nodes. Without a summary, pre-tail raw rows remain in the store but no summary points at them.
 
-Rotate refuses stateless sessions. Repeating an already-satisfied rotate reports a no-op and preserves the previous known-good rolling backup.
+Repeating an already-satisfied rotate reports a no-op and preserves the previous known-good rolling backup.
 
 Use a separate session when the user wants a new active conversational boundary. Use rotate when the problem is active transcript/frontier size without changing identity.

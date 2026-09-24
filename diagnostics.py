@@ -2,58 +2,12 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Any
 
 
 DOCTOR_ACTION_SAFE_IGNORE = "safe/ignore"
 DOCTOR_ACTION_INSPECT = "inspect"
 DOCTOR_ACTION_BACKUP_FIRST_CLEANUP = "backup-first cleanup"
-
-
-def _enforce_state_db_containment(path: Path, *, description: str) -> Path:
-    resolved = path.expanduser().resolve()
-    env_base = os.environ.get("LCM_HERMES_BASE_DIR")
-    if env_base:
-        allowed_base = Path(env_base).expanduser().resolve()
-        try:
-            resolved.relative_to(allowed_base)
-        except ValueError:
-            raise ValueError(
-                f"{description} resolves to {resolved} which is not within allowed base {allowed_base}"
-            )
-    return resolved
-
-
-def state_db_path_for_engine(engine: Any) -> Path:
-    """Return the Hermes state database path for an LCM engine.
-
-    The path is read-only diagnostic input. When ``LCM_HERMES_BASE_DIR`` is
-    configured, enforce the same containment guard for all diagnostic surfaces.
-    """
-    hermes_home = getattr(engine, "_hermes_home", "") or ""
-    if hermes_home:
-        return _enforce_state_db_containment(
-            Path(hermes_home) / "state.db",
-            description=f"hermes_home {hermes_home}",
-        )
-    db_path = Path(getattr(engine._store, "db_path", Path.home() / ".hermes" / "lcm.db"))
-    return _enforce_state_db_containment(
-        db_path.parent / "state.db",
-        description=f"state database fallback from LCM database {db_path}",
-    )
-
-
-def has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
-    """Return whether lifecycle diagnostics should be treated as warning evidence.
-
-    Retained-history drift, including lifecycle rows with no stored data, is
-    read-only diagnostic context. Warn only when the diagnostic could not read the
-    host state database; do not make overall health unhealthy solely because
-    historical LCM/state indexes no longer agree.
-    """
-    return bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
 
 
 def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
@@ -118,13 +72,6 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
     elif name == "source_lineage_hygiene":
         command = "inspect source-lineage diagnostics and SQLite read errors"
         rationale = "source-lineage failures indicate the doctor could not read attribution state reliably"
-    elif name == "lifecycle_fragmentation":
-        command = "inspect lifecycle categories and the host state database path"
-        if status == "warn":
-            warning_only = True
-            rationale = "not every lifecycle/state mismatch is harmful or safe to mutate"
-        else:
-            rationale = "lifecycle diagnostic failures mean doctor could not read session lifecycle state reliably"
     elif name == "context_pressure":
         action = DOCTOR_ACTION_SAFE_IGNORE
         command = "safe to ignore if compaction proceeds normally; inspect lcm_status only if pressure stays high or compaction loops"
@@ -149,8 +96,3 @@ def doctor_guidance_for_checks(checks: list[dict[str, Any]]) -> list[dict[str, A
         if item is not None:
             guidance.append(item)
     return guidance
-
-
-# Backward-compatible private aliases for existing command/tool internals and tests.
-_state_db_path_for_engine = state_db_path_for_engine
-_has_lifecycle_fragmentation = has_lifecycle_fragmentation

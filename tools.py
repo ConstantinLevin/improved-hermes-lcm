@@ -16,11 +16,7 @@ from .externalize import (
     load_externalized_payload,
     read_externalized_payload_metadata_prefix,
 )
-from .diagnostics import (
-    _has_lifecycle_fragmentation,
-    _state_db_path_for_engine,
-    doctor_guidance_for_checks,
-)
+from .diagnostics import doctor_guidance_for_checks
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
     check_external_content_fts_integrity,
@@ -1959,9 +1955,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "session_id": session_id,
             "conversation_id": conversation_id,
             "session_platform": platform,
-            "side_channel_active": engine.side_channel_active,
-            "bound_session_id": getattr(engine, "_session_id", ""),
-            "bound_conversation_id": getattr(engine, "_conversation_id", ""),
             "lifecycle": lifecycle,
             "source_lineage": full_status.get("source_lineage"),
         },
@@ -2006,9 +1999,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "latest_nodes": latest_nodes,
         },
         "externalized_refs": _inspect_externalized_refs(engine, session_id, limit),
-        "filters": {
-            "stateless": engine.current_session_stateless,
-        },
     }
     if requested_limit > _LCM_INSPECT_HARD_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
@@ -2021,12 +2011,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    # Read the foreground view so a side-channel session that briefly owns
-    # engine._session_id (cron tick inside the gateway process, debug probe,
-    # etc.) does not divert lcm_status away from the operator's real
-    # conversation. Falls back to the bound id when no foreground has ever
-    # been bound, so cron-only or stateless-only deployments still report
-    # something usable.
     session_id = engine.current_session_id
     if not session_id:
         return json.dumps({
@@ -2047,18 +2031,12 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
     full_status = engine.get_status()
     lifecycle = full_status.get("lifecycle")
-    lifecycle_fragmentation = full_status.get("lifecycle_fragmentation")
     source_lineage = full_status.get("source_lineage")
     runtime_identity = full_status.get("runtime_identity")
     ingest_reconciliation = full_status.get("ingest_reconciliation")
     config_sources = full_status.get("config_sources") or {}
     config_source_warnings = full_status.get("config_source_warnings") or []
     ignored_config_yaml_lcm_keys = full_status.get("ignored_config_yaml_lcm_keys") or []
-
-    # Filter classification for the session lcm_status is reporting on.
-    # The engine encapsulates the foreground vs bound divergence; this tool
-    # just reads the property contract.
-    side_channel_active = engine.side_channel_active
 
     return json.dumps({
         "session_id": session_id,
@@ -2130,21 +2108,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "config_sources": config_sources,
         "config_source_warnings": config_source_warnings,
         "ignored_config_yaml_lcm_keys": ignored_config_yaml_lcm_keys,
-        "session_filters": {
-            "stateless": engine.current_session_stateless,
-            "side_channel_active": side_channel_active,
-            **(
-                {"side_channel_session_id": engine._session_id}
-                if side_channel_active
-                else {}
-            ),
-        },
         "source_lineage": source_lineage,
         "preset_suggestion": preset_status_payload(engine),
         "ingest_reconciliation": ingest_reconciliation,
         "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
-        "lifecycle_fragmentation": lifecycle_fragmentation,
     })
 
 
@@ -2155,9 +2123,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     checks: list[dict] = []
-    # Diagnose the foreground session, not whatever side-channel session
-    # currently owns engine._session_id. Falls back to the bound id when no
-    # foreground has ever been bound.
     session_id = engine.current_session_id
 
     # 1. Database integrity
@@ -2398,24 +2363,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
-    # 6. Lifecycle/session fragmentation
-    try:
-        lifecycle_fragmentation = engine._lifecycle.get_fragmentation_stats(
-            state_db_path=_state_db_path_for_engine(engine)
-        )
-        checks.append({
-            "check": "lifecycle_fragmentation",
-            "status": "warn" if _has_lifecycle_fragmentation(lifecycle_fragmentation) else "pass",
-            "detail": lifecycle_fragmentation,
-        })
-    except Exception as e:
-        checks.append({
-            "check": "lifecycle_fragmentation",
-            "status": "fail",
-            "detail": str(e),
-        })
-
-    # 7. Context pressure
+    # 6. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))

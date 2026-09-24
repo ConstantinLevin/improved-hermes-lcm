@@ -30,32 +30,7 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
-    def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
-        maybe_reclassify = getattr(
-            self,
-            "_maybe_reclassify_current_session_as_auxiliary_before_message_ingest",
-            None,
-        )
-        if callable(maybe_reclassify):
-            maybe_reclassify()
-
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        if self._bypasses_lcm_context_management():
-            if self._compression_boundary_cooldown_active():
-                return False
-            if prompt_tokens is not None:
-                tokens = prompt_tokens
-            else:
-                auxiliary_session_id = self._thread_context_session_id()
-                if auxiliary_session_id:
-                    tokens = self._current_auxiliary_prompt_tokens(auxiliary_session_id)
-                else:
-                    tokens = self.last_prompt_tokens
-            if self._should_force_overflow_recovery(observed_tokens=tokens):
-                return True
-            if self.threshold_tokens <= 0:
-                return False
-            return tokens >= self.threshold_tokens
         if self._compression_boundary_cooldown_active():
             return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
@@ -68,15 +43,6 @@ class CompactionMixin:
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        self._maybe_reclassify_late_auxiliary_before_compaction_write()
-        if self._bypasses_lcm_context_management():
-            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            rough = count_messages_tokens(messages)
-            if self._compression_boundary_cooldown_active():
-                return False
-            if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
-                return True
-            return self.threshold_tokens > 0 and rough >= self.threshold_tokens
         rough = count_messages_tokens(messages)
         replay_messages = None
         if self._session_id and messages:
@@ -302,24 +268,6 @@ class CompactionMixin:
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
-
-        self._maybe_reclassify_late_auxiliary_before_compaction_write()
-        if self._bypasses_lcm_context_management():
-            bypass_current_tokens = current_tokens
-            if bypass_current_tokens is None or bypass_current_tokens <= 0:
-                auxiliary_session_id = self._thread_context_session_id()
-                if auxiliary_session_id:
-                    auxiliary_prompt_tokens = self._current_auxiliary_prompt_tokens(
-                        auxiliary_session_id
-                    )
-                    if auxiliary_prompt_tokens > 0:
-                        bypass_current_tokens = auxiliary_prompt_tokens
-            return self._compress_lcm_bypassed_session(
-                messages,
-                current_tokens=bypass_current_tokens,
-                focus_topic=focus_topic,
-                force=force,
-            )
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
         force_overflow = self._should_force_overflow_recovery(
