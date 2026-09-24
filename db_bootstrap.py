@@ -27,12 +27,14 @@ logger = logging.getLogger(__name__)
 
 
 # The layout this build writes. A store with any other format is refused.
-STORE_FORMAT = "ihl-store/0"
+STORE_FORMAT = "ihl-store/1"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 REQUIRED_CORE_TABLES = (
     "store_identity",
+    "sessions",
+    "session_facts",
     "messages",
     "metadata",
     "summary_nodes",
@@ -135,16 +137,48 @@ NODES_FTS_SPEC = ExternalContentFtsSpec(
 FTS_SPECS = (MESSAGES_FTS_SPEC, NODES_FTS_SPEC)
 
 
-_SCHEMA_SQL = """
+# The tables of the plugin's own record. Each is insert-only: triggers raise on any
+# UPDATE or DELETE, so that append-only is a property of the database (#29, W1).
+INSERT_ONLY_TABLES = ("store_identity", "sessions", "session_facts")
+
+
+def _insert_only_triggers_sql(tables: Sequence[str]) -> str:
+    return "\n".join(
+        f"CREATE TRIGGER {table}_no_{verb} BEFORE {verb.upper()} ON {table}\n"
+        f"    BEGIN SELECT RAISE(ABORT, '{table} is insert-only'); END;"
+        for table in tables
+        for verb in ("update", "delete")
+    )
+
+
+_RECORD_SQL = """
 CREATE TABLE store_identity (
     format TEXT NOT NULL,
     store_uuid TEXT NOT NULL,
     created_at REAL NOT NULL
 );
-CREATE TRIGGER store_identity_no_update BEFORE UPDATE ON store_identity
-    BEGIN SELECT RAISE(ABORT, 'store_identity is never changed'); END;
-CREATE TRIGGER store_identity_no_delete BEFORE DELETE ON store_identity
-    BEGIN SELECT RAISE(ABORT, 'store_identity is never changed'); END;
+
+CREATE TABLE sessions (
+    handle TEXT PRIMARY KEY,
+    began_at REAL NOT NULL,
+    signal TEXT NOT NULL,
+    kind TEXT,
+    host_session_id TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE session_facts (
+    fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL REFERENCES sessions(handle),
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    host_session_id TEXT,
+    at REAL NOT NULL
+);
+CREATE INDEX idx_session_facts_session ON session_facts(session, fact_id);
+"""
+
+_SCHEMA_SQL = _RECORD_SQL + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + """
 
 CREATE TABLE messages (
     store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -309,6 +343,7 @@ def configure_connection(conn: sqlite3.Connection, db_path: str | Path) -> None:
       refused, never used as if it were in rollback mode.
     - synchronous=FULL: fsync the database and the journal at every commit.
     - busy_timeout=30 s: writers wait for each other and for readers.
+    - foreign_keys=ON: a reference in the record names a row that exists.
     - No memory-mapped I/O: SQLite documents that it needs a correct unified
       buffer cache when several processes share the file, and that an I/O error
       on a mapped file crashes the process instead of raising (sqlite.org/mmap.html).
@@ -320,6 +355,7 @@ def configure_connection(conn: sqlite3.Connection, db_path: str | Path) -> None:
     if mode != "delete":
         raise _refuse(db_path, f"SQLite kept journal_mode={mode or 'unknown'} when DELETE was requested")
     conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA foreign_keys=ON")
 
 
 # --- Identity and creation ----------------------------------------------------
