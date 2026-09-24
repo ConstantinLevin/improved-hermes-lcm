@@ -21,7 +21,7 @@ Reference map:
 - Architecture and data ownership: `references/architecture.md`
 - Diagnostics and safe operator workflow: `references/diagnostics.md`
 - Recall tools and routing: `references/recall-tools.md`
-- `/new`, session continuity, and `/lcm rotate`: `references/session-lifecycle.md`
+- `/new` and session continuity: `references/session-lifecycle.md`
 - Canonical runtime recall policy: `references/recall-policy.md`
 
 Working rules:

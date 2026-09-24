@@ -123,11 +123,8 @@ LCM_STATUS = {
     "description": (
         "Get a quick health overview of the LCM engine for the current session. "
         "Shows compression count, store size, DAG depth distribution, context usage, "
-        "active configuration, and rotate snapshot "
-        "state (last_rotate_at, rotate_backup_path, rotate_backup_size when a "
-        "/lcm rotate apply has been run). Use this to understand how much history "
-        "has been compacted, how the engine is performing, and when the rolling rotate "
-        "backup was last written."
+        "and active configuration. Use this to understand how much history "
+        "has been compacted and how the engine is performing."
     ),
     "parameters": {
         "type": "object",

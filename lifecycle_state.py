@@ -42,12 +42,8 @@ class LifecycleState:
     last_finalized_session_id: str | None
     current_frontier_store_id: int
     last_finalized_frontier_store_id: int
-    debt_kind: str | None
-    debt_size_estimate: int
     current_bound_at: float | None
     last_finalized_at: float | None
-    debt_updated_at: float | None
-    last_maintenance_attempt_at: float | None
     last_rollover_at: float | None
     last_reset_at: float | None
     updated_at: float
@@ -91,17 +87,6 @@ class LifecycleStateStore:
         except Exception:
             pass
 
-    @property
-    def connection(self) -> sqlite3.Connection | None:
-        """The live SQLite connection, or ``None`` once :meth:`close` has run.
-
-        Exposed for read-oriented diagnostics -- for example the doctor's
-        maintenance-debt scan -- that need ad-hoc queries the store does not wrap
-        in a purpose-built method. Callers must treat it as read-only; writes go
-        through the store's own methods.
-        """
-        return getattr(self, "_conn", None)
-
     def _row_to_state(self, row: sqlite3.Row | None) -> LifecycleState | None:
         if row is None:
             return None
@@ -111,12 +96,8 @@ class LifecycleStateStore:
             last_finalized_session_id=row["last_finalized_session_id"],
             current_frontier_store_id=int(row["current_frontier_store_id"] or 0),
             last_finalized_frontier_store_id=int(row["last_finalized_frontier_store_id"] or 0),
-            debt_kind=row["debt_kind"],
-            debt_size_estimate=int(row["debt_size_estimate"] or 0),
             current_bound_at=row["current_bound_at"],
             last_finalized_at=row["last_finalized_at"],
-            debt_updated_at=row["debt_updated_at"],
-            last_maintenance_attempt_at=row["last_maintenance_attempt_at"],
             last_rollover_at=row["last_rollover_at"],
             last_reset_at=row["last_reset_at"],
             updated_at=float(row["updated_at"] or 0.0),
@@ -160,11 +141,7 @@ class LifecycleStateStore:
         current_bound_at = now
         last_finalized_session_id = None
         last_finalized_frontier = 0
-        debt_kind = None
-        debt_size_estimate = 0
         last_finalized_at = None
-        debt_updated_at = None
-        last_maintenance_attempt_at = None
         last_rollover_at = None
         last_reset_at = None
 
@@ -179,11 +156,7 @@ class LifecycleStateStore:
             )
             last_finalized_session_id = existing.last_finalized_session_id
             last_finalized_frontier = existing.last_finalized_frontier_store_id
-            debt_kind = existing.debt_kind
-            debt_size_estimate = existing.debt_size_estimate
             last_finalized_at = existing.last_finalized_at
-            debt_updated_at = existing.debt_updated_at
-            last_maintenance_attempt_at = existing.last_maintenance_attempt_at
             last_rollover_at = (
                 now
                 if (
@@ -206,27 +179,19 @@ class LifecycleStateStore:
                 last_finalized_session_id,
                 current_frontier_store_id,
                 last_finalized_frontier_store_id,
-                debt_kind,
-                debt_size_estimate,
                 current_bound_at,
                 last_finalized_at,
-                debt_updated_at,
-                last_maintenance_attempt_at,
                 last_rollover_at,
                 last_reset_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(conversation_id) DO UPDATE SET
                 current_session_id = excluded.current_session_id,
                 last_finalized_session_id = excluded.last_finalized_session_id,
                 current_frontier_store_id = excluded.current_frontier_store_id,
                 last_finalized_frontier_store_id = excluded.last_finalized_frontier_store_id,
-                debt_kind = excluded.debt_kind,
-                debt_size_estimate = excluded.debt_size_estimate,
                 current_bound_at = excluded.current_bound_at,
                 last_finalized_at = excluded.last_finalized_at,
-                debt_updated_at = excluded.debt_updated_at,
-                last_maintenance_attempt_at = excluded.last_maintenance_attempt_at,
                 last_rollover_at = excluded.last_rollover_at,
                 last_reset_at = excluded.last_reset_at,
                 updated_at = excluded.updated_at
@@ -237,12 +202,8 @@ class LifecycleStateStore:
                 last_finalized_session_id,
                 current_frontier,
                 last_finalized_frontier,
-                debt_kind,
-                debt_size_estimate,
                 current_bound_at,
                 last_finalized_at,
-                debt_updated_at,
-                last_maintenance_attempt_at,
                 last_rollover_at,
                 last_reset_at,
                 now,
@@ -280,8 +241,6 @@ class LifecycleStateStore:
                 last_finalized_session_id = ?,
                 current_frontier_store_id = ?,
                 last_finalized_frontier_store_id = ?,
-                debt_kind = debt_kind,
-                debt_size_estimate = debt_size_estimate,
                 last_finalized_at = ?,
                 updated_at = ?
             WHERE conversation_id = ?
@@ -301,75 +260,6 @@ class LifecycleStateStore:
 
 
     @_synchronized
-    def record_debt(
-        self,
-        conversation_id: str | None,
-        *,
-        kind: str,
-        size_estimate: int,
-    ) -> LifecycleState | None:
-        if not conversation_id:
-            return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None:
-            return None
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET debt_kind = ?,
-                debt_size_estimate = ?,
-                debt_updated_at = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (kind, max(0, int(size_estimate or 0)), now, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
-
-    def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
-        if not conversation_id:
-            return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None:
-            return None
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET debt_kind = NULL,
-                debt_size_estimate = 0,
-                debt_updated_at = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (now, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
-
-    @_synchronized
-    def record_maintenance_attempt(self, conversation_id: str | None) -> LifecycleState | None:
-        if not conversation_id:
-            return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None:
-            return None
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET last_maintenance_attempt_at = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (now, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
-
-    @_synchronized
     def record_reset(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -381,13 +271,10 @@ class LifecycleStateStore:
             """
             UPDATE lcm_lifecycle_state
             SET last_reset_at = ?,
-                debt_kind = NULL,
-                debt_size_estimate = 0,
-                debt_updated_at = ?,
                 updated_at = ?
             WHERE conversation_id = ?
             """,
-            (now, now, now, conversation_id),
+            (now, now, conversation_id),
         )
         self._conn.commit()
         return self.get_by_conversation(conversation_id)

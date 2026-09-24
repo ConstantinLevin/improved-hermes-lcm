@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 import os
 import sqlite3
@@ -28,7 +27,7 @@ from .presets import (
     suggest_preset_for_engine,
     unsupported_runtime_fields_text,
 )
-from .maintenance import backup_database, rotate_backup_database
+from .maintenance import backup_database
 from .store import build_message_fts_spec
 
 
@@ -61,8 +60,6 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
         "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
         "- /lcm backup: create a timestamped SQLite backup",
-        "- /lcm rotate: preview a tail-preserving in-place compact of the active session (read-only)",
-        "- /lcm rotate apply: backup-first rotate that advances the lifecycle frontier past pre-tail raw messages",
         "- /lcm preset show [name]: inspect shipped preset metadata and benchmark provenance",
         "- /lcm preset suggest: preview the best shipped preset for the current engine state",
         "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
@@ -152,20 +149,6 @@ def _status_text(engine) -> str:
         f"source_effective_unknown_messages: {source_stats['effective_unknown_messages']}",
     ]
 
-    last_rotate_at = status.get("last_rotate_at")
-    if last_rotate_at:
-        lines.append(
-            f"last_rotate_at: "
-            f"{datetime.fromtimestamp(float(last_rotate_at), tz=timezone.utc).isoformat(timespec='seconds')}"
-        )
-        rotate_backup_size = int(status.get("rotate_backup_size", 0) or 0)
-        if rotate_backup_size:
-            lines.append(f"rotate_backup_size: {_fmt_size(rotate_backup_size)}")
-    else:
-        lines.append("last_rotate_at: (never)")
-    if status.get("rotate_backup_path"):
-        lines.append(f"rotate_backup_path: {status['rotate_backup_path']}")
-
     if session_bound:
         lines.extend([
             f"store_messages: {status.get('store_messages', 0)}",
@@ -185,134 +168,6 @@ def _status_text(engine) -> str:
         )
     if source_stats.get("error"):
         lines.append(f"source_lineage_error: {source_stats['error']}")
-    return "\n".join(lines)
-
-
-def _rotate_text(engine) -> str:
-    preview = engine.rotate_active_session(apply=False)
-    if not preview.get("ok"):
-        reason = preview.get("reason", "unknown")
-        lines = [
-            "LCM rotate",
-            "status: refused",
-            f"reason: {reason}",
-        ]
-        session_id = preview.get("session_id")
-        if session_id:
-            lines.append(f"session_id: {session_id}")
-        lines.append("note: read-only preview — no changes were made")
-        return "\n".join(lines)
-
-    backup_path = engine.rotate_backup_path()
-    lines = [
-        "LCM rotate",
-        f"status: {'noop' if preview.get('noop') else 'preview'}",
-        f"session_id: {preview['session_id']}",
-        f"conversation_id: {preview['conversation_id']}",
-        f"total_message_count: {preview['total_message_count']}",
-        f"fresh_tail_count: {preview['fresh_tail_count']}",
-        f"fresh_tail_max_tokens: {preview['fresh_tail_max_tokens']}",
-        f"effective_fresh_tail_count: {preview['effective_fresh_tail_count']}",
-        f"effective_fresh_tail_tokens: {preview['effective_fresh_tail_tokens']}",
-        f"pre_tail_message_count: {preview.get('pre_tail_message_count', 0)}",
-        f"current_frontier_store_id: {preview['current_frontier_store_id']}",
-        f"new_frontier_store_id: {preview['new_frontier_store_id']}",
-        f"rotate_backup_path: {backup_path}",
-    ]
-    if preview.get("noop"):
-        lines.append(f"reason: {preview.get('reason', 'no_change')}")
-        lines.append("note: read-only preview — rotate apply would be a no-op for this session")
-    else:
-        lines.append("note: read-only preview — use `/lcm rotate apply` to advance the frontier (backup-first)")
-        lines.append("note: pre-tail raw messages remain in the store")
-    return "\n".join(lines)
-
-
-def _rotate_apply_text(engine) -> str:
-    # Pre-flight refusal AND noop check before touching disk. This avoids
-    # both writing a backup for a session that would refuse and overwriting
-    # the previous known-good rolling backup when the apply would be a no-op
-    # (e.g., idempotent rerun on an already-rotated session).
-    pre = engine.rotate_active_session(apply=False)
-    if not pre.get("ok"):
-        reason = pre.get("reason", "unknown")
-        lines = [
-            "LCM rotate apply",
-            "status: refused",
-            f"reason: {reason}",
-        ]
-        session_id = pre.get("session_id")
-        if session_id:
-            lines.append(f"session_id: {session_id}")
-        lines.append("note: rotate apply refused; no backup was created and no lifecycle state was changed")
-        return "\n".join(lines)
-
-    if pre.get("noop"):
-        # Surface the same shape as a successful apply but with status:noop so
-        # operators get the standard fields without a fresh backup write
-        # destroying the previous known-good snapshot.
-        lines = [
-            "LCM rotate apply",
-            "status: noop",
-            f"session_id: {pre['session_id']}",
-            f"conversation_id: {pre['conversation_id']}",
-            f"total_message_count: {pre['total_message_count']}",
-            f"fresh_tail_count: {pre['fresh_tail_count']}",
-            f"fresh_tail_max_tokens: {pre['fresh_tail_max_tokens']}",
-            f"effective_fresh_tail_count: {pre['effective_fresh_tail_count']}",
-            f"effective_fresh_tail_tokens: {pre['effective_fresh_tail_tokens']}",
-            f"pre_tail_message_count: {pre.get('pre_tail_message_count', 0)}",
-            f"previous_frontier_store_id: {pre['current_frontier_store_id']}",
-            f"new_frontier_store_id: {pre['new_frontier_store_id']}",
-            f"reason: {pre.get('reason', 'no_change')}",
-            "note: rotate is a no-op; rolling backup was not written so the previous rotate-latest snapshot is preserved",
-        ]
-        return "\n".join(lines)
-
-    backup = rotate_backup_database(engine)
-    if not backup["ok"]:
-        return "\n".join([
-            "LCM rotate apply",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"error: backup failed: {backup['error']}",
-            "note: rotate apply aborted before any lifecycle mutation",
-        ])
-
-    result = engine.rotate_active_session(apply=True)
-    if not result.get("ok"):
-        return "\n".join([
-            "LCM rotate apply",
-            "status: refused",
-            f"reason: {result.get('reason', 'unknown')}",
-            f"rotate_backup_path: {backup['backup_path']}",
-            f"rotate_backup_size: {_fmt_size(int(backup['backup_size']))}",
-            "note: backup was created before rotate refused; lifecycle state unchanged",
-        ])
-
-    is_noop = bool(result.get("noop"))
-    lines = [
-        "LCM rotate apply",
-        f"status: {'noop' if is_noop else 'ok'}",
-        f"session_id: {result['session_id']}",
-        f"conversation_id: {result['conversation_id']}",
-        f"rotate_backup_path: {backup['backup_path']}",
-        f"rotate_backup_size: {_fmt_size(int(backup['backup_size']))}",
-        f"total_message_count: {result['total_message_count']}",
-        f"fresh_tail_count: {result['fresh_tail_count']}",
-        f"fresh_tail_max_tokens: {result['fresh_tail_max_tokens']}",
-        f"effective_fresh_tail_count: {result['effective_fresh_tail_count']}",
-        f"effective_fresh_tail_tokens: {result['effective_fresh_tail_tokens']}",
-        f"pre_tail_message_count: {result.get('pre_tail_message_count', 0)}",
-        f"previous_frontier_store_id: {result['current_frontier_store_id']}",
-        f"new_frontier_store_id: {result.get('applied_frontier_store_id', result['new_frontier_store_id'])}",
-    ]
-    if is_noop:
-        lines.append(f"reason: {result.get('reason', 'no_change')}")
-        lines.append("note: lifecycle state already at or ahead of the target frontier")
-    else:
-        lines.append("note: pre-tail raw messages remain in the store")
-        lines.append("note: rolling backup overwrites the previous rotate-latest slot")
     return "\n".join(lines)
 
 
@@ -537,22 +392,6 @@ def _doctor_text(engine) -> str:
         issues.append("payload_storage")
     missing_side_files = int(side_file_integrity.get("externalized_payload_refs_missing", 0) or 0)
 
-    debt_rows = []
-    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "connection", None)
-    if lifecycle_conn is not None:
-        try:
-            debt_rows = lifecycle_conn.execute(
-                """
-                SELECT conversation_id, debt_kind, debt_size_estimate
-                FROM lcm_lifecycle_state
-                WHERE debt_kind IS NOT NULL AND debt_size_estimate > 0
-                ORDER BY updated_at DESC
-                """
-            ).fetchall()
-        except Exception as exc:  # pragma: no cover - defensive
-            issues.append("lifecycle_state")
-            debt_rows = [(f"error: {exc}", "error", 0)]
-
     observations: list[str] = []
 
     if schema_health.get("error"):
@@ -569,15 +408,6 @@ def _doctor_text(engine) -> str:
         )
     else:
         observations.append("schema_core_tables: ok")
-
-    if debt_rows:
-        first = debt_rows[0]
-        observations.append(
-            f"maintenance_debt: {len(debt_rows)} conversation(s) currently carry deferred maintenance debt; first={first[0]} kind={first[1]} size={first[2]}"
-        )
-        recommended_actions.append(
-            "let normal compaction turns reduce maintenance debt"
-        )
 
     if missing_side_files:
         issues.append("payload_storage")
@@ -906,14 +736,6 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         if rest:
             return _help_text("`/lcm backup` does not accept extra arguments.")
         return _backup_text(engine)
-
-    if head == "rotate":
-        if not rest:
-            return _rotate_text(engine)
-        if len(rest) == 1 and rest[0].lower() == "apply":
-            return _rotate_apply_text(engine)
-        return _help_text("`/lcm rotate` accepts an optional `apply` subcommand.")
-
 
     if head == "preset":
         return _preset_text(rest, engine)

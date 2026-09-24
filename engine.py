@@ -1013,13 +1013,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         )
         self._clear_pending_reset_boundary()
 
-    def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        fresh_tail_start = self._fresh_tail_start(messages)
-        leading_anchor_count = self._leading_anchor_count(messages)
-        if fresh_tail_start <= leading_anchor_count:
-            return []
-        return messages[leading_anchor_count:fresh_tail_start]
-
     def _fresh_tail_boundary(self, messages: List[Dict[str, Any]]) -> FreshTailBoundary:
         return resolve_fresh_tail_boundary(
             messages,
@@ -1079,103 +1072,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             return 1
         return 0
-
-    def _raw_backlog_tokens(self, messages: List[Dict[str, Any]]) -> int:
-        backlog = self._raw_backlog_messages(messages)
-        if not backlog:
-            return 0
-        return count_messages_tokens(backlog)
-
-    def _raw_backlog_threshold(self, raw_tokens: int) -> int:
-        if self._config.dynamic_leaf_chunk_enabled:
-            return self._working_leaf_chunk_tokens(raw_tokens)
-        return max(1, self._config.leaf_chunk_tokens)
-
-    def _has_raw_backlog_debt(self) -> bool:
-        if not self._config.deferred_maintenance_enabled or not self._conversation_id:
-            return False
-        state = self._lifecycle.get_by_conversation(self._conversation_id)
-        return bool(state and state.debt_kind == "raw_backlog" and state.debt_size_estimate > 0)
-
-    def _budget_pressure_ratio(
-        self,
-        *,
-        observed_tokens: int | None = None,
-        messages: List[Dict[str, Any]] | None = None,
-    ) -> float | None:
-        if self.context_length <= 0:
-            return None
-        token_count: int | None = None
-        if observed_tokens is not None and observed_tokens > 0:
-            token_count = observed_tokens
-        elif messages is not None:
-            token_count = count_messages_tokens(messages)
-        elif self.last_prompt_tokens > 0:
-            token_count = self.last_prompt_tokens
-        if token_count is None or token_count <= 0:
-            return None
-        return token_count / self.context_length
-
-    def _critical_budget_pressure_reached(
-        self,
-        *,
-        observed_tokens: int | None = None,
-        messages: List[Dict[str, Any]] | None = None,
-    ) -> bool:
-        threshold = self._config.critical_budget_pressure_ratio
-        if threshold <= 0:
-            return False
-        pressure = self._budget_pressure_ratio(
-            observed_tokens=observed_tokens,
-            messages=messages,
-        )
-        return pressure is not None and pressure >= threshold
-
-    def _should_run_deferred_maintenance(
-        self,
-        messages: List[Dict[str, Any]],
-        *,
-        observed_tokens: int | None = None,
-    ) -> bool:
-        if not self._has_raw_backlog_debt():
-            return False
-        raw_tokens = self._raw_backlog_tokens(messages)
-        if raw_tokens <= 0:
-            return False
-        if raw_tokens >= self._raw_backlog_threshold(raw_tokens):
-            return True
-        return self._critical_budget_pressure_reached(
-            observed_tokens=observed_tokens,
-            messages=messages,
-        )
-
-    def _refresh_raw_backlog_debt(
-        self,
-        messages: List[Dict[str, Any]],
-        *,
-        observed_tokens: int | None = None,
-    ) -> None:
-        if not self._config.deferred_maintenance_enabled or not self._conversation_id:
-            return
-        raw_tokens = self._raw_backlog_tokens(messages)
-        threshold = self._raw_backlog_threshold(raw_tokens) if raw_tokens > 0 else 0
-        keep_under_critical_pressure = (
-            raw_tokens > 0
-            and self._has_raw_backlog_debt()
-            and self._critical_budget_pressure_reached(
-                observed_tokens=observed_tokens,
-                messages=messages,
-            )
-        )
-        if raw_tokens > 0 and (raw_tokens >= threshold or keep_under_critical_pressure):
-            self._lifecycle.record_debt(
-                self._conversation_id,
-                kind="raw_backlog",
-                size_estimate=raw_tokens,
-            )
-            return
-        if self._has_raw_backlog_debt():
-            self._lifecycle.clear_debt(self._conversation_id)
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
@@ -1769,26 +1665,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             status["source_lineage"] = self._store.get_source_stats(session_id or None)
         except Exception as exc:  # pragma: no cover - defensive
             status["source_lineage"] = {"error": str(exc)}
-        try:
-            rotate_backup_path = self.rotate_backup_path()
-            status["rotate_backup_path"] = str(rotate_backup_path)
-            # Single stat() to avoid a TOCTOU window where the rolling slot
-            # could be atomically replaced between separate mtime and size reads.
-            try:
-                rotate_stat = rotate_backup_path.stat()
-            except FileNotFoundError:
-                rotate_stat = None
-            if rotate_stat is not None:
-                status["last_rotate_at"] = rotate_stat.st_mtime
-                status["rotate_backup_size"] = rotate_stat.st_size
-            else:
-                status["last_rotate_at"] = None
-                status["rotate_backup_size"] = 0
-        except Exception as exc:  # pragma: no cover - defensive
-            status["rotate_backup_path"] = None
-            status["last_rotate_at"] = None
-            status["rotate_backup_size"] = 0
-            status["rotate_backup_error"] = str(exc)
         if session_id:
             status["store_messages"] = self._store.get_session_count(session_id)
             status["dag_nodes"] = self._dag.get_session_node_count(session_id)
@@ -1804,12 +1680,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
                     "last_finalized_session_id": lifecycle_state.last_finalized_session_id,
                     "current_frontier_store_id": lifecycle_state.current_frontier_store_id,
                     "last_finalized_frontier_store_id": lifecycle_state.last_finalized_frontier_store_id,
-                    "debt_kind": lifecycle_state.debt_kind,
-                    "debt_size_estimate": lifecycle_state.debt_size_estimate,
                     "current_bound_at": lifecycle_state.current_bound_at,
                     "last_finalized_at": lifecycle_state.last_finalized_at,
-                    "debt_updated_at": lifecycle_state.debt_updated_at,
-                    "last_maintenance_attempt_at": lifecycle_state.last_maintenance_attempt_at,
                     "last_rollover_at": lifecycle_state.last_rollover_at,
                     "last_reset_at": lifecycle_state.last_reset_at,
                     "updated_at": lifecycle_state.updated_at,
@@ -2300,15 +2172,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         uncondensed_count: int,
         leaf_compacted_this_turn: bool,
         force_overflow: bool,
-        critical_budget_pressure: bool = False,
     ) -> tuple[bool, str]:
         if not leaf_compacted_this_turn:
             return True, ""
         if not self._config.cache_friendly_condensation_enabled:
             return True, ""
         if force_overflow:
-            return True, ""
-        if critical_budget_pressure:
             return True, ""
 
         fanin = max(1, self._config.condensation_fanin)
@@ -2325,7 +2194,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         *,
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
-        critical_budget_pressure: bool = False,
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
@@ -2358,7 +2226,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
                 uncondensed_count=len(uncondensed),
                 leaf_compacted_this_turn=leaf_compacted_this_turn,
                 force_overflow=force_overflow,
-                critical_budget_pressure=critical_budget_pressure,
             )
             if not allow_condense:
                 suppression_reason = reason or suppression_reason
@@ -3036,13 +2903,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             return hint.split("\n")[0].strip()
         return ""
 
-    # -- Rotate ------------------------------------------------------------
+    # -- Backup paths ------------------------------------------------------
 
     def backup_dir(self) -> Path:
         """Return the directory where LCM backup snapshots are written.
 
-        Centralized so the timestamped ``/lcm backup`` slot and the rolling
-        ``/lcm rotate apply`` slot share the same directory derivation.
+        Centralized so the timestamped ``/lcm backup`` copies and the
+        single rolling slot share the same directory derivation.
         """
         db_path = Path(self._store.db_path)
         backup_root = (
@@ -3053,175 +2920,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         return backup_root / "backups" / "lcm"
 
     def rotate_backup_path(self) -> Path:
-        """Return the rolling rotate-latest SQLite backup path for this engine.
+        """Return the single rolling backup slot for this engine's store.
 
-        Centralized so command.py (which writes the backup) and get_status()
-        (which reads its mtime to surface last_rotate_at) cannot drift.
+        Written only by ``maintenance.rotate_backup_database``, which has no
+        caller since ``/lcm rotate`` was removed; the automatic daily backup
+        is to be built on it.
         """
         db_path = Path(self._store.db_path)
         return self.backup_dir() / f"{db_path.stem}-rotate-latest.sqlite3"
-
-    def rotate_active_session(
-        self,
-        *,
-        apply: bool = False,
-    ) -> dict[str, Any]:
-        """Compact the active session in-place without changing identity.
-
-        Read-only by default (``apply=False``). Returns a preview describing
-        what would change. When ``apply=True``, advances the lifecycle frontier
-        marker past the pre-tail raw messages so they are no longer replayed
-        into active context on subsequent bootstrap. Raw messages remain in
-        the SQLite store and are reachable through ``lcm_expand(store_id=...)``.
-
-        Refuses on sessions that are unbound.
-
-        Two frontier markers are intentionally kept separate:
-
-        - The **persisted lifecycle frontier**
-          (``lifecycle_state.current_frontier_store_id``) is the
-          bootstrap signal — on next session start, raw rows at or
-          below it are not replayed into the active context. Rotate
-          advances this marker.
-        - The **in-process source-mapping marker**
-          (``self._last_compacted_store_id``) tracks raw rows that the
-          *current process* has already moved into summary DAG nodes.
-          ``_get_store_ids_for_messages`` uses it to filter candidates
-          when mapping in-memory active messages back to ``store_id``.
-          Rotate deliberately does NOT advance this marker: pre-tail
-          raw messages remain in the in-memory active context until
-          the host rebuilds it, so a normal ``compress()`` later in
-          the same process can still summarize them with correct
-          ``source_ids`` lineage. On next process start,
-          ``_bind_lifecycle_state`` reads the persisted frontier into
-          the in-process marker — at that point the active context is
-          being built from scratch, so the contract holds.
-
-        Refusal/no-op reason codes (returned as ``reason``):
-
-        - ``no_active_session``: engine has no bound session or conversation.
-        - ``no_pre_tail_content``: no stored messages precede the resolved
-          count/token-bounded fresh tail; nothing to rotate.
-        - ``empty_tail``: tail query returned no rows despite a non-zero
-          count (concurrent deletion race); rotate cannot compute a boundary.
-        - ``frontier_already_ahead``: lifecycle frontier is already at or
-          past the proposed new frontier; rotate is a no-op.
-        - ``stale_lifecycle_state``: apply requested but lifecycle's
-          ``current_session_id`` did not match this engine's session, so
-          ``advance_frontier`` did not persist the change.
-        """
-        session_id = self._session_id
-        conversation_id = self._conversation_id
-
-        if not session_id or not conversation_id:
-            return {"ok": False, "reason": "no_active_session"}
-
-        fresh_tail_count = max(1, int(self._config.fresh_tail_count))
-        total_count = int(self._store.get_session_count(session_id))
-        tail, fresh_tail_boundary = self._get_session_fresh_tail(
-            session_id,
-            minimum_count=1,
-        )
-        effective_fresh_tail_count = len(tail)
-
-        state = self._lifecycle.get_by_conversation(conversation_id)
-        current_frontier = int(state.current_frontier_store_id) if state else 0
-
-        base = {
-            "ok": True,
-            "session_id": session_id,
-            "conversation_id": conversation_id,
-            "total_message_count": total_count,
-            "fresh_tail_count": fresh_tail_count,
-            "fresh_tail_max_tokens": self._config.fresh_tail_max_tokens,
-            "effective_fresh_tail_count": effective_fresh_tail_count,
-            "effective_fresh_tail_tokens": fresh_tail_boundary.tokens,
-            "fresh_tail_token_limited": fresh_tail_boundary.token_limited,
-            "fresh_tail_tool_group_extended": fresh_tail_boundary.tool_group_extended,
-            "current_frontier_store_id": current_frontier,
-            "mode": "apply" if apply else "preview",
-        }
-
-        if total_count <= effective_fresh_tail_count:
-            return {
-                **base,
-                "noop": True,
-                "reason": "no_pre_tail_content",
-                "pre_tail_message_count": 0,
-                "new_frontier_store_id": current_frontier,
-            }
-
-        if not tail:
-            # Concurrent deletion can empty the tail after the count check.
-            # Surface the same shape callers expect for any other no-op so
-            # downstream formatters can render it without KeyError.
-            return {
-                **base,
-                "noop": True,
-                "reason": "empty_tail",
-                "pre_tail_message_count": 0,
-                "new_frontier_store_id": current_frontier,
-            }
-
-        smallest_tail_store_id = int(tail[0].get("store_id") or 0)
-        new_frontier = max(0, smallest_tail_store_id - 1)
-        pre_tail_count = max(0, total_count - len(tail))
-
-        is_noop = new_frontier <= current_frontier
-        result = {
-            **base,
-            "pre_tail_message_count": pre_tail_count,
-            "new_frontier_store_id": new_frontier,
-            "noop": is_noop,
-        }
-        if is_noop:
-            # Set the reason for both preview and apply so downstream
-            # formatters can render a stable explanation. Preview previously
-            # omitted the reason, which left _rotate_apply_text's preflight
-            # check unable to distinguish frontier-already-ahead from other
-            # no-ops.
-            result["reason"] = "frontier_already_ahead"
-
-        if not apply:
-            return result
-
-        if is_noop:
-            return result
-
-        new_state = self._lifecycle.advance_frontier(
-            conversation_id,
-            session_id,
-            new_frontier,
-        )
-        # advance_frontier silently returns the unchanged state when its
-        # session_id check fails (lifecycle_state.py:557-559). Detect that
-        # by checking whether the persisted frontier actually advanced; only
-        # promote the in-process marker on a confirmed persist.
-        persisted_frontier = (
-            int(new_state.current_frontier_store_id) if new_state else current_frontier
-        )
-        if persisted_frontier < new_frontier:
-            return {
-                **{k: v for k, v in result.items() if k != "ok"},
-                "ok": False,
-                "noop": False,
-                "reason": "stale_lifecycle_state",
-                "applied_frontier_store_id": persisted_frontier,
-            }
-        # Deliberately do NOT touch self._last_compacted_store_id here.
-        # The in-process source-mapping marker must stay aligned with the
-        # in-memory active context the host is still using. Pre-tail raw
-        # messages remain in that active context until the host rebuilds
-        # it; advancing the marker would make
-        # _get_store_ids_for_messages filter out those rows on the next
-        # in-process compress(), producing summary nodes whose text
-        # covers pre-rotate messages but whose source_ids reference only
-        # post-rotate rows. The persisted lifecycle frontier we just
-        # advanced is the bootstrap signal for the next process start,
-        # where _bind_lifecycle_state will read it into the marker
-        # against a freshly-built active context.
-        result["applied_frontier_store_id"] = persisted_frontier
-        return result
 
     # -- Lifecycle ---------------------------------------------------------
 

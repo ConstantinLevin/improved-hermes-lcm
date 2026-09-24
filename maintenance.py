@@ -1,8 +1,10 @@
-"""Backup and rotate maintenance operations for the LCM store.
+"""Backup operations for the LCM store.
 
-These are the data-layer maintenance primitives behind ``/lcm backup`` and
-``/lcm rotate``: they flush the engine's SQLite connections and snapshot the
-store to a timestamped or rolling backup file. They are pure functions that
+``backup_database`` is the primitive behind ``/lcm backup``; it snapshots the
+store to a timestamped file. ``rotate_backup_database`` writes the single
+rolling slot and has no caller since ``/lcm rotate`` was removed; the
+automatic daily backup is to be built on it. Both flush the engine's SQLite
+connections first. They are pure functions that
 take the engine so the command layer (``command.py``) keeps only the text
 formatting, and the store/dag/lifecycle connection handling lives in one place.
 """
@@ -108,11 +110,11 @@ def backup_database(engine) -> dict[str, Any]:
 
 
 def rotate_backup_database(engine) -> dict[str, Any]:
-    """Write a rolling rotate-latest SQLite snapshot of the LCM store.
+    """Write the single rolling SQLite snapshot of the LCM store.
 
     Atomic via tmp-then-rename so the slot is never half-written. Unlike
     ``backup_database`` which produces timestamped files, this overwrites a
-    single rolling slot so disk usage stays bounded across repeated rotates.
+    single rolling slot so disk usage stays bounded across repeated runs.
     """
     db_path = Path(engine._store.db_path)
     if not db_path.exists():
