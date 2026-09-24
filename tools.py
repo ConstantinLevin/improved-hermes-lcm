@@ -269,10 +269,7 @@ def _bound_operator_strings(value: Any) -> tuple[Any, int]:
 def _bounded_inspect_json(response: dict[str, Any]) -> str:
     """Serialize ``lcm_inspect`` under one final response-size invariant."""
     payload, truncated_fields = _bound_operator_strings(response)
-    rollup_truncated_fields = (
-        (payload.get("temporal_rollups") or {}).get("truncated_fields") or []
-    )
-    total_truncated_fields = truncated_fields + len(rollup_truncated_fields)
+    total_truncated_fields = truncated_fields
     payload["char_limit"] = _LCM_INSPECT_MAX_RESPONSE_CHARS
     payload["truncated"] = bool(total_truncated_fields)
     if total_truncated_fields:
@@ -289,7 +286,6 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         "session_id",
         "conversation_id",
         "limit",
-        "temporal_rollups",
         "runtime_identity",
         "lineage",
         "messages",

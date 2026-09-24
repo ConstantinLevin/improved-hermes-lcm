@@ -786,7 +786,6 @@ class CompactionMixin:
                 expand_hint=self._extract_expand_hint(summary_text),
             )
             self._dag.add_node(node)
-            self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             self._persist_frontier_marker()

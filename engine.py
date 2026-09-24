@@ -4,7 +4,6 @@ Implements the ContextEngine ABC. Replaces the built-in ContextCompressor
 with a DAG-based summarization system that preserves every message.
 """
 
-import asyncio
 import copy
 import hashlib
 import json
@@ -14,10 +13,9 @@ import re
 import sqlite3
 import threading
 import time
-from collections import deque
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
 
@@ -80,11 +78,6 @@ from .runtime_identity import (
     _git_runtime_identity,
     _plugin_metadata,
 )
-from .rollup_builder import (
-    initialize_rollup_invalidation_outbox,
-    mark_stale_for_published_summary,
-    run_rollup_maintenance,
-)
 from .schemas import (
     LCM_DOCTOR,
     LCM_EXPAND,
@@ -131,207 +124,6 @@ from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
 
-
-class _RollupMaintenanceScheduler:
-    """Run deduplicated rollup jobs on one process-wide worker.
-
-    Session binding only enqueues work. The worker is shared by every engine so
-    rapid gateway binds cannot create one thread per session. A key that is
-    already queued is ignored; a key requested while active gets at most one
-    follow-up pass, which preserves eventual progress when new staleness arrives
-    during an in-flight build without allowing concurrent duplicate builds.
-    """
-
-    def __init__(self, max_pending_jobs: int = 64) -> None:
-        self._condition = threading.Condition()
-        self._max_pending_jobs = max(1, int(max_pending_jobs))
-        self._jobs: deque[
-            tuple[tuple[str, str], Callable[[], None]]
-        ] = deque()
-        self._queued_keys: set[tuple[str, str]] = set()
-        self._active_keys: set[tuple[str, str]] = set()
-        # One worker means at most one active key. Keep its requested rerun in
-        # a literal single slot so queue saturation cannot discard the
-        # documented active-pass follow-up guarantee or grow hidden state.
-        self._follow_up_key: tuple[str, str] | None = None
-        self._follow_up_job: Callable[[], None] | None = None
-        self._running_follow_up = False
-        self._exclusive_keys: set[tuple[str, str]] = set()
-        self._owned_keys: dict[object, set[tuple[str, str]]] = {}
-        self._key_owners: dict[tuple[str, str], set[object]] = {}
-        self._worker: threading.Thread | None = None
-
-    def _track_owner_locked(
-        self,
-        key: tuple[str, str],
-        owner: object | None,
-    ) -> None:
-        if owner is None:
-            return
-        self._owned_keys.setdefault(owner, set()).add(key)
-        self._key_owners.setdefault(key, set()).add(owner)
-
-    def _release_key_owners_if_idle_locked(self, key: tuple[str, str]) -> None:
-        if (
-            key in self._queued_keys
-            or key in self._active_keys
-            or key in self._exclusive_keys
-            or self._follow_up_key == key
-        ):
-            return
-        for owner in self._key_owners.pop(key, set()):
-            owned = self._owned_keys.get(owner)
-            if owned is None:
-                continue
-            owned.discard(key)
-            if not owned:
-                self._owned_keys.pop(owner, None)
-
-    def schedule(
-        self,
-        key: tuple[str, str],
-        job: Callable[[], None],
-        *,
-        owner: object | None = None,
-    ) -> bool:
-        with self._condition:
-            if key in self._exclusive_keys:
-                logger.info(
-                    "LCM temporal rollup maintenance deferred while an operator "
-                    "rebuild owns database=%s scope=%s",
-                    key[0],
-                    key[1],
-                )
-                return False
-            if key in self._queued_keys:
-                self._track_owner_locked(key, owner)
-                return True
-            if key in self._active_keys and not self._running_follow_up:
-                self._follow_up_key = key
-                self._follow_up_job = job
-                self._track_owner_locked(key, owner)
-                self._condition.notify_all()
-                return True
-            if len(self._jobs) >= self._max_pending_jobs:
-                logger.warning(
-                    "LCM temporal rollup maintenance queue is full; "
-                    "deferring database=%s scope=%s until a later bind",
-                    key[0],
-                    key[1],
-                )
-                return False
-            if self._worker is None or not self._worker.is_alive():
-                worker = threading.Thread(
-                    target=self._run,
-                    name="lcm-rollup-maintenance",
-                    daemon=True,
-                )
-                worker.start()
-                self._worker = worker
-            self._jobs.append((key, job))
-            self._queued_keys.add(key)
-            self._track_owner_locked(key, owner)
-            self._condition.notify_all()
-            return True
-
-    def try_acquire_exclusive(self, key: tuple[str, str]) -> bool:
-        """Reserve one idle key for a synchronous operator rebuild.
-
-        This is intentionally non-blocking: a manual rebuild must not race a
-        provider-backed maintenance pass, but it also must not wait behind one
-        on the gateway thread. The caller can ask the operator to retry once the
-        background pass completes.
-        """
-        with self._condition:
-            busy_keys = self._queued_keys | self._active_keys | self._exclusive_keys
-            if key in busy_keys or self._follow_up_key == key:
-                return False
-            if len(self._exclusive_keys) >= self._max_pending_jobs:
-                return False
-            self._exclusive_keys.add(key)
-            return True
-
-    def release_exclusive(self, key: tuple[str, str]) -> None:
-        with self._condition:
-            self._exclusive_keys.discard(key)
-            self._condition.notify_all()
-
-    def drain(
-        self,
-        keys: set[tuple[str, str]],
-        timeout: float | None = None,
-    ) -> bool:
-        """Wait until none of ``keys`` is queued or active."""
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        with self._condition:
-            while keys & (
-                self._queued_keys
-                | self._active_keys
-                | self._exclusive_keys
-                | ({self._follow_up_key} if self._follow_up_key else set())
-            ):
-                if deadline is None:
-                    self._condition.wait()
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-    def drain_owner(
-        self,
-        owner: object,
-        timeout: float | None = None,
-    ) -> bool:
-        """Wait until every outstanding key accepted for ``owner`` is idle."""
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        with self._condition:
-            while self._owned_keys.get(owner):
-                if deadline is None:
-                    self._condition.wait()
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-    def _run(self) -> None:
-        while True:
-            with self._condition:
-                while not self._jobs:
-                    self._condition.wait()
-                key, job = self._jobs.popleft()
-                self._queued_keys.discard(key)
-                self._active_keys.add(key)
-                self._running_follow_up = False
-            while True:
-                try:
-                    job()
-                except (Exception, asyncio.CancelledError):
-                    logger.warning(
-                        "LCM background temporal rollup maintenance failed for database=%s scope=%s",
-                        key[0],
-                        key[1],
-                        exc_info=True,
-                    )
-                with self._condition:
-                    if self._follow_up_key == key and self._follow_up_job is not None:
-                        job = self._follow_up_job
-                        self._follow_up_key = None
-                        self._follow_up_job = None
-                        self._running_follow_up = True
-                        self._condition.notify_all()
-                        continue
-                    self._active_keys.discard(key)
-                    self._running_follow_up = False
-                    self._release_key_owners_if_idle_locked(key)
-                    self._condition.notify_all()
-                    break
-
-
-_ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
@@ -581,9 +373,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
-        # The scheduler associates this identity only with outstanding work, so
-        # diagnostic drains do not retain every historical session key forever.
-        self._rollup_maintenance_owner = object()
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -662,10 +451,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 hermes_home=hermes_home,
             )
             self._dag = SummaryDAG(db_path)
-            if self._config.temporal_rollups_enabled:
-                # Install the transaction-coupled summary mutation triggers before
-                # this engine can publish or delete a DAG node.
-                initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
         except Exception:
             self._close_storage()
@@ -1656,75 +1441,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- ContextEngine optional methods ------------------------------------
 
-    def _rollup_maintenance_key(self, scope: str) -> tuple[str, str]:
-        raw_database_path = str(self._dag.db_path)
-        if raw_database_path == ":memory:":
-            database_identity = f":memory:{id(self._dag)}"
-        else:
-            database_identity = str(Path(raw_database_path).resolve())
-        return database_identity, str(scope)
-
-    def try_acquire_rollup_operator_lease(
-        self,
-        scope: str,
-    ) -> tuple[str, str] | None:
-        """Reserve this database/scope for a synchronous rollup rebuild."""
-        key = self._rollup_maintenance_key(scope)
-        if not _ROLLUP_MAINTENANCE_SCHEDULER.try_acquire_exclusive(key):
-            return None
-        return key
-
-    def release_rollup_operator_lease(self, key: tuple[str, str]) -> None:
-        _ROLLUP_MAINTENANCE_SCHEDULER.release_exclusive(key)
-
-    def _schedule_rollup_maintenance(self, scope: str) -> None:
-        """Enqueue one best-effort rollup pass using private SQLite helpers."""
-        try:
-            raw_database_path = str(self._dag.db_path)
-            if raw_database_path == ":memory:":
-                logger.warning(
-                    "LCM cannot run background temporal rollup maintenance for "
-                    "an isolated in-memory SQLite database; maintenance skipped"
-                )
-                return
-            database_path = Path(raw_database_path).resolve()
-            key = self._rollup_maintenance_key(scope)
-            config = copy.deepcopy(self._config)
-            circuit_breaker = self._summary_circuit_breaker
-            spend_guard = self._summary_spend_guard
-
-            def maintain() -> None:
-                private_dag = SummaryDAG(database_path)
-                try:
-                    run_rollup_maintenance(
-                        private_dag,
-                        config,
-                        scope,
-                        circuit_breaker=circuit_breaker,
-                        spend_guard=spend_guard,
-                    )
-                finally:
-                    private_dag.close()
-
-            _ROLLUP_MAINTENANCE_SCHEDULER.schedule(
-                key,
-                maintain,
-                owner=self._rollup_maintenance_owner,
-            )
-        except Exception:
-            # Maintenance is opportunistic; a scheduler/setup failure must never
-            # turn a successful foreground session bind into a host failure.
-            logger.warning(
-                "LCM could not schedule background temporal rollup maintenance",
-                exc_info=True,
-            )
-
-    def drain_rollup_maintenance(self, timeout: float | None = None) -> bool:
-        """Wait for rollup jobs scheduled by this engine (tests and diagnostics)."""
-        return _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(
-            self._rollup_maintenance_owner,
-            timeout=timeout,
-        )
 
     def _bind_lifecycle_state(
         self,
@@ -1768,37 +1484,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     deleted,
                     self._config.empty_lifecycle_gc_threshold,
                 )
-        # Bypassed/stateless sessions skip every LCM write, so they must also skip
-        # rollup maintenance — otherwise the bind-time hook would build rollups for
-        # a session whose ingest is suppressed (maintainer #388: gate on the same
-        # not-bypassed condition the ingest write uses).
-        if (
-            self._config.temporal_rollups_enabled
-            and not self._session_ignored
-            and not self._session_stateless
-        ):
-            self._schedule_rollup_maintenance(session_id)
-
-    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
-        """Stale the rollups covering EVERY UTC day a just-published node spans.
-
-        Rollups consume published summary nodes, so publication — not raw ingest
-        — is the load-bearing staleness signal (maintainer #388 blocker 1). This
-        is called after every ``_dag.add_node`` on the engine so a later summary
-        cannot leave an older rollup ``ready`` and apparently current. The node's
-        ``earliest_at``/``latest_at`` coverage span is passed through so a summary
-        crossing midnight stales BOTH days, not only its newest (maintainer #388
-        blocker 2 / B2).
-        """
-        if not self._config.temporal_rollups_enabled:
-            return
-        mark_stale_for_published_summary(
-            self._dag,
-            str(node.session_id or ""),
-            node.latest_at,
-            node.created_at,
-            earliest_at=node.earliest_at,
-        )
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -3502,14 +3187,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ``session_scope='current'`` may therefore include a carried-over node in
         the new session, while ``source`` filtering still evaluates against the
         node's original descendant message sources.
-
-        Temporal rollups are deliberately NOT re-scoped here: they are keyed by
-        (period_kind, period_start, scope=session_id) with a UNIQUE constraint, so
-        rewriting scope on rollover could collide with the new session's own
-        rollups and would need a core-schema change to do safely. Rotation is the
-        documented rollup scope boundary; ``lcm_recent`` compensates at read time
-        by spanning the same current + last-finalized sessions its leaf fallback
-        uses (see ``_recent_ready_rollups``), so no window content is dropped.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
@@ -4675,11 +4352,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
-        # Rollup staleness is driven by summary-node PUBLICATION
-        # (_invalidate_rollups_for_published_node at every add_node site), not by
-        # raw ingest: marking a period stale before its covering summary exists
-        # would let a rebuild publish 'ready' from old sources and omit the leaf
-        # (maintainer #388 P1).
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
@@ -5324,7 +4996,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             expand_hint=self._extract_expand_hint(summary_text),
         )
         self._dag.add_node(condensed_node)
-        self._invalidate_rollups_for_published_node(condensed_node)
         return source_tokens, summary_tokens, level
 
     def _summary_frontier_nodes(self) -> List[SummaryNode]:
