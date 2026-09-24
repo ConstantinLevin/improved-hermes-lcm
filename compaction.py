@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
+from .record_write import _ATTEMPT, AttemptCancelled
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
+        self._bind_from_list(messages)
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
         rough = count_messages_tokens(messages)
         replay_messages = None
@@ -223,18 +225,39 @@ class CompactionMixin:
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
                  force: bool = False) -> List[Dict[str, Any]]:
-        """Run compaction and leave a terminal public status on every failure."""
+        """Run one compaction attempt.
+
+        The host's cancellation check and the attempt's generation are captured here,
+        at entry, on this attempt's own thread (#33 D12). A cancelled attempt returns
+        its input at once and sets nothing. Engine attributes are set only when the
+        attempt returns and is the host's current working attempt; a terminal status
+        is left on every failure under the same rule.
+        """
+        attempt = self._begin_attempt()
+        if attempt.cancelled():
+            return messages
+        token = _ATTEMPT.set(attempt)
         try:
-            return self._compress_impl(
+            result = self._compress_impl(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
             )
+        except AttemptCancelled:
+            return messages
         except BaseException:
-            self._last_compression_status = "error"
-            self._last_compression_noop_reason = ""
+            if not attempt.cancelled() and self._attempt_is_current(attempt):
+                self._last_compression_status = "error"
+                self._last_compression_noop_reason = ""
             raise
+        finally:
+            _ATTEMPT.reset(token)
+        if attempt.cancelled():
+            return messages
+        if self._attempt_is_current(attempt):
+            self._apply_attempt_outcome(attempt)
+        return result
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
@@ -248,13 +271,12 @@ class CompactionMixin:
         4. Check if condensation is needed
         5. Assemble new active context: summaries + fresh tail
         """
+        attempt = _ATTEMPT.get()
         if not messages:
-            self._last_compression_status = "noop"
-            self._last_compression_noop_reason = "empty message list"
+            self._publish("_last_compression_status", "noop")
+            self._publish("_last_compression_noop_reason", "empty message list")
             return messages
 
-        self._last_compression_status = "running"
-        self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
@@ -281,6 +303,22 @@ class CompactionMixin:
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
+        # The shadow record maps each working copy back to the host's entry by
+        # object identity, taken here, before any pass re-slices the working list.
+        index_by_working = (
+            {id(message): index for index, message in enumerate(working_messages)}
+            if len(working_messages) == len(messages)
+            else None
+        )
+        if attempt is not None:
+            attempt.messages = messages
+            attempt.index_by_working = index_by_working
+            if index_by_working is None:
+                self._shadow_failed(
+                    attempt,
+                    "working_list_misaligned",
+                    f"{len(working_messages)} working entries for {len(messages)} host entries",
+                )
         ingest_cleanup_changed_active_context = working_messages != messages
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
@@ -292,9 +330,9 @@ class CompactionMixin:
                 working_messages,
                 insert_missing_tool_stubs=False,
             )
-            self._ingest_cursor = len(sanitized_messages)
-            self._last_compression_status = "sanitized"
-            self._last_compression_noop_reason = ""
+            self._publish("_ingest_cursor", len(sanitized_messages))
+            self._publish("_last_compression_status", "sanitized")
+            self._publish("_last_compression_noop_reason", "")
             self._write_generated_ignored_placeholder_hash_counts(
                 self._generated_placeholder_digest_budget_for_active_replay(
                     sanitized_messages
@@ -333,8 +371,9 @@ class CompactionMixin:
         sweep_summary_prefix_before = (
             self._summary_frontier_tokens() if threshold_full_sweep_active else 0
         )
+        sweep_state: Dict[str, Any] = {}
         if threshold_full_sweep_active:
-            self._last_threshold_full_sweep = {
+            sweep_state = {
                 "status": "running",
                 "leaf_passes": 0,
                 "condensation_passes": 0,
@@ -484,6 +523,13 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
+            # A cancelled attempt starts no further summariser call (#29 W2 step 2).
+            if attempt is not None and attempt.cancelled():
+                raise AttemptCancelled()
+            shadow_chunk = None
+            if attempt is not None:
+                self._shadow_begin(attempt, force=force)
+                shadow_chunk = self._shadow_chunk(attempt, selected_raw_chunk)
             try:
                 summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
                 if threshold_full_sweep_active:
@@ -515,6 +561,25 @@ class CompactionMixin:
             last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
             source_lookup_chunk = selected_raw_chunk[: last_compacted_raw_pos + 1]
             selected_raw_len = len(source_lookup_chunk)
+            if attempt is not None:
+                if shadow_chunk is not None and len(source_lookup_chunk) != len(selected_raw_chunk):
+                    # The rescue summarised a shorter prefix than the chunk it was
+                    # given; the summary stands for that prefix (the rescue goes in D).
+                    self._records.event(
+                        "rescue_shortened_chunk",
+                        session=attempt.session,
+                        compaction=attempt.compaction,
+                        detail={"chunk": shadow_chunk, "given": len(selected_raw_chunk),
+                                "summarised": len(source_lookup_chunk)},
+                    )
+                    shadow_chunk = self._shadow_chunk(attempt, source_lookup_chunk)
+                self._shadow_derivation(
+                    attempt,
+                    shadow_chunk,
+                    text=summary_text,
+                    level=_level,
+                    est_tokens=count_tokens(summary_text),
+                )
             remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
             source_tokens = count_messages_tokens(source_lookup_chunk)
 
@@ -627,28 +692,28 @@ class CompactionMixin:
                 # or reassembled context, keeping the old cursor could make the
                 # next appended messages look already ingested. This applies to
                 # content-only cleanup as well as dropped-message cleanup.
-                self._ingest_cursor = len(sanitized_messages)
-                self._last_compression_status = "sanitized"
-                self._last_compression_noop_reason = ""
+                self._publish("_ingest_cursor", len(sanitized_messages))
+                self._publish("_last_compression_status", "sanitized")
+                self._publish("_last_compression_noop_reason", "")
             else:
                 if dropped_replayed_scaffold_messages:
                     # The active context changed even though no new leaf node was
                     # written. Keep the cursor aligned with the returned context
                     # so the next appended turn is ingested instead of skipped.
-                    self._ingest_cursor = len(sanitized_messages)
-                self._last_compression_status = "noop"
-                self._last_compression_noop_reason = noop_reason
+                    self._publish("_ingest_cursor", len(sanitized_messages))
+                self._publish("_last_compression_status", "noop")
+                self._publish("_last_compression_noop_reason", noop_reason)
                 logger.info("LCM compression no-op: %s", noop_reason)
             if threshold_full_sweep_active:
                 duration_ms = (time.perf_counter() - _compress_started) * 1000.0
-                self._last_threshold_full_sweep = {
-                    **self._last_threshold_full_sweep,
+                self._publish("_last_threshold_full_sweep", {
+                    **sweep_state,
                     "status": "noop",
                     "duration_ms": round(duration_ms, 3),
                     "stop_reason": sweep_stop_reason or noop_reason,
                     "budget_exhausted": sweep_stop_reason
                     in {"pass_budget_exhausted", "time_budget_exhausted"},
-                }
+                })
             self._write_generated_ignored_placeholder_hash_counts(
                 self._generated_placeholder_digest_budget_for_active_replay(sanitized_messages)
             )
@@ -661,6 +726,8 @@ class CompactionMixin:
         # condenses after the eligible raw prefix has been drained, and shares
         # the same total pass/deadline budget as its leaf work.
         condensation_passes = 0
+        if attempt is not None and attempt.cancelled():
+            raise AttemptCancelled()
         if threshold_full_sweep_active:
             if sweep_raw_drained:
                 remaining_passes = max(
@@ -694,18 +761,27 @@ class CompactionMixin:
             )
         finally:
             self._pending_context_anchor_messages = None
-        self.compression_count += 1
-        self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
-        logger.info(
-            "LCM leaf compaction finished in %.1fms", self._last_compaction_duration_ms
+        compressed = self._untouched_return(
+            messages,
+            compressed,
+            working_messages[leading_anchor_count:],
+            has_system=bool(leading_anchor_count),
+            index_by_working=index_by_working,
         )
-        self._last_compression_status = "compacted"
-        self._last_compression_noop_reason = ""
+        compaction_number = self._publish_compaction_counted()
+        compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+        self._publish("_last_compaction_duration_ms", compaction_duration_ms)
+        logger.info(
+            "LCM leaf compaction finished in %.1fms", compaction_duration_ms
+        )
+        self._publish("_last_compression_status", "compacted")
+        self._publish("_last_compression_noop_reason", "")
         if recovery_assembly_cap is None:
-            self._last_overflow_recovery_failed = False
+            self._publish("_last_overflow_recovery_failed", False)
         else:
-            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > recovery_assembly_cap
-            if self._last_overflow_recovery_failed:
+            overflow_recovery_failed = count_messages_tokens(compressed) > recovery_assembly_cap
+            self._publish("_last_overflow_recovery_failed", overflow_recovery_failed)
+            if overflow_recovery_failed:
                 logger.warning(
                     "LCM overflow recovery could not get under cap=%d after compaction; returning best-effort context (%d tokens)",
                     recovery_assembly_cap,
@@ -713,12 +789,12 @@ class CompactionMixin:
                 )
         # Reset cursor to the length of the compressed context so that
         # only messages appended *after* this point get ingested next time.
-        self._ingest_cursor = len(compressed)
-        self._ingest_cursor_needs_reconcile = False
+        self._publish("_ingest_cursor", len(compressed))
+        self._publish("_ingest_cursor_needs_reconcile", False)
 
         logger.info(
             "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",
-            self.compression_count,
+            compaction_number,
             len(messages),
             len(compressed),
             leaf_passes,
@@ -729,10 +805,6 @@ class CompactionMixin:
             ", forced overflow recovery" if force_overflow else "",
         )
 
-        # ── Active-context cleanup / tool-pair guardrail (same as _assemble_context) ──
-        # compress() output is consumed directly by the main loop in some
-        # edge cases (e.g. forced overflow recovery bypassing _assemble_context).
-        compressed = self._sanitize_active_context_messages(compressed)
         if threshold_full_sweep_active:
             total_passes = leaf_passes + condensation_passes
             duration_ms = (time.perf_counter() - _compress_started) * 1000.0
@@ -745,13 +817,13 @@ class CompactionMixin:
                 "condensation_no_progress",
                 "no_same_depth_condensation_group",
             }
-            self._last_threshold_full_sweep = {
+            self._publish("_last_threshold_full_sweep", {
                 "status": "partial" if final_stop_reason in partial_stop_reasons else "completed",
                 "leaf_passes": leaf_passes,
                 "condensation_passes": condensation_passes,
                 "total_passes": total_passes,
                 "duration_ms": round(duration_ms, 3),
-                "tokens_before": self._last_threshold_full_sweep["tokens_before"],
+                "tokens_before": sweep_state["tokens_before"],
                 "tokens_after": count_messages_tokens(compressed),
                 "summary_prefix_tokens_before": sweep_summary_prefix_before,
                 "summary_prefix_tokens_after": self._summary_frontier_tokens(),
@@ -759,7 +831,7 @@ class CompactionMixin:
                 "stop_reason": final_stop_reason,
                 "budget_exhausted": final_stop_reason
                 in {"pass_budget_exhausted", "time_budget_exhausted"},
-            }
+            })
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(compressed)
         )
@@ -773,5 +845,12 @@ class CompactionMixin:
         )
         if callable(record_successful_compaction):
             record_successful_compaction()
+
+        # The return fences on the captured check: a cancelled attempt writes no
+        # return and hands the host its input (#29 W2 steps 2 and 6).
+        if attempt is not None:
+            if attempt.cancelled():
+                raise AttemptCancelled()
+            self._shadow_returns(attempt, compressed)
 
         return compressed

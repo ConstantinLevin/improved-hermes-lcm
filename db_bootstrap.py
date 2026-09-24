@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 # The layout this build writes. A store with any other format is refused.
-STORE_FORMAT = "ihl-store/1"
+STORE_FORMAT = "ihl-store/2"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -139,7 +139,25 @@ FTS_SPECS = (MESSAGES_FTS_SPEC, NODES_FTS_SPEC)
 
 # The tables of the plugin's own record. Each is insert-only: triggers raise on any
 # UPDATE or DELETE, so that append-only is a property of the database (#29, W1).
-INSERT_ONLY_TABLES = ("store_identity", "sessions", "session_facts")
+INSERT_ONLY_TABLES = (
+    "store_identity",
+    "sessions",
+    "session_facts",
+    "compactions",
+    "records",
+    "tool_calls",
+    "tool_results",
+    "compaction_inputs",
+    "chunks",
+    "chunk_members",
+    "derivations",
+    "derivation_sources",
+    "compaction_returns",
+    "confirmations",
+    "rejections",
+    "bindings",
+    "store_events",
+)
 
 
 def _insert_only_triggers_sql(tables: Sequence[str]) -> str:
@@ -176,6 +194,136 @@ CREATE TABLE session_facts (
     at REAL NOT NULL
 );
 CREATE INDEX idx_session_facts_session ON session_facts(session, fact_id);
+
+CREATE TABLE compactions (
+    compaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session TEXT NOT NULL REFERENCES sessions(handle),
+    kind TEXT NOT NULL,
+    host_session_before TEXT,
+    attempt_generation INTEGER,
+    began_at REAL NOT NULL
+);
+CREATE INDEX idx_compactions_session ON compactions(session, compaction_id);
+
+CREATE TABLE records (
+    handle TEXT PRIMARY KEY,
+    session TEXT NOT NULL REFERENCES sessions(handle),
+    predecessor TEXT REFERENCES records(handle),
+    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
+    kind TEXT NOT NULL CHECK (kind IN ('transcript', 'host_insertion', 'revision')),
+    revises TEXT REFERENCES records(handle),
+    raw TEXT NOT NULL,
+    role TEXT,
+    tool_call_id TEXT,
+    text TEXT
+);
+CREATE INDEX idx_records_session ON records(session);
+
+CREATE TABLE tool_calls (
+    handle TEXT PRIMARY KEY,
+    record TEXT NOT NULL REFERENCES records(handle),
+    position INTEGER NOT NULL,
+    tool_call_id TEXT,
+    result_record TEXT REFERENCES records(handle),
+    UNIQUE (record, position)
+);
+CREATE INDEX idx_tool_calls_id ON tool_calls(tool_call_id);
+
+CREATE TABLE tool_results (
+    tool_call TEXT NOT NULL REFERENCES tool_calls(handle),
+    result_record TEXT NOT NULL REFERENCES records(handle),
+    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
+    PRIMARY KEY (tool_call, result_record)
+);
+
+CREATE TABLE compaction_inputs (
+    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
+    position INTEGER NOT NULL,
+    host_row_id INTEGER,
+    record TEXT REFERENCES records(handle),
+    PRIMARY KEY (compaction, position)
+);
+CREATE INDEX idx_compaction_inputs_row ON compaction_inputs(host_row_id);
+
+CREATE TABLE chunks (
+    handle TEXT PRIMARY KEY,
+    session TEXT NOT NULL REFERENCES sessions(handle),
+    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id)
+);
+
+CREATE TABLE chunk_members (
+    chunk TEXT NOT NULL REFERENCES chunks(handle),
+    ordinal INTEGER NOT NULL,
+    record TEXT NOT NULL REFERENCES records(handle),
+    PRIMARY KEY (chunk, ordinal),
+    UNIQUE (chunk, record)
+);
+
+CREATE TABLE derivations (
+    handle TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    compaction INTEGER REFERENCES compactions(compaction_id),
+    model TEXT,
+    provider TEXT,
+    effort TEXT,
+    prompt TEXT,
+    budget INTEGER,
+    finish_reason TEXT,
+    level INTEGER,
+    est_tokens INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE derivation_sources (
+    derivation TEXT NOT NULL REFERENCES derivations(handle),
+    ordinal INTEGER NOT NULL,
+    chunk TEXT REFERENCES chunks(handle),
+    source_derivation TEXT REFERENCES derivations(handle),
+    PRIMARY KEY (derivation, ordinal),
+    CHECK ((chunk IS NULL) != (source_derivation IS NULL))
+);
+
+CREATE TABLE compaction_returns (
+    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
+    position INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('summary', 'record', 'reinsertion')),
+    record TEXT REFERENCES records(handle),
+    derivation TEXT REFERENCES derivations(handle),
+    PRIMARY KEY (compaction, position)
+);
+
+CREATE TABLE confirmations (
+    compaction INTEGER NOT NULL UNIQUE REFERENCES compactions(compaction_id),
+    host_session_before TEXT,
+    host_session_after TEXT NOT NULL,
+    at REAL NOT NULL
+);
+CREATE INDEX idx_confirmations_after ON confirmations(host_session_after);
+
+CREATE TABLE rejections (
+    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
+    how TEXT NOT NULL,
+    at REAL NOT NULL
+);
+
+CREATE TABLE bindings (
+    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
+    position INTEGER NOT NULL,
+    host_row_id INTEGER NOT NULL,
+    at REAL NOT NULL,
+    PRIMARY KEY (compaction, position)
+);
+CREATE INDEX idx_bindings_row ON bindings(host_row_id);
+
+CREATE TABLE store_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    kind TEXT NOT NULL,
+    session TEXT,
+    compaction INTEGER,
+    detail TEXT
+);
 """
 
 _SCHEMA_SQL = _RECORD_SQL + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + """
