@@ -367,10 +367,6 @@ def _family_verifier(prefix: str):
         from .query_view_store import _verify_query_view_schema
 
         return _verify_query_view_schema
-    if prefix == "lcm_trajectory":
-        from .trajectory_store import _verify_trajectory_schema
-
-        return _verify_trajectory_schema
     return None
 
 

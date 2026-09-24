@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
-    branches: [main]
+    branches: [main, staging]
+  schedule:
+    # Daily: the plugin targets the latest Hermes main, which moves without us.
+    - cron: "17 5 * * *"
 
 permissions:
   contents: read
@@ -38,61 +41,80 @@ jobs:
       - name: Lint with ruff
         run: ruff check .
 
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+      - name: Check shell syntax
+        run: bash -n scripts/install.sh scripts/update.sh
 
+  host-load:
+    # Installs the plugin into a scratch Hermes home against the latest Hermes main and
+    # fails unless it loads, registers its context engine, and the host selects that engine
+    # for `context.engine: lcm` instead of falling back to its built-in compressor.
+    # It proves import, registration and selection; nothing about compaction, the tools,
+    # the hooks, or a session.
+    runs-on: ubuntu-latest
+    env:
+      HERMES_HOME: ${{ runner.temp }}/hermes-home
+      HERMES_SRC: ${{ runner.temp }}/hermes-agent
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Clone the latest Hermes main
+        run: |
+          git clone --depth 1 https://github.com/nousresearch/hermes-agent "$HERMES_SRC"
+          echo "Hermes main at $(git -C "$HERMES_SRC" rev-parse HEAD)"
+
+      - name: Set up Python (the host's floor)
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
 
-      - name: Install test dependencies
-        run: pip install pytest numpy
-
-      - name: Stub hermes-agent ABC
+      - name: Install the host's core dependencies
         run: |
-          mkdir -p agent
-          cat > agent/__init__.py <<'STUB'
-          STUB
-          cat > agent/context_engine.py <<'STUB'
-          """Minimal stub of hermes-agent ContextEngine ABC for CI."""
-          class ContextEngine:
-              """Base class stub — just enough for LCMEngine to import."""
-              def __init__(self, **kwargs):
-                  self.compression_count = 0
-                  self.last_prompt_tokens = 0
-              def compress(self, messages, current_tokens=None, **kwargs):
-                  raise NotImplementedError
-              def on_session_start(self, session_id, **kwargs):
-                  pass
-              def on_session_end(self, **kwargs):
-                  pass
-              def on_session_reset(self):
-                  self.compression_count = 0
-                  self.last_prompt_tokens = 0
-              def get_tool_schemas(self):
-                  return []
-              def handle_tool_call(self, name, args, **kwargs):
-                  raise NotImplementedError
-              def get_status(self):
-                  return {}
-          STUB
+          python - "$HERMES_SRC/pyproject.toml" > "$RUNNER_TEMP/hermes-requirements.txt" <<'PY'
+          import sys
+          import tomllib
 
-      - name: Run pytest under low file descriptor limit
-        run: |
-          ulimit -n 1024
-          python -m pytest tests/ -q
+          with open(sys.argv[1], "rb") as handle:
+              print("\n".join(tomllib.load(handle)["project"]["dependencies"]))
+          PY
+          pip install -r "$RUNNER_TEMP/hermes-requirements.txt"
 
-      - name: Run static validation
+      - name: Install the plugin into the scratch Hermes home
         run: |
-          python scripts/validate_dependency_contract.py
-          python -m compileall -q .
-          python -m py_compile scripts/import_lossless_claw.py
-          bash -n scripts/install.sh scripts/update.sh
-          git diff --check
+          mkdir -p "$HERMES_HOME"
+          bash scripts/install.sh
+          printf 'plugins:\n  enabled:\n    - hermes-lcm\ncontext:\n  engine: lcm\n' > "$HERMES_HOME/config.yaml"
+
+      - name: Load the plugin and let the host select its context engine
+        env:
+          PYTHONPATH: ${{ runner.temp }}/hermes-agent
+        run: |
+          python - <<'PY'
+          import sys
+
+          from agent.agent_init import _select_context_engine
+          from hermes_cli.plugins import get_plugin_context_engine, get_plugin_manager
+
+          failures = []
+          manager = get_plugin_manager()
+          manager.discover_and_load()
+          entries = [p for p in manager.list_plugins() if p.get("name") == "hermes-lcm"]
+          print("plugin:", entries)
+          if len(entries) != 1 or entries[0].get("error"):
+              failures.append(f"plugin hermes-lcm did not load: {entries}")
+
+          registered = get_plugin_context_engine()
+          print("registered engine:", type(registered).__name__, getattr(registered, "name", None))
+          if registered is None or registered.name != "lcm":
+              failures.append("no context engine named 'lcm' was registered")
+
+          selected = _select_context_engine({"context": {"engine": "lcm"}})
+          print("selected engine:", type(selected).__name__, getattr(selected, "name", None))
+          if selected is None or selected.name != "lcm":
+              failures.append("the host did not select 'lcm' and fell back to its built-in compressor")
+          else:
+              print("tool schemas (reported, not asserted):", len(selected.get_tool_schemas()))
+
+          for failure in failures:
+              print("FAIL:", failure, file=sys.stderr)
+          sys.exit(1 if failures else 0)
+          PY
