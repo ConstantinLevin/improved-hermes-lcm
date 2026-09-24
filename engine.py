@@ -2938,13 +2938,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._reset_session_scoped_runtime_state()
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
-        """Move retained summaries from the old session into the new one.
+        """Move the old session's summary nodes into the new one.
 
-        This reassigns session ownership for retained summary nodes, but it does
-        not rewrite the nodes' descendant raw-message lineage. Retrieval under
-        ``session_scope='current'`` may therefore include a carried-over node in
-        the new session, while ``source`` filtering still evaluates against the
-        node's original descendant message sources.
+        This reassigns session ownership for the summary nodes, but it does
+        not rewrite the nodes' descendant raw-message lineage: a carried-over
+        node belongs to the new session while its sources stay with the old one.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
