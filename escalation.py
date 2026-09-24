@@ -183,13 +183,6 @@ class SummarySpendGuard:
                 self.backoff_seconds,
             )
 
-    def record_call(self, *, now: float | None = None) -> None:
-        if self.max_calls <= 0:
-            return
-        current_time = time.monotonic() if now is None else now
-        with self._lock:
-            self._prune(current_time)
-            self._record_call_locked(current_time)
 
     def clear(self) -> None:
         with self._lock:

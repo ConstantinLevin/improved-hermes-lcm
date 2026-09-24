@@ -4,20 +4,17 @@ Implements the ContextEngine ABC. Replaces the built-in ContextCompressor
 with a DAG-based summarization system that preserves every message.
 """
 
-import asyncio
 import copy
 import hashlib
 import json
 import logging
-import os
 import re
 import sqlite3
 import threading
 import time
-from collections import deque
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
 
@@ -40,80 +37,35 @@ from .escalation import (
     SummarySpendGuard,
     summarize_with_escalation,
 )
-from .externalize import (
-    build_transcript_gc_placeholder,
-    extract_externalized_ref,
-    find_externalized_payload_for_message,
-    find_externalized_tool_result_content_for_call,
-    is_externalized_placeholder,
-    load_externalized_payload,
-    maybe_externalize_tool_output,
-)
+from .externalize import load_externalized_payload
 from .extraction import (
-    extract_before_compaction,
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
-    _expected_persisted_output_chars,
-    _has_lossy_sensitive_redaction,
-    _contains_media_payload,
     _is_hermes_persisted_output_marker,
-    _persisted_output_inline_preview_sha256,
-    _persisted_output_preview_prefix_digest,
-    _persisted_output_saved_path,
-    assistant_output_quarantine_reason,
-    extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
-    recover_hermes_persisted_output_with_file_stat,
-    redact_sensitive_text,
-    redact_sensitive_value,
     restore_ingest_payload_placeholders,
-    sensitive_pattern_status,
 )
 from .runtime_identity import (
     _PLUGIN_ROOT,
     _git_runtime_identity,
     _plugin_metadata,
 )
-from .rollup_builder import (
-    initialize_rollup_invalidation_outbox,
-    mark_stale_for_published_summary,
-    run_rollup_maintenance,
-)
-from .assertion_extraction import ModelAssertionExtractor
-from .assertion_store import AssertionStore, SourceSnapshot
-from .adaptive_retrieval import AdaptiveRetrievalRegistry
-from .query_view_store import QueryViewStore
 from .schemas import (
-    LCM_DESCRIBE,
     LCM_DOCTOR,
     LCM_EXPAND,
     LCM_EXPAND_QUERY,
     LCM_GREP,
     LCM_INSPECT,
-    LCM_LOAD_SESSION,
-    LCM_COMPUTE,
-    LCM_COMPILE_EVIDENCE,
-    LCM_EVIDENCE_PACK,
-    LCM_QUERY_STATE,
-    LCM_RECALL,
-    LCM_RECENT,
-    LCM_RETRIEVE,
     LCM_STATUS,
 )
 from .sanitize import (
     _clean_active_assistant_message,
-    _should_drop_active_assistant_message,
-)
-from .session_patterns import (
-    build_session_match_keys,
-    compile_session_patterns,
-    matches_session_pattern,
 )
 from .message_analysis import (
     _is_synthetic_assistant_noise,
@@ -121,7 +73,6 @@ from .message_analysis import (
     _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
-from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
@@ -131,7 +82,6 @@ from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
     normalize_content_value,
-    stored_text_content_for_pattern_matching,
     text_content_for_pattern_matching,
 )
 from .sqlite_util import (
@@ -144,208 +94,6 @@ from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
 
-_ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
-
-class _RollupMaintenanceScheduler:
-    """Run deduplicated rollup jobs on one process-wide worker.
-
-    Session binding only enqueues work. The worker is shared by every engine so
-    rapid gateway binds cannot create one thread per session. A key that is
-    already queued is ignored; a key requested while active gets at most one
-    follow-up pass, which preserves eventual progress when new staleness arrives
-    during an in-flight build without allowing concurrent duplicate builds.
-    """
-
-    def __init__(self, max_pending_jobs: int = 64) -> None:
-        self._condition = threading.Condition()
-        self._max_pending_jobs = max(1, int(max_pending_jobs))
-        self._jobs: deque[
-            tuple[tuple[str, str], Callable[[], None]]
-        ] = deque()
-        self._queued_keys: set[tuple[str, str]] = set()
-        self._active_keys: set[tuple[str, str]] = set()
-        # One worker means at most one active key. Keep its requested rerun in
-        # a literal single slot so queue saturation cannot discard the
-        # documented active-pass follow-up guarantee or grow hidden state.
-        self._follow_up_key: tuple[str, str] | None = None
-        self._follow_up_job: Callable[[], None] | None = None
-        self._running_follow_up = False
-        self._exclusive_keys: set[tuple[str, str]] = set()
-        self._owned_keys: dict[object, set[tuple[str, str]]] = {}
-        self._key_owners: dict[tuple[str, str], set[object]] = {}
-        self._worker: threading.Thread | None = None
-
-    def _track_owner_locked(
-        self,
-        key: tuple[str, str],
-        owner: object | None,
-    ) -> None:
-        if owner is None:
-            return
-        self._owned_keys.setdefault(owner, set()).add(key)
-        self._key_owners.setdefault(key, set()).add(owner)
-
-    def _release_key_owners_if_idle_locked(self, key: tuple[str, str]) -> None:
-        if (
-            key in self._queued_keys
-            or key in self._active_keys
-            or key in self._exclusive_keys
-            or self._follow_up_key == key
-        ):
-            return
-        for owner in self._key_owners.pop(key, set()):
-            owned = self._owned_keys.get(owner)
-            if owned is None:
-                continue
-            owned.discard(key)
-            if not owned:
-                self._owned_keys.pop(owner, None)
-
-    def schedule(
-        self,
-        key: tuple[str, str],
-        job: Callable[[], None],
-        *,
-        owner: object | None = None,
-    ) -> bool:
-        with self._condition:
-            if key in self._exclusive_keys:
-                logger.info(
-                    "LCM temporal rollup maintenance deferred while an operator "
-                    "rebuild owns database=%s scope=%s",
-                    key[0],
-                    key[1],
-                )
-                return False
-            if key in self._queued_keys:
-                self._track_owner_locked(key, owner)
-                return True
-            if key in self._active_keys and not self._running_follow_up:
-                self._follow_up_key = key
-                self._follow_up_job = job
-                self._track_owner_locked(key, owner)
-                self._condition.notify_all()
-                return True
-            if len(self._jobs) >= self._max_pending_jobs:
-                logger.warning(
-                    "LCM temporal rollup maintenance queue is full; "
-                    "deferring database=%s scope=%s until a later bind",
-                    key[0],
-                    key[1],
-                )
-                return False
-            if self._worker is None or not self._worker.is_alive():
-                worker = threading.Thread(
-                    target=self._run,
-                    name="lcm-rollup-maintenance",
-                    daemon=True,
-                )
-                worker.start()
-                self._worker = worker
-            self._jobs.append((key, job))
-            self._queued_keys.add(key)
-            self._track_owner_locked(key, owner)
-            self._condition.notify_all()
-            return True
-
-    def try_acquire_exclusive(self, key: tuple[str, str]) -> bool:
-        """Reserve one idle key for a synchronous operator rebuild.
-
-        This is intentionally non-blocking: a manual rebuild must not race a
-        provider-backed maintenance pass, but it also must not wait behind one
-        on the gateway thread. The caller can ask the operator to retry once the
-        background pass completes.
-        """
-        with self._condition:
-            busy_keys = self._queued_keys | self._active_keys | self._exclusive_keys
-            if key in busy_keys or self._follow_up_key == key:
-                return False
-            if len(self._exclusive_keys) >= self._max_pending_jobs:
-                return False
-            self._exclusive_keys.add(key)
-            return True
-
-    def release_exclusive(self, key: tuple[str, str]) -> None:
-        with self._condition:
-            self._exclusive_keys.discard(key)
-            self._condition.notify_all()
-
-    def drain(
-        self,
-        keys: set[tuple[str, str]],
-        timeout: float | None = None,
-    ) -> bool:
-        """Wait until none of ``keys`` is queued or active."""
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        with self._condition:
-            while keys & (
-                self._queued_keys
-                | self._active_keys
-                | self._exclusive_keys
-                | ({self._follow_up_key} if self._follow_up_key else set())
-            ):
-                if deadline is None:
-                    self._condition.wait()
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-    def drain_owner(
-        self,
-        owner: object,
-        timeout: float | None = None,
-    ) -> bool:
-        """Wait until every outstanding key accepted for ``owner`` is idle."""
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        with self._condition:
-            while self._owned_keys.get(owner):
-                if deadline is None:
-                    self._condition.wait()
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-    def _run(self) -> None:
-        while True:
-            with self._condition:
-                while not self._jobs:
-                    self._condition.wait()
-                key, job = self._jobs.popleft()
-                self._queued_keys.discard(key)
-                self._active_keys.add(key)
-                self._running_follow_up = False
-            while True:
-                try:
-                    job()
-                except (Exception, asyncio.CancelledError):
-                    logger.warning(
-                        "LCM background temporal rollup maintenance failed for database=%s scope=%s",
-                        key[0],
-                        key[1],
-                        exc_info=True,
-                    )
-                with self._condition:
-                    if self._follow_up_key == key and self._follow_up_job is not None:
-                        job = self._follow_up_job
-                        self._follow_up_key = None
-                        self._follow_up_job = None
-                        self._running_follow_up = True
-                        self._condition.notify_all()
-                        continue
-                    self._active_keys.discard(key)
-                    self._running_follow_up = False
-                    self._release_key_owners_if_idle_locked(key)
-                    self._condition.notify_all()
-                    break
-
-
-_ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
@@ -381,8 +129,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
          are summarized into leaf nodes (D0) in a SummaryDAG
       2. When enough nodes accumulate at a depth, they're condensed into
          higher-depth nodes (D1, D2, ...)
-      3. The agent gets tools (lcm_grep, lcm_load_session, lcm_describe,
-         lcm_expand) to search and drill into compacted history
+      3. The agent gets tools (lcm_grep, lcm_expand, lcm_expand_query) to
+         search and drill into compacted history
       4. Active context = system prompt + DAG summaries + fresh tail
     """
 
@@ -390,36 +138,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
-        self._assertion_extraction_metrics_lock = threading.RLock()
-        self._assertion_extraction_idle = threading.Event()
-        self._assertion_extraction_idle.set()
-        self._assertion_extraction_batches_scheduled = 0
-        self._assertion_extraction_batches_skipped_busy = 0
-        self._assertion_extraction_sources_scheduled = 0
-        self._assertion_extraction_sources_completed = 0
-        self._assertion_extraction_sources_failed = 0
-        self._assertion_extraction_provider_calls = 0
-        self._assertion_extraction_input_tokens = 0
-        self._assertion_extraction_output_tokens = 0
-        self._assertion_extraction_last_duration_ms = 0.0
-        self._assertion_extraction_last_error = ""
-        self._assertion_extraction_last_model = ""
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
 
         self._session_id: str = ""
         self._session_platform: str = ""
-        # Tracks the most recent non-ignored, non-stateless binding so that
-        # user-facing tools (lcm_status, lcm_grep default scope, lcm_describe,
-        # lcm_expand_query, lcm_doctor) keep showing the foreground session
-        # even while a side-channel session (cron, debug) temporarily owns the
+        # Tracks the most recent non-stateless binding so that
+        # user-facing tools (lcm_status, lcm_grep, lcm_expand_query,
+        # lcm_doctor) keep showing the foreground session
+        # even while a side-channel session temporarily owns the
         # engine's _session_id binding. Updated alongside _session_id only
         # when _refresh_session_filters classifies the new session as a real
-        # foreground (neither ignored nor stateless). Read via the
+        # foreground (not stateless). Read via the
         # `current_session_id` / `current_session_platform` properties and
-        # `current_session_ignored` / `current_session_stateless` /
-        # `side_channel_active` companion predicates.
+        # `current_session_stateless` / `side_channel_active` companion
+        # predicates.
         self._foreground_session_id: str = ""
         self._foreground_session_platform: str = ""
         self._foreground_conversation_id: str = ""
@@ -429,26 +163,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_rebind_previous_conversation_id: str = ""
         self._foreground_rebind_parent_session_id: str = ""
         self._conversation_id: str = ""
-        self._session_match_keys: list[str] = []
-        self._session_ignored = False
         self._session_stateless = False
-        self._compiled_ignore_session_patterns = compile_session_patterns(
-            self._config.ignore_session_patterns
-        )
-        self._compiled_stateless_session_patterns = compile_session_patterns(
-            self._config.stateless_session_patterns
-        )
-        self._compiled_ignore_message_patterns = compile_message_patterns(
-            self._config.ignore_message_patterns
-        )
-        self._ignored_message_count: int = 0
-        # Raw messages permanently dropped because they matched
-        # ignore_message_patterns. These are NOT persisted anywhere, so an
-        # over-broad operator pattern silently discards substantive turns from
-        # the "lossless" store. Count + log them so the loss is at least
-        # visible; full lossless retention (store with ignored=1) is a larger
-        # follow-up that touches cursor reconciliation and FTS.
-        self._ignore_pattern_dropped_count: int = 0
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -556,14 +271,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # not session-scoped, so it is not cleared on session reset.
         self._ingest_failure_count = 0
         self._consecutive_ingest_failures = 0
-        # Proactive-recall injection telemetry (SPEC F). Store-scoped counters so
-        # a session reset does not zero the operator's running totals; surfaced
-        # through lcm_status. injected = a block was placed this assembly;
-        # skipped = ran but nothing survived the floor/dedupe; timeout = the
-        # recall query hit its deadline (inject nothing, never block assembly).
-        self._proactive_recall_injected_count = 0
-        self._proactive_recall_skipped_count = 0
-        self._proactive_recall_timeout_count = 0
         self._last_ingest_error = ""
         self._last_ingest_error_time: float = 0
         # Cooldown timestamp to prevent compression cascade after boundary skip.
@@ -577,18 +284,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # keep anchoring opt-in rather than changing its public behavior.
         self._pending_context_anchor_messages: Optional[List[Dict[str, Any]]] = None
         self._current_compress_store_ids_by_message_id: dict[int, int] = {}
-        self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
-        self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
-        self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget: dict[str, int] = {}
-        self._compression_boundary_active_placeholder_digest_ordinals: dict[str, set[int]] = {}
-        self._compression_boundary_stored_placeholder_digest_counts: dict[str, int] = {}
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
@@ -617,9 +317,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
-        # The scheduler associates this identity only with outstanding work, so
-        # diagnostic drains do not retain every historical session key forever.
-        self._rollup_maintenance_owner = object()
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -691,10 +388,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
-        self._assertions = None
-        self._query_views = None
-        self._adaptive_retrieval = None
-        self._assertion_extractor = None
         try:
             self._store = MessageStore(
                 db_path,
@@ -702,38 +395,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 hermes_home=hermes_home,
             )
             self._dag = SummaryDAG(db_path)
-            if self._config.temporal_rollups_enabled:
-                # Install the transaction-coupled summary mutation triggers before
-                # this engine can publish or delete a DAG node.
-                initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
-            self._assertions = (
-                AssertionStore(db_path)
-                if bool(getattr(self._config, "assertions_enabled", False))
-                else None
-            )
-            self._query_views = (
-                QueryViewStore(db_path)
-                if bool(getattr(self._config, "query_views_enabled", False))
-                or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
-                else None
-            )
-            self._adaptive_retrieval = (
-                AdaptiveRetrievalRegistry(self._query_views)
-                if bool(
-                    getattr(self._config, "adaptive_retrieval_enabled", False)
-                )
-                else None
-            )
-            if (
-                self._assertions is not None
-                and bool(getattr(self._config, "assertion_extraction_enabled", False))
-            ):
-                self._assertion_extractor = ModelAssertionExtractor(
-                    self._assertions,
-                    model=self._assertion_extraction_model(),
-                    timeout_seconds=self._assertion_extraction_timeout(),
-                )
         except Exception:
             self._close_storage()
             raise
@@ -741,12 +403,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
         for attr in (
-            "_adaptive_retrieval",
             "_store",
             "_dag",
             "_lifecycle",
-            "_assertions",
-            "_query_views",
         ):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
@@ -756,24 +415,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
-    def _assertion_extraction_model(self) -> str:
-        return str(
-            getattr(self._config, "assertion_extraction_model", "")
-            or getattr(self._config, "extraction_model", "")
-            or getattr(self._config, "summary_model", "")
-            or ""
-        )
-
-    def _assertion_extraction_timeout(self) -> float:
-        value = float(
-            getattr(self._config, "assertion_extraction_timeout_seconds", 30.0)
-        )
-        return min(120.0, max(0.1, value))
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
         self._session_id = ""
         self._session_platform = ""
@@ -782,14 +426,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_conversation_id = ""
         self._clear_foreground_rebind_candidate()
         self._conversation_id = ""
-        self._session_match_keys = []
-        self._session_ignored = False
         self._session_stateless = False
         self._clear_pending_reset_boundary()
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget = {}
-        self._compression_boundary_active_placeholder_digest_ordinals = {}
-        self._compression_boundary_stored_placeholder_digest_counts = {}
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
@@ -992,25 +630,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def name(self) -> str:
         return "lcm"
 
-    @property
-    def last_compression_status(self) -> str:
-        """Public status for the most recent compression/preflight attempt.
-
-        Host runtimes use this to distinguish a real compaction boundary from
-        an LCM no-op (for example, when request pressure is high but all
-        compactable raw backlog is protected by the fresh tail).
-        """
-        return self._last_compression_status
-
-    @property
-    def last_compression_noop_reason(self) -> str:
-        """Human-readable reason for the latest no-op compression decision."""
-        return self._last_compression_noop_reason
-
-    @property
-    def last_compression_was_noop(self) -> bool:
-        """Whether the most recent compression/preflight decision was a no-op."""
-        return self._last_compression_status == "noop"
 
     def _mark_preflight_compression_requested(self) -> bool:
         """Record that preflight found work and clear any stale no-op reason."""
@@ -1034,8 +653,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """User-facing "current session" id surfaced by LCM tools.
 
         Returns the most recent foreground binding (the last session id that
-        ``_refresh_session_filters`` classified as neither ignored nor
-        stateless). Falls back to ``_session_id`` when no foreground has
+        ``_refresh_session_filters`` did not classify as stateless). Falls back to ``_session_id`` when no foreground has
         ever been bound, so unattended cron-only or stateless-only processes
         remain observable via ``lcm_status``.
 
@@ -1063,7 +681,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     @property
     def side_channel_active(self) -> bool:
-        """True when an ignored or stateless session has temporarily rebound
+        """True when a stateless session has temporarily rebound
         ``_session_id`` while a real foreground binding still exists.
 
         Operators reading lcm_status during this window see the foreground
@@ -1074,16 +692,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         return bool(self._foreground_session_id) and self._foreground_session_id != self._session_id
 
-    @property
-    def current_session_ignored(self) -> bool:
-        """``_session_ignored`` reported for ``current_session_id``.
-
-        When a side channel is in flight the foreground is by definition
-        non-ignored; otherwise this is the bound session's ignore flag.
-        """
-        if self.side_channel_active:
-            return False
-        return self._session_ignored
 
     @property
     def current_session_stateless(self) -> bool:
@@ -1572,7 +1180,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id = str(self._session_id or "")
         if not session_id:
             return False
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+        if self._session_stateless or self._thread_context_stateless():
             return False
         if self._ingest_cursor > 0:
             return False
@@ -1741,75 +1349,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- ContextEngine optional methods ------------------------------------
 
-    def _rollup_maintenance_key(self, scope: str) -> tuple[str, str]:
-        raw_database_path = str(self._dag.db_path)
-        if raw_database_path == ":memory:":
-            database_identity = f":memory:{id(self._dag)}"
-        else:
-            database_identity = str(Path(raw_database_path).resolve())
-        return database_identity, str(scope)
-
-    def try_acquire_rollup_operator_lease(
-        self,
-        scope: str,
-    ) -> tuple[str, str] | None:
-        """Reserve this database/scope for a synchronous rollup rebuild."""
-        key = self._rollup_maintenance_key(scope)
-        if not _ROLLUP_MAINTENANCE_SCHEDULER.try_acquire_exclusive(key):
-            return None
-        return key
-
-    def release_rollup_operator_lease(self, key: tuple[str, str]) -> None:
-        _ROLLUP_MAINTENANCE_SCHEDULER.release_exclusive(key)
-
-    def _schedule_rollup_maintenance(self, scope: str) -> None:
-        """Enqueue one best-effort rollup pass using private SQLite helpers."""
-        try:
-            raw_database_path = str(self._dag.db_path)
-            if raw_database_path == ":memory:":
-                logger.warning(
-                    "LCM cannot run background temporal rollup maintenance for "
-                    "an isolated in-memory SQLite database; maintenance skipped"
-                )
-                return
-            database_path = Path(raw_database_path).resolve()
-            key = self._rollup_maintenance_key(scope)
-            config = copy.deepcopy(self._config)
-            circuit_breaker = self._summary_circuit_breaker
-            spend_guard = self._summary_spend_guard
-
-            def maintain() -> None:
-                private_dag = SummaryDAG(database_path)
-                try:
-                    run_rollup_maintenance(
-                        private_dag,
-                        config,
-                        scope,
-                        circuit_breaker=circuit_breaker,
-                        spend_guard=spend_guard,
-                    )
-                finally:
-                    private_dag.close()
-
-            _ROLLUP_MAINTENANCE_SCHEDULER.schedule(
-                key,
-                maintain,
-                owner=self._rollup_maintenance_owner,
-            )
-        except Exception:
-            # Maintenance is opportunistic; a scheduler/setup failure must never
-            # turn a successful foreground session bind into a host failure.
-            logger.warning(
-                "LCM could not schedule background temporal rollup maintenance",
-                exc_info=True,
-            )
-
-    def drain_rollup_maintenance(self, timeout: float | None = None) -> bool:
-        """Wait for rollup jobs scheduled by this engine (tests and diagnostics)."""
-        return _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(
-            self._rollup_maintenance_owner,
-            timeout=timeout,
-        )
 
     def _bind_lifecycle_state(
         self,
@@ -1822,68 +1361,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
         self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
-        if not self._session_ignored and not self._session_stateless:
+        if not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
             self._lcm_session_last_normal_conversation_id[session_id] = state.conversation_id
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
-
-        # Garbage-collect empty lifecycle rows when the table exceeds threshold.
-        # Gateway restarts, ephemeral cron ticks, and crash-loops all create
-        # lifecycle rows that never ingest data — prune them here so they
-        # don't accumulate forever.
-        if (
-            self._config.empty_lifecycle_gc_enabled
-            and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
-        ):
-            protected = {str(self._session_id)} if self._session_id else None
-            max_age = self._config.empty_lifecycle_gc_max_age_hours
-            try:
-                deleted = self._lifecycle.prune_empty_sessions(
-                    protected_session_ids=protected,
-                    max_age_hours=max_age,
-                )
-            except Exception:
-                deleted = 0
-            if deleted:
-                logger.info(
-                    "LCM pruned %d lifecycle rows with zero stored data "
-                    "(table exceeded threshold of %d rows)",
-                    deleted,
-                    self._config.empty_lifecycle_gc_threshold,
-                )
-        # Bypassed/stateless sessions skip every LCM write, so they must also skip
-        # rollup maintenance — otherwise the bind-time hook would build rollups for
-        # a session whose ingest is suppressed (maintainer #388: gate on the same
-        # not-bypassed condition the ingest write uses).
-        if (
-            self._config.temporal_rollups_enabled
-            and not self._session_ignored
-            and not self._session_stateless
-        ):
-            self._schedule_rollup_maintenance(session_id)
-
-    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
-        """Stale the rollups covering EVERY UTC day a just-published node spans.
-
-        Rollups consume published summary nodes, so publication — not raw ingest
-        — is the load-bearing staleness signal (maintainer #388 blocker 1). This
-        is called after every ``_dag.add_node`` on the engine so a later summary
-        cannot leave an older rollup ``ready`` and apparently current. The node's
-        ``earliest_at``/``latest_at`` coverage span is passed through so a summary
-        crossing midnight stales BOTH days, not only its newest (maintainer #388
-        blocker 2 / B2).
-        """
-        if not self._config.temporal_rollups_enabled:
-            return
-        mark_stale_for_published_summary(
-            self._dag,
-            str(node.session_id or ""),
-            node.latest_at,
-            node.created_at,
-            earliest_at=node.earliest_at,
-        )
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -1932,12 +1415,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._lcm_session_last_platform[session_id] = platform
             self._lcm_session_last_bypassed[session_id] = True
 
-    def _unmark_lcm_bypass_lineage_session(self, session_id: str) -> None:
-        if not session_id:
-            return
-        with self._auxiliary_session_lock:
-            self._lcm_bypass_lineage_session_ids.discard(session_id)
-            self._lcm_bypass_lineage_platforms.pop(session_id, None)
 
     def _handoff_lcm_bypass_lineage(
         self,
@@ -1962,24 +1439,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if old_session_id in self._lcm_session_last_bypassed:
             return bool(self._lcm_session_last_bypassed.get(old_session_id))
         if old_session_id == self._session_id:
-            return bool(
-                self._bypasses_lcm_context_management()
-                or self._session_id_matches_lcm_bypass_filters(
-                    old_session_id,
-                    platform=self._session_platform,
-                )
-            )
-        return bool(
-            self._has_lcm_bypass_lineage_session(old_session_id)
-            or self._session_id_matches_lcm_bypass_filters(old_session_id)
-        )
+            return bool(self._bypasses_lcm_context_management())
+        return bool(self._has_lcm_bypass_lineage_session(old_session_id))
 
-    def _get_allowed_hermes_base(self) -> Path | None:
-        """Get the allowed base directory for hermes_home, or None if not restricted."""
-        env_base = os.environ.get("LCM_HERMES_BASE_DIR")
-        if env_base:
-            return Path(env_base).expanduser().resolve()
-        return None  # No restriction when env var not set
 
     def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
         kwargs = kwargs or {}
@@ -2192,13 +1654,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
         # Hold the foreground view stable when the new binding is a side
-        # channel (cron tick inside the gateway process, debug probe, etc.).
-        # Tools that report "current session" to operators must keep pointing
-        # at the real foreground rather than the ignored/stateless session
+        # channel. Tools that report "current session" to operators must keep
+        # pointing at the real foreground rather than the stateless session
         # that just stole _session_id. Lifecycle paths still read _session_id
-        # directly so cron's compress short-circuits correctly via the
-        # _session_ignored / _session_stateless gates.
-        if not self._session_ignored and not self._session_stateless:
+        # directly so compress short-circuits correctly via the
+        # _session_stateless gate.
+        if not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
@@ -2516,12 +1977,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     boundary_placeholder_budget.get(digest, 0),
                     len(ordinals),
                 )
-            self._compression_boundary_stored_placeholder_digest_counts = (
-                self._stored_active_replay_placeholder_digest_counts(
-                    source_session_id,
-                    after_store_id=frontier,
-                )
-            )
 
         if can_reassign:
             self._lifecycle.finalize_session(
@@ -2529,12 +1984,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 source_session_id,
                 frontier_store_id=frontier,
             )
-            self._copy_generated_ignore_hashes_to_session(
-                source_session_id,
-                session_id,
-                copy_dependent_content=True,
-                source_frontier_store_id=frontier,
-            )
+            self._copy_generated_ignore_hashes_to_session(source_session_id, session_id)
             self._write_generated_ignored_placeholder_hash_counts(
                 boundary_placeholder_budget,
                 self._session_scoped_hash_metadata_keys(
@@ -2578,7 +2028,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             self._schedule_ingest_cursor_reconciliation()
             self._clear_pending_reset_boundary()
-            self._log_session_filter_diagnostics()
             return
 
         self._apply_session_start_metadata(session_id, kwargs)
@@ -2593,10 +2042,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if state is not None:
                 self._last_compacted_store_id = state.current_frontier_store_id
         self._clear_pending_reset_boundary()
-        self._compression_boundary_ingest_pending = can_reassign
-        self._compression_boundary_active_placeholder_digest_budget = boundary_placeholder_budget
-        self._compression_boundary_active_placeholder_digest_ordinals = boundary_placeholder_ordinals
-        self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
@@ -2807,7 +2252,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     conversation_id=kwargs.get("conversation_id"),
                 )
                 self._schedule_ingest_cursor_reconciliation()
-                self._log_session_filter_diagnostics()
                 logger.info(
                     "LCM compression boundary %s -> %s stayed stateless because the source session bypasses LCM storage",
                     old_session_id,
@@ -2844,10 +2288,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             return
         start_platform = str(kwargs.get("platform") or "")
-        side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
-            session_id,
-            platform=start_platform,
-        ) or self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
+        side_channel_rebind = self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
         self._unmark_thread_context_auxiliary_session(
             session_id,
             suppress_as_foreground_reuse=not side_channel_rebind,
@@ -2873,7 +2314,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             conversation_id=kwargs.get("conversation_id"),
         )
         self._schedule_ingest_cursor_reconciliation()
-        self._log_session_filter_diagnostics()
 
     def _session_end_matches_current_store_prefix(
         self,
@@ -2921,20 +2361,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     content = payload.get("content")
                     if isinstance(content, str):
                         return content
-
-        if is_externalized_placeholder(stripped):
-            ref = extract_externalized_ref(stripped)
-            payload = load_externalized_payload(
-                ref or "",
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-            if payload is not None:
-                payload_session_id = str(payload.get("session_id") or "")
-                if not session_id or not payload_session_id or payload_session_id == session_id:
-                    content = payload.get("content")
-                    if isinstance(content, str):
-                        return content
         return text
 
     def _session_end_prefix_compare_content(
@@ -2947,11 +2373,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             (message or {}).get("content"),
             session_id=session_id,
         )
-        content = redact_sensitive_value(
-            content,
-            self._config,
-            parse_json_strings=False,
-        )
         return normalize_content_value(content)
 
     def _session_end_prefix_compare_tool_calls(
@@ -2963,11 +2384,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tool_calls = self._session_end_prefix_compare_value(
             (message or {}).get("tool_calls"),
             session_id=session_id,
-        )
-        tool_calls = redact_sensitive_value(
-            tool_calls,
-            self._config,
-            parse_json_strings=True,
         )
         if tool_calls is None or tool_calls == [] or tool_calls == {}:
             tool_calls = None
@@ -3101,12 +2517,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ),
         )
 
-    def _messages_match_fingerprint_prefix(
-        self,
-        fingerprints: list[str],
-        messages: List[Dict[str, Any]],
-    ) -> bool:
-        return self._matching_fingerprint_prefix_count(fingerprints, messages) > 0
 
     def _matching_fingerprint_prefix_count(
         self,
@@ -3123,20 +2533,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return compare_count
         return 0
 
-    def _messages_match_lcm_bypass_prefix(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-    ) -> bool:
-        return self._matching_lcm_bypass_prefix_count(session_id, messages) > 0
-
-    def _matching_lcm_bypass_prefix_count(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-    ) -> int:
-        count, _truncated = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
-        return count
 
     def _matching_lcm_bypass_prefix_evidence(
         self,
@@ -3155,18 +2551,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 best_truncated = best_truncated or count_truncated
         return best_count, best_truncated
 
-    def _messages_match_lcm_normal_prefix(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        *,
-        conversation_id: str | None = None,
-    ) -> bool:
-        return self._matching_lcm_normal_prefix_count(
-            session_id,
-            messages,
-            conversation_id=conversation_id,
-        ) > 0
 
     def _matching_lcm_normal_prefix_count(
         self,
@@ -3192,22 +2576,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> list[int]:
         if not session_id or not suffix:
             return []
-        kept: list[Dict[str, Any]] = []
-        for msg in suffix:
-            if self._matches_ignore_message_patterns(msg):
-                self._ignored_message_count += 1
-                excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[:80].replace("\n", " ")
-                logger.debug(
-                    "LCM ignore_message_patterns dropped late session-end %s message: %r",
-                    msg.get("role", "unknown"),
-                    excerpt,
-                )
-                continue
-            kept.append(msg)
-        if not kept:
-            return []
         protected_messages = protect_messages_for_ingest(
-            kept,
+            suffix,
             session_id=session_id,
             config=self._config,
             hermes_home=self._hermes_home,
@@ -3567,200 +2937,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lifecycle.record_reset(self._conversation_id)
         self._reset_session_scoped_runtime_state()
 
-        # Retain DAG nodes across sessions based on config.
-        #   -1  → keep all nodes
-        #    0  → delete everything
-        #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
-        retain = self._config.new_session_retain_depth
-        if self._session_id and retain != -1:
-            if retain == 0:
-                self._dag.delete_session_nodes(
-                    self._session_id,
-                    on_deleted_batch=self._purge_embeddings_for_nodes,
-                )
-            else:
-                self._dag.delete_below_depth(
-                    self._session_id,
-                    retain,
-                    on_deleted_batch=self._purge_embeddings_for_nodes,
-                )
-
-    def _purge_embeddings_for_nodes(
-        self,
-        node_ids: "list[int]",
-        *,
-        connection: "sqlite3.Connection | None" = None,
-    ) -> None:
-        """Purge stored embeddings for deleted summary nodes (best effort).
-
-        No-op unless embeddings are enabled. Opens a short-lived VectorStore on
-        the shared DB; any failure is swallowed so a purge problem never breaks
-        session reset — the summary_nodes join still keeps orphaned vectors out
-        of ranking.
-        """
-        if not node_ids:
-            return
-        if not bool(getattr(self._config, "embeddings_enabled", False)):
-            return
-        try:
-            from .vector_store import VectorStore
-
-            if connection is not None:
-                VectorStore.purge_embedding_batch_on_connection(connection, node_ids)
-                return
-            store = VectorStore(self._store.db_path, config=self._config)
-            try:
-                store.purge_embeddings_for_nodes(node_ids)
-            finally:
-                store.close()
-        except Exception:  # pragma: no cover - defensive; purge is best-effort
-            logger.debug(
-                "LCM embedding purge for deleted nodes failed", exc_info=True
-            )
-
-    def _archive_chunks_for_messages(
-        self,
-        store_ids: "list[int]",
-        *,
-        connection: "sqlite3.Connection | None" = None,
-    ) -> None:
-        """Soft-archive raw-history chunks for purged/GC'd messages (best effort).
-
-        Mirrors ``_purge_embeddings_for_nodes`` but for the chunk corpus: when a
-        message is deleted or its content is GC-rewritten, its chunks no longer
-        map to live content, so they are archived (dropped from ranking, rows
-        retained). No-op unless embeddings are enabled; any failure is swallowed
-        so a chunk-archive problem never breaks purge/GC.
-        """
-        if not store_ids:
-            return
-        if not bool(getattr(self._config, "embeddings_enabled", False)):
-            return
-        try:
-            from .vector_store import VectorStore
-
-            if connection is not None:
-                for offset in range(0, len(store_ids), 256):
-                    VectorStore.archive_chunks_for_messages_on_connection(
-                        connection, store_ids[offset:offset + 256]
-                    )
-                return
-            store = VectorStore(self._store.db_path, config=self._config)
-            try:
-                store.archive_chunks_for_messages(store_ids)
-            finally:
-                store.close()
-        except Exception:  # pragma: no cover - defensive; archive is best-effort
-            logger.debug(
-                "LCM chunk archive for purged messages failed", exc_info=True
-            )
-
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
-        """Move retained summaries from the old session into the new one.
+        """Move the old session's summary nodes into the new one.
 
-        This reassigns session ownership for retained summary nodes, but it does
-        not rewrite the nodes' descendant raw-message lineage. Retrieval under
-        ``session_scope='current'`` may therefore include a carried-over node in
-        the new session, while ``source`` filtering still evaluates against the
-        node's original descendant message sources.
-
-        Temporal rollups are deliberately NOT re-scoped here: they are keyed by
-        (period_kind, period_start, scope=session_id) with a UNIQUE constraint, so
-        rewriting scope on rollover could collide with the new session's own
-        rollups and would need a core-schema change to do safely. Rotation is the
-        documented rollup scope boundary; ``lcm_recent`` compensates at read time
-        by spanning the same current + last-finalized sessions its leaf fallback
-        uses (see ``_recent_ready_rollups``), so no window content is dropped.
+        This reassigns session ownership for the summary nodes, but it does
+        not rewrite the nodes' descendant raw-message lineage: a carried-over
+        node belongs to the new session while its sources stay with the old one.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        if self._session_ignored and new_session_id == self._session_id:
-            logger.debug(
-                "LCM carry-over skipped for ignored session %s",
-                new_session_id,
-            )
-            return 0
         return self._dag.reassign_session_nodes(old_session_id, new_session_id)
 
-    def rollover_session(
-        self,
-        old_session_id: str,
-        new_session_id: str,
-        previous_messages: List[Dict[str, Any]] | None = None,
-        carry_over_context: bool = True,
-        **kwargs,
-    ) -> int:
-        """Complete a Hermes-style `/new` rollover for this engine.
-
-        This is a small helper for host/runtime integrations that need the
-        correct lifecycle ordering in one call:
-        1. flush old-session messages into the store
-        2. prune/reset retained DAG state on the old session
-        3. bind the engine to the new session
-        4. optionally move retained summaries into the new session
-        """
-        previous_messages = previous_messages or []
-        boundary_reason = str(kwargs.get("boundary_reason") or "")
-        conversation_id = self._conversation_id or old_session_id or new_session_id
-        bound_session_id = self._session_id
-        can_carry_over = bool(
-            old_session_id and bound_session_id and old_session_id == bound_session_id
-        )
-
-        if carry_over_context and boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
-            before_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
-            if can_carry_over:
-                self.on_session_end(old_session_id, previous_messages)
-            else:
-                logger.warning(
-                    "LCM compression rollover old_session_id=%s does not match bound session=%s; using boundary handler fallback",
-                    old_session_id,
-                    bound_session_id,
-                )
-            self.on_session_start(
-                new_session_id,
-                old_session_id=old_session_id,
-                **kwargs,
-            )
-            after_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
-            return len(after_node_ids - before_node_ids)
-
-        if old_session_id and can_carry_over:
-            self.on_session_end(old_session_id, previous_messages)
-            self.on_session_reset()
-        elif old_session_id and not carry_over_context:
-            logger.warning(
-                "LCM rollover skipped old-session finalization: old_session_id=%s does not match bound session=%s",
-                old_session_id,
-                bound_session_id,
-            )
-        elif old_session_id and not can_carry_over:
-            logger.warning(
-                "LCM carry-over skipped: old_session_id=%s does not match bound session=%s",
-                old_session_id,
-                bound_session_id,
-            )
-
-        self.on_session_start(new_session_id, conversation_id=conversation_id, **kwargs)
-
-        if not carry_over_context:
-            return 0
-        if old_session_id and not can_carry_over:
-            return 0
-        return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             LCM_GREP,
-            LCM_RECALL,
-            LCM_QUERY_STATE,
-            LCM_COMPUTE,
-            LCM_COMPILE_EVIDENCE,
-            LCM_EVIDENCE_PACK,
-            LCM_RETRIEVE,
-            LCM_RECENT,
-            LCM_LOAD_SESSION,
-            LCM_DESCRIBE,
             LCM_EXPAND,
             LCM_EXPAND_QUERY,
             LCM_STATUS,
@@ -3775,9 +2966,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if name != "lcm_inspect" and messages and self._session_id:
             if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
                 self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            elif not (
-                self._session_ignored or self._session_stateless or self._thread_context_stateless()
-            ):
+            elif not (self._session_stateless or self._thread_context_stateless()):
                 try:
                     self._ingest_messages(messages)
                     self._record_ingest_success()
@@ -3787,15 +2976,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
-            "lcm_recall": lcm_tools.lcm_recall,
-            "lcm_query_state": lcm_tools.lcm_query_state,
-            "lcm_compute": lcm_tools.lcm_compute,
-            "lcm_compile_evidence": lcm_tools.lcm_compile_evidence,
-            "lcm_evidence_pack": lcm_tools.lcm_evidence_pack,
-            "lcm_retrieve": lcm_tools.lcm_retrieve,
-            "lcm_recent": lcm_tools.lcm_recent,
-            "lcm_load_session": lcm_tools.lcm_load_session,
-            "lcm_describe": lcm_tools.lcm_describe,
             "lcm_expand": lcm_tools.lcm_expand,
             "lcm_expand_query": lcm_tools.lcm_expand_query,
             "lcm_status": lcm_tools.lcm_status,
@@ -3902,33 +3082,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
         })
-        with self._assertion_extraction_metrics_lock:
-            status["assertion_extraction"] = {
-                "store_enabled": self._assertions is not None,
-                "enabled": bool(
-                    getattr(self._config, "assertion_extraction_enabled", False)
-                ),
-                "model": self._assertion_extraction_model(),
-                "extractor": (
-                    getattr(self._assertion_extractor, "kind", "")
-                    if self._assertion_extractor is not None
-                    else ""
-                ),
-                "busy": not self._assertion_extraction_idle.is_set(),
-                "batches_scheduled": self._assertion_extraction_batches_scheduled,
-                "batches_skipped_busy": self._assertion_extraction_batches_skipped_busy,
-                "sources_scheduled": self._assertion_extraction_sources_scheduled,
-                "sources_completed": self._assertion_extraction_sources_completed,
-                "sources_failed": self._assertion_extraction_sources_failed,
-                "provider_calls": self._assertion_extraction_provider_calls,
-                "input_tokens": self._assertion_extraction_input_tokens,
-                "output_tokens": self._assertion_extraction_output_tokens,
-                "last_duration_ms": round(
-                    self._assertion_extraction_last_duration_ms, 3
-                ),
-                "last_error": self._assertion_extraction_last_error,
-                "last_model": self._assertion_extraction_last_model,
-            }
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
         lifecycle_state = self._lifecycle.get_by_conversation(conversation_id) if conversation_id else None
@@ -3951,7 +3104,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         status["total_compactions_scope"] = _TOTAL_COMPACTIONS_SCOPE
         status["engine"] = "lcm"
         status["runtime_identity"] = self.get_runtime_identity()
-        status["ingest_protection"] = sensitive_pattern_status(self._config)
         try:
             status["source_lineage"] = self._store.get_source_stats(session_id or None)
         except Exception as exc:  # pragma: no cover - defensive
@@ -3986,16 +3138,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             status["store_messages"] = self._store.get_session_count(session_id)
             status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
-            status["session_ignored"] = self.current_session_ignored
             status["session_stateless"] = self.current_session_stateless
-            status["ignore_session_patterns"] = list(self._config.ignore_session_patterns)
-            status["stateless_session_patterns"] = list(self._config.stateless_session_patterns)
-            status["ignore_message_patterns"] = list(self._config.ignore_message_patterns)
-            status["ignore_session_patterns_source"] = self._config.ignore_session_patterns_source
-            status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
-            status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
-            status["ignored_message_count"] = self._ignored_message_count
-            status["ignore_pattern_dropped_count"] = self._ignore_pattern_dropped_count
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
@@ -4064,76 +3207,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
-        self._session_match_keys = build_session_match_keys(
-            self._session_id,
-            platform=self._session_platform,
-        )
-        self._session_ignored = matches_session_pattern(
-            self._session_match_keys,
-            self._compiled_ignore_session_patterns,
-        )
-        self._session_stateless = (
-            not self._session_ignored
-            and (
-                (
-                    self._lcm_current_start_allows_bypass_lineage
-                    and self._has_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
-                )
-                or matches_session_pattern(
-                    self._session_match_keys,
-                    self._compiled_stateless_session_patterns,
-                )
-            )
+        self._session_stateless = bool(
+            self._lcm_current_start_allows_bypass_lineage
+            and self._has_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
         )
         if self._session_id:
             self._lcm_session_last_platform[self._session_id] = self._session_platform
-            self._lcm_session_last_bypassed[self._session_id] = bool(self._session_ignored or self._session_stateless)
-            if not self._session_ignored and not self._session_stateless:
+            self._lcm_session_last_bypassed[self._session_id] = self._session_stateless
+            if not self._session_stateless:
                 self._lcm_non_bypass_platforms.setdefault(self._session_id, set()).add(self._session_platform)
                 self._lcm_session_last_normal_platform[self._session_id] = self._session_platform
-        if self._session_ignored or self._session_stateless:
+        if self._session_stateless:
             self._mark_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
 
-    def _log_session_filter_diagnostics(self) -> None:
-        if not self._logged_filter_config:
-            if self._config.ignore_session_patterns:
-                logger.info(
-                    "LCM ignore_session_patterns from %s: %s",
-                    self._config.ignore_session_patterns_source,
-                    ", ".join(self._config.ignore_session_patterns),
-                )
-            if self._config.stateless_session_patterns:
-                logger.info(
-                    "LCM stateless_session_patterns from %s: %s",
-                    self._config.stateless_session_patterns_source,
-                    ", ".join(self._config.stateless_session_patterns),
-                )
-            if self._config.ignore_message_patterns:
-                logger.info(
-                    "LCM ignore_message_patterns from %s: %s",
-                    self._config.ignore_message_patterns_source,
-                    ", ".join(self._config.ignore_message_patterns),
-                )
-            self._logged_filter_config = True
-        if self._session_ignored:
-            logger.info(
-                "LCM session %s matched ignore_session_patterns via %s — skipping writes and compaction",
-                self._session_id,
-                ", ".join(self._session_match_keys),
-            )
-        elif self._session_stateless:
-            logger.info(
-                "LCM session %s matched stateless_session_patterns via %s — read-only mode (no LCM writes)",
-                self._session_id,
-                ", ".join(self._session_match_keys),
-            )
 
     # -- Internal: message ingestion ---------------------------------------
 
     def _schedule_ingest_cursor_reconciliation(self) -> None:
         """Mark existing-session rebinds for cursor repair on next ingest."""
         self._ingest_cursor_needs_reconcile = False
-        if not self._session_id or self._session_ignored or self._session_stateless:
+        if not self._session_id or self._session_stateless:
             return
         try:
             self._ingest_cursor_needs_reconcile = self._store.get_session_count(self._session_id) > 0
@@ -4141,132 +3234,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
-    def _stored_row_externalized_text_parts_for_pattern_matching(self, msg: Dict[str, Any]) -> list[str]:
-        ref_sources: list[str] = []
-        content = msg.get("content")
-        if isinstance(content, str):
-            ref_sources.append(content)
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            try:
-                ref_sources.append(json.dumps(tool_calls, ensure_ascii=False))
-            except (TypeError, ValueError):
-                ref_sources.append(str(tool_calls))
-        refs: list[str] = []
-        for source in ref_sources:
-            for ref in extract_all_externalized_payload_refs(source):
-                if ref not in refs:
-                    refs.append(ref)
-        parts: list[str] = []
-        session_id = str(msg.get("session_id") or self._session_id or "")
-        for ref in refs:
-            payload = load_externalized_payload(
-                ref,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-            if not payload:
-                continue
-            payload_session_id = str(payload.get("session_id") or "")
-            if session_id and payload_session_id and payload_session_id != session_id:
-                continue
-            payload_content = payload.get("content")
-            if isinstance(payload_content, str):
-                parts.append(payload_content)
-        return parts
-
-    def _stored_row_externalized_text_for_pattern_matching(self, msg: Dict[str, Any]) -> str:
-        return "\n".join(self._stored_row_externalized_text_parts_for_pattern_matching(msg))
-
-    def _is_cached_active_replay_message_at_index(self, idx: int, msg: Dict[str, Any]) -> bool:
-        if idx < 0 or idx >= len(self._last_active_replay_messages):
-            return False
-        return self._message_replay_identity(msg) == self._message_replay_identity(
-            self._last_active_replay_messages[idx]
-        )
-
-    def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
-        if not self._compiled_ignore_message_patterns:
-            return False
-        content = msg.get("content")
-        text = (
-            stored_text_content_for_pattern_matching(content)
-            if stored_row
-            else text_content_for_pattern_matching(content)
-        ) or ""
-        if matches_message_pattern(text, self._compiled_ignore_message_patterns):
-            return True
-        if stored_row:
-            externalized_parts = self._stored_row_externalized_text_parts_for_pattern_matching(msg)
-            for externalized_text in externalized_parts:
-                if externalized_text and matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns):
-                    return True
-            externalized_text = "\n".join(externalized_parts)
-            if externalized_text and externalized_text != text:
-                return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
-        return False
 
     def _content_has_externalized_placeholder_ref(self, content: str) -> bool:
-        return bool(extract_externalized_ref(content) or extract_ingest_externalized_refs(content))
+        return bool(extract_ingest_externalized_refs(content))
 
-    def _has_prior_raw_externalized_placeholder_row(self, store_id: int, msg: Dict[str, Any]) -> bool:
-        if not self._session_id:
-            return False
-        raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-        after_store_id = 0
-        while True:
-            rows = self._store.get_session_messages_after(
-                self._session_id,
-                after_store_id=after_store_id,
-                limit=1000,
-            )
-            if not rows:
-                return False
-            for row in rows:
-                row_store_id = int(row.get("store_id") or 0)
-                if row_store_id >= store_id:
-                    return False
-                if self._raw_externalized_placeholder_replay_identity(row) == raw_identity:
-                    return True
-                after_store_id = max(after_store_id, row_store_id)
 
-    def _mapped_stored_row_matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
-        store_id = msg.get("store_id")
-        content = normalize_content_value(msg.get("content")) or ""
-        has_externalized_placeholder = self._content_has_externalized_placeholder_ref(content)
-        mapped_from_active_placeholder = False
-        if store_id is None:
-            store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
-            mapped_from_active_placeholder = has_externalized_placeholder and store_id is not None
-        if store_id is None:
-            return False
-        if mapped_from_active_placeholder and self._has_prior_raw_externalized_placeholder_row(int(store_id), msg):
-            raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-            if self._current_compress_placeholder_identity_counts.get(raw_identity, 0) <= 1:
-                return False
-        try:
-            stored = self._store.get(int(store_id))
-        except Exception:
-            logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
-            return False
-        return bool(stored and self._matches_ignore_message_patterns(stored, stored_row=True))
-
-    def _copy_active_replay_messages_preserving_generated_ids(
-        self,
+    @staticmethod
+    def _copy_active_replay_messages(
         active_replay_messages: List[Dict[str, Any]],
     ) -> list[Dict[str, Any]]:
-        copied_replay_messages: list[Dict[str, Any]] = []
-        generated_message_ids = getattr(
-            self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
-        )
-        for message in active_replay_messages:
-            copied_message = dict(message)
-            if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(copied_message))
-            copied_replay_messages.append(copied_message)
-        return copied_replay_messages
+        return [dict(message) for message in active_replay_messages]
 
     def _remember_active_replay_messages(
         self,
@@ -4276,7 +3253,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
-        self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+        self._last_active_replay_messages = self._copy_active_replay_messages(
             active_replay_messages
         )
         self._write_generated_ignored_placeholder_hash_counts(
@@ -4295,7 +3272,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                return self._copy_active_replay_messages(cached)
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -4374,118 +3351,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_id=session_id,
         )
 
-    def _recovered_content_matches_durable_identity(self, recovered_content: str, durable_content: str) -> bool:
-        recovered_identity_content = normalize_content_value(
-            redact_sensitive_value(
-                recovered_content,
-                self._config,
-                parse_json_strings=False,
-            )
-        )
-        if recovered_identity_content == durable_content:
-            return True
-        redaction_names = sorted(set(re.findall(r"\[LCM sensitive redaction: name=([^;\]]+)", durable_content)))
-        if not redaction_names or bool(getattr(self._config, "sensitive_patterns_enabled", False)):
-            return False
-        compat_config = copy.copy(self._config)
-        compat_config.sensitive_patterns_enabled = True
-        compat_config.sensitive_patterns = redaction_names
-        compat_identity_content = normalize_content_value(
-            redact_sensitive_value(
-                recovered_content,
-                compat_config,
-                parse_json_strings=False,
-            )
-        )
-        return compat_identity_content == durable_content
-
-    @staticmethod
-    def _persisted_output_marker_replay_proof(content: str) -> tuple[str | None, bool]:
-        inline_preview_sha256 = _persisted_output_inline_preview_sha256(content)
-        preview_sha256 = inline_preview_sha256 or _persisted_output_preview_prefix_digest(content)
-        if not preview_sha256:
-            return None, False
-        allow_redacted_preview_match = inline_preview_sha256 is None and not _has_lossy_sensitive_redaction(content)
-        return preview_sha256, allow_redacted_preview_match
-
-    def _has_any_durable_persisted_output_payload_for_marker(self, msg: Dict[str, Any]) -> bool:
-        role = str(msg.get("role") or "unknown")
-        content = normalize_content_value(msg.get("content")) or ""
-        if role != "tool" or not _is_hermes_persisted_output_marker(content):
-            return False
-        expected_chars = _expected_persisted_output_chars(content)
-        persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
-        if expected_chars is None or not persisted_output_source_path or not persisted_output_preview_sha256:
-            return False
-        if recover_hermes_persisted_output_with_file_stat(content) is None:
-            return False
-        durable_content = find_externalized_tool_result_content_for_call(
-            tool_call_id=str(msg.get("tool_call_id") or ""),
-            session_id=str(msg.get("session_id") or self._session_id or ""),
-            expected_chars=expected_chars,
-            persisted_output_source_path=persisted_output_source_path,
-            persisted_output_preview_sha256=persisted_output_preview_sha256,
-            allow_redacted_preview_match=allow_redacted_preview_match,
-            config=self._config,
-            hermes_home=self._hermes_home,
-        )
-        return durable_content is not None
-
-    @classmethod
-    def _is_active_context_droppable_identity(cls, identity: tuple[str, str, str, str]) -> bool:
-        """Return true for durable rows sanitized out of active replay only."""
-        role, content, _tool_call_id, tool_calls = identity
-        if role != "assistant" or tool_calls:
-            return False
-        return _should_drop_active_assistant_message({
-            "role": role,
-            "content": cls._identity_content_for_active_cleanup(content),
-        })
-
-    def _ignored_message_is_quarantinable_assistant(self, msg: Dict[str, Any]) -> bool:
-        if self._is_volatile_ignored_quarantine_placeholder(
-            msg,
-            text_content_for_pattern_matching(msg.get("content")) or "",
-        ):
-            return True
-        identity = self._message_replay_identity(msg)
-        if self._is_quarantined_assistant_replay_identity(identity):
-            return True
-        if not self._matches_ignore_message_patterns(msg):
-            return False
-        if identity[0] != "assistant":
-            return False
-        content = normalize_content_value(msg.get("content")) or ""
-        return assistant_output_quarantine_reason(content) is not None
-
-    def _redact_active_replay_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        redacted_replay_messages: list[Dict[str, Any]] = []
-        generated_message_ids = getattr(
-            self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
-        )
-        for message in messages:
-            redacted_message = dict(message)
-            if "content" in redacted_message:
-                redacted_content = redact_sensitive_value(
-                    redacted_message.get("content"),
-                    self._config,
-                    parse_json_strings=False,
-                )
-                redacted_message["content"] = redacted_content
-
-            if "tool_calls" in redacted_message:
-                redacted_message["tool_calls"] = redact_sensitive_value(
-                    redacted_message.get("tool_calls"),
-                    self._config,
-                    parse_json_strings=True,
-                )
-            if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(redacted_message))
-            redacted_replay_messages.append(redacted_message)
-        return redacted_replay_messages
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
@@ -4502,38 +3367,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
-            return self._redact_active_replay_messages(messages)
+            return self._copy_active_replay_messages(messages)
 
-        if self._session_ignored or self._session_stateless:
-            logger.debug(
-                "Ingest skipped for %s session %s",
-                "ignored" if self._session_ignored else "stateless",
-                self._session_id,
-            )
-            return self._redact_active_replay_messages(messages)
+        if self._session_stateless:
+            logger.debug("Ingest skipped for stateless session %s", self._session_id)
+            return self._copy_active_replay_messages(messages)
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
-        ignored_original_messages = [False] * n
-        if self._compiled_ignore_message_patterns:
-            previous_store_id_map = self._current_compress_store_ids_by_message_id
-            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
-            try:
-                for idx in range(scan_start, n):
-                    mapped_ignore = self._mapped_stored_row_matches_ignore_message_patterns(messages[idx])
-                    ignored_original_messages[idx] = (
-                        self._matches_ignore_message_patterns(messages[idx])
-                        or mapped_ignore
-                    )
-            finally:
-                self._current_compress_store_ids_by_message_id = previous_store_id_map
-        externalize_messages = [False] * n
-        prefer_existing_externalized = [False] * n
-        for idx in range(scan_start, n):
-            externalize_messages[idx] = not ignored_original_messages[idx]
-        for idx in range(0, scan_start):
-            prefer_existing_externalized[idx] = not ignored_original_messages[idx]
+        externalize_messages = [idx >= scan_start for idx in range(n)]
+        prefer_existing_externalized = [idx < scan_start for idx in range(n)]
         replay_messages = quarantine_suspicious_assistant_messages(
             messages,
             session_id=self._session_id,
@@ -4542,33 +3386,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             externalize=externalize_messages,
             prefer_existing_externalized=prefer_existing_externalized,
         )
-        replay_messages = self._redact_active_replay_messages(replay_messages)
-        replay_messages = self._apply_ignored_active_replay_placeholders(
-            messages,
-            replay_messages,
-            scan_start=scan_start,
-            ignored_messages=ignored_original_messages,
-        )
+        replay_messages = self._copy_active_replay_messages(replay_messages)
         if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = [
-                original_msg
-                if (
-                    (
-                        str(original_msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(original_msg.get("content")) or ""
-                        )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
-                    )
-                    or (
-                        self._compiled_ignore_message_patterns
-                        and ignored_original_messages[idx]
-                    )
-                )
-                else replay_msg
-                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-            ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(replay_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
@@ -4585,7 +3405,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ]
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
-                        self._copy_active_replay_messages_preserving_generated_ids(
+                        self._copy_active_replay_messages(
                             cached_active_replay_messages[:cursor]
                         )
                         + replay_messages[cursor:]
@@ -4600,243 +3420,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not new_messages:
             cached_replay = self._cached_active_replay_messages(messages)
-            self._compression_boundary_ingest_pending = False
-            self._compression_boundary_active_placeholder_digest_budget = {}
-            self._compression_boundary_active_placeholder_digest_ordinals = {}
-            self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
 
-        active_replay_messages = replay_messages
-        compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
-        empty_session_placeholder_budget: dict[str, int] = {}
-        empty_session_placeholder_ordinals: dict[str, set[int]] = {}
-        if not compression_boundary_ingest_pending and self._session_id:
-            try:
-                if self._store.get_session_count(self._session_id) == 0:
-                    empty_session_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
-                    empty_session_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
-            except Exception:
-                empty_session_placeholder_budget = {}
-                empty_session_placeholder_ordinals = {}
-        messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
-            (cursor + offset, replay_msg)
-            for offset, replay_msg in enumerate(new_messages)
-        ]
-        if messages_to_store_with_index:
-            kept: list[tuple[int, Dict[str, Any]]] = []
-            boundary_placeholder_seen: dict[str, int] = {}
-            boundary_seen_synthetic_summary_before = False
-            empty_session_placeholder_seen: dict[str, int] = {}
-            if empty_session_placeholder_ordinals and cursor > 0:
-                for replay_msg in replay_messages[:cursor]:
-                    replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
-                    digest = self._active_replay_placeholder_digest(replay_text)
-                    if digest:
-                        empty_session_placeholder_seen[digest] = empty_session_placeholder_seen.get(digest, 0) + 1
-            boundary_all_placeholder_replay_batch = (
-                compression_boundary_ingest_pending
-                and len(new_messages) > 1
-                and all(
-                    self._is_ignored_active_replay_placeholder(
-                        msg,
-                        text_content_for_pattern_matching(msg.get("content")) or "",
-                    )
-                    for msg in new_messages
+        messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = []
+        for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
+            absolute_idx = cursor + offset
+            replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+            original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+            volatile_digest = self._active_replay_placeholder_digest(replay_text)
+            generated_volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
+                replay_msg,
+                replay_text,
+            ) and (
+                original_text != replay_text
+                or (
+                    volatile_digest is not None
+                    and volatile_digest in self._load_generated_ignored_placeholder_hashes()
                 )
             )
-            if compression_boundary_ingest_pending:
-                boundary_budget = self._compression_boundary_active_placeholder_digest_budget
-                stored_counts = self._compression_boundary_stored_placeholder_digest_counts
-                if boundary_budget and stored_counts:
-                    incoming_counts: dict[str, int] = {}
-                    relevant_digests = set(boundary_budget) | set(stored_counts)
-                    for msg in new_messages:
-                        text = text_content_for_pattern_matching(msg.get("content")) or ""
-                        digest = self._active_replay_placeholder_digest(text)
-                        if digest in relevant_digests:
-                            incoming_counts[digest] = incoming_counts.get(digest, 0) + 1
-                    adjusted_budget: dict[str, int] = {}
-                    for digest, count in boundary_budget.items():
-                        parsed_count = max(0, int(count or 0))
-                        incoming_count = max(0, int(incoming_counts.get(digest, 0) or 0))
-                        stored_count = max(0, int(stored_counts.get(digest, 0) or 0))
-                        remaining = min(parsed_count, max(0, incoming_count - stored_count))
-                        if remaining > 0:
-                            adjusted_budget[digest] = remaining
-                    self._compression_boundary_active_placeholder_digest_budget = adjusted_budget
-            empty_session_all_placeholder_replay_batch = (
-                bool(empty_session_placeholder_ordinals)
-                and len(new_messages) > 1
-                and all(
-                    self._is_ignored_active_replay_placeholder(
-                        msg,
-                        text_content_for_pattern_matching(msg.get("content")) or "",
-                    )
-                    for msg in new_messages
+            if generated_volatile_placeholder:
+                if volatile_digest is not None:
+                    self._remember_generated_ignored_placeholder_hash(volatile_digest)
+                logger.debug(
+                    "LCM did not store a generated quarantine placeholder for %s message: %r",
+                    original_msg.get("role", "unknown"),
+                    original_text[:80].replace("\n", " "),
                 )
-            )
-            for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
-                absolute_idx = cursor + offset
-                replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
-                original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
-                volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
-                    replay_msg,
-                    replay_text,
+                continue
+            store_msg = replay_msg
+            if (
+                str(original_msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(
+                    normalize_content_value(original_msg.get("content")) or ""
                 )
-                volatile_digest = self._active_replay_placeholder_digest(replay_text)
-                generated_volatile_placeholder = volatile_placeholder and (
-                    original_text != replay_text
-                    or (
-                        volatile_digest is not None
-                        and volatile_digest in self._load_generated_ignored_placeholder_hashes()
-                    )
-                )
-                active_replay_placeholder = self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
-                active_replay_placeholder_digest = self._active_replay_placeholder_digest(replay_text)
-                if not active_replay_placeholder:
-                    replay_text_stripped = replay_text.strip()
-                    if (
-                        self._is_context_summary_content(replay_text)
-                        or replay_text_stripped.startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
-                        or replay_text_stripped.startswith(_PRESERVED_TODO_CONTEXT_PREFIX)
-                    ):
-                        boundary_seen_synthetic_summary_before = True
-                compression_carried_active_placeholder = False
-                metadata_replayed_active_placeholder = False
-                if (
-                    empty_session_placeholder_budget
-                    and empty_session_placeholder_ordinals
-                    and active_replay_placeholder
-                    and active_replay_placeholder_digest is not None
-                ):
-                    empty_session_placeholder_seen[active_replay_placeholder_digest] = (
-                        empty_session_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
-                    )
-                    ordinal = empty_session_placeholder_seen[active_replay_placeholder_digest]
-                    remaining = empty_session_placeholder_budget.get(active_replay_placeholder_digest, 0)
-                    if (
-                        remaining > 0
-                        and ordinal in empty_session_placeholder_ordinals.get(
-                            active_replay_placeholder_digest,
-                            set(),
-                        )
-                        and (ordinal > 1 or empty_session_all_placeholder_replay_batch)
-                    ):
-                        metadata_replayed_active_placeholder = True
-                        if remaining == 1:
-                            empty_session_placeholder_budget.pop(active_replay_placeholder_digest, None)
-                        else:
-                            empty_session_placeholder_budget[active_replay_placeholder_digest] = remaining - 1
-                if (
-                    compression_boundary_ingest_pending
-                    and active_replay_placeholder
-                    and active_replay_placeholder_digest is not None
-                ):
-                    boundary_placeholder_seen[active_replay_placeholder_digest] = (
-                        boundary_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
-                    )
-                    current_placeholder_ordinal = boundary_placeholder_seen[active_replay_placeholder_digest]
-                    boundary_budget = self._compression_boundary_active_placeholder_digest_budget
-                    boundary_ordinals = self._compression_boundary_active_placeholder_digest_ordinals
-                    generated_message_ids = getattr(
-                        self,
-                        "_generated_ignored_active_replay_placeholder_message_ids",
-                        set(),
-                    )
-                    has_generated_provenance = (
-                        id(replay_msg) in generated_message_ids
-                        or id(original_msg) in generated_message_ids
-                    )
-                    ordinal_matches_generated = (
-                        current_placeholder_ordinal in boundary_ordinals.get(
-                            active_replay_placeholder_digest,
-                            set(),
-                        )
-                        and (
-                            current_placeholder_ordinal > 1
-                            or boundary_seen_synthetic_summary_before
-                            or boundary_all_placeholder_replay_batch
-                        )
-                    )
-                    if boundary_budget and (
-                        has_generated_provenance
-                        or (not has_generated_provenance and ordinal_matches_generated)
-                    ):
-                        remaining = boundary_budget.get(active_replay_placeholder_digest, 0)
-                        if remaining > 0:
-                            compression_carried_active_placeholder = True
-                            if remaining == 1:
-                                boundary_budget.pop(active_replay_placeholder_digest, None)
-                            else:
-                                boundary_budget[active_replay_placeholder_digest] = remaining - 1
-                replayed_active_placeholder = active_replay_placeholder and (
-                    self._is_cached_active_replay_message_at_index(absolute_idx, replay_msg)
-                    or compression_carried_active_placeholder
-                    or metadata_replayed_active_placeholder
-                )
-                if (
-                    ignored_original_messages[absolute_idx]
-                    or generated_volatile_placeholder
-                    or replayed_active_placeholder
-                ):
-                    self._ignored_message_count += 1
-                    if generated_volatile_placeholder and volatile_digest is not None:
-                        self._remember_generated_ignored_placeholder_hash(volatile_digest)
-                    replay_preserves_ignore_decision = (
-                        self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
-                        or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
-                    )
-                    if ignored_original_messages[absolute_idx] and not replay_preserves_ignore_decision:
-                        if active_replay_messages is replay_messages:
-                            active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                                replay_messages
-                            )
-                        active_message = dict(active_replay_messages[absolute_idx])
-                        active_message["content"] = self._ignored_active_replay_placeholder(original_text)
-                        active_replay_messages[absolute_idx] = active_message
-                    excerpt = original_text[:80].replace("\n", " ")
-                    if ignored_original_messages[absolute_idx]:
-                        # A raw message matched ignore_message_patterns and is
-                        # discarded here - never persisted anywhere. Count and
-                        # log it (INFO) so an over-broad pattern silently eating
-                        # substantive turns is at least visible to the operator.
-                        self._ignore_pattern_dropped_count += 1
-                        logger.info(
-                            "LCM ignore_message_patterns dropped %s message "
-                            "(not persisted; total dropped=%d): %r",
-                            original_msg.get("role", "unknown"),
-                            self._ignore_pattern_dropped_count,
-                            excerpt,
-                        )
-                    else:
-                        logger.debug(
-                            "LCM ignore_message_patterns dropped %s message: %r",
-                            original_msg.get("role", "unknown"),
-                            excerpt,
-                        )
-                    continue
-                store_msg = replay_msg
-                if (
-                    str(original_msg.get("role") or "") == "tool"
-                    and _is_hermes_persisted_output_marker(
-                        normalize_content_value(original_msg.get("content")) or ""
-                    )
-                ):
-                    store_msg = original_msg
-                kept.append((absolute_idx, store_msg))
-            messages_to_store_with_index = kept
+            ):
+                store_msg = original_msg
+            messages_to_store_with_index.append((absolute_idx, store_msg))
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
-            self._compression_boundary_ingest_pending = False
-            self._compression_boundary_active_placeholder_digest_budget = {}
-            self._compression_boundary_active_placeholder_digest_ordinals = {}
-            self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            return self._remember_active_replay_messages(messages, active_replay_messages)
+            return self._remember_active_replay_messages(messages, replay_messages)
 
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
@@ -4844,35 +3471,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=self._config,
             hermes_home=self._hermes_home,
         )
-        recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(
-            active_replay_messages
-        )
-        for (absolute_idx, _replay_msg), protected_msg in zip(
-            messages_to_store_with_index,
-            protected_messages,
-        ):
-            if self._protected_message_uses_raw_payload_active_stub(protected_msg):
-                if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
-                    )
-                active_message = dict(active_replay_messages[absolute_idx])
-                active_message["content"] = protected_msg["content"]
-                active_replay_messages[absolute_idx] = active_message
-                continue
-
-            active_message = active_replay_messages[absolute_idx]
-            stubbed_message = self._maybe_stub_active_tool_result(
-                active_message,
-                recovery_tool_call_ids=recovery_tool_call_ids,
-            )
-            if stubbed_message is not None:
-                if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
-                    )
-                active_replay_messages[absolute_idx] = stubbed_message
-
         estimates = [count_message_tokens(m) for m in protected_messages]
         self._store._append_protected_batch(
             self._session_id,
@@ -4881,30 +3479,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
-        # Rollup staleness is driven by summary-node PUBLICATION
-        # (_invalidate_rollups_for_published_node at every add_node site), not by
-        # raw ingest: marking a period stale before its covering summary exists
-        # would let a rebuild publish 'ready' from old sources and omit the leaf
-        # (maintainer #388 P1).
         self._ingest_cursor = n
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget = {}
-        self._compression_boundary_active_placeholder_digest_ordinals = {}
-        self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-        # Most ``protected_messages`` changes are storage-only: inline media and
-        # data/base64 substrings stay provider-usable in active replay. The
-        # exceptions are whole-message ``raw_payload`` externalization and the
-        # separately opt-in textual tool-result interceptor above.
-        return self._remember_active_replay_messages(messages, active_replay_messages)
+        # ``protected_messages`` changes are storage-only: inline media and
+        # data/base64 substrings stay provider-usable in active replay.
+        return self._remember_active_replay_messages(messages, replay_messages)
 
-    @staticmethod
-    def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
-        content = message.get("content")
-        return isinstance(content, str) and content.startswith(
-            "[Externalized payload: kind=raw_payload;"
-        )
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
@@ -4912,248 +3493,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: summarization -------------------------------------------
 
-    def _run_pre_compaction_extraction(
-        self,
-        messages: List[Dict[str, Any]],
-        *,
-        timeout_seconds: Optional[float] = None,
-    ) -> None:
-        """Best-effort extraction of decisions before compaction."""
-        try:
-            serialized = self._serialize_messages(messages)
-            output_path = self._config.extraction_output_path
-            if not output_path:
-                base = self._hermes_home or os.path.expanduser("~/.hermes")
-                output_path = os.path.join(base, "lcm-extractions")
-            extraction_model = self._config.extraction_model or self._config.summary_model
-            extract_before_compaction(
-                serialized_messages=serialized,
-                output_path=output_path,
-                session_id=self._session_id or "",
-                model=extraction_model,
-                timeout=(
-                    timeout_seconds
-                    if timeout_seconds is not None
-                    else self._config.summary_timeout_ms / 1000
-                ),
-            )
-        except Exception as e:
-            logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
-
-    def _run_assertion_extraction_batch(
-        self,
-        db_path: str,
-        snapshots: tuple[SourceSnapshot, ...],
-        model: str,
-        timeout_seconds: float,
-    ) -> None:
-        """Derive one bounded batch on a daemon worker outside raw writes."""
-        started = time.perf_counter()
-        completed = 0
-        failed = 0
-        last_error = ""
-        extractor = None
-        writer = None
-        try:
-            writer = AssertionStore(db_path)
-            extractor = ModelAssertionExtractor(
-                writer,
-                model=model,
-                timeout_seconds=timeout_seconds,
-            )
-            for snapshot in snapshots:
-                try:
-                    if writer.has_current_receipt(snapshot):
-                        completed += 1
-                        continue
-                    extraction = extractor(snapshot)
-                    writer.publish_source(
-                        snapshot,
-                        extraction.assertions,
-                        relations=extraction.relations,
-                    )
-                    completed += 1
-                except Exception as exc:
-                    failed += 1
-                    last_error = f"{type(exc).__name__}: {exc}"[:300]
-                    logger.warning(
-                        "Structured assertion extraction failed for store_id %s: %s",
-                        snapshot.store_id,
-                        last_error,
-                    )
-        except Exception as exc:
-            failed += max(1, len(snapshots) - completed)
-            last_error = f"{type(exc).__name__}: {exc}"[:300]
-            logger.warning("Structured assertion batch failed: %s", last_error)
-        finally:
-            if writer is not None:
-                try:
-                    writer.close()
-                except Exception:
-                    logger.warning(
-                        "Structured assertion writer close failed",
-                        exc_info=True,
-                    )
-            duration_ms = (time.perf_counter() - started) * 1000
-            with self._assertion_extraction_metrics_lock:
-                self._assertion_extraction_sources_completed += completed
-                self._assertion_extraction_sources_failed += failed
-                self._assertion_extraction_last_duration_ms = duration_ms
-                self._assertion_extraction_last_error = last_error
-                self._assertion_extraction_last_model = model
-                if extractor is not None:
-                    self._assertion_extraction_provider_calls += extractor.call_count
-                    self._assertion_extraction_input_tokens += extractor.total_input_tokens
-                    self._assertion_extraction_output_tokens += extractor.total_output_tokens
-            self._assertion_extraction_idle.set()
-            _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
-
-    def _schedule_pre_compaction_assertions(
-        self, messages: List[Dict[str, Any]]
-    ) -> bool:
-        """Queue exact persisted rows without blocking the compaction path."""
-        if (
-            not bool(getattr(self._config, "assertion_extraction_enabled", False))
-            or self._assertions is None
-            or not messages
-        ):
-            return False
-        max_sources = min(
-            8,
-            max(
-                1,
-                int(
-                    getattr(
-                        self._config,
-                        "assertion_extraction_max_sources_per_pass",
-                        4,
-                    )
-                ),
-            ),
-        )
-        store_ids = sorted(dict.fromkeys(self._get_store_ids_for_messages(messages)))
-        snapshots: list[SourceSnapshot] = []
-        for store_id in store_ids:
-            try:
-                snapshot = self._assertions.snapshot_source(store_id)
-                if snapshot.role not in {"user", "assistant"}:
-                    continue
-                if not self._assertions.has_current_receipt(snapshot):
-                    snapshots.append(snapshot)
-            except (KeyError, sqlite3.Error):
-                continue
-            if len(snapshots) >= max_sources:
-                break
-        if not snapshots:
-            return False
-        if not _ASSERTION_EXTRACTION_PROCESS_SLOT.acquire(blocking=False):
-            with self._assertion_extraction_metrics_lock:
-                self._assertion_extraction_batches_skipped_busy += 1
-            return False
-
-        model = self._assertion_extraction_model()
-        timeout_seconds = self._assertion_extraction_timeout()
-        with self._assertion_extraction_metrics_lock:
-            self._assertion_extraction_batches_scheduled += 1
-            self._assertion_extraction_sources_scheduled += len(snapshots)
-        self._assertion_extraction_idle.clear()
-        worker = threading.Thread(
-            target=self._run_assertion_extraction_batch,
-            args=(str(self._store.db_path), tuple(snapshots), model, timeout_seconds),
-            name="lcm-assertion-extraction",
-            daemon=True,
-        )
-        try:
-            worker.start()
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"[:300]
-            with self._assertion_extraction_metrics_lock:
-                self._assertion_extraction_sources_failed += len(snapshots)
-                self._assertion_extraction_last_error = last_error
-                self._assertion_extraction_last_model = model
-            self._assertion_extraction_idle.set()
-            _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
-            logger.warning(
-                "Structured assertion worker could not start: %s",
-                last_error,
-            )
-            return False
-        return True
-
-    def _maybe_gc_compacted_tool_results(
-        self,
-        compacted_chunk: List[Dict[str, Any]],
-        source_store_ids: List[int],
-    ) -> None:
-        if not getattr(self._config, "large_output_transcript_gc_enabled", False):
-            return
-        if not compacted_chunk or not source_store_ids:
-            return
-
-        stored_by_id = self._store.get_batch(source_store_ids)
-
-        def _archive_in_rewrite_txn(conn: "sqlite3.Connection", sid: int) -> None:
-            # Runs inside gc_externalized_tool_result's write transaction, right
-            # after the content rewrite and before its commit: archive this row's
-            # now-stale chunks ATOMICALLY with the rewrite so a recall can never
-            # slice the new (short) content at the old chunk offsets (F2).
-            self._archive_chunks_for_messages([sid], connection=conn)
-
-        for store_id in source_store_ids:
-            stored = stored_by_id.get(store_id)
-            if not stored or stored.get("session_id") != self._session_id:
-                continue
-            if stored.get("role") != "tool":
-                continue
-            content = stored.get("content", "") or ""
-            tool_call_id = stored.get("tool_call_id", "") or ""
-            if not content:
-                continue
-
-            # Only take the fast ref-branch when the ENTIRE row is the
-            # externalized placeholder. A ref merely embedded in surrounding
-            # text (e.g. a recall-tool result that quotes a placeholder) must
-            # fall through to the content-equality lookup below, which tombstones
-            # only when the full row content matches the stored payload -
-            # otherwise the surrounding, never-externalized text is lost.
-            ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
-            if ref:
-                externalized = load_externalized_payload(
-                    ref,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
-                    placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(
-                        store_id, placeholder, before_commit=_archive_in_rewrite_txn
-                    )
-                    continue
-
-            lookup_candidates = []
-            sanitized_content = sanitize_pre_compaction_content(content)
-            if sanitized_content and sanitized_content != content:
-                lookup_candidates.append(sanitized_content)
-            lookup_candidates.append(content)
-
-            externalized = None
-            for candidate in lookup_candidates:
-                externalized = find_externalized_payload_for_message(
-                    candidate,
-                    tool_call_id=tool_call_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized is not None:
-                    break
-            if externalized is None:
-                continue
-
-            placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(
-                store_id, placeholder, before_commit=_archive_in_rewrite_txn
-            )
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
@@ -5161,26 +3500,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
-            content = redact_sensitive_value(
-                msg.get("content") or "",
-                self._config,
-                parse_json_strings=False,
-            )
+            content = msg.get("content") or ""
             if role == "tool":
                 tool_id = str(msg.get("tool_call_id") or "").strip()
-                externalized = maybe_externalize_tool_output(
-                    content,
-                    tool_call_id=tool_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized:
-                    content = externalized["placeholder"]
-                else:
-                    content = sanitize_pre_compaction_content(content)
-                    if len(content) > 3000:
-                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                content = sanitize_pre_compaction_content(content)
+                if len(content) > 3000:
+                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
@@ -5205,11 +3530,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
                             args = fn.get("arguments", "")
-                            args = redact_sensitive_value(
-                                args,
-                                self._config,
-                                parse_json_strings=True,
-                            )
                             args = sanitize_pre_compaction_tool_arguments(args)
                             if len(args) > 500:
                                 args = args[:400] + "..."
@@ -5270,187 +3590,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             insert_missing_tool_stubs=insert_missing_tool_stubs,
         )
 
-    @staticmethod
-    def _active_tool_stub_content(original_content: Any, placeholder: str) -> Any:
-        """Preserve compatible structured text-block shape when inserting a ref."""
-        if not isinstance(original_content, list):
-            return placeholder
-        for block in original_content:
-            if isinstance(block, str):
-                return [placeholder]
-            if not isinstance(block, dict):
-                continue
-            block_type = str(block.get("type") or "").lower()
-            if block_type not in {"text", "input_text", "output_text"}:
-                continue
-            for value_key in ("text", "content"):
-                text_value = block.get(value_key)
-                if isinstance(text_value, str):
-                    return [{"type": block_type, value_key: placeholder}]
-                if not isinstance(text_value, dict):
-                    continue
-                for nested_key in ("value", "content"):
-                    if isinstance(text_value.get(nested_key), str):
-                        return [{
-                            "type": block_type,
-                            value_key: {nested_key: placeholder},
-                        }]
-        # _is_textual_tool_result_content() only admits supported shapes, so
-        # this fallback is defensive rather than a normal provider path.
-        return [{"type": "text", "text": placeholder}]
-
-    @staticmethod
-    def _structured_text_block_value(block: Dict[str, Any]) -> str | None:
-        for value_key in ("text", "content"):
-            text_value = block.get(value_key)
-            if isinstance(text_value, str):
-                return text_value
-            if not isinstance(text_value, dict):
-                continue
-            for nested_key in ("value", "content"):
-                nested = text_value.get(nested_key)
-                if isinstance(nested, str):
-                    return nested
-        return None
-
-    @staticmethod
-    def _is_textual_tool_result_content(content: Any) -> bool:
-        """Return whether active stubbing can preserve provider semantics."""
-        if _contains_media_payload(content):
-            return False
-        if isinstance(content, str):
-            return True
-        if not isinstance(content, list) or not content:
-            return False
-        for block in content:
-            if isinstance(block, str):
-                continue
-            if not isinstance(block, dict):
-                return False
-            if str(block.get("type") or "").lower() not in {
-                "text",
-                "input_text",
-                "output_text",
-            }:
-                return False
-            if LCMEngine._structured_text_block_value(block) is None:
-                return False
-        return True
-
-    def _active_replay_recovery_tool_call_ids(
-        self,
-        messages: List[Dict[str, Any]],
-    ) -> set[str]:
-        recovery_tool_call_ids: set[str] = set()
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            for tool_call in message.get("tool_calls") or []:
-                if not isinstance(tool_call, dict):
-                    continue
-                call_id = _tool_call_id(tool_call)
-                function = tool_call.get("function") or {}
-                tool_name = str(function.get("name") or "") if isinstance(function, dict) else ""
-                if call_id and tool_name in {"lcm_describe", "lcm_expand"}:
-                    recovery_tool_call_ids.add(call_id)
-        return recovery_tool_call_ids
-
-    def _maybe_stub_active_tool_result(
-        self,
-        message: Dict[str, Any],
-        *,
-        recovery_tool_call_ids: set[str],
-    ) -> Dict[str, Any] | None:
-        if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
-            return None
-        if not getattr(self._config, "large_output_externalization_enabled", False):
-            return None
-        if not isinstance(message, dict) or message.get("role") != "tool":
-            return None
-        tool_call_id = str(message.get("tool_call_id") or "").strip()
-        if not tool_call_id or tool_call_id in recovery_tool_call_ids:
-            return None
-        content = message.get("content")
-        if not self._is_textual_tool_result_content(content):
-            return None
-        normalized_content = normalize_content_value(content) or ""
-        if not normalized_content or is_externalized_placeholder(normalized_content):
-            return None
-        threshold = max(
-            1,
-            int(
-                getattr(
-                    self._config,
-                    "large_output_active_replay_stub_threshold_tokens",
-                    25_000,
-                )
-                or 0
-            ),
-        )
-        if count_tokens(normalized_content) <= threshold:
-            return None
-        externalized = maybe_externalize_tool_output(
-            normalized_content,
-            tool_call_id=tool_call_id,
-            session_id=self._session_id,
-            config=self._config,
-            hermes_home=self._hermes_home,
-            force=True,
-        )
-        if externalized is None:
-            return None
-        replacement = dict(message)
-        replacement["content"] = self._active_tool_stub_content(
-            content,
-            externalized["placeholder"],
-        )
-        return replacement
-
-    def _stub_large_tool_results_for_active_replay(
-        self,
-        messages: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Replace eligible old tool payloads with durable refs for assembly.
-
-        This is provider-replay-only. It never mutates the input messages, raw
-        SQLite rows, or DAG lineage. The newest ``fresh_tail_count`` messages
-        stay inline.
-        """
-        if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
-            return messages
-        if not getattr(self._config, "large_output_externalization_enabled", False):
-            return messages
-        protected_tail_count = max(0, int(getattr(self._config, "fresh_tail_count", 0) or 0))
-        eligible_end = max(0, len(messages) - protected_tail_count)
-        if eligible_end <= 0:
-            return messages
-
-        recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(messages)
-
-        result = list(messages)
-        stubbed_count = 0
-        tokens_saved = 0
-        for idx, message in enumerate(messages[:eligible_end]):
-            replacement = self._maybe_stub_active_tool_result(
-                message,
-                recovery_tool_call_ids=recovery_tool_call_ids,
-            )
-            if replacement is None:
-                continue
-            result[idx] = replacement
-            stubbed_count += 1
-            tokens_saved += max(
-                0,
-                count_message_tokens(message) - count_message_tokens(replacement),
-            )
-
-        if stubbed_count:
-            logger.info(
-                "LCM active replay stubbing: replaced %d evictable tool result(s), saved about %d tokens",
-                stubbed_count,
-                tokens_saved,
-            )
-        return result
 
     def _sanitize_tool_pairs(
         self,
@@ -5680,7 +3819,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             expand_hint=self._extract_expand_hint(summary_text),
         )
         self._dag.add_node(condensed_node)
-        self._invalidate_rollups_for_published_node(condensed_node)
         return source_tokens, summary_tokens, level
 
     def _summary_frontier_nodes(self) -> List[SummaryNode]:
@@ -5765,7 +3903,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         note = (
             "\n\n[Note: This conversation uses Lossless Context Management (LCM). "
             "Earlier turns have been compacted into hierarchical summaries below. "
-            "Use lcm_grep to search history, lcm_describe to inspect the DAG, "
+            "Use lcm_grep to search history "
             "and lcm_expand to recover original details from any summary.]"
         )
         if isinstance(content, str):
@@ -5848,15 +3986,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if not isinstance(message, dict):
                 continue
             content_text = text_content_for_pattern_matching(message.get("content")) or ""
-            if (
-                self._matches_ignore_message_patterns(message)
-                or self._mapped_stored_row_matches_ignore_message_patterns(message)
-                or self._is_volatile_ignored_quarantine_placeholder(
-                    message,
-                    content_text,
-                )
-                or self._is_ignored_active_replay_placeholder(message, content_text)
-            ):
+            if self._is_volatile_ignored_quarantine_placeholder(message, content_text):
                 continue
             if self._preserved_objective_context_content(message):
                 return None
@@ -5869,142 +3999,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._build_preserved_objective_summary_part(message)
         return None
 
-    @staticmethod
-    def _newest_user_message_text(messages: List[Dict[str, Any]]) -> str:
-        """Return the newest real user turn's text (SPEC F injection query).
-
-        Scans from the tail so the block reflects the turn the host is about to
-        answer. Returns "" when the tail carries no user text (e.g. a tool-only
-        continuation) — the caller then leaves the feature inert.
-        """
-        for message in reversed(messages):
-            if not isinstance(message, dict) or message.get("role") != "user":
-                continue
-            text = (text_content_for_pattern_matching(message.get("content")) or "").strip()
-            if text:
-                return text
-        return ""
-
-    def _build_proactive_recall_message(
-        self,
-        tail_messages: List[Dict[str, Any]],
-        summary_role: str,
-        active_node_ids: set,
-    ) -> Optional[Dict[str, Any]]:
-        """Build the single proactive "relevant memories" block, or None.
-
-        SPEC F: at assembly time embed the newest user message, run the
-        lcm_recall pipeline (k=6, moderate scope bias), drop hits already in the
-        active context (summary-prefix node ids + current session) and hits
-        below the relevance floor, then render ONE budget-capped block. Any
-        failure or timeout injects nothing — assembly is never blocked. Wrapped
-        in <relevant-memories> so it is stripped before ingest/summarization and
-        never re-enters the lossless store as a real turn.
-        """
-        config = self._config
-        if not getattr(config, "proactive_recall_enabled", False):
-            return None
-        # Injection is an embedding-query feature: silently inert when embeddings
-        # are disabled/unwarmed (no provider to embed the newest message).
-        if not getattr(config, "embeddings_enabled", False):
-            return None
-
-        query = self._newest_user_message_text(tail_messages)
-        if not query:
-            return None
-
-        # SPEC F retrieval constants: small k, moderate scope bias (favor — never
-        # hard-filter — the current conversation).
-        recall_k = 6
-        scope_bias = 0.3
-        min_score = float(getattr(config, "proactive_recall_min_score", 0.01) or 0.0)
-        budget_tokens = int(getattr(config, "proactive_recall_budget_tokens", 500) or 0)
-        if budget_tokens <= 0:
-            return None
-        provider_override = getattr(config, "proactive_recall_provider", "") or ""
-
-        try:
-            raw = lcm_tools.lcm_recall(
-                {
-                    "query": query,
-                    "limit": recall_k,
-                    "scope_bias": scope_bias,
-                    "include": "all",
-                },
-                engine=self,
-                provider_override=provider_override,
-            )
-            payload = json.loads(raw)
-        except Exception:  # noqa: BLE001 - never let recall break assembly
-            logger.debug("LCM proactive recall failed; injecting nothing", exc_info=True)
-            self._proactive_recall_skipped_count += 1
-            return None
-
-        if payload.get("timeout"):
-            # Deadline hit: inject nothing this turn (contract), count it.
-            self._proactive_recall_timeout_count += 1
-            return None
-
-        surviving: list[dict] = []
-        for hit in payload.get("hits", []):
-            if not isinstance(hit, dict):
-                continue
-            # Dedupe: skip anything already represented in the active context —
-            # the current session (its summary prefix + recent tail window) and
-            # any summary node already placed in the prefix.
-            if hit.get("from_current_session"):
-                continue
-            node_id = hit.get("node_id")
-            if node_id is not None and node_id in active_node_ids:
-                continue
-            # Relevance floor.
-            if float(hit.get("score") or 0.0) < min_score:
-                continue
-            snippet = (hit.get("snippet") or "").strip()
-            if not snippet:
-                continue
-            surviving.append(hit)
-
-        if not surviving:
-            self._proactive_recall_skipped_count += 1
-            return None
-
-        # Render 1-3 items inside the token budget. The header labels the block
-        # as retrieved memory (provenance-honest, never asserted as fact).
-        header = (
-            "Possibly relevant memories (retrieved from earlier conversations — "
-            "context only, not asserted as fact):"
-        )
-        rendered_lines: list[str] = []
-        for hit in surviving[:3]:
-            ts = hit.get("timestamp") or 0
-            try:
-                when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts))) if ts else "unknown time"
-            except (TypeError, ValueError, OSError):
-                when = "unknown time"
-            snippet = (hit.get("snippet") or "").strip().replace("\n", " ")
-            expand = hit.get("expand_hint") or ""
-            line = f"- [{when}] {snippet}"
-            if expand:
-                line += f" (expand: {expand})"
-            candidate_lines = rendered_lines + [line]
-            block = self._wrap_relevant_memories(header, candidate_lines)
-            if count_message_tokens({"role": summary_role, "content": block}) > budget_tokens:
-                break
-            rendered_lines = candidate_lines
-
-        if not rendered_lines:
-            self._proactive_recall_skipped_count += 1
-            return None
-
-        content = self._wrap_relevant_memories(header, rendered_lines)
-        self._proactive_recall_injected_count += 1
-        return {"role": summary_role, "content": content}
-
-    @staticmethod
-    def _wrap_relevant_memories(header: str, lines: List[str]) -> str:
-        body = "\n".join([header, *lines])
-        return f"<relevant-memories>\n{body}\n</relevant-memories>"
 
     def _assemble_context(
         self,
@@ -6043,11 +4037,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             else self._effective_assembly_token_cap()
         )
 
-        # Stub durably externalized evictable tool payloads before the assembly
-        # budget pass so the selector sees their reduced provider-visible cost.
-        # The helper protects the configured fresh tail and is fail-open.
-        assembly_tail_messages = self._stub_large_tool_results_for_active_replay(tail_messages)
-        tail_selected = assembly_tail_messages
+        tail_selected = tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
             anchor_source = tail_messages
@@ -6058,7 +4048,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
             tail_for_selection = self._sanitize_active_context_messages(
-                assembly_tail_messages,
+                tail_messages,
                 insert_missing_tool_stubs=False,
             )
             skipped_tail_gap = False
@@ -6096,9 +4086,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
                 summary_parts.append(anchor_part)
 
-        # Node ids placed in the summary prefix — used to dedupe proactive-recall
-        # injection against summaries already visible in the active context.
-        active_summary_node_ids: set = set()
         all_nodes = self._dag.get_session_nodes(self._session_id)
         if all_nodes:
             # Group by depth, take the most recent uncondensed at each level
@@ -6108,7 +4095,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for d in depths:
                 uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, d)
                 for node in uncondensed:
-                    active_summary_node_ids.add(node.node_id)
                     depth_label = {
                         0: "Recent",
                         1: "Session Arc",
@@ -6135,17 +4121,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
                 result.append({"role": summary_role, "content": combined})
-
-        # Proactive memory injection (SPEC F, default-off). One bounded block is
-        # placed adjacent to the summary prefix — a stable position below the
-        # cache-stable summaries and above the volatile fresh tail — so the
-        # already-volatile tail region absorbs its per-turn variability and the
-        # cached summary prefix is left intact. Never inside the fresh tail.
-        proactive_msg = self._build_proactive_recall_message(
-            tail_messages, summary_role, active_summary_node_ids
-        )
-        if proactive_msg is not None:
-            result.append(proactive_msg)
 
         # Fresh tail
         result.extend(tail_selected)
@@ -6372,16 +4347,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         and empty turns).  Returns a brief text block suitable for injection
         into the summarizer prompt as ``focus_topic``.
 
-        IMPORTANT: The ``messages`` parameter must be ``working_messages``
-        (output of ``_ingest_messages``), not raw messages.  ``working_messages``
-        has already been redacted by ``_redact_active_replay_messages``.
-
-        As an additional safety layer, text extracted by
-        ``text_content_for_pattern_matching`` is run through
-        ``redact_sensitive_text`` with the active config.  This covers
-        sensitive values that ``_redact_active_replay_messages`` misses
-        (e.g., dict/JSON token content deserialized into text,
-        bearer-style auth text that survived structured-content flattening).
+        The ``messages`` parameter must be ``working_messages`` (output of
+        ``_ingest_messages``), not raw messages.
 
         Mirrors Hermes upstream ``ContextCompressor._derive_auto_focus_topic``
         from ``fix/compression-auto-focus-topic``.
@@ -6397,18 +4364,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if self._is_context_summary_content(content):
                 continue
             text = (text_content_for_pattern_matching(content) or "").strip()
-            if self._matches_ignore_message_patterns(msg) or self._is_volatile_ignored_quarantine_placeholder(
-                msg,
-                text,
-            ) or self._is_ignored_active_replay_placeholder(msg, text):
+            if self._is_volatile_ignored_quarantine_placeholder(msg, text):
                 continue
-            # Additional redaction safety net: run extracted text through the
-            # configured redaction path.  _redact_active_replay_messages uses
-            # parse_json_strings=False for content, so structured content
-            # (dict/JSON tokens, bearer-style auth text) may not be fully
-            # covered.  This extra pass ensures the same redaction rules apply
-            # to whatever text is extracted for the focus topic.
-            text = redact_sensitive_text(text, self._config)
             if not text:
                 continue
             text = " ".join(text.split())
@@ -6490,8 +4447,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         what would change. When ``apply=True``, advances the lifecycle frontier
         marker past the pre-tail raw messages so they are no longer replayed
         into active context on subsequent bootstrap. Raw messages remain in
-        the SQLite store and are recoverable through ``lcm_load_session`` and
-        ``lcm_expand`` — the lossless raw recovery contract is preserved.
+        the SQLite store and are reachable through ``lcm_expand(store_id=...)``.
 
         Refuses on sessions that are unbound, ignored, or stateless.
 
@@ -6519,10 +4475,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         Refusal/no-op reason codes (returned as ``reason``):
 
         - ``no_active_session``: engine has no bound session or conversation.
-        - ``session_ignored``: foreground session matched
-          ``LCM_IGNORE_SESSION_PATTERNS``.
-        - ``session_stateless``: foreground session matched
-          ``LCM_STATELESS_SESSION_PATTERNS``.
+        - ``session_stateless``: the bound session bypasses LCM storage.
         - ``no_pre_tail_content``: no stored messages precede the resolved
           count/token-bounded fresh tail; nothing to rotate.
         - ``empty_tail``: tail query returned no rows despite a non-zero
@@ -6538,8 +4491,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not session_id or not conversation_id:
             return {"ok": False, "reason": "no_active_session"}
-        if self._session_ignored:
-            return {"ok": False, "reason": "session_ignored", "session_id": session_id}
         if self._session_stateless:
             return {"ok": False, "reason": "session_stateless", "session_id": session_id}
 
@@ -6654,12 +4605,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
         self._store.close()
         self._dag.close()
         self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()

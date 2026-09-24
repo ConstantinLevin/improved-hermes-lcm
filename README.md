@@ -11,7 +11,10 @@ the agent gets tools to fetch them back.
 
 The code is upstream's v1.0.0-rc.1 (commit 8d1b1e6) with its tests, benchmark harnesses,
 documents, release notes and lossless-claw importer removed, and two false lossless claims
-deleted. Its behaviour is upstream's,
+deleted. Upstream's opt-in subsystems (recall, embeddings, evidence, assertions, rollups,
+extraction) and the switches that lose data on request (redaction, large-output externalisation,
+transcript GC, ignore patterns, deletion on `/new`, cleanup commands) are removed too; the agent
+gets six tools. Its behaviour is otherwise upstream's,
 including every loss listed below. None of what the fork will do instead is built. The fork is
 not usable for its purpose yet; the work is the issues in this repository's tracker.
 

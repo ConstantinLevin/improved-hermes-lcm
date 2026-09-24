@@ -10,24 +10,11 @@ Hermes-LCM keeps raw messages in profile-local SQLite and builds a summary DAG t
 4. Context assembly combines selected summaries with a protected fresh raw tail.
 5. Recall tools recover exact source rows or bounded expanded context when summaries are insufficient.
 
-Raw messages are source truth. Summary nodes, embeddings, temporal rollups, query views, and assertions are derived and rebuildable layers with explicit provenance.
+Raw messages are source truth. Summary nodes are a derived layer with explicit provenance.
 
 ## Scope model
 
 - Current-session DAG operations use the active engine/session binding.
-- `lcm_recall` searches all conversations already stored in the local LCM database.
-- `lcm_load_session` enumerates a known LCM session.
 - Hermes `session_search` covers host-tracked history outside `lcm.db`.
 
 Do not silently treat those stores or scopes as interchangeable.
-
-## V4 derived state
-
-The V4 branch adds same-database, default-off assertion/query-view state and provider-neutral reasoning/evidence components. They remain subordinate to raw messages:
-
-- assertions require exact message IDs, spans, quotes, and lifecycle provenance;
-- query views cache evidence dependencies and coverage, never final prose;
-- computation validates exact operands and emits an immutable trace;
-- evidence packs return bounded evidence/computation, not an authoritative answer.
-
-Unknown source/event time and unresolved conflict are valid states. Derived data must fail closed rather than manufacture certainty.

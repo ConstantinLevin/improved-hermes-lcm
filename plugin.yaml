@@ -4,17 +4,13 @@ description: "Lossless Context Management context engine for Hermes; a fork of h
 author: "ConstantinLevin (fork of hermes-lcm by Stephen Schoettler)"
 provides_tools:
   - lcm_grep
-  - lcm_recall
-  - lcm_query_state
-  - lcm_compute
-  - lcm_compile_evidence
-  - lcm_evidence_pack
-  - lcm_retrieve
-  - lcm_recent
-  - lcm_load_session
-  - lcm_describe
   - lcm_expand
   - lcm_expand_query
   - lcm_status
   - lcm_inspect
   - lcm_doctor
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - subagent_start
+  - subagent_stop

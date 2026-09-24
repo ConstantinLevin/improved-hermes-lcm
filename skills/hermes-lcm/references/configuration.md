@@ -37,9 +37,8 @@ Start with:
 - `LCM_FRESH_TAIL_COUNT`: newest messages kept raw;
 - `LCM_LEAF_CHUNK_TOKENS`: maximum raw material per leaf compaction group;
 - `LCM_DATABASE_PATH`: profile-local SQLite path when the default is unsuitable;
-- `LCM_IGNORE_SESSION_PATTERNS` and `LCM_STATELESS_SESSION_PATTERNS`: storage ownership boundaries;
-- summary/embedding provider settings only after confirming credentials, cost, and data handling.
+- summary provider settings only after confirming credentials, cost, and data handling.
 
-Optional slash commands are disabled by default with `LCM_ENABLE_SLASH_COMMAND=false`. Destructive cleanup apply is separately guarded. Do not enable mutation surfaces merely to diagnose a problem.
+Optional slash commands are disabled by default with `LCM_ENABLE_SLASH_COMMAND=false`. Do not enable mutation surfaces merely to diagnose a problem.
 
 Change one tuning variable at a time, then re-check `lcm_status`, context pressure, summary health, latency, and actual answer quality.

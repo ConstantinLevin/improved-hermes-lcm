@@ -20,27 +20,13 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .externalize import (
-    extract_externalized_ref,
-    externalized_tool_result_has_persisted_output_marker,
-    find_externalized_tool_result_content_for_call,
-    load_externalized_payload,
-)
 from .ingest_protection import (
-    _add_inline_persisted_output_generation_metadata,
-    _add_inline_persisted_output_identity_metadata,
-    _expected_persisted_output_chars,
     _has_inline_persisted_output_generation_metadata,
-    _has_lossy_sensitive_redaction,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
-    _persisted_output_marker_identity_digest,
-    _persisted_output_saved_path,
     recover_hermes_persisted_output_with_file_stat,
-    redact_sensitive_value,
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
@@ -87,136 +73,10 @@ class ReconcileMixin:
         except (TypeError, ValueError):
             return str(tool_calls)
 
-    def _has_durable_persisted_output_replay_identity(self, msg: Dict[str, Any]) -> bool:
-        role = str(msg.get("role") or "unknown")
-        content = normalize_content_value(msg.get("content")) or ""
-        if role != "tool" or not _is_hermes_persisted_output_marker(content):
-            return False
-        expected_chars = _expected_persisted_output_chars(content)
-        persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
-        if (
-            expected_chars is None
-            or not persisted_output_source_path
-            or not persisted_output_preview_sha256
-        ):
-            return False
-        recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content)
-        if recovered_with_stat is None:
-            return False
-        require_live_file_freshness = True
-        durable_content = find_externalized_tool_result_content_for_call(
-            tool_call_id=str(msg.get("tool_call_id") or ""),
-            session_id=str(msg.get("session_id") or self._session_id or ""),
-            expected_chars=expected_chars,
-            persisted_output_source_path=persisted_output_source_path,
-            persisted_output_preview_sha256=persisted_output_preview_sha256,
-            require_persisted_output_file_not_newer=require_live_file_freshness,
-            allow_redacted_preview_match=allow_redacted_preview_match,
-            config=self._config,
-            hermes_home=self._hermes_home,
-        )
-        if durable_content is None:
-            return False
-        if recovered_with_stat is not None:
-            recovered_content, _file_stat = recovered_with_stat
-            if not self._recovered_content_matches_durable_identity(recovered_content, durable_content):
-                return False
-        return True
 
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
-        if (
-            role == "tool"
-            and _is_hermes_persisted_output_marker(content)
-            and bool(getattr(self._config, "large_output_externalization_enabled", True))
-        ):
-            expected_chars = _expected_persisted_output_chars(content)
-            persisted_output_source_path = _persisted_output_saved_path(content)
-            persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
-            durable_content = None
-            recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content) if not stored_row else None
-            recovered_content = recovered_with_stat[0] if recovered_with_stat is not None else None
-            recovered_identity_content = None
-            if recovered_content is not None:
-                recovered_identity_content = normalize_content_value(
-                    redact_sensitive_value(
-                        recovered_content,
-                        self._config,
-                        parse_json_strings=False,
-                    )
-                )
-            require_live_file_freshness = recovered_with_stat is not None
-
-            def live_file_generation_identity() -> str:
-                try:
-                    live_stat = Path(str(persisted_output_source_path)).stat()
-                    return (
-                        "[LCM persisted-output live file: "
-                        f"path={persisted_output_source_path}; "
-                        f"mtime_ns={live_stat.st_mtime_ns}; "
-                        f"chars={expected_chars}]"
-                    )
-                except OSError:
-                    return (
-                        "[LCM persisted-output live file: "
-                        f"path={persisted_output_source_path}; "
-                        f"chars={expected_chars}]"
-                    )
-
-            if (
-                not stored_row
-                and expected_chars is not None
-                and persisted_output_source_path
-                and persisted_output_preview_sha256
-                and recovered_with_stat is not None
-            ):
-                durable_content = find_externalized_tool_result_content_for_call(
-                    tool_call_id=str(msg.get("tool_call_id") or ""),
-                    session_id=str(msg.get("session_id") or self._session_id or ""),
-                    expected_chars=expected_chars,
-                    persisted_output_source_path=persisted_output_source_path,
-                    persisted_output_preview_sha256=persisted_output_preview_sha256,
-                    require_persisted_output_file_not_newer=require_live_file_freshness,
-                    allow_redacted_preview_match=allow_redacted_preview_match,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-            if durable_content is not None and (
-                recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
-            ):
-                content = durable_content
-            elif recovered_content is not None:
-                stale_durable_content = find_externalized_tool_result_content_for_call(
-                    tool_call_id=str(msg.get("tool_call_id") or ""),
-                    session_id=str(msg.get("session_id") or self._session_id or ""),
-                    expected_chars=expected_chars,
-                    persisted_output_source_path=persisted_output_source_path,
-                    persisted_output_preview_sha256=persisted_output_preview_sha256,
-                    allow_redacted_preview_match=allow_redacted_preview_match,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if (
-                    stale_durable_content is not None
-                    and self._recovered_content_matches_durable_identity(recovered_content, stale_durable_content)
-                    and not _has_lossy_sensitive_redaction(stale_durable_content)
-                    and not _has_lossy_sensitive_redaction(recovered_identity_content)
-                ):
-                    content = stale_durable_content
-                elif stale_durable_content is not None:
-                    content = live_file_generation_identity()
-                elif recovered_with_stat is not None:
-                    content = _add_inline_persisted_output_generation_metadata(
-                        _add_inline_persisted_output_identity_metadata(
-                            content,
-                            _persisted_output_marker_identity_digest(content),
-                        ),
-                        recovered_with_stat[1],
-                    )
-                elif recovered_identity_content is not None:
-                    content = recovered_identity_content
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")
@@ -225,15 +85,6 @@ class ReconcileMixin:
                 session_id=session_id,
             )
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
-        ref = extract_externalized_ref(content)
-        if ref and "quarantined_assistant_output" not in content:
-            payload = load_externalized_payload(
-                ref,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-            if payload is not None and isinstance(payload.get("content"), str):
-                content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
             role,
@@ -268,64 +119,6 @@ class ReconcileMixin:
         )
         return (role, stripped, tool_call_id, tool_calls)
 
-    def _stored_row_has_durable_persisted_output_marker(self, row: Dict[str, Any]) -> bool:
-        if str(row.get("role") or "") != "tool":
-            return False
-        content = normalize_content_value(row.get("content")) or ""
-        ref = extract_externalized_ref(content)
-        if not ref:
-            return False
-        return externalized_tool_result_has_persisted_output_marker(
-            ref,
-            config=self._config,
-            hermes_home=self._hermes_home,
-        )
-
-    @staticmethod
-    def _persisted_output_durable_wildcard_identity(
-        identity: tuple[str, str, str, str],
-    ) -> tuple[str, str, str, str]:
-        role, _content, tool_call_id, tool_calls = identity
-        return (role, "[LCM persisted-output durable replay]", tool_call_id, tool_calls)
-
-    def _matches_persisted_output_durable_full_replay(
-        self,
-        candidate_messages: list[Dict[str, Any]],
-        candidate_prefix: list[tuple[str, str, str, str]],
-        stored_tail: list[tuple[str, str, str, str]],
-        stored_tail_rows: list[Dict[str, Any]] | None,
-    ) -> bool:
-        if not stored_tail_rows or len(candidate_prefix) != len(stored_tail) or len(candidate_messages) != len(candidate_prefix):
-            return False
-        transformed_candidate: list[tuple[str, str, str, str]] = []
-        transformed_stored: list[tuple[str, str, str, str]] = []
-        saw_persisted_output = False
-        for candidate_msg, candidate_identity, stored_identity, stored_row in zip(
-            candidate_messages,
-            candidate_prefix,
-            stored_tail,
-            stored_tail_rows,
-        ):
-            candidate_content = normalize_content_value(candidate_msg.get("content")) or ""
-            candidate_is_persisted_marker = (
-                str(candidate_msg.get("role") or "") == "tool"
-                and _is_hermes_persisted_output_marker(candidate_content)
-            )
-            stored_is_persisted_output = self._stored_row_has_durable_persisted_output_marker(stored_row)
-            if candidate_is_persisted_marker or stored_is_persisted_output:
-                if (
-                    not candidate_is_persisted_marker
-                    or not stored_is_persisted_output
-                    or not self._has_durable_persisted_output_replay_identity(candidate_msg)
-                ):
-                    return False
-                saw_persisted_output = True
-                transformed_candidate.append(self._persisted_output_durable_wildcard_identity(candidate_identity))
-                transformed_stored.append(self._persisted_output_durable_wildcard_identity(stored_identity))
-                continue
-            transformed_candidate.append(candidate_identity)
-            transformed_stored.append(stored_identity)
-        return saw_persisted_output and transformed_candidate == transformed_stored
 
     @classmethod
     def _identity_content_for_active_cleanup(cls, content: str) -> Any:
@@ -452,7 +245,6 @@ class ReconcileMixin:
                 msg
                 for msg in candidate_messages
                 if not self._is_replayed_context_scaffold_message(msg)
-                and not self._matches_ignore_message_patterns(msg)
             ]
             candidate_non_placeholder_messages = [
                 msg
@@ -460,17 +252,6 @@ class ReconcileMixin:
                 if not self._is_volatile_ignored_quarantine_placeholder(
                     msg,
                     text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
-                    and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
             ]
             filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
@@ -536,12 +317,6 @@ class ReconcileMixin:
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
                 for msg in candidate_identity_messages
             )
-            matches_durable_persisted_output_full_replay = self._matches_persisted_output_durable_full_replay(
-                candidate_identity_messages,
-                candidate_prefix,
-                stored_tail,
-                stored_tail_rows,
-            )
             candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
@@ -574,7 +349,6 @@ class ReconcileMixin:
                 not matches_sanitized_tail
                 and not matches_raw_tail
                 and not matches_inline_generation_cleanup_tail
-                and not matches_durable_persisted_output_full_replay
             ):
                 continue
 
@@ -594,17 +368,6 @@ class ReconcileMixin:
                     msg,
                     text_content_for_pattern_matching(msg.get("content")) or "",
                 )
-                or self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                or (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
-                    and self._matches_ignore_message_patterns(msg, stored_row=True)
-                )
                 for msg in candidate_messages
             )
             has_quarantined_singleton_replay = (
@@ -619,13 +382,6 @@ class ReconcileMixin:
                 if len(candidate_identity_messages) == 1
                 else ""
             )
-            has_externalized_singleton_replay = (
-                matches_raw_tail
-                and len(candidate_prefix) == 1
-                and raw_session_count == 1
-                and bool(extract_externalized_ref(candidate_singleton_original_content))
-                and candidate_prefix == stored_tail
-            )
             has_persisted_marker_singleton_replay = (
                 matches_raw_tail
                 and not candidate_has_unrecoverable_persisted_marker
@@ -634,15 +390,6 @@ class ReconcileMixin:
                 and candidate_prefix == stored_tail
                 and candidate_prefix[0][0] == "tool"
                 and _is_hermes_persisted_output_marker(candidate_singleton_original_content)
-            )
-            has_durable_persisted_marker_suffix_replay = (
-                (matches_sanitized_tail or matches_raw_tail)
-                and any(
-                    str(msg.get("role") or "") == "tool"
-                    and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                    and self._has_durable_persisted_output_replay_identity(msg)
-                    for msg in candidate_messages
-                )
             )
             has_filtered_full_replay = (
                 matches_sanitized_tail
@@ -675,8 +422,6 @@ class ReconcileMixin:
             )
             has_persisted_marker_specific_replay_evidence = (
                 not candidate_has_persisted_marker
-                or has_durable_persisted_marker_suffix_replay
-                or matches_durable_persisted_output_full_replay
                 or has_inline_generation_cleanup_replay
                 or has_inline_persisted_generation_suffix_replay
                 or has_persisted_marker_singleton_replay
@@ -728,10 +473,7 @@ class ReconcileMixin:
             )
             if (
                 has_effective_full_replay
-                or has_externalized_singleton_replay
                 or has_persisted_marker_singleton_replay
-                or has_durable_persisted_marker_suffix_replay
-                or matches_durable_persisted_output_full_replay
                 or has_inline_generation_cleanup_replay
                 or has_inline_persisted_generation_suffix_replay
                 or has_raw_full_replay
@@ -771,7 +513,6 @@ class ReconcileMixin:
             self._message_replay_identity(msg)
             for msg in messages
             if not self._is_replayed_context_scaffold_message(msg)
-            and not self._matches_ignore_message_patterns(msg)
         ]
 
     def _is_suspicious_stale_no_overlap_snapshot(
@@ -845,19 +586,14 @@ class ReconcileMixin:
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
             return 0
-        stored_tail_rows = [
-            row
-            for row in stored_rows
-            if not self._matches_ignore_message_patterns(row, stored_row=True)
-        ]
         stored_tail = [
             self._message_replay_identity(row, stored_row=True)
-            for row in stored_tail_rows
+            for row in stored_rows
         ]
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
-            stored_tail_rows=stored_tail_rows,
+            stored_tail_rows=stored_rows,
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
@@ -894,9 +630,6 @@ class ReconcileMixin:
             limit=tail_limit,
         )
         stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
-        # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
-        # filters may suppress noisy rows for tail reconciliation, but filtered
-        # history alone must not create replay evidence for skipping a batch.
         incoming_has_unproofed_raw_persisted_marker = any(
             str(msg.get("role") or "") == "tool"
             and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
@@ -1014,12 +747,6 @@ class ReconcileMixin:
                 _raw_placeholder_identity_cache[probe_idx] = cached
             return cached
         active_surplus_skips: dict[tuple[Any, ...], int] = {}
-        generated_surplus_skip_message_ids: set[int] = set()
-        generated_placeholder_message_ids = getattr(
-            self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
-        )
         for identity, active_count in active_identity_counts.items():
             wanted_cleanup_identity = self._active_cleanup_replay_identity(identity)
             stored_exact = stored_identity_counts.get(identity, 0)
@@ -1028,18 +755,7 @@ class ReconcileMixin:
                 stored_cleanup = stored_cleanup_identity_counts.get(wanted_cleanup_identity, 0)
             stored_available = max(stored_exact, stored_cleanup)
             if active_count > stored_available:
-                surplus_count = active_count - stored_available
-                for msg in messages:
-                    if surplus_count <= 0:
-                        break
-                    if id(msg) not in generated_placeholder_message_ids:
-                        continue
-                    if self._message_replay_identity(msg) != identity:
-                        continue
-                    generated_surplus_skip_message_ids.add(id(msg))
-                    surplus_count -= 1
-                if surplus_count > 0:
-                    active_surplus_skips[identity] = surplus_count
+                active_surplus_skips[identity] = active_count - stored_available
 
         placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         for msg in messages:
@@ -1047,7 +763,6 @@ class ReconcileMixin:
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
                 raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
                 placeholder_identity_counts[raw_identity] = placeholder_identity_counts.get(raw_identity, 0) + 1
-        self._current_compress_placeholder_identity_counts = placeholder_identity_counts
 
         def find_raw_placeholder_match_index(
             raw_identity: tuple[str, str, str, str],
@@ -1104,8 +819,6 @@ class ReconcileMixin:
                         probe_idx = raw_match_idx + 1
                         continue
                 message_identity = self._message_replay_identity(remaining_msg)
-                if id(remaining_msg) in generated_surplus_skip_message_ids:
-                    continue
                 surplus = local_surplus_skips.get(message_identity, 0)
                 if surplus > 0:
                     local_surplus_skips[message_identity] = surplus - 1
@@ -1159,8 +872,6 @@ class ReconcileMixin:
                 if id(msg) in ids_by_message_id:
                     continue
             message_identity = self._message_replay_identity(msg)
-            if id(msg) in generated_surplus_skip_message_ids:
-                continue
             surplus = active_surplus_skips.get(message_identity, 0)
             if surplus > 0:
                 active_surplus_skips[message_identity] = surplus - 1

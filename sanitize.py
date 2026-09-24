@@ -2,8 +2,7 @@
 
 Pure functions that shape the active replay context emitted back to providers:
 strip internal/reasoning content from assistant messages, decide whether an
-assistant message still has visible content, and detect sensitive-redaction
-markers. Raw store and DAG history stay lossless -- these only sanitize the
+assistant message still has visible content. Raw store and DAG history stay lossless -- these only sanitize the
 active context, never stored rows.
 
 Extracted verbatim from ``LCMEngine`` (WS5 seam 2). These depend only on
@@ -29,20 +28,6 @@ _INTERNAL_ASSISTANT_PART_TYPES = {
     "thought",
     "thinking",
 }
-
-
-def _contains_sensitive_redaction(value: Any) -> bool:
-    if isinstance(value, str):
-        return "[LCM sensitive redaction:" in value
-    if isinstance(value, dict):
-        return any(
-            _contains_sensitive_redaction(item)
-            for pair in value.items()
-            for item in pair
-        )
-    if isinstance(value, list):
-        return any(_contains_sensitive_redaction(item) for item in value)
-    return False
 
 
 def _structured_part_text(part: Dict[str, Any]) -> str:
@@ -78,19 +63,6 @@ def _structured_part_has_visible_assistant_content(part: Any) -> bool:
     # images/audio/annotations in provider-specific formats).  Preserve
     # them rather than risk dropping a legitimate assistant turn.
     return True
-
-
-def _assistant_message_has_visible_content(msg: Dict[str, Any]) -> bool:
-    content = msg.get("content")
-    if content is None:
-        return False
-    if isinstance(content, str):
-        return bool(_strip_reasoning_blocks(content).strip())
-    if isinstance(content, list):
-        return any(_structured_part_has_visible_assistant_content(part) for part in content)
-    if isinstance(content, dict):
-        return _structured_part_has_visible_assistant_content(content)
-    return bool(str(content).strip())
 
 
 def _strip_structured_text_part(part: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -170,9 +142,3 @@ def _clean_active_assistant_message(msg: Dict[str, Any]) -> Dict[str, Any] | Non
     return cleaned
 
 
-def _should_drop_active_assistant_message(msg: Dict[str, Any]) -> bool:
-    if msg.get("role") != "assistant":
-        return False
-    if msg.get("tool_calls"):
-        return False
-    return _clean_active_assistant_message(msg) is None

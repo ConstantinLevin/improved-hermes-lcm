@@ -2,8 +2,7 @@
 
 Extracted verbatim from :mod:`hermes_lcm.engine` as ``ResetStateMixin``
 (WS5 seam). The methods clear the session-scoped counters, compaction
-progress, and per-turn placeholder-boundary bookkeeping when a session is
-reset or rolled over. State stays on the engine (accessed via ``self``);
+progress when a session is reset or rolled over. State stays on the engine (accessed via ``self``);
 mixing this in leaves every call site and ``self._*`` reference unchanged.
 """
 
@@ -53,9 +52,3 @@ class ResetStateMixin:
         """
         self._reset_session_counters()
         self._reset_compaction_progress()
-        self._generated_ignored_active_replay_placeholder_hashes = set()
-        self._generated_ignored_active_replay_placeholder_message_ids = set()
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget = {}
-        self._compression_boundary_active_placeholder_digest_ordinals = {}
-        self._compression_boundary_stored_placeholder_digest_counts = {}

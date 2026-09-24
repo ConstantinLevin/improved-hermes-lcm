@@ -48,16 +48,12 @@ def state_db_path_for_engine(engine: Any) -> Path:
 def has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
     """Return whether lifecycle diagnostics should be treated as warning evidence.
 
-    Retained-history drift is intentionally read-only diagnostic context. Keep the
-    doctor warning for concrete operator action (empty lifecycle rows that the
-    explicit backup-first cleanup path can prune) or diagnostic unreadability, but
-    do not make overall health unhealthy solely because historical LCM/state
-    indexes no longer agree.
+    Retained-history drift, including lifecycle rows with no stored data, is
+    read-only diagnostic context. Warn only when the diagnostic could not read the
+    host state database; do not make overall health unhealthy solely because
+    historical LCM/state indexes no longer agree.
     """
-    empty_lifecycle_rows = int(stats.get("empty_lifecycle_rows", 0) or 0)
-    return empty_lifecycle_rows > 0 or (
-        bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
-    )
+    return bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
 
 
 def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
@@ -85,44 +81,22 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
     elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:
         if status == "warn" and isinstance(detail, dict) and detail.get("status") == "unchecked":
             action = DOCTOR_ACTION_INSPECT
-            command = "rerun `/lcm doctor` with read-write SQLite access if a deep FTS integrity result is needed"
+            command = "rerun the doctor with read-write SQLite access if a deep FTS integrity result is needed"
             warning_only = True
             rationale = "the deep FTS check could not run, but this is not evidence that the index is corrupt"
         else:
             action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
-            command = "run `/lcm doctor repair` first; if it still recommends repair, run `/lcm backup` before `/lcm doctor repair apply`"
+            command = "back up the database, then rebuild the FTS index from the stored rows"
             rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
     elif name == "sqlite_storage":
         command = "inspect journal/quick_check output and database/WAL size; restore from backup if SQLite reports corruption"
     elif name == "payload_storage":
-        missing_refs = 0
-        heartbeat_rows = 0
-        suspicious_rows = 0
-        if isinstance(detail, dict):
-            missing_refs = int(detail.get("externalized_payload_refs_missing", 0) or 0)
-            heartbeat_rows = len(detail.get("heartbeat_noise_rows") or [])
-            suspicious_rows = sum(
-                len(detail.get(key) or [])
-                for key in (
-                    "suspicious_data_uri_content_rows",
-                    "suspicious_data_uri_tool_calls_rows",
-                    "suspicious_base64_like_rows",
-                    "suspicious_repetitive_assistant_rows",
-                )
-            )
-        if status == "warn" and heartbeat_rows and not missing_refs and not suspicious_rows:
-            action = DOCTOR_ACTION_SAFE_IGNORE
-            command = "safe to ignore unless heartbeat/progress noise is crowding useful recall; consider message/session filters for future rows"
-            rationale = "heartbeat rows are read-only noise diagnostics, not corruption"
+        command = "inspect the missing ingest side-file refs; restore missing side files from backup before deleting or rewriting anything"
+        if status == "warn":
+            warning_only = True
+            rationale = "the rows still hold their placeholders; the side files hold the original payloads"
         else:
-            command = "inspect payload rows/refs; restore missing externalized payload files from backup before deleting or rewriting anything"
-            if status == "warn":
-                warning_only = True
-                rationale = "payload warnings may represent preserved user/tool data"
-            else:
-                rationale = "payload diagnostic failures mean doctor could not read storage risk state reliably"
-    elif name == "sensitive_pattern_handling":
-        command = "inspect LCM_SENSITIVE_PATTERNS settings; remove unknown names or configure supported catalog entries"
+            rationale = "payload diagnostic failures mean doctor could not read side-file state reliably"
     elif name == "orphaned_dag_nodes":
         command = "inspect affected DAG/source IDs; do not auto-delete summaries without confirming recall impact"
         if status == "warn":
@@ -139,13 +113,13 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = "inspect LCM_* environment/config values and adjust only intentional operator overrides"
     elif name == "source_lineage_hygiene" and status == "warn":
         action = DOCTOR_ACTION_SAFE_IGNORE
-        command = "safe to ignore legacy blank-source observations; use `/lcm doctor source` only when you intentionally want backup-first normalization"
-        rationale = "legacy blank sources are normalized to unknown for compatibility"
+        command = "safe to ignore legacy blank-source observations"
+        rationale = "legacy blank sources are read as unknown for compatibility"
     elif name == "source_lineage_hygiene":
-        command = "inspect source-lineage diagnostics and SQLite read errors before running any source normalization workflow"
+        command = "inspect source-lineage diagnostics and SQLite read errors"
         rationale = "source-lineage failures indicate the doctor could not read attribution state reliably"
     elif name == "lifecycle_fragmentation":
-        command = "inspect lifecycle categories; only use explicit backup-first lifecycle cleanup for empty lifecycle rows"
+        command = "inspect lifecycle categories and the host state database path"
         if status == "warn":
             warning_only = True
             rationale = "not every lifecycle/state mismatch is harmful or safe to mutate"
@@ -156,10 +130,6 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = "safe to ignore if compaction proceeds normally; inspect lcm_status only if pressure stays high or compaction loops"
         warning_only = True
         rationale = "context pressure is an operating state, not persisted-state corruption"
-    elif name == "cleanup_candidates":
-        action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
-        command = "run `/lcm doctor clean` first; if candidates are expected junk/noise, run `/lcm backup` before `/lcm doctor clean apply`"
-        rationale = "candidate cleanup deletes rows and must stay preview-and-backup gated"
 
     return {
         "check": name,

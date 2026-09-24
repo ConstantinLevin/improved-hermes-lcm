@@ -18,7 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -28,9 +28,6 @@ from .db_bootstrap import (
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
-
-_DELETE_SESSION_SCOPE_TABLE = "temp_lcm_delete_session_scope"
-_DELETE_SESSION_SCOPE_INSERT_CHUNK = 512
 from .search_query import (
     AGE_DECAY_RATE,
     compute_search_candidate_cap,
@@ -159,8 +156,6 @@ class SummaryNode:
 class SummaryDAG:
     """SQLite-backed DAG of summary nodes."""
 
-    DELETE_SESSION_SCOPE_TABLE = _DELETE_SESSION_SCOPE_TABLE
-
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
@@ -270,123 +265,6 @@ class SummaryDAG:
             node.node_id = cur.lastrowid
             return node.node_id
 
-    @staticmethod
-    def stage_delete_session_scope(
-        conn: sqlite3.Connection,
-        session_ids: Sequence[str],
-    ) -> int:
-        """Stage an arbitrarily large caller-owned session scope in TEMP SQL."""
-        normalized = tuple(sorted({str(value) for value in session_ids if value}))
-        conn.execute(
-            f"CREATE TEMP TABLE IF NOT EXISTS {_DELETE_SESSION_SCOPE_TABLE}("
-            "session_id TEXT PRIMARY KEY) WITHOUT ROWID"
-        )
-        conn.execute(f"DELETE FROM {_DELETE_SESSION_SCOPE_TABLE}")
-        for offset in range(0, len(normalized), _DELETE_SESSION_SCOPE_INSERT_CHUNK):
-            conn.executemany(
-                f"INSERT INTO {_DELETE_SESSION_SCOPE_TABLE}(session_id) VALUES(?)",
-                ((value,) for value in normalized[offset:offset + _DELETE_SESSION_SCOPE_INSERT_CHUNK]),
-            )
-        return len(normalized)
-
-    @staticmethod
-    def delete_node_batch(
-        conn: sqlite3.Connection,
-        session_ids: Sequence[str],
-        *,
-        min_depth: int | None = None,
-        batch_size: int = 256,
-        staged_scope: bool = False,
-    ) -> list[int]:
-        """Delete and return one deterministic, SQL-bounded node-id batch.
-
-        The caller owns transaction boundaries. Temporal invalidation remains
-        trigger-owned; the returned exact ids are for external consumers such
-        as the embedding purge and are never pre-enumerated corpus-wide.
-        """
-        limit = max(1, min(256, int(batch_size)))
-        if not staged_scope and not SummaryDAG.stage_delete_session_scope(conn, session_ids):
-            return []
-        where = "1 = 1"
-        args: list[object] = []
-        order = "n.session_id, n.node_id"
-        if min_depth is not None:
-            where += " AND n.depth < ?"
-            args.append(int(min_depth))
-            order = "n.session_id, n.depth, n.node_id"
-        rows = conn.execute(
-            f"SELECT n.node_id FROM summary_nodes AS n "
-            f"JOIN {_DELETE_SESSION_SCOPE_TABLE} AS scope "
-            f"ON scope.session_id = n.session_id WHERE {where} "
-            f"ORDER BY {order} LIMIT ?",
-            (*args, limit),
-        ).fetchall()
-        node_ids = [int(row[0]) for row in rows]
-        if node_ids:
-            id_placeholders = ",".join("?" for _ in node_ids)
-            conn.execute(
-                f"DELETE FROM summary_nodes WHERE node_id IN ({id_placeholders})",
-                node_ids,
-            )
-        return node_ids
-
-    def _delete_nodes_batched(
-        self,
-        session_id: str,
-        *,
-        min_depth: int | None,
-        on_deleted_batch: Callable[[list[int]], None] | None,
-    ) -> int:
-        deleted = 0
-        while True:
-            with self._db_lock:
-                try:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    node_ids = self.delete_node_batch(
-                        self._conn,
-                        (session_id,),
-                        min_depth=min_depth,
-                    )
-                    self._conn.commit()
-                except Exception:
-                    self._conn.rollback()
-                    raise
-            if not node_ids:
-                return deleted
-            deleted += len(node_ids)
-            if on_deleted_batch is not None:
-                on_deleted_batch(node_ids)
-
-    def delete_below_depth(
-        self,
-        session_id: str,
-        min_depth: int,
-        *,
-        on_deleted_batch: Callable[[list[int]], None] | None = None,
-    ) -> int:
-        """Delete all nodes for a session with depth < min_depth.
-
-        Returns the number of deleted nodes. Used during session reset
-        to retain only high-level summaries across sessions.
-        """
-        return self._delete_nodes_batched(
-            session_id,
-            min_depth=min_depth,
-            on_deleted_batch=on_deleted_batch,
-        )
-
-    def delete_session_nodes(
-        self,
-        session_id: str,
-        *,
-        on_deleted_batch: Callable[[list[int]], None] | None = None,
-    ) -> int:
-        """Delete all nodes for a session. Returns count deleted."""
-        return self._delete_nodes_batched(
-            session_id,
-            min_depth=None,
-            on_deleted_batch=on_deleted_batch,
-        )
 
     def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:
         """Move all nodes from one session_id to another.
@@ -432,39 +310,6 @@ class SummaryDAG:
                 ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
-    def get_session_node_ids_below_depth(
-        self, session_id: str, min_depth: int | None
-    ) -> List[int]:
-        """All node ids for a session that a reset would delete, UNBOUNDED.
-
-        ``min_depth=None`` returns every node id (the retain=0 case); otherwise it
-        returns ids with ``depth < min_depth``. Unlike :meth:`get_session_nodes`
-        (which caps at ``limit=1000``), this returns the complete set so
-        deletion-driven rollup staleness covers every removed node, not just the
-        first 1000.
-        """
-        with self._db_lock:
-            if min_depth is None:
-                rows = self._conn.execute(
-                    "SELECT node_id FROM summary_nodes WHERE session_id = ?",
-                    (session_id,),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT node_id FROM summary_nodes WHERE session_id = ? AND depth < ?",
-                    (session_id, min_depth),
-                ).fetchall()
-        return [int(r[0]) for r in rows if r[0] is not None]
-
-    def count_at_depth(self, session_id: str, depth: int) -> int:
-        """Count nodes at a specific depth for a session."""
-        with self._db_lock:
-            row = self._conn.execute(
-                """SELECT COUNT(*) FROM summary_nodes
-                   WHERE session_id = ? AND depth = ?""",
-                (session_id, depth),
-            ).fetchone()
-        return row[0] if row else 0
 
     def get_session_node_count(self, session_id: str) -> int:
         """Count summary nodes for a session without loading node rows."""
@@ -496,35 +341,6 @@ class SummaryDAG:
             for row in rows
         }
 
-    def get_session_depth_samples(
-        self,
-        session_id: str,
-        *,
-        per_depth_limit: int = 20,
-        depths: List[int] | None = None,
-    ) -> Dict[int, List[SummaryNode]]:
-        """Return a bounded ordered sample of nodes per depth."""
-        if per_depth_limit <= 0:
-            return {}
-        if depths is None:
-            depth_rows = self._conn.execute(
-                """SELECT DISTINCT depth FROM summary_nodes
-                   WHERE session_id = ?
-                   ORDER BY depth""",
-                (session_id,),
-            ).fetchall()
-            depths = [int(row[0]) for row in depth_rows]
-
-        samples: Dict[int, List[SummaryNode]] = {}
-        for depth in depths:
-            rows = self._conn.execute(
-                """SELECT * FROM summary_nodes
-                   WHERE session_id = ? AND depth = ?
-                   ORDER BY created_at LIMIT ?""",
-                (session_id, depth, per_depth_limit),
-            ).fetchall()
-            samples[int(depth)] = [self._row_to_node(row) for row in rows]
-        return samples
 
     def get_uncondensed_at_depth(self, session_id: str, depth: int,
                                   limit: int = 100) -> List[SummaryNode]:
@@ -705,61 +521,6 @@ class SummaryDAG:
 
     # -- DAG traversal ------------------------------------------------------
 
-    def get_source_nodes(self, node: SummaryNode) -> List[SummaryNode]:
-        """Get the immediate child nodes of a summary node."""
-        if node.source_type != "nodes" or not node.source_ids:
-            return []
-        placeholders = ",".join("?" * len(node.source_ids))
-        rows = self._conn.execute(
-            f"""SELECT * FROM summary_nodes
-                WHERE node_id IN ({placeholders})
-                ORDER BY created_at""",
-            node.source_ids,
-        ).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
-    def source_message_ids(self, node_id: int, *, limit: int) -> List[int]:
-        """Resolve a node to the store_ids of the messages underneath it.
-
-        Walks ``source_ids`` down through nested nodes to the ``messages`` leaves,
-        so a derived (depth > 0) node resolves to real rows rather than to the
-        child nodes it was built from. Ordered by store_id and bounded by
-        ``limit`` so a node summarizing a long session cannot flood a caller.
-
-        A node's own summary text is generated prose and is never a citation for
-        these rows; this is the lineage link, used to let the source MESSAGES be
-        retrieved and cited in their own right.
-        """
-        if limit <= 0:
-            return []
-        with self._db_lock:
-            rows = self._conn.execute(
-                """
-                WITH RECURSIVE source_walk(source_type, source_id) AS (
-                    SELECT n.source_type, CAST(j.value AS INTEGER)
-                    FROM summary_nodes n, json_each(n.source_ids) j
-                    WHERE n.node_id = ?
-
-                    UNION
-
-                    SELECT child.source_type, CAST(j.value AS INTEGER)
-                    FROM summary_nodes child
-                    JOIN source_walk walk
-                      ON walk.source_type = 'nodes'
-                     AND child.node_id = walk.source_id
-                    JOIN json_each(child.source_ids) j
-                )
-                SELECT DISTINCT m.store_id
-                FROM source_walk walk
-                JOIN messages m
-                  ON walk.source_type = 'messages'
-                 AND m.store_id = walk.source_id
-                ORDER BY m.store_id
-                LIMIT ?
-                """,
-                (node_id, limit),
-            ).fetchall()
-        return [int(row[0]) for row in rows]
 
     def _node_matches_source(
         self,
@@ -825,35 +586,6 @@ class SummaryDAG:
             return None, None
         return row[0], row[1]
 
-    def describe_subtree(self, node_id: int) -> Dict[str, Any]:
-        """Return metadata about a node's subtree without loading content."""
-        node = self.get_node(node_id)
-        if not node:
-            return {"error": f"Node {node_id} not found"}
-
-        children = []
-        if node.source_type == "nodes":
-            for child_node in self.get_source_nodes(node):
-                children.append({
-                    "node_id": child_node.node_id,
-                    "depth": child_node.depth,
-                    "token_count": child_node.token_count,
-                    "source_token_count": child_node.source_token_count,
-                    "expand_hint": child_node.expand_hint,
-                })
-
-        return {
-            "node_id": node.node_id,
-            "depth": node.depth,
-            "token_count": node.token_count,
-            "source_token_count": node.source_token_count,
-            "source_type": node.source_type,
-            "num_sources": len(node.source_ids),
-            "earliest_at": node.earliest_at,
-            "latest_at": node.latest_at,
-            "expand_hint": node.expand_hint,
-            "children": children,
-        }
 
     # -- Helpers ------------------------------------------------------------
 

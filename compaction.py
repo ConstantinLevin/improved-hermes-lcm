@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
-from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -79,26 +78,6 @@ class CompactionMixin:
                 return True
             return self.threshold_tokens > 0 and rough >= self.threshold_tokens
         rough = count_messages_tokens(messages)
-        pre_ingest_placeholder_ambiguous_noop = False
-        pre_ingest_noop_reason = ""
-        if (
-            self.threshold_tokens > 0
-            and rough >= self.threshold_tokens
-            and not self._compiled_ignore_message_patterns
-            and any(
-                self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                for msg in messages
-            )
-        ):
-            eligible, reason = self._leaf_compaction_candidate_status(
-                messages,
-                allow_partial_leaf=self._config.threshold_full_sweep_enabled,
-            )
-            pre_ingest_placeholder_ambiguous_noop = not eligible
-            pre_ingest_noop_reason = reason
         replay_messages = None
         if self._session_id and messages:
             try:
@@ -144,11 +123,6 @@ class CompactionMixin:
             # summarizer spend.
             if self._compression_boundary_cooldown_active():
                 return False
-            if pre_ingest_placeholder_ambiguous_noop:
-                self._last_compression_status = "noop"
-                self._last_compression_noop_reason = pre_ingest_noop_reason
-                logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
-                return False
             eligible, reason = self._leaf_compaction_candidate_status(
                 replay_messages,
                 allow_partial_leaf=bool(
@@ -158,8 +132,6 @@ class CompactionMixin:
                 ),
             )
             if eligible:
-                return self._mark_preflight_compression_requested()
-            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
                 return self._mark_preflight_compression_requested()
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
@@ -177,18 +149,11 @@ class CompactionMixin:
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
-            if pre_ingest_placeholder_ambiguous_noop:
-                self._last_compression_status = "noop"
-                self._last_compression_noop_reason = pre_ingest_noop_reason
-                logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
-                return False
             eligible, reason = self._leaf_compaction_candidate_status(
                 messages,
                 allow_partial_leaf=self._config.threshold_full_sweep_enabled,
             )
             if eligible:
-                return self._mark_preflight_compression_requested()
-            if self._has_ignored_backlog_outside_fresh_tail(messages):
                 return self._mark_preflight_compression_requested()
             if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
                 return self._mark_preflight_compression_requested()
@@ -214,45 +179,9 @@ class CompactionMixin:
             if original_text != replay_text:
                 if replay_text.startswith("[Externalized LCM ingest payload:"):
                     return True
-                if replay_text.startswith("[Externalized payload: kind=raw_payload;"):
-                    return True
-                if replay_text.startswith("[Externalized tool output:"):
-                    return True
                 if replay_text.startswith("[LCM active replay placeholder: assistant output quarantined;"):
                     return True
-                if replay_text.startswith("[LCM active replay placeholder: message ignored;"):
-                    return True
-                if "[LCM sensitive redaction:" in replay_text:
-                    return True
-            if original_msg.get("content") != replay_msg.get("content") and _contains_sensitive_redaction(
-                replay_msg.get("content")
-            ):
-                return True
-            if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and _contains_sensitive_redaction(
-                replay_msg.get("tool_calls")
-            ):
-                return True
         return False
-
-    def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
-        if not self._compiled_ignore_message_patterns or not messages:
-            return False
-        fresh_tail_start = self._fresh_tail_start(messages)
-        leading_anchor_count = self._leading_anchor_count(messages)
-        if fresh_tail_start <= leading_anchor_count:
-            return False
-        previous_store_id_map = self._current_compress_store_ids_by_message_id
-        self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(
-            messages[leading_anchor_count:fresh_tail_start]
-        )
-        try:
-            return any(
-                self._matches_ignore_message_patterns(msg)
-                or self._mapped_stored_row_matches_ignore_message_patterns(msg)
-                for msg in messages[leading_anchor_count:fresh_tail_start]
-            )
-        finally:
-            self._current_compress_store_ids_by_message_id = previous_store_id_map
 
     def _leaf_compaction_candidate_status(
         self,
@@ -281,29 +210,18 @@ class CompactionMixin:
         if not candidate_raw:
             return False, "no eligible raw backlog outside fresh tail"
         generated_placeholder_hashes = self._load_generated_ignored_placeholder_hashes()
-        if self._compiled_ignore_message_patterns or generated_placeholder_hashes:
-            previous_store_id_map = self._current_compress_store_ids_by_message_id
-            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(candidate_raw)
-            try:
-                filtered_candidate_raw: list[Dict[str, Any]] = []
-                for msg in candidate_raw:
-                    content_text = text_content_for_pattern_matching(msg.get("content")) or ""
-                    volatile_digest = self._active_replay_placeholder_digest(content_text)
-                    generated_volatile_placeholder = (
-                        self._is_volatile_ignored_quarantine_placeholder(msg, content_text)
-                        and volatile_digest is not None
-                        and volatile_digest in generated_placeholder_hashes
-                    )
-                    if (
-                        self._matches_ignore_message_patterns(msg)
-                        or self._mapped_stored_row_matches_ignore_message_patterns(msg)
-                        or self._is_ignored_active_replay_placeholder(msg, content_text)
-                        or generated_volatile_placeholder
-                    ):
-                        continue
-                    filtered_candidate_raw.append(msg)
-            finally:
-                self._current_compress_store_ids_by_message_id = previous_store_id_map
+        if generated_placeholder_hashes:
+            filtered_candidate_raw: list[Dict[str, Any]] = []
+            for msg in candidate_raw:
+                content_text = text_content_for_pattern_matching(msg.get("content")) or ""
+                volatile_digest = self._active_replay_placeholder_digest(content_text)
+                if (
+                    self._is_volatile_ignored_quarantine_placeholder(msg, content_text)
+                    and volatile_digest is not None
+                    and volatile_digest in generated_placeholder_hashes
+                ):
+                    continue
+                filtered_candidate_raw.append(msg)
             candidate_raw = filtered_candidate_raw
             if not candidate_raw:
                 return False, "no eligible raw backlog outside fresh tail"
@@ -524,8 +442,6 @@ class CompactionMixin:
         noop_reason = "no eligible raw backlog outside fresh tail"
         sweep_stop_reason = ""
         sweep_raw_drained = False
-        dependent_reply_message_ids: set[int] = set()
-        preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
@@ -573,45 +489,21 @@ class CompactionMixin:
                 )
                 kept_working: list[Dict[str, Any]] = []
                 kept_pressure: list[Dict[str, Any]] = []
-                dropped_ignored_backlog = False
-                drop_dependent_reply = False
+                dropped_generated_placeholder = False
+                generated_placeholder_hashes = self._load_generated_ignored_placeholder_hashes()
                 for working_msg, pressure_msg in compactable_pairs:
-                    role = str(working_msg.get("role") or "")
                     content_text = text_content_for_pattern_matching(working_msg.get("content")) or ""
-                    generated_dependent_reply = self._is_generated_ignored_dependent_reply(
-                        working_msg,
-                        content_text,
-                    )
                     volatile_digest = self._active_replay_placeholder_digest(content_text)
-                    generated_volatile_placeholder = (
+                    if (
                         self._is_volatile_ignored_quarantine_placeholder(working_msg, content_text)
                         and volatile_digest is not None
-                        and volatile_digest in self._load_generated_ignored_placeholder_hashes()
-                    )
-                    if (
-                        self._matches_ignore_message_patterns(working_msg)
-                        or self._matches_ignore_message_patterns(pressure_msg)
-                        or self._mapped_stored_row_matches_ignore_message_patterns(working_msg)
-                        or self._is_ignored_active_replay_placeholder(working_msg, content_text)
-                        or generated_volatile_placeholder
+                        and volatile_digest in generated_placeholder_hashes
                     ):
-                        dropped_ignored_backlog = True
-                        if role in {"user", "system", "tool", "assistant"}:
-                            drop_dependent_reply = True
+                        dropped_generated_placeholder = True
                         continue
-                    if generated_dependent_reply:
-                        dependent_reply_message_ids.add(id(working_msg))
-                        if role in {"assistant", "tool"}:
-                            drop_dependent_reply = True
-                    if drop_dependent_reply and role in {"assistant", "tool"}:
-                        dependent_reply_message_ids.add(id(working_msg))
-                        self._remember_generated_ignored_dependent_reply(working_msg, content_text)
-                    if role in {"user", "system"}:
-                        drop_dependent_reply = False
                     kept_working.append(working_msg)
                     kept_pressure.append(pressure_msg)
-                drop_dependent_reply_into_tail = drop_dependent_reply
-                if dropped_ignored_backlog:
+                if dropped_generated_placeholder:
                     dropped_replayed_scaffold_messages = True
                     working_messages = (
                         working_messages[:candidate_start]
@@ -624,32 +516,13 @@ class CompactionMixin:
                         + pressure_messages[fresh_tail_start:]
                     )
                     fresh_tail_start = self._fresh_tail_start(pressure_messages)
-                if drop_dependent_reply_into_tail:
-                    tail_scan_start = max(fresh_tail_start, leading_anchor_count)
-                    pending_tail_dependents: list[tuple[Dict[str, Any], str]] = []
-                    saw_tail_boundary = False
-                    for tail_msg in working_messages[tail_scan_start:]:
-                        if not isinstance(tail_msg, dict):
-                            continue
-                        tail_role = str(tail_msg.get("role") or "")
-                        if tail_role in {"user", "system"}:
-                            saw_tail_boundary = True
-                            break
-                        if tail_role in {"assistant", "tool"}:
-                            tail_text = text_content_for_pattern_matching(tail_msg.get("content")) or ""
-                            self._remember_generated_ignored_dependent_reply(tail_msg, tail_text)
-                            pending_tail_dependents.append((tail_msg, tail_text))
-                    if saw_tail_boundary or leading_anchor_count > 0 or kept_working:
-                        for tail_msg, _tail_text in pending_tail_dependents:
-                            dependent_reply_message_ids.add(id(tail_msg))
-                if dropped_ignored_backlog and fresh_tail_start <= leading_anchor_count:
-                    noop_reason = "selected leaf chunk lacks raw store lineage"
-                    break
+                    if fresh_tail_start <= leading_anchor_count:
+                        noop_reason = "selected leaf chunk lacks raw store lineage"
+                        break
 
             # Auto-derive focus topic from the post-filter compaction view when
             # not explicitly provided.  The derived focus is summarizer-visible,
-            # so it must follow the same ignored-message filtering as the leaf
-            # chunk itself.
+            # so it must follow the same filtering as the leaf chunk itself.
             if not explicit_focus_topic:
                 focus_topic = self._derive_auto_focus_topic(working_messages)
 
@@ -697,86 +570,43 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
-            summary_input_chunk = [
-                message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
-            ]
-            if not summary_input_chunk:
-                compacted_chunk = selected_raw_chunk
-                source_tokens = count_messages_tokens(selected_raw_chunk)
-                summary_text = (
-                    "Filtered replies derived from ignored messages.\n"
-                    "[Expand for details: ignored-dependent reply]"
+            try:
+                summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
+                if threshold_full_sweep_active:
+                    summary_kwargs["deadline"] = sweep_deadline
+                (
+                    compacted_chunk,
+                    source_tokens,
+                    summary_text,
+                    _level,
+                    _rescue_attempts,
+                ) = self._summarize_leaf_chunk_with_rescue(
+                    selected_raw_chunk,
+                    **summary_kwargs,
                 )
-                _level = 0
-                _rescue_attempts = 0
-            else:
-                # Pre-compaction extraction: best-effort, never blocks compaction.
-                # Use the same dependency-filtered view as summarization so ignored
-                # turns cannot leak through derived assistant/tool replies.
-                if self._config.extraction_enabled:
-                    extraction_timeout = None
-                    if threshold_full_sweep_active:
-                        extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
-                    self._run_pre_compaction_extraction(
-                        summary_input_chunk,
-                        timeout_seconds=extraction_timeout,
+            except Exception as exc:
+                if threshold_full_sweep_active and leaf_compacted_this_turn:
+                    sweep_stop_reason = "leaf_summary_error"
+                    logger.warning(
+                        "LCM threshold full sweep stopped after %d persisted leaf pass(es): %s",
+                        leaf_passes,
+                        exc,
                     )
-                if bool(
-                    getattr(
-                        self._config,
-                        "assertion_extraction_enabled",
-                        False,
-                    )
-                ):
-                    self._schedule_pre_compaction_assertions(summary_input_chunk)
-
-                try:
-                    summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
-                    if threshold_full_sweep_active:
-                        summary_kwargs["deadline"] = sweep_deadline
-                    (
-                        compacted_chunk,
-                        source_tokens,
-                        summary_text,
-                        _level,
-                        _rescue_attempts,
-                    ) = self._summarize_leaf_chunk_with_rescue(
-                        summary_input_chunk,
-                        **summary_kwargs,
-                    )
-                except Exception as exc:
-                    if threshold_full_sweep_active and leaf_compacted_this_turn:
-                        sweep_stop_reason = "leaf_summary_error"
-                        logger.warning(
-                            "LCM threshold full sweep stopped after %d persisted leaf pass(es): %s",
-                            leaf_passes,
-                            exc,
-                        )
-                        break
-                    raise
+                    break
+                raise
             compacted_summary_ids = {id(message) for message in compacted_chunk}
             compacted_positions = [
                 idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
             ]
             last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
-            last_consumed_raw_pos = last_compacted_raw_pos
-            while (
-                last_consumed_raw_pos + 1 < len(selected_raw_chunk)
-                and id(selected_raw_chunk[last_consumed_raw_pos + 1]) in dependent_reply_message_ids
-            ):
-                last_consumed_raw_pos += 1
-            source_lookup_chunk = selected_raw_chunk[: last_consumed_raw_pos + 1]
+            source_lookup_chunk = selected_raw_chunk[: last_compacted_raw_pos + 1]
             selected_raw_len = len(source_lookup_chunk)
             remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
             source_tokens = count_messages_tokens(source_lookup_chunk)
 
-            source_lineage_chunk = [
-                message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
-            ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
+            source_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
-            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
-            consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
+            consumed_store_ids = source_store_ids
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
 
@@ -794,8 +624,6 @@ class CompactionMixin:
                 expand_hint=self._extract_expand_hint(summary_text),
             )
             self._dag.add_node(node)
-            self._invalidate_rollups_for_published_node(node)
-            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             self._persist_frontier_marker()
 
@@ -866,10 +694,7 @@ class CompactionMixin:
                     assembly_cap_override=recovery_assembly_cap,
                     ingest_cleanup_changed_active_context=ingest_cleanup_changed_active_context,
                 )
-            active_context_messages = self._drop_preexisting_generated_ignored_dependent_eof_replies(
-                working_messages,
-                preexisting_dependent_reply_records,
-            )
+            active_context_messages = working_messages
             if dropped_replayed_scaffold_messages:
                 leading_anchor_count = self._leading_anchor_count(active_context_messages)
                 anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
