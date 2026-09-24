@@ -214,6 +214,17 @@ def register(ctx):
                 exc,
             )
 
+        # The host's explicit session signals: /new, and a delegate's parent.
+        # They write into the store of the home this plugin was loaded for.
+        def _on_session_reset(**payload):
+            engine._sessions.on_session_reset_hook(**payload)
+
+        def _on_subagent_start(**payload):
+            engine._sessions.subagent_start_hook(**payload)
+
+        register_hook("on_session_reset", _on_session_reset)
+        register_hook("subagent_start", _on_subagent_start)
+
     # Register tools via the plugin registry only on hosts that preserve the
     # active messages=... contract for registered context-engine tools.
     # Older/current Hermes hosts already expose lcm_* correctly through the

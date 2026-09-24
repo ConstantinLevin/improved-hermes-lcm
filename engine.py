@@ -75,6 +75,7 @@ from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .lifecycle_state import LifecycleStateStore
+from .plugin_sessions import PluginSessions
 from .message_content import (
     normalize_content_value,
     text_content_for_pattern_matching,
@@ -97,6 +98,17 @@ _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
+
+
+class ReviewForkDetachRefused(RuntimeError):
+    """Raised when the host detaches an engine copy from every session.
+
+    The host makes this call, ``bind_session_state(session_db=None, session_id="")``,
+    on the engine copy of its background-review fork and enables the fork's
+    compaction only when it succeeds. The host neither commits nor confirms a fork's
+    compaction and names no parent for the fork, so the plugin could record it only
+    by guessing. Refusing keeps the fork's compaction disabled, as it was.
+    """
 
 
 def _normalize_total_compactions(value: Any) -> int:
@@ -134,6 +146,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         self._session_id: str = ""
         self._session_platform: str = ""
         self._conversation_id: str = ""
+        # The plugin session this engine copy acts for, set only from this copy's
+        # own bind_session_state() and on_session_start(). Nothing else names it:
+        # not a hook's session id, not a turn id, not another copy's session.
+        self._plugin_session: str = ""
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -345,6 +361,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             )
             self._dag = SummaryDAG(db_path)
             self._lifecycle = LifecycleStateStore(db_path)
+            self._sessions = PluginSessions(db_path)
         except Exception:
             self._close_storage()
             raise
@@ -355,6 +372,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             "_store",
             "_dag",
             "_lifecycle",
+            "_sessions",
         ):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
@@ -371,6 +389,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         self._session_id = ""
         self._session_platform = ""
         self._conversation_id = ""
+        self._plugin_session = ""
         self._clear_pending_reset_boundary()
         self._reset_session_scoped_runtime_state()
 
@@ -1491,6 +1510,59 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
             conversation_id=kwargs.get("conversation_id"),
         )
         self._schedule_ingest_cursor_reconciliation()
+        # A compaction boundary is not a beginning: it continues the plugin session,
+        # and its record line is written with the compaction record.
+        if boundary_reason != "compression":
+            self._name_plugin_session(
+                session_id,
+                signal="on_session_start",
+                platform=str(kwargs.get("platform") or "") or None,
+            )
+
+    def _name_plugin_session(self, host_session_id: str, *, signal: str, platform: str | None) -> None:
+        """Bind this engine copy to the plugin session a host session id names.
+
+        An id the store has not seen names a new plugin session; a known id
+        continues its session (ruling 1). Only this copy's own calls reach here.
+        """
+        if not host_session_id:
+            return
+        handle, _created = self._sessions.name_session(
+            host_session_id,
+            signal=signal,
+            platform=platform,
+        )
+        self._plugin_session = handle
+
+    def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
+        """The host's binding of this engine copy to a session id.
+
+        The host calls it for every agent it builds, before ``on_session_start``, and
+        after a switch that only resets (CLI ``/new``, ``/resume``, ``/branch``; ACP
+        ``/reset``), which is how this copy learns the new id there. The plugin uses
+        only the id, never the host's database. An empty id is the host detaching the
+        copy of its background-review fork; it is recorded on this copy's own session
+        and refused (``ReviewForkDetachRefused``).
+        """
+        if session_id:
+            self._name_plugin_session(session_id, signal="bind_session_state", platform=None)
+            return
+        if self._plugin_session:
+            self._sessions.add_fact(
+                self._plugin_session,
+                "detach",
+                "refused",
+                signal="bind_session_state",
+            )
+        message = (
+            "LCM refuses bind_session_state(session_id=''), the host's detach of a "
+            "background-review fork: the host neither commits nor confirms a fork's "
+            "compaction and names no parent for it, so the plugin cannot record it "
+            "without guessing. The host keeps this fork's compaction disabled. "
+            "See issue #20 and ask A-32.4 (a session id of its own for the fork)."
+        )
+        logger.warning(message)
+        raise ReviewForkDetachRefused(message)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Not a session boundary, and nothing is written here.
