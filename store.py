@@ -22,12 +22,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
+    MESSAGES_FTS_SPEC,
     ExternalContentFtsSpec,
-    add_column_if_missing,
-    configure_connection,
-    ensure_external_content_fts,
-    refuse_schema_version_too_new,
-    run_versioned_migrations,
+    StoreRefusedError,
+    open_store,
+    refuse_cross_vm_filesystem,
 )
 from .config import LCMConfig
 from .ingest_protection import protect_message_for_ingest
@@ -52,8 +51,7 @@ from .search_query import (
 )
 from .message_content import normalize_content_value as _normalize_content_value
 from .sqlite_util import (
-    _prepare_private_sqlite_file,
-    _restrict_existing_sqlite_artifacts,
+    _create_private_sqlite_file,
     _temporary_sqlite_busy_timeout,
 )
 
@@ -118,15 +116,32 @@ def _restrict_created_sqlite_directory(path: Path) -> None:
 
 
 def _prepare_private_sqlite_storage(db_path: Path) -> None:
-    """Create or tighten one SQLite database path before SQLite opens it."""
+    """Create a new store file with mode 0600 before SQLite opens it.
+
+    An existing regular file is left alone: it is never opened and closed here,
+    because closing a descriptor on a live database releases SQLite's locks on it
+    for every connection in the process. Whether an existing file is a store of
+    this plugin is decided by its identity row when SQLite opens it. Anything else
+    at the path (a directory, a symbolic link to a missing file) is refused.
+    """
+    if os.path.isfile(db_path):
+        return
+    refuse_cross_vm_filesystem(db_path)
     try:
         db_path.parent.mkdir(parents=True, mode=0o700)
     except FileExistsError:
         pass
     else:
         _restrict_created_sqlite_directory(db_path.parent)
-
-    _prepare_private_sqlite_file(db_path)
+    try:
+        _create_private_sqlite_file(db_path)
+    except OSError as exc:
+        message = (
+            f"LCM cannot create its store at {db_path}: {exc}. "
+            f"Nothing was created."
+        )
+        logger.error(message)
+        raise StoreRefusedError(message) from exc
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -290,37 +305,7 @@ def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
 
 
 def build_message_fts_spec() -> ExternalContentFtsSpec:
-    return ExternalContentFtsSpec(
-        table_name="messages_fts",
-        content_table="messages",
-        content_rowid="store_id",
-        indexed_column="content",
-        trigger_sqls=(
-            """
-            CREATE TRIGGER IF NOT EXISTS msg_fts_insert
-                AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, content)
-                    VALUES (new.store_id, new.content);
-            END;
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS msg_fts_delete
-                AFTER DELETE ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES('delete', old.store_id, old.content);
-            END;
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS msg_fts_update
-                AFTER UPDATE OF content ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES('delete', old.store_id, old.content);
-                INSERT INTO messages_fts(rowid, content)
-                    VALUES (new.store_id, new.content);
-            END;
-            """,
-        ),
-    )
+    return MESSAGES_FTS_SPEC
 
 
 class MessageStore:
@@ -328,9 +313,7 @@ class MessageStore:
 
     def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
-        self._is_memory_database = str(self.db_path) == ":memory:"
-        if not self._is_memory_database:
-            _prepare_private_sqlite_storage(self.db_path)
+        _prepare_private_sqlite_storage(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
@@ -355,103 +338,14 @@ class MessageStore:
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        if not self._is_memory_database:
-            _restrict_existing_sqlite_artifacts(self.db_path)
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS messages (
-                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                source TEXT DEFAULT '',
-                conversation_id TEXT DEFAULT '',
-                role TEXT NOT NULL,
-                content TEXT,
-                tool_call_id TEXT,
-                tool_calls TEXT,
-                tool_name TEXT,
-                timestamp REAL NOT NULL,
-                token_estimate INTEGER DEFAULT 0,
-                pinned INTEGER DEFAULT 0,
-                ingested_at REAL,
-                observed_at REAL,
-                observed_at_source TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_msg_session
-                ON messages(session_id, store_id);
-            CREATE INDEX IF NOT EXISTS idx_msg_session_ts
-                ON messages(session_id, timestamp);
-
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-        ensure_external_content_fts(
-            self._conn,
-            build_message_fts_spec(),
-        )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_column()
-        self._ensure_conversation_id_column()
-        self._ensure_time_contract_columns()
-        self._conn.commit()
-
-    def _ensure_source_column(self) -> None:
-        columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
-        }
-        add_column_if_missing(
-            self._conn, columns, "source",
-            "ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''",
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_msg_source_session ON messages(source, session_id, store_id)"
-        )
-
-    def _ensure_conversation_id_column(self) -> None:
-        columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
-        }
-        add_column_if_missing(
-            self._conn, columns, "conversation_id",
-            "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
-        )
-
-    def _ensure_time_contract_columns(self) -> None:
-        """Add the backward-compatible V4.2 source-time sidecar columns.
-
-        ``timestamp`` remains the historical LCM write timestamp. Existing
-        rows receive only an ``ingested_at`` copy; their ``observed_at`` stays
-        NULL because no source timestamp can be recovered honestly.
-        """
-        columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
-        }
-        add_column_if_missing(
-            self._conn,
-            columns,
-            "ingested_at",
-            "ALTER TABLE messages ADD COLUMN ingested_at REAL",
-        )
-        add_column_if_missing(
-            self._conn,
-            columns,
-            "observed_at",
-            "ALTER TABLE messages ADD COLUMN observed_at REAL",
-        )
-        add_column_if_missing(
-            self._conn,
-            columns,
-            "observed_at_source",
-            "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
-        )
-        self._conn.execute(
-            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
-        )
+        try:
+            # Refuses a database this plugin did not write, creates the store in an
+            # empty one, and repairs a damaged full-text index. No DDL otherwise.
+            open_store(self._conn, self.db_path, check_fts=True)
+        except BaseException:
+            self._conn.close()
+            self._conn = None
+            raise
 
     # -- Write operations ---------------------------------------------------
 
@@ -1396,13 +1290,6 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
 

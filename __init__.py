@@ -151,14 +151,14 @@ def register(ctx):
 
     config = LCMConfig.from_env()
 
-    # Resolve hermes_home for profile-scoped storage
+    # The store lives under the home the host gives. Without one (and without
+    # LCM_DATABASE_PATH) the engine refuses to guess a location.
     hermes_home = ""
     try:
         from hermes_cli.config import get_hermes_home
         hermes_home = str(get_hermes_home())
     except Exception:
-        import os
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+        hermes_home = os.environ.get("HERMES_HOME", "")
 
     engine = LCMEngine(config=config, hermes_home=hermes_home)
 

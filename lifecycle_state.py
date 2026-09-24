@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .db_bootstrap import open_store
 
 
 def _synchronized(method):
@@ -56,7 +56,6 @@ class LifecycleState:
 class LifecycleStateStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
         # The connection is opened check_same_thread=False in autocommit mode
         # and is shared across the gateway thread, dispatcher, and sub-agents.
@@ -72,19 +71,17 @@ class LifecycleStateStore:
             check_same_thread=False,
             isolation_level=None,
         )
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
+        try:
+            open_store(self._conn, self.db_path)
+        except BaseException:
+            self._conn.close()
+            self._conn = None
+            raise
         self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        self._conn.commit()
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
             conn.close()
             self._conn = None
 

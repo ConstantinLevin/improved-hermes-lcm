@@ -375,7 +375,7 @@ class LCMConfig:
     expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
-    database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
+    database_path: str = ""       # empty = <host-given Hermes home>/lcm-record.db; LCM_DATABASE_PATH may override
 
     # -- Diagnostics ---
     # Field-level provenance for values loaded through from_env(). Manual
