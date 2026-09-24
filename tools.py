@@ -27,7 +27,11 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     load_integrity_failed,
 )
-from .ingest_protection import _QUARANTINED_ASSISTANT_KIND, extract_ingest_externalized_refs
+from .ingest_protection import (
+    _QUARANTINED_ASSISTANT_KIND,
+    extract_ingest_externalized_refs,
+    scan_ingest_side_file_integrity,
+)
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 from .presets import preset_status_payload
@@ -2276,6 +2280,27 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "sqlite_storage",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # Ingest side files (base64 payloads, quarantined assistant output): SQLite
+    # integrity cannot see a missing or unreferenced file.
+    try:
+        side_file_integrity = scan_ingest_side_file_integrity(
+            engine._store.connection,
+            engine._config,
+            hermes_home=engine._hermes_home,
+        )
+        missing_side_files = int(side_file_integrity.get("externalized_payload_refs_missing", 0) or 0)
+        checks.append({
+            "check": "payload_storage",
+            "status": "warn" if missing_side_files else "pass",
+            "detail": side_file_integrity,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "payload_storage",
             "status": "fail",
             "detail": str(e),
         })
