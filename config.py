@@ -213,22 +213,6 @@ def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str
     )
 
 
-def _hermes_compression_threshold(default: float) -> float:
-    """Read lcm.context_threshold or Hermes compression.threshold from config.yaml.
-
-    Priority when no ``LCM_CONTEXT_THRESHOLD`` env var is set:
-      1. ``lcm.context_threshold`` (LCM-specific override in config.yaml)
-      2. ``compression.threshold`` (Hermes global setting, unless compression disabled)
-
-    Hermes gateways may load ``~/.hermes/config.yaml`` without exporting every
-    setting into the process environment. The ``lcm.context_threshold`` key lets
-    operators tune LCM compaction independently of the Hermes compression setting.
-    Disabled Hermes compression should not leak its threshold into LCM.
-    """
-    value, _source = _hermes_compression_threshold_with_source(default)
-    return value
-
-
 def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
     cfg = _load_hermes_config_yaml()
     try:
@@ -248,18 +232,6 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
     except Exception:
         return default, "default"
     return default, "default"
-
-
-def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
-    """Read Hermes auxiliary.compression.timeout when no LCM override is present.
-
-    Hermes uses seconds for the auxiliary compression timeout, while LCM stores
-    the summary timeout in milliseconds. Aligning the default keeps LCM summary
-    calls from timing out earlier than the host compression route unless
-    ``LCM_SUMMARY_TIMEOUT_MS`` is explicitly configured.
-    """
-    value, _source = _hermes_auxiliary_compression_timeout_ms_with_source(default)
-    return value
 
 
 def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[int, str]:

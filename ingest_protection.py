@@ -404,14 +404,6 @@ def recover_hermes_persisted_output_with_file_stat(text: str | None) -> tuple[st
     return recovered, file_stat
 
 
-def recover_hermes_persisted_output(text: str | None) -> str | None:
-    recovered_with_stat = recover_hermes_persisted_output_with_file_stat(text)
-    if recovered_with_stat is None:
-        return None
-    recovered, _file_stat = recovered_with_stat
-    return recovered
-
-
 def _add_inline_persisted_output_generation_metadata(text: str, file_stat: dict[str, int] | None) -> str:
     if not file_stat or not isinstance(text, str) or "</persisted-output>" not in text:
         return text
@@ -447,21 +439,6 @@ def extract_ingest_externalized_refs(text: str) -> list[str]:
     for match in _INGEST_PLACEHOLDER_RE.finditer(text):
         ref = match.group(1).strip()
         if ref and ref not in refs:
-            refs.append(ref)
-    return refs
-
-
-def _is_basename_ref(ref: str) -> bool:
-    return bool(ref) and ref.endswith(".json") and "/" not in ref and "\\" not in ref and Path(ref).name == ref
-
-
-def extract_all_externalized_payload_refs(text: str) -> list[str]:
-    """Return deduplicated refs from recognized externalized payload placeholders."""
-    if not isinstance(text, str) or not text:
-        return []
-    refs: list[str] = []
-    for ref in extract_ingest_externalized_refs(text):
-        if _is_basename_ref(ref) and ref not in refs:
             refs.append(ref)
     return refs
 

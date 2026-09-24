@@ -30,7 +30,7 @@ from .db_bootstrap import (
     run_versioned_migrations,
 )
 from .config import LCMConfig
-from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
+from .ingest_protection import protect_message_for_ingest
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -497,38 +497,13 @@ class MessageStore:
             self._conn.commit()
             return cur.lastrowid
 
-    def append_batch(self, session_id: str,
-                     messages: List[Dict[str, Any]],
-                     token_estimates: List[int] | None = None,
-                     source: str = "",
-                     conversation_id: str = "") -> List[int]:
-        """Persist multiple messages in one transaction. Returns store_ids."""
-        protected_messages = protect_messages_for_ingest(
-            messages,
-            config=self._ingest_protection_config,
-            hermes_home=self._hermes_home,
-            session_id=session_id,
-        )
-        return self._append_protected_batch(
-            session_id,
-            protected_messages,
-            token_estimates,
-            source=source,
-            conversation_id=conversation_id,
-        )
 
     def _append_protected_batch(self, session_id: str,
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
                                 conversation_id: str = "") -> List[int]:
-        """Persist messages that already passed ingest protection.
-
-        This is an internal fast path for callers that need the protected form
-        before storage, for example to update active replay with raw-payload
-        stubs. Direct callers should use ``append_batch`` so storage-boundary
-        payload protection cannot be bypassed accidentally.
-        """
+        """Persist messages that already passed ``protect_messages_for_ingest``."""
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
@@ -589,54 +564,6 @@ class MessageStore:
         ).fetchall()
         return {row[0]: self._row_to_dict(row) for row in rows}
 
-    def scan_evidence_rows(self, *, limit: int = 4096) -> Dict[str, Any]:
-        """Return one bounded, read-only whole-corpus evidence snapshot.
-
-        The window metadata and rows come from one SQLite statement, so a
-        caller cannot accidentally certify finite coverage from a count and a
-        row page taken at different corpus generations.  This API deliberately
-        has no query or session filter: a narrower scan is not whole-corpus
-        coverage.  Callers must treat ``truncated`` as an honest fallback.
-        """
-        bounded_limit = min(4096, max(1, int(limit)))
-        rows = self._conn.execute(
-            f"""
-            WITH snapshot AS (
-                SELECT {_MESSAGE_SELECT_COLUMNS},
-                       COUNT(*) OVER () AS snapshot_total_rows,
-                       MAX(store_id) OVER () AS snapshot_max_store_id,
-                       SUM(CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END)
-                           OVER () AS snapshot_observed_at_missing_rows
-                FROM messages
-            )
-            SELECT * FROM snapshot
-            ORDER BY store_id
-            LIMIT ?
-            """,
-            (bounded_limit,),
-        ).fetchall()
-        if not rows:
-            return {
-                "rows": [],
-                "snapshot_max_store_id": 0,
-                "total_rows": 0,
-                "returned_rows": 0,
-                "truncated": False,
-                "observed_at_missing_rows": 0,
-            }
-        message_column_count = _MESSAGE_SELECT_COLUMN_COUNT
-        total_rows = int(rows[0][message_column_count] or 0)
-        snapshot_max_store_id = int(rows[0][message_column_count + 1] or 0)
-        observed_at_missing_rows = int(rows[0][message_column_count + 2] or 0)
-        messages = [self._row_to_dict(row[:message_column_count]) for row in rows]
-        return {
-            "rows": messages,
-            "snapshot_max_store_id": snapshot_max_store_id,
-            "total_rows": total_rows,
-            "returned_rows": len(messages),
-            "truncated": total_rows > len(messages),
-            "observed_at_missing_rows": observed_at_missing_rows,
-        }
 
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
@@ -683,27 +610,6 @@ class MessageStore:
             args.append(time_to)
         return where, args
 
-    def count_session_load_messages(
-        self,
-        session_id: str,
-        *,
-        roles: list[str] | None = None,
-        time_from: float | None = None,
-        time_to: float | None = None,
-    ) -> int:
-        """Count messages matching the lcm_load_session filter contract."""
-        where, args = self._session_load_where(
-            session_id,
-            roles=roles,
-            time_from=time_from,
-            time_to=time_to,
-        )
-        return int(
-            self._conn.execute(
-                f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(where)}",
-                args,
-            ).fetchone()[0]
-        )
 
     def load_session_page(
         self,
@@ -736,33 +642,6 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def load_session_window(
-        self,
-        session_id: str,
-        *,
-        anchor_store_id: int,
-        before: int = 2,
-        after: int = 3,
-    ) -> List[Dict[str, Any]]:
-        """Load one bounded ordered window around an exact message anchor."""
-        before = min(12, max(0, int(before)))
-        after = min(12, max(0, int(after)))
-        prior = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                FROM messages
-                WHERE session_id = ? AND store_id < ?
-                ORDER BY store_id DESC LIMIT ?""",
-            (session_id, anchor_store_id, before),
-        ).fetchall()
-        following = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                FROM messages
-                WHERE session_id = ? AND store_id >= ?
-                ORDER BY store_id LIMIT ?""",
-            (session_id, anchor_store_id, after + 1),
-        ).fetchall()
-        rows = list(reversed(prior)) + list(following)
-        return [self._row_to_dict(row) for row in rows]
 
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:
@@ -1077,19 +956,6 @@ class MessageStore:
                     conn.rollback()
                 raise
 
-    def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:
-        """Upsert the per-conversation compaction-telemetry record.
-
-        Stored as a single JSON row in the existing metadata table (no dedicated
-        schema, no version bump) under the store write lock. The write -- and its
-        commit -- is skipped when the serialized payload is unchanged so idle
-        turns do not churn the row.
-        """
-        if not conversation_id:
-            return
-        serialized = json.dumps(record, sort_keys=True)
-        key = self._compaction_telemetry_key(conversation_id)
-        self.write_metadata_json([key], serialized, skip_unchanged=True)
 
     # -- Search -------------------------------------------------------------
 
@@ -1492,18 +1358,6 @@ class MessageStore:
                 pass
         return d
 
-    def to_openai_msg(self, stored: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert a stored message back to OpenAI format."""
-        msg: Dict[str, Any] = {"role": stored["role"]}
-        if stored.get("content") is not None:
-            msg["content"] = stored["content"]
-        if stored.get("tool_calls"):
-            msg["tool_calls"] = stored["tool_calls"]
-        if stored.get("tool_call_id"):
-            msg["tool_call_id"] = stored["tool_call_id"]
-        if stored.get("tool_name"):
-            msg["name"] = stored["tool_name"]
-        return msg
 
     # -- Connection access --------------------------------------------------
 

@@ -311,16 +311,6 @@ class SummaryDAG:
         return [self._row_to_node(r) for r in rows]
 
 
-    def count_at_depth(self, session_id: str, depth: int) -> int:
-        """Count nodes at a specific depth for a session."""
-        with self._db_lock:
-            row = self._conn.execute(
-                """SELECT COUNT(*) FROM summary_nodes
-                   WHERE session_id = ? AND depth = ?""",
-                (session_id, depth),
-            ).fetchone()
-        return row[0] if row else 0
-
     def get_session_node_count(self, session_id: str) -> int:
         """Count summary nodes for a session without loading node rows."""
         row = self._conn.execute(
@@ -351,35 +341,6 @@ class SummaryDAG:
             for row in rows
         }
 
-    def get_session_depth_samples(
-        self,
-        session_id: str,
-        *,
-        per_depth_limit: int = 20,
-        depths: List[int] | None = None,
-    ) -> Dict[int, List[SummaryNode]]:
-        """Return a bounded ordered sample of nodes per depth."""
-        if per_depth_limit <= 0:
-            return {}
-        if depths is None:
-            depth_rows = self._conn.execute(
-                """SELECT DISTINCT depth FROM summary_nodes
-                   WHERE session_id = ?
-                   ORDER BY depth""",
-                (session_id,),
-            ).fetchall()
-            depths = [int(row[0]) for row in depth_rows]
-
-        samples: Dict[int, List[SummaryNode]] = {}
-        for depth in depths:
-            rows = self._conn.execute(
-                """SELECT * FROM summary_nodes
-                   WHERE session_id = ? AND depth = ?
-                   ORDER BY created_at LIMIT ?""",
-                (session_id, depth, per_depth_limit),
-            ).fetchall()
-            samples[int(depth)] = [self._row_to_node(row) for row in rows]
-        return samples
 
     def get_uncondensed_at_depth(self, session_id: str, depth: int,
                                   limit: int = 100) -> List[SummaryNode]:
@@ -560,61 +521,6 @@ class SummaryDAG:
 
     # -- DAG traversal ------------------------------------------------------
 
-    def get_source_nodes(self, node: SummaryNode) -> List[SummaryNode]:
-        """Get the immediate child nodes of a summary node."""
-        if node.source_type != "nodes" or not node.source_ids:
-            return []
-        placeholders = ",".join("?" * len(node.source_ids))
-        rows = self._conn.execute(
-            f"""SELECT * FROM summary_nodes
-                WHERE node_id IN ({placeholders})
-                ORDER BY created_at""",
-            node.source_ids,
-        ).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
-    def source_message_ids(self, node_id: int, *, limit: int) -> List[int]:
-        """Resolve a node to the store_ids of the messages underneath it.
-
-        Walks ``source_ids`` down through nested nodes to the ``messages`` leaves,
-        so a derived (depth > 0) node resolves to real rows rather than to the
-        child nodes it was built from. Ordered by store_id and bounded by
-        ``limit`` so a node summarizing a long session cannot flood a caller.
-
-        A node's own summary text is generated prose and is never a citation for
-        these rows; this is the lineage link, used to let the source MESSAGES be
-        retrieved and cited in their own right.
-        """
-        if limit <= 0:
-            return []
-        with self._db_lock:
-            rows = self._conn.execute(
-                """
-                WITH RECURSIVE source_walk(source_type, source_id) AS (
-                    SELECT n.source_type, CAST(j.value AS INTEGER)
-                    FROM summary_nodes n, json_each(n.source_ids) j
-                    WHERE n.node_id = ?
-
-                    UNION
-
-                    SELECT child.source_type, CAST(j.value AS INTEGER)
-                    FROM summary_nodes child
-                    JOIN source_walk walk
-                      ON walk.source_type = 'nodes'
-                     AND child.node_id = walk.source_id
-                    JOIN json_each(child.source_ids) j
-                )
-                SELECT DISTINCT m.store_id
-                FROM source_walk walk
-                JOIN messages m
-                  ON walk.source_type = 'messages'
-                 AND m.store_id = walk.source_id
-                ORDER BY m.store_id
-                LIMIT ?
-                """,
-                (node_id, limit),
-            ).fetchall()
-        return [int(row[0]) for row in rows]
 
     def _node_matches_source(
         self,
@@ -680,35 +586,6 @@ class SummaryDAG:
             return None, None
         return row[0], row[1]
 
-    def describe_subtree(self, node_id: int) -> Dict[str, Any]:
-        """Return metadata about a node's subtree without loading content."""
-        node = self.get_node(node_id)
-        if not node:
-            return {"error": f"Node {node_id} not found"}
-
-        children = []
-        if node.source_type == "nodes":
-            for child_node in self.get_source_nodes(node):
-                children.append({
-                    "node_id": child_node.node_id,
-                    "depth": child_node.depth,
-                    "token_count": child_node.token_count,
-                    "source_token_count": child_node.source_token_count,
-                    "expand_hint": child_node.expand_hint,
-                })
-
-        return {
-            "node_id": node.node_id,
-            "depth": node.depth,
-            "token_count": node.token_count,
-            "source_token_count": node.source_token_count,
-            "source_type": node.source_type,
-            "num_sources": len(node.source_ids),
-            "earliest_at": node.earliest_at,
-            "latest_at": node.latest_at,
-            "expand_hint": node.expand_hint,
-            "children": children,
-        }
 
     # -- Helpers ------------------------------------------------------------
 

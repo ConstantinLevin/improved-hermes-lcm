@@ -763,7 +763,6 @@ class ReconcileMixin:
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
                 raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
                 placeholder_identity_counts[raw_identity] = placeholder_identity_counts.get(raw_identity, 0) + 1
-        self._current_compress_placeholder_identity_counts = placeholder_identity_counts
 
         def find_raw_placeholder_match_index(
             raw_identity: tuple[str, str, str, str],

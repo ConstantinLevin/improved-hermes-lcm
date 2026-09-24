@@ -1,7 +1,6 @@
 """Product-owned model guidance for safe Hermes-LCM recall."""
 
 from functools import lru_cache
-import hashlib
 from pathlib import Path
 
 
@@ -29,6 +28,3 @@ def get_recall_policy() -> str:
     return policy
 
 
-def recall_policy_sha256() -> str:
-    """Return the digest used to prove the exact product policy in a run."""
-    return hashlib.sha256(get_recall_policy().encode("utf-8")).hexdigest()

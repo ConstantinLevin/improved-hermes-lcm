@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-import uuid
 from contextlib import contextmanager
 from typing import Iterator, List
 
@@ -197,25 +196,6 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
 def _sqlite_busy_timeout_ms(conn: sqlite3.Connection) -> int:
     row = conn.execute("PRAGMA busy_timeout").fetchone()
     return int(row[0]) if row and row[0] is not None else 0
-
-
-@contextmanager
-def _sqlite_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
-    """Isolate helper writes without taking ownership of a caller transaction."""
-    # UUID hex contains only identifier-safe characters and keeps every nested
-    # helper's SAVEPOINT name unique with a fixed upper bound on name length.
-    name = f"lcm_{uuid.uuid4().hex}"
-    conn.execute(f"SAVEPOINT {name}")
-    try:
-        yield
-    except BaseException:
-        try:
-            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
-        finally:
-            conn.execute(f"RELEASE SAVEPOINT {name}")
-        raise
-    else:
-        conn.execute(f"RELEASE SAVEPOINT {name}")
 
 
 @contextmanager

@@ -8,7 +8,6 @@ import copy
 import hashlib
 import json
 import logging
-import os
 import re
 import sqlite3
 import threading
@@ -67,7 +66,6 @@ from .schemas import (
 )
 from .sanitize import (
     _clean_active_assistant_message,
-    _should_drop_active_assistant_message,
 )
 from .message_analysis import (
     _is_synthetic_assistant_noise,
@@ -632,25 +630,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def name(self) -> str:
         return "lcm"
 
-    @property
-    def last_compression_status(self) -> str:
-        """Public status for the most recent compression/preflight attempt.
-
-        Host runtimes use this to distinguish a real compaction boundary from
-        an LCM no-op (for example, when request pressure is high but all
-        compactable raw backlog is protected by the fresh tail).
-        """
-        return self._last_compression_status
-
-    @property
-    def last_compression_noop_reason(self) -> str:
-        """Human-readable reason for the latest no-op compression decision."""
-        return self._last_compression_noop_reason
-
-    @property
-    def last_compression_was_noop(self) -> bool:
-        """Whether the most recent compression/preflight decision was a no-op."""
-        return self._last_compression_status == "noop"
 
     def _mark_preflight_compression_requested(self) -> bool:
         """Record that preflight found work and clear any stale no-op reason."""
@@ -1436,12 +1415,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._lcm_session_last_platform[session_id] = platform
             self._lcm_session_last_bypassed[session_id] = True
 
-    def _unmark_lcm_bypass_lineage_session(self, session_id: str) -> None:
-        if not session_id:
-            return
-        with self._auxiliary_session_lock:
-            self._lcm_bypass_lineage_session_ids.discard(session_id)
-            self._lcm_bypass_lineage_platforms.pop(session_id, None)
 
     def _handoff_lcm_bypass_lineage(
         self,
@@ -1469,12 +1442,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return bool(self._bypasses_lcm_context_management())
         return bool(self._has_lcm_bypass_lineage_session(old_session_id))
 
-    def _get_allowed_hermes_base(self) -> Path | None:
-        """Get the allowed base directory for hermes_home, or None if not restricted."""
-        env_base = os.environ.get("LCM_HERMES_BASE_DIR")
-        if env_base:
-            return Path(env_base).expanduser().resolve()
-        return None  # No restriction when env var not set
 
     def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
         kwargs = kwargs or {}
@@ -2550,12 +2517,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ),
         )
 
-    def _messages_match_fingerprint_prefix(
-        self,
-        fingerprints: list[str],
-        messages: List[Dict[str, Any]],
-    ) -> bool:
-        return self._matching_fingerprint_prefix_count(fingerprints, messages) > 0
 
     def _matching_fingerprint_prefix_count(
         self,
@@ -2572,20 +2533,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return compare_count
         return 0
 
-    def _messages_match_lcm_bypass_prefix(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-    ) -> bool:
-        return self._matching_lcm_bypass_prefix_count(session_id, messages) > 0
-
-    def _matching_lcm_bypass_prefix_count(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-    ) -> int:
-        count, _truncated = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
-        return count
 
     def _matching_lcm_bypass_prefix_evidence(
         self,
@@ -2604,18 +2551,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 best_truncated = best_truncated or count_truncated
         return best_count, best_truncated
 
-    def _messages_match_lcm_normal_prefix(
-        self,
-        session_id: str,
-        messages: List[Dict[str, Any]],
-        *,
-        conversation_id: str | None = None,
-    ) -> bool:
-        return self._matching_lcm_normal_prefix_count(
-            session_id,
-            messages,
-            conversation_id=conversation_id,
-        ) > 0
 
     def _matching_lcm_normal_prefix_count(
         self,
@@ -3419,18 +3354,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
 
-    @classmethod
-    def _is_active_context_droppable_identity(cls, identity: tuple[str, str, str, str]) -> bool:
-        """Return true for durable rows sanitized out of active replay only."""
-        role, content, _tool_call_id, tool_calls = identity
-        if role != "assistant" or tool_calls:
-            return False
-        return _should_drop_active_assistant_message({
-            "role": role,
-            "content": cls._identity_content_for_active_cleanup(content),
-        })
-
-
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -4077,22 +4000,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return None
             return self._build_preserved_objective_summary_part(message)
         return None
-
-    @staticmethod
-    def _newest_user_message_text(messages: List[Dict[str, Any]]) -> str:
-        """Return the newest real user turn's text (SPEC F injection query).
-
-        Scans from the tail so the block reflects the turn the host is about to
-        answer. Returns "" when the tail carries no user text (e.g. a tool-only
-        continuation) — the caller then leaves the feature inert.
-        """
-        for message in reversed(messages):
-            if not isinstance(message, dict) or message.get("role") != "user":
-                continue
-            text = (text_content_for_pattern_matching(message.get("content")) or "").strip()
-            if text:
-                return text
-        return ""
 
 
     def _assemble_context(
