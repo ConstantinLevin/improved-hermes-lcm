@@ -8,7 +8,9 @@ engine, so (ruling 1):
   signal recorded as it was received and no kind unless the signal itself carries one;
 - a host session id it has seen continues the plugin session that began at it. Until
   the record line exists, that is the session whose beginning carried the id;
-- explicit signals about a session that already exists are appended as facts.
+- explicit signals about a session that already exists are appended as facts;
+- a platform a signal states is the fact ``platform``, appended when it differs from
+  the session's last platform fact.
 
 Session records are written when their signal arrives, between compactions too. The
 tables are insert-only; nothing here is ever changed.
@@ -66,7 +68,6 @@ class PluginSessions:
         host_session_id: str,
         *,
         signal: str,
-        platform: Optional[str] = None,
         kind: Optional[str] = None,
     ) -> tuple[str, bool]:
         """Return ``(handle, created)`` for the plugin session a host id names.
@@ -85,7 +86,7 @@ class PluginSessions:
                     if existing is not None:
                         conn.execute("COMMIT")
                         return existing, False
-                    handle = self._insert_session(conn, host_session_id, signal, platform, kind)
+                    handle = self._insert_session(conn, host_session_id, signal, kind)
                     conn.execute("COMMIT")
                 except BaseException:
                     conn.execute("ROLLBACK")
@@ -112,16 +113,15 @@ class PluginSessions:
         conn: sqlite3.Connection,
         host_session_id: str,
         signal: str,
-        platform: Optional[str],
         kind: Optional[str],
     ) -> str:
         for _ in range(_HANDLE_DRAWS):
             handle = new_handle(SESSION)
             try:
                 conn.execute(
-                    "INSERT INTO sessions(handle, began_at, signal, kind, host_session_id, platform) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (handle, time.time(), signal, kind, host_session_id, platform or None),
+                    "INSERT INTO sessions(handle, began_at, signal, kind, host_session_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (handle, time.time(), signal, kind, host_session_id),
                 )
                 return handle
             except sqlite3.IntegrityError:
@@ -150,12 +150,13 @@ class PluginSessions:
         handle, created = self.name_session(
             host_session_id,
             signal="hook:on_session_reset",
-            platform=str(payload.get("platform") or "") or None,
             kind=kind,
         )
         if kind and not created:
             self.add_fact(handle, "began_as", kind, signal="hook:on_session_reset",
                           host_session_id=host_session_id)
+        self.note_platform(handle, str(payload.get("platform") or ""),
+                           signal="hook:on_session_reset", host_session_id=host_session_id)
 
     def subagent_start_hook(self, **payload) -> None:
         """``subagent_start(parent_session_id, child_session_id, …)``: the child's parent.
@@ -172,6 +173,50 @@ class PluginSessions:
         parent, _ = self.name_session(parent_host, signal="hook:subagent_start")
         self.add_fact(child, "parent", parent, signal="hook:subagent_start",
                       host_session_id=parent_host)
+
+    def note_platform(
+        self,
+        session: str,
+        platform: str,
+        *,
+        signal: str,
+        host_session_id: Optional[str] = None,
+    ) -> None:
+        """Append the fact ``platform`` when a signal states one that differs from
+        the session's last platform fact. The read and the insert run under the
+        write lock, so two processes stating the same platform append it once."""
+        if not platform:
+            return
+        with self._lock:
+            conn = self._conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM session_facts WHERE session = ? AND kind = 'platform' "
+                        "ORDER BY fact_id DESC LIMIT 1",
+                        (session,),
+                    ).fetchone()
+                    if row is None or row[0] != platform:
+                        conn.execute(
+                            "INSERT INTO session_facts(session, kind, value, signal, host_session_id, at) "
+                            "VALUES (?, 'platform', ?, ?, ?, ?)",
+                            (session, platform, signal, host_session_id or None, time.time()),
+                        )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+            except Exception:
+                logger.error(
+                    "LCM could not record the fact platform=%s on plugin session %s (signal %s) in %s",
+                    platform,
+                    session,
+                    signal,
+                    self.db_path,
+                    exc_info=True,
+                )
+                raise
 
     def add_fact(
         self,

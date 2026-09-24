@@ -1527,12 +1527,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, PlaceholderLed
         """
         if not host_session_id:
             return
-        handle, _created = self._sessions.name_session(
-            host_session_id,
-            signal=signal,
-            platform=platform,
-        )
+        handle, _created = self._sessions.name_session(host_session_id, signal=signal)
         self._plugin_session = handle
+        if platform:
+            self._sessions.note_platform(handle, platform, signal=signal,
+                                         host_session_id=host_session_id)
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """The host's binding of this engine copy to a session id.

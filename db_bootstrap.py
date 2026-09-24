@@ -163,8 +163,7 @@ CREATE TABLE sessions (
     began_at REAL NOT NULL,
     signal TEXT NOT NULL,
     kind TEXT,
-    host_session_id TEXT NOT NULL UNIQUE,
-    platform TEXT
+    host_session_id TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE session_facts (
