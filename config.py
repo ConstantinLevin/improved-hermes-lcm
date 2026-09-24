@@ -238,9 +238,6 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("dynamic_leaf_chunk_max", "LCM_DYNAMIC_LEAF_CHUNK_MAX", int),
     _EnvFieldSpec("cache_friendly_condensation_enabled", "LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", bool),
     _EnvFieldSpec("cache_friendly_min_debt_groups", "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", int),
-    _EnvFieldSpec("deferred_maintenance_enabled", "LCM_DEFERRED_MAINTENANCE_ENABLED", bool),
-    _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
-    _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
@@ -310,20 +307,11 @@ class LCMConfig:
     # Upper bound for the working dynamic leaf chunk threshold
     dynamic_leaf_chunk_max: int = 40_000
     # When enabled, suppress follow-on condensation after a leaf pass unless
-    # debt/pressure says the extra churn is worth it
+    # enough uncondensed same-depth summaries have accumulated
     cache_friendly_condensation_enabled: bool = False
     # Minimum number of same-depth fanin groups before one follow-on
     # condensation pass is allowed in cache-friendly mode
     cache_friendly_min_debt_groups: int = 2
-    # When enabled, turns can persist raw-backlog maintenance debt and use
-    # later bounded catch-up passes to reduce it.
-    deferred_maintenance_enabled: bool = False
-    # Maximum extra leaf passes a debt-triggered later turn may spend on
-    # catch-up work.
-    deferred_maintenance_max_passes: int = 4
-    # Disabled at 0.0. When set, only bypass cache-friendly/deferred polite
-    # gates once prompt pressure reaches this fraction of the context window.
-    critical_budget_pressure_ratio: float = 0.0
     # Opt into one bounded synchronous sweep after threshold pressure is reached.
     threshold_full_sweep_enabled: bool = False
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).

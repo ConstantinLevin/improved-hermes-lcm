@@ -100,15 +100,9 @@ class CompactionMixin:
             if eligible:
                 return self._mark_preflight_compression_requested()
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
-                if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
-                    return self._mark_preflight_compression_requested()
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = reason
                 logger.info("LCM preflight compression no-op: %s", reason)
-                return False
-            self._refresh_raw_backlog_debt(replay_messages, observed_tokens=replay_rough)
-            if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
-                return self._mark_preflight_compression_requested()
             return False
         if self._compression_boundary_cooldown_active():
             return False
@@ -121,15 +115,9 @@ class CompactionMixin:
             )
             if eligible:
                 return self._mark_preflight_compression_requested()
-            if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
-                return self._mark_preflight_compression_requested()
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = reason
             logger.info("LCM preflight compression no-op: %s", reason)
-            return False
-        self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
-        if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
-            return self._mark_preflight_compression_requested()
         return False
 
     def _replay_diff_requests_ingest_cleanup(
@@ -304,10 +292,6 @@ class CompactionMixin:
                 working_messages,
                 insert_missing_tool_stubs=False,
             )
-            self._refresh_raw_backlog_debt(
-                sanitized_messages,
-                observed_tokens=observed_prompt_tokens,
-            )
             self._ingest_cursor = len(sanitized_messages)
             self._last_compression_status = "sanitized"
             self._last_compression_noop_reason = ""
@@ -364,26 +348,10 @@ class CompactionMixin:
                 "stop_reason": "",
                 "budget_exhausted": False,
             }
-        critical_budget_pressure = self._critical_budget_pressure_reached(
-            observed_tokens=observed_prompt_tokens,
-            messages=working_messages,
-        )
-        deferred_maintenance_active = (
-            not force_overflow
-            and not threshold_full_sweep_active
-            and self._should_run_deferred_maintenance(
-                working_messages,
-                observed_tokens=observed_prompt_tokens,
-            )
-        )
-        if deferred_maintenance_active:
-            self._lifecycle.record_maintenance_attempt(self._conversation_id)
         base_max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
         max_leaf_passes = base_max_leaf_passes
         if threshold_full_sweep_active:
             max_leaf_passes = _THRESHOLD_FULL_SWEEP_MAX_PASSES
-        if deferred_maintenance_active:
-            max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
 
         explicit_focus_topic = focus_topic is not None
 
@@ -495,22 +463,20 @@ class CompactionMixin:
             elif self._config.dynamic_leaf_chunk_enabled:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
-                        noop_reason = (
-                            "raw backlog outside fresh tail is below leaf chunk threshold"
-                        )
-                        break
+                    noop_reason = (
+                        "raw backlog outside fresh tail is below leaf chunk threshold"
+                    )
+                    break
                 if force_overflow:
                     to_compact = candidate_raw
                 else:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
-                        noop_reason = (
-                            "raw backlog outside fresh tail is below leaf chunk threshold"
-                        )
-                        break
+                    noop_reason = (
+                        "raw backlog outside fresh tail is below leaf chunk threshold"
+                    )
+                    break
                 to_compact = candidate_raw
 
             if not to_compact:
@@ -598,7 +564,7 @@ class CompactionMixin:
                 break
 
             if not force_overflow:
-                if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
+                if self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 remaining_fresh_tail_start = self._fresh_tail_start(pressure_messages)
@@ -613,8 +579,7 @@ class CompactionMixin:
                 remaining_raw_tokens = count_messages_tokens(pressure_remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
                 if remaining_raw_tokens < remaining_threshold:
-                    if not (deferred_maintenance_active and critical_budget_pressure):
-                        break
+                    break
 
         if (
             threshold_full_sweep_active
@@ -625,10 +590,6 @@ class CompactionMixin:
             sweep_stop_reason = "pass_budget_exhausted"
 
         if not leaf_compacted_this_turn:
-            self._refresh_raw_backlog_debt(
-                working_messages,
-                observed_tokens=observed_prompt_tokens,
-            )
             if force_overflow and len(messages) >= 1:
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 compressed = self._assemble_overflow_recovery_context(
@@ -719,14 +680,9 @@ class CompactionMixin:
                 focus_topic=focus_topic,
                 leaf_compacted_this_turn=True,
                 force_overflow=force_overflow,
-                critical_budget_pressure=critical_budget_pressure,
             )
 
         # Step 7: Assemble new active context
-        self._refresh_raw_backlog_debt(
-            working_messages,
-            observed_tokens=observed_prompt_tokens,
-        )
         leading_anchor_count = self._leading_anchor_count(working_messages)
         anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
         self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]

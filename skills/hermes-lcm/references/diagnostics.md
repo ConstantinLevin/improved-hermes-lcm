@@ -14,7 +14,7 @@ If optional slash commands are enabled, `/lcm status` and `/lcm doctor` expose t
 
 ## Safe mutation order
 
-For repair or rotate:
+For repair:
 
 1. run the read-only preview;
 2. inspect exact candidates and paths;
