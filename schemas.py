@@ -123,12 +123,10 @@ LCM_STATUS = {
     "description": (
         "Get a quick health overview of the LCM engine for the current session. "
         "Shows compression count, store size, DAG depth distribution, context usage, "
-        "active configuration, session/message filter state, and rotate snapshot "
+        "active configuration, and rotate snapshot "
         "state (last_rotate_at, rotate_backup_path, rotate_backup_size when a "
         "/lcm rotate apply has been run). Use this to understand how much history "
-        "has been compacted, how the engine is performing, whether the current "
-        "session is matched by ignore or stateless session patterns, which message "
-        "noise-suppression patterns are loaded, and when the rolling rotate "
+        "has been compacted, how the engine is performing, and when the rolling rotate "
         "backup was last written."
     ),
     "parameters": {
@@ -143,8 +141,8 @@ LCM_INSPECT = {
     "description": (
         "Inspect read-only LCM metadata for the current session: session/conversation "
         "lineage, message frontier and fresh tail, DAG compaction frontier, latest "
-        "compaction skip/no-op reason, externalized payload refs and readability, "
-        "and matched ignore/stateless patterns. This is an operator inventory tool; "
+        "compaction skip/no-op reason, and externalized payload refs and readability. "
+        "This is an operator inventory tool; "
         "use lcm_grep/lcm_expand when you need actual content."
     ),
     "parameters": {

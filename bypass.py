@@ -14,7 +14,6 @@ from typing import Any, Dict, List, Optional
 
 from .message_analysis import _assistant_tool_call_ids
 from .message_content import normalize_content_value
-from .session_patterns import build_session_match_keys, matches_session_pattern
 from .tokens import count_messages_tokens
 
 logger = logging.getLogger(__name__)
@@ -24,22 +23,16 @@ class BypassMixin:
     def _bypasses_lcm_context_management(self) -> bool:
         """Return True when this binding must not write/manage LCM state.
 
-        Ignored, stateless, and in-process auxiliary sessions are excluded from
-        LCM storage. They still need context-size protection because Hermes has
+        Stateless and in-process auxiliary sessions are excluded from LCM
+        storage. They still need context-size protection because Hermes has
         exactly one active context engine; returning a pure no-op here would
         disable every compaction layer for the session.
         """
-        return bool(
-            self._session_ignored
-            or self._session_stateless
-            or self._thread_context_stateless()
-        )
+        return bool(self._session_stateless or self._thread_context_stateless())
 
     def _bypass_lcm_reason(self) -> str:
         if self._thread_context_stateless():
             return "auxiliary thread context"
-        if self._session_ignored:
-            return "ignored session"
         if self._session_stateless:
             return "stateless session"
         return "active session"
@@ -47,26 +40,11 @@ class BypassMixin:
     def _bypass_lcm_session_id(self) -> str:
         return self._thread_context_session_id() or self._session_id or "(unknown)"
 
-    def _session_id_matches_lcm_bypass_filters(
-        self,
-        session_id: str,
-        *,
-        platform: str = "",
-    ) -> bool:
-        if not session_id:
-            return False
-        match_keys = build_session_match_keys(session_id, platform=platform)
-        if matches_session_pattern(match_keys, self._compiled_ignore_session_patterns):
-            return True
-        return matches_session_pattern(match_keys, self._compiled_stateless_session_patterns)
-
     def _ended_session_directly_bypasses_lcm(self, session_id: str) -> bool:
         """Classify a session-end callback by the ended id, not the active binding."""
         if not session_id:
             return False
-        if session_id == self._thread_context_session_id():
-            return True
-        return self._session_id_matches_lcm_bypass_filters(session_id)
+        return session_id == self._thread_context_session_id()
 
     def _end_host_fallback_compressor_for_session(
         self,
@@ -150,7 +128,7 @@ class BypassMixin:
         except TypeError:
             # Older Hermes hosts may not expose all constructor kwargs. Keep the
             # fallback deliberately conservative rather than failing open to an
-            # unbounded ignored/stateless transcript.
+            # unbounded stateless transcript.
             try:
                 compressor = ContextCompressor(
                     self.model or "unknown",
@@ -403,7 +381,7 @@ class BypassMixin:
         marker = {
             "role": "user",
             "content": (
-                "[Context omitted: this session is ignored/stateless for LCM, "
+                "[Context omitted: this session is stateless for LCM, "
                 "and Hermes native compression was unavailable. Older messages "
                 "were dropped to keep the request within the model context window.]"
             ),
@@ -419,7 +397,7 @@ class BypassMixin:
         focus_topic: Optional[str] = None,
         force: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Delegate ignored/stateless context bounding without writing to LCM."""
+        """Delegate stateless context bounding without writing to LCM."""
         reason = self._bypass_lcm_reason()
         session_id = self._bypass_lcm_session_id()
         self._remember_lcm_bypass_message_prefix(session_id, messages)
@@ -438,12 +416,12 @@ class BypassMixin:
             )
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = f"LCM bypassed below threshold: {reason}"
-            return self._copy_active_replay_messages_preserving_generated_ids(messages)
+            return self._copy_active_replay_messages(messages)
 
         logger.debug("LCM delegating compaction for bypassed %s %s", reason, session_id)
         self._last_compression_status = "host_fallback"
         self._last_compression_noop_reason = f"LCM bypassed: {reason}"
-        safe_messages = self._copy_active_replay_messages_preserving_generated_ids(messages)
+        safe_messages = self._copy_active_replay_messages(messages)
         target_tokens = self._bypass_compaction_target_tokens(
             observed_tokens=observed_tokens,
             messages=safe_messages,

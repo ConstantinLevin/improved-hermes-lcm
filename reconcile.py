@@ -245,7 +245,6 @@ class ReconcileMixin:
                 msg
                 for msg in candidate_messages
                 if not self._is_replayed_context_scaffold_message(msg)
-                and not self._matches_ignore_message_patterns(msg)
             ]
             candidate_non_placeholder_messages = [
                 msg
@@ -253,17 +252,6 @@ class ReconcileMixin:
                 if not self._is_volatile_ignored_quarantine_placeholder(
                     msg,
                     text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
-                    and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
             ]
             filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
@@ -379,17 +367,6 @@ class ReconcileMixin:
                 self._is_volatile_ignored_quarantine_placeholder(
                     msg,
                     text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                or self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                or (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
-                    and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
                 for msg in candidate_messages
             )
@@ -536,7 +513,6 @@ class ReconcileMixin:
             self._message_replay_identity(msg)
             for msg in messages
             if not self._is_replayed_context_scaffold_message(msg)
-            and not self._matches_ignore_message_patterns(msg)
         ]
 
     def _is_suspicious_stale_no_overlap_snapshot(
@@ -610,19 +586,14 @@ class ReconcileMixin:
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
             return 0
-        stored_tail_rows = [
-            row
-            for row in stored_rows
-            if not self._matches_ignore_message_patterns(row, stored_row=True)
-        ]
         stored_tail = [
             self._message_replay_identity(row, stored_row=True)
-            for row in stored_tail_rows
+            for row in stored_rows
         ]
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
-            stored_tail_rows=stored_tail_rows,
+            stored_tail_rows=stored_rows,
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
@@ -659,9 +630,6 @@ class ReconcileMixin:
             limit=tail_limit,
         )
         stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
-        # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
-        # filters may suppress noisy rows for tail reconciliation, but filtered
-        # history alone must not create replay evidence for skipping a batch.
         incoming_has_unproofed_raw_persisted_marker = any(
             str(msg.get("role") or "") == "tool"
             and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
@@ -779,12 +747,6 @@ class ReconcileMixin:
                 _raw_placeholder_identity_cache[probe_idx] = cached
             return cached
         active_surplus_skips: dict[tuple[Any, ...], int] = {}
-        generated_surplus_skip_message_ids: set[int] = set()
-        generated_placeholder_message_ids = getattr(
-            self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
-        )
         for identity, active_count in active_identity_counts.items():
             wanted_cleanup_identity = self._active_cleanup_replay_identity(identity)
             stored_exact = stored_identity_counts.get(identity, 0)
@@ -793,18 +755,7 @@ class ReconcileMixin:
                 stored_cleanup = stored_cleanup_identity_counts.get(wanted_cleanup_identity, 0)
             stored_available = max(stored_exact, stored_cleanup)
             if active_count > stored_available:
-                surplus_count = active_count - stored_available
-                for msg in messages:
-                    if surplus_count <= 0:
-                        break
-                    if id(msg) not in generated_placeholder_message_ids:
-                        continue
-                    if self._message_replay_identity(msg) != identity:
-                        continue
-                    generated_surplus_skip_message_ids.add(id(msg))
-                    surplus_count -= 1
-                if surplus_count > 0:
-                    active_surplus_skips[identity] = surplus_count
+                active_surplus_skips[identity] = active_count - stored_available
 
         placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         for msg in messages:
@@ -869,8 +820,6 @@ class ReconcileMixin:
                         probe_idx = raw_match_idx + 1
                         continue
                 message_identity = self._message_replay_identity(remaining_msg)
-                if id(remaining_msg) in generated_surplus_skip_message_ids:
-                    continue
                 surplus = local_surplus_skips.get(message_identity, 0)
                 if surplus > 0:
                     local_surplus_skips[message_identity] = surplus - 1
@@ -924,8 +873,6 @@ class ReconcileMixin:
                 if id(msg) in ids_by_message_id:
                     continue
             message_identity = self._message_replay_identity(msg)
-            if id(msg) in generated_surplus_skip_message_ids:
-                continue
             surplus = active_surplus_skips.get(message_identity, 0)
             if surplus > 0:
                 active_surplus_skips[message_identity] = surplus - 1

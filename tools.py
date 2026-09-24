@@ -32,7 +32,6 @@ from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 from .presets import preset_status_payload
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
-from .session_patterns import build_session_match_keys, compile_session_pattern
 from .store import build_message_fts_spec
 
 if TYPE_CHECKING:
@@ -1614,19 +1613,6 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
     }
 
 
-def _matched_session_patterns(session_keys: list[str], patterns: list[str]) -> list[str]:
-    """Return configured session glob patterns that match the supplied keys."""
-    matched: list[str] = []
-    for pattern in patterns:
-        try:
-            compiled = compile_session_pattern(pattern)
-        except re.error:
-            continue
-        if any(compiled.match(key) for key in session_keys if key):
-            matched.append(pattern)
-    return matched
-
-
 def _inspect_externalized_refs_from_value(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1936,9 +1922,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     runtime_last_compacted = int(getattr(engine, "_last_compacted_store_id", 0) or 0)
 
     platform = engine.current_session_platform
-    session_keys = build_session_match_keys(session_id, platform=platform)
-    ignore_patterns = list(engine._config.ignore_session_patterns or [])
-    stateless_patterns = list(engine._config.stateless_session_patterns or [])
 
     response: dict[str, Any] = {
         "read_only": True,
@@ -1998,15 +1981,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
         },
         "externalized_refs": _inspect_externalized_refs(engine, session_id, limit),
         "filters": {
-            "session_keys": session_keys,
-            "ignored": engine.current_session_ignored,
             "stateless": engine.current_session_stateless,
-            "ignore_session_patterns": ignore_patterns,
-            "stateless_session_patterns": stateless_patterns,
-            "matched_ignore_session_patterns": _matched_session_patterns(session_keys, ignore_patterns),
-            "matched_stateless_session_patterns": _matched_session_patterns(session_keys, stateless_patterns),
-            "ignore_message_patterns": list(engine._config.ignore_message_patterns or []),
-            "ignored_message_count": full_status.get("ignored_message_count", 0),
         },
     }
     if requested_limit > _LCM_INSPECT_HARD_LIMIT_CAP:
@@ -2130,15 +2105,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "config_source_warnings": config_source_warnings,
         "ignored_config_yaml_lcm_keys": ignored_config_yaml_lcm_keys,
         "session_filters": {
-            "ignored": engine.current_session_ignored,
             "stateless": engine.current_session_stateless,
-            "ignore_session_patterns": full_status.get("ignore_session_patterns", []),
-            "ignore_session_patterns_source": full_status.get("ignore_session_patterns_source", "default"),
-            "stateless_session_patterns": full_status.get("stateless_session_patterns", []),
-            "stateless_session_patterns_source": full_status.get("stateless_session_patterns_source", "default"),
-            "ignore_message_patterns": full_status.get("ignore_message_patterns", []),
-            "ignore_message_patterns_source": full_status.get("ignore_message_patterns_source", "default"),
-            "ignored_message_count": full_status.get("ignored_message_count", 0),
             "side_channel_active": side_channel_active,
             **(
                 {"side_channel_session_id": engine._session_id}
@@ -2202,20 +2169,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "last_error": getattr(engine, "_last_ingest_error", "") or "",
             "last_error_time": getattr(engine, "_last_ingest_error_time", 0) or 0,
         } if ingest_failures else "no ingest failures recorded",
-    })
-
-    # ignore_message_patterns drops discard raw content that is never persisted.
-    # A non-zero count is worth surfacing so an over-broad pattern is noticed.
-    dropped = int(getattr(engine, "_ignore_pattern_dropped_count", 0) or 0)
-    checks.append({
-        "check": "ignore_pattern_drops",
-        "status": "warn" if dropped else "pass",
-        "detail": (
-            f"{dropped} message(s) dropped by ignore_message_patterns and not "
-            "persisted; verify the pattern is not matching substantive turns"
-            if dropped
-            else "no messages dropped by ignore_message_patterns"
-        ),
     })
 
     try:

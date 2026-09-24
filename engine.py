@@ -46,8 +46,6 @@ from .extraction import (
 )
 from .ingest_protection import (
     _is_hermes_persisted_output_marker,
-    assistant_output_quarantine_reason,
-    extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
@@ -71,18 +69,12 @@ from .sanitize import (
     _clean_active_assistant_message,
     _should_drop_active_assistant_message,
 )
-from .session_patterns import (
-    build_session_match_keys,
-    compile_session_patterns,
-    matches_session_pattern,
-)
 from .message_analysis import (
     _is_synthetic_assistant_noise,
     _matched_tool_call_ids,
     _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
-from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
@@ -92,7 +84,6 @@ from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
     normalize_content_value,
-    stored_text_content_for_pattern_matching,
     text_content_for_pattern_matching,
 )
 from .sqlite_util import (
@@ -155,16 +146,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         self._session_id: str = ""
         self._session_platform: str = ""
-        # Tracks the most recent non-ignored, non-stateless binding so that
+        # Tracks the most recent non-stateless binding so that
         # user-facing tools (lcm_status, lcm_grep, lcm_expand_query,
         # lcm_doctor) keep showing the foreground session
-        # even while a side-channel session (cron, debug) temporarily owns the
+        # even while a side-channel session temporarily owns the
         # engine's _session_id binding. Updated alongside _session_id only
         # when _refresh_session_filters classifies the new session as a real
-        # foreground (neither ignored nor stateless). Read via the
+        # foreground (not stateless). Read via the
         # `current_session_id` / `current_session_platform` properties and
-        # `current_session_ignored` / `current_session_stateless` /
-        # `side_channel_active` companion predicates.
+        # `current_session_stateless` / `side_channel_active` companion
+        # predicates.
         self._foreground_session_id: str = ""
         self._foreground_session_platform: str = ""
         self._foreground_conversation_id: str = ""
@@ -174,26 +165,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_rebind_previous_conversation_id: str = ""
         self._foreground_rebind_parent_session_id: str = ""
         self._conversation_id: str = ""
-        self._session_match_keys: list[str] = []
-        self._session_ignored = False
         self._session_stateless = False
-        self._compiled_ignore_session_patterns = compile_session_patterns(
-            self._config.ignore_session_patterns
-        )
-        self._compiled_stateless_session_patterns = compile_session_patterns(
-            self._config.stateless_session_patterns
-        )
-        self._compiled_ignore_message_patterns = compile_message_patterns(
-            self._config.ignore_message_patterns
-        )
-        self._ignored_message_count: int = 0
-        # Raw messages permanently dropped because they matched
-        # ignore_message_patterns. These are NOT persisted anywhere, so an
-        # over-broad operator pattern silently discards substantive turns from
-        # the "lossless" store. Count + log them so the loss is at least
-        # visible; full lossless retention (store with ignored=1) is a larger
-        # follow-up that touches cursor reconciliation and FTS.
-        self._ignore_pattern_dropped_count: int = 0
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -314,18 +286,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # keep anchoring opt-in rather than changing its public behavior.
         self._pending_context_anchor_messages: Optional[List[Dict[str, Any]]] = None
         self._current_compress_store_ids_by_message_id: dict[int, int] = {}
-        self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
-        self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
-        self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget: dict[str, int] = {}
-        self._compression_boundary_active_placeholder_digest_ordinals: dict[str, set[int]] = {}
-        self._compression_boundary_stored_placeholder_digest_counts: dict[str, int] = {}
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
@@ -463,14 +428,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_conversation_id = ""
         self._clear_foreground_rebind_candidate()
         self._conversation_id = ""
-        self._session_match_keys = []
-        self._session_ignored = False
         self._session_stateless = False
         self._clear_pending_reset_boundary()
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget = {}
-        self._compression_boundary_active_placeholder_digest_ordinals = {}
-        self._compression_boundary_stored_placeholder_digest_counts = {}
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
@@ -715,8 +674,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """User-facing "current session" id surfaced by LCM tools.
 
         Returns the most recent foreground binding (the last session id that
-        ``_refresh_session_filters`` classified as neither ignored nor
-        stateless). Falls back to ``_session_id`` when no foreground has
+        ``_refresh_session_filters`` did not classify as stateless). Falls back to ``_session_id`` when no foreground has
         ever been bound, so unattended cron-only or stateless-only processes
         remain observable via ``lcm_status``.
 
@@ -744,7 +702,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     @property
     def side_channel_active(self) -> bool:
-        """True when an ignored or stateless session has temporarily rebound
+        """True when a stateless session has temporarily rebound
         ``_session_id`` while a real foreground binding still exists.
 
         Operators reading lcm_status during this window see the foreground
@@ -755,16 +713,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         return bool(self._foreground_session_id) and self._foreground_session_id != self._session_id
 
-    @property
-    def current_session_ignored(self) -> bool:
-        """``_session_ignored`` reported for ``current_session_id``.
-
-        When a side channel is in flight the foreground is by definition
-        non-ignored; otherwise this is the bound session's ignore flag.
-        """
-        if self.side_channel_active:
-            return False
-        return self._session_ignored
 
     @property
     def current_session_stateless(self) -> bool:
@@ -1253,7 +1201,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id = str(self._session_id or "")
         if not session_id:
             return False
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+        if self._session_stateless or self._thread_context_stateless():
             return False
         if self._ingest_cursor > 0:
             return False
@@ -1434,7 +1382,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
         self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
-        if not self._session_ignored and not self._session_stateless:
+        if not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
             self._lcm_session_last_normal_conversation_id[session_id] = state.conversation_id
             self._foreground_session_id = session_id
@@ -1518,17 +1466,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if old_session_id in self._lcm_session_last_bypassed:
             return bool(self._lcm_session_last_bypassed.get(old_session_id))
         if old_session_id == self._session_id:
-            return bool(
-                self._bypasses_lcm_context_management()
-                or self._session_id_matches_lcm_bypass_filters(
-                    old_session_id,
-                    platform=self._session_platform,
-                )
-            )
-        return bool(
-            self._has_lcm_bypass_lineage_session(old_session_id)
-            or self._session_id_matches_lcm_bypass_filters(old_session_id)
-        )
+            return bool(self._bypasses_lcm_context_management())
+        return bool(self._has_lcm_bypass_lineage_session(old_session_id))
 
     def _get_allowed_hermes_base(self) -> Path | None:
         """Get the allowed base directory for hermes_home, or None if not restricted."""
@@ -1748,13 +1687,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
         # Hold the foreground view stable when the new binding is a side
-        # channel (cron tick inside the gateway process, debug probe, etc.).
-        # Tools that report "current session" to operators must keep pointing
-        # at the real foreground rather than the ignored/stateless session
+        # channel. Tools that report "current session" to operators must keep
+        # pointing at the real foreground rather than the stateless session
         # that just stole _session_id. Lifecycle paths still read _session_id
-        # directly so cron's compress short-circuits correctly via the
-        # _session_ignored / _session_stateless gates.
-        if not self._session_ignored and not self._session_stateless:
+        # directly so compress short-circuits correctly via the
+        # _session_stateless gate.
+        if not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
@@ -2072,12 +2010,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     boundary_placeholder_budget.get(digest, 0),
                     len(ordinals),
                 )
-            self._compression_boundary_stored_placeholder_digest_counts = (
-                self._stored_active_replay_placeholder_digest_counts(
-                    source_session_id,
-                    after_store_id=frontier,
-                )
-            )
 
         if can_reassign:
             self._lifecycle.finalize_session(
@@ -2085,12 +2017,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 source_session_id,
                 frontier_store_id=frontier,
             )
-            self._copy_generated_ignore_hashes_to_session(
-                source_session_id,
-                session_id,
-                copy_dependent_content=True,
-                source_frontier_store_id=frontier,
-            )
+            self._copy_generated_ignore_hashes_to_session(source_session_id, session_id)
             self._write_generated_ignored_placeholder_hash_counts(
                 boundary_placeholder_budget,
                 self._session_scoped_hash_metadata_keys(
@@ -2134,7 +2061,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             self._schedule_ingest_cursor_reconciliation()
             self._clear_pending_reset_boundary()
-            self._log_session_filter_diagnostics()
             return
 
         self._apply_session_start_metadata(session_id, kwargs)
@@ -2149,10 +2075,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if state is not None:
                 self._last_compacted_store_id = state.current_frontier_store_id
         self._clear_pending_reset_boundary()
-        self._compression_boundary_ingest_pending = can_reassign
-        self._compression_boundary_active_placeholder_digest_budget = boundary_placeholder_budget
-        self._compression_boundary_active_placeholder_digest_ordinals = boundary_placeholder_ordinals
-        self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
@@ -2363,7 +2285,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     conversation_id=kwargs.get("conversation_id"),
                 )
                 self._schedule_ingest_cursor_reconciliation()
-                self._log_session_filter_diagnostics()
                 logger.info(
                     "LCM compression boundary %s -> %s stayed stateless because the source session bypasses LCM storage",
                     old_session_id,
@@ -2400,10 +2321,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             return
         start_platform = str(kwargs.get("platform") or "")
-        side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
-            session_id,
-            platform=start_platform,
-        ) or self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
+        side_channel_rebind = self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
         self._unmark_thread_context_auxiliary_session(
             session_id,
             suppress_as_foreground_reuse=not side_channel_rebind,
@@ -2429,7 +2347,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             conversation_id=kwargs.get("conversation_id"),
         )
         self._schedule_ingest_cursor_reconciliation()
-        self._log_session_filter_diagnostics()
 
     def _session_end_matches_current_store_prefix(
         self,
@@ -2724,22 +2641,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> list[int]:
         if not session_id or not suffix:
             return []
-        kept: list[Dict[str, Any]] = []
-        for msg in suffix:
-            if self._matches_ignore_message_patterns(msg):
-                self._ignored_message_count += 1
-                excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[:80].replace("\n", " ")
-                logger.debug(
-                    "LCM ignore_message_patterns dropped late session-end %s message: %r",
-                    msg.get("role", "unknown"),
-                    excerpt,
-                )
-                continue
-            kept.append(msg)
-        if not kept:
-            return []
         protected_messages = protect_messages_for_ingest(
-            kept,
+            suffix,
             session_id=session_id,
             config=self._config,
             hermes_home=self._hermes_home,
@@ -3110,12 +3013,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        if self._session_ignored and new_session_id == self._session_id:
-            logger.debug(
-                "LCM carry-over skipped for ignored session %s",
-                new_session_id,
-            )
-            return 0
         return self._dag.reassign_session_nodes(old_session_id, new_session_id)
 
 
@@ -3136,9 +3033,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if name != "lcm_inspect" and messages and self._session_id:
             if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
                 self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            elif not (
-                self._session_ignored or self._session_stateless or self._thread_context_stateless()
-            ):
+            elif not (self._session_stateless or self._thread_context_stateless()):
                 try:
                     self._ingest_messages(messages)
                     self._record_ingest_success()
@@ -3310,16 +3205,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             status["store_messages"] = self._store.get_session_count(session_id)
             status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
-            status["session_ignored"] = self.current_session_ignored
             status["session_stateless"] = self.current_session_stateless
-            status["ignore_session_patterns"] = list(self._config.ignore_session_patterns)
-            status["stateless_session_patterns"] = list(self._config.stateless_session_patterns)
-            status["ignore_message_patterns"] = list(self._config.ignore_message_patterns)
-            status["ignore_session_patterns_source"] = self._config.ignore_session_patterns_source
-            status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
-            status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
-            status["ignored_message_count"] = self._ignored_message_count
-            status["ignore_pattern_dropped_count"] = self._ignore_pattern_dropped_count
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
@@ -3388,76 +3274,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
-        self._session_match_keys = build_session_match_keys(
-            self._session_id,
-            platform=self._session_platform,
-        )
-        self._session_ignored = matches_session_pattern(
-            self._session_match_keys,
-            self._compiled_ignore_session_patterns,
-        )
-        self._session_stateless = (
-            not self._session_ignored
-            and (
-                (
-                    self._lcm_current_start_allows_bypass_lineage
-                    and self._has_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
-                )
-                or matches_session_pattern(
-                    self._session_match_keys,
-                    self._compiled_stateless_session_patterns,
-                )
-            )
+        self._session_stateless = bool(
+            self._lcm_current_start_allows_bypass_lineage
+            and self._has_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
         )
         if self._session_id:
             self._lcm_session_last_platform[self._session_id] = self._session_platform
-            self._lcm_session_last_bypassed[self._session_id] = bool(self._session_ignored or self._session_stateless)
-            if not self._session_ignored and not self._session_stateless:
+            self._lcm_session_last_bypassed[self._session_id] = self._session_stateless
+            if not self._session_stateless:
                 self._lcm_non_bypass_platforms.setdefault(self._session_id, set()).add(self._session_platform)
                 self._lcm_session_last_normal_platform[self._session_id] = self._session_platform
-        if self._session_ignored or self._session_stateless:
+        if self._session_stateless:
             self._mark_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
 
-    def _log_session_filter_diagnostics(self) -> None:
-        if not self._logged_filter_config:
-            if self._config.ignore_session_patterns:
-                logger.info(
-                    "LCM ignore_session_patterns from %s: %s",
-                    self._config.ignore_session_patterns_source,
-                    ", ".join(self._config.ignore_session_patterns),
-                )
-            if self._config.stateless_session_patterns:
-                logger.info(
-                    "LCM stateless_session_patterns from %s: %s",
-                    self._config.stateless_session_patterns_source,
-                    ", ".join(self._config.stateless_session_patterns),
-                )
-            if self._config.ignore_message_patterns:
-                logger.info(
-                    "LCM ignore_message_patterns from %s: %s",
-                    self._config.ignore_message_patterns_source,
-                    ", ".join(self._config.ignore_message_patterns),
-                )
-            self._logged_filter_config = True
-        if self._session_ignored:
-            logger.info(
-                "LCM session %s matched ignore_session_patterns via %s — skipping writes and compaction",
-                self._session_id,
-                ", ".join(self._session_match_keys),
-            )
-        elif self._session_stateless:
-            logger.info(
-                "LCM session %s matched stateless_session_patterns via %s — read-only mode (no LCM writes)",
-                self._session_id,
-                ", ".join(self._session_match_keys),
-            )
 
     # -- Internal: message ingestion ---------------------------------------
 
     def _schedule_ingest_cursor_reconciliation(self) -> None:
         """Mark existing-session rebinds for cursor repair on next ingest."""
         self._ingest_cursor_needs_reconcile = False
-        if not self._session_id or self._session_ignored or self._session_stateless:
+        if not self._session_id or self._session_stateless:
             return
         try:
             self._ingest_cursor_needs_reconcile = self._store.get_session_count(self._session_id) > 0
@@ -3465,132 +3301,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
-    def _stored_row_externalized_text_parts_for_pattern_matching(self, msg: Dict[str, Any]) -> list[str]:
-        ref_sources: list[str] = []
-        content = msg.get("content")
-        if isinstance(content, str):
-            ref_sources.append(content)
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            try:
-                ref_sources.append(json.dumps(tool_calls, ensure_ascii=False))
-            except (TypeError, ValueError):
-                ref_sources.append(str(tool_calls))
-        refs: list[str] = []
-        for source in ref_sources:
-            for ref in extract_all_externalized_payload_refs(source):
-                if ref not in refs:
-                    refs.append(ref)
-        parts: list[str] = []
-        session_id = str(msg.get("session_id") or self._session_id or "")
-        for ref in refs:
-            payload = load_externalized_payload(
-                ref,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-            if not payload:
-                continue
-            payload_session_id = str(payload.get("session_id") or "")
-            if session_id and payload_session_id and payload_session_id != session_id:
-                continue
-            payload_content = payload.get("content")
-            if isinstance(payload_content, str):
-                parts.append(payload_content)
-        return parts
-
-    def _stored_row_externalized_text_for_pattern_matching(self, msg: Dict[str, Any]) -> str:
-        return "\n".join(self._stored_row_externalized_text_parts_for_pattern_matching(msg))
-
-    def _is_cached_active_replay_message_at_index(self, idx: int, msg: Dict[str, Any]) -> bool:
-        if idx < 0 or idx >= len(self._last_active_replay_messages):
-            return False
-        return self._message_replay_identity(msg) == self._message_replay_identity(
-            self._last_active_replay_messages[idx]
-        )
-
-    def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
-        if not self._compiled_ignore_message_patterns:
-            return False
-        content = msg.get("content")
-        text = (
-            stored_text_content_for_pattern_matching(content)
-            if stored_row
-            else text_content_for_pattern_matching(content)
-        ) or ""
-        if matches_message_pattern(text, self._compiled_ignore_message_patterns):
-            return True
-        if stored_row:
-            externalized_parts = self._stored_row_externalized_text_parts_for_pattern_matching(msg)
-            for externalized_text in externalized_parts:
-                if externalized_text and matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns):
-                    return True
-            externalized_text = "\n".join(externalized_parts)
-            if externalized_text and externalized_text != text:
-                return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
-        return False
 
     def _content_has_externalized_placeholder_ref(self, content: str) -> bool:
         return bool(extract_ingest_externalized_refs(content))
 
-    def _has_prior_raw_externalized_placeholder_row(self, store_id: int, msg: Dict[str, Any]) -> bool:
-        if not self._session_id:
-            return False
-        raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-        after_store_id = 0
-        while True:
-            rows = self._store.get_session_messages_after(
-                self._session_id,
-                after_store_id=after_store_id,
-                limit=1000,
-            )
-            if not rows:
-                return False
-            for row in rows:
-                row_store_id = int(row.get("store_id") or 0)
-                if row_store_id >= store_id:
-                    return False
-                if self._raw_externalized_placeholder_replay_identity(row) == raw_identity:
-                    return True
-                after_store_id = max(after_store_id, row_store_id)
 
-    def _mapped_stored_row_matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
-        store_id = msg.get("store_id")
-        content = normalize_content_value(msg.get("content")) or ""
-        has_externalized_placeholder = self._content_has_externalized_placeholder_ref(content)
-        mapped_from_active_placeholder = False
-        if store_id is None:
-            store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
-            mapped_from_active_placeholder = has_externalized_placeholder and store_id is not None
-        if store_id is None:
-            return False
-        if mapped_from_active_placeholder and self._has_prior_raw_externalized_placeholder_row(int(store_id), msg):
-            raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-            if self._current_compress_placeholder_identity_counts.get(raw_identity, 0) <= 1:
-                return False
-        try:
-            stored = self._store.get(int(store_id))
-        except Exception:
-            logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
-            return False
-        return bool(stored and self._matches_ignore_message_patterns(stored, stored_row=True))
-
-    def _copy_active_replay_messages_preserving_generated_ids(
-        self,
+    @staticmethod
+    def _copy_active_replay_messages(
         active_replay_messages: List[Dict[str, Any]],
     ) -> list[Dict[str, Any]]:
-        copied_replay_messages: list[Dict[str, Any]] = []
-        generated_message_ids = getattr(
-            self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
-        )
-        for message in active_replay_messages:
-            copied_message = dict(message)
-            if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(copied_message))
-            copied_replay_messages.append(copied_message)
-        return copied_replay_messages
+        return [dict(message) for message in active_replay_messages]
 
     def _remember_active_replay_messages(
         self,
@@ -3600,7 +3320,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
-        self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+        self._last_active_replay_messages = self._copy_active_replay_messages(
             active_replay_messages
         )
         self._write_generated_ignored_placeholder_hash_counts(
@@ -3619,7 +3339,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                return self._copy_active_replay_messages(cached)
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -3710,22 +3430,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "content": cls._identity_content_for_active_cleanup(content),
         })
 
-    def _ignored_message_is_quarantinable_assistant(self, msg: Dict[str, Any]) -> bool:
-        if self._is_volatile_ignored_quarantine_placeholder(
-            msg,
-            text_content_for_pattern_matching(msg.get("content")) or "",
-        ):
-            return True
-        identity = self._message_replay_identity(msg)
-        if self._is_quarantined_assistant_replay_identity(identity):
-            return True
-        if not self._matches_ignore_message_patterns(msg):
-            return False
-        if identity[0] != "assistant":
-            return False
-        content = normalize_content_value(msg.get("content")) or ""
-        return assistant_output_quarantine_reason(content) is not None
-
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
@@ -3742,38 +3446,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
-            return self._copy_active_replay_messages_preserving_generated_ids(messages)
+            return self._copy_active_replay_messages(messages)
 
-        if self._session_ignored or self._session_stateless:
-            logger.debug(
-                "Ingest skipped for %s session %s",
-                "ignored" if self._session_ignored else "stateless",
-                self._session_id,
-            )
-            return self._copy_active_replay_messages_preserving_generated_ids(messages)
+        if self._session_stateless:
+            logger.debug("Ingest skipped for stateless session %s", self._session_id)
+            return self._copy_active_replay_messages(messages)
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
-        ignored_original_messages = [False] * n
-        if self._compiled_ignore_message_patterns:
-            previous_store_id_map = self._current_compress_store_ids_by_message_id
-            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
-            try:
-                for idx in range(scan_start, n):
-                    mapped_ignore = self._mapped_stored_row_matches_ignore_message_patterns(messages[idx])
-                    ignored_original_messages[idx] = (
-                        self._matches_ignore_message_patterns(messages[idx])
-                        or mapped_ignore
-                    )
-            finally:
-                self._current_compress_store_ids_by_message_id = previous_store_id_map
-        externalize_messages = [False] * n
-        prefer_existing_externalized = [False] * n
-        for idx in range(scan_start, n):
-            externalize_messages[idx] = not ignored_original_messages[idx]
-        for idx in range(0, scan_start):
-            prefer_existing_externalized[idx] = not ignored_original_messages[idx]
+        externalize_messages = [idx >= scan_start for idx in range(n)]
+        prefer_existing_externalized = [idx < scan_start for idx in range(n)]
         replay_messages = quarantine_suspicious_assistant_messages(
             messages,
             session_id=self._session_id,
@@ -3782,24 +3465,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             externalize=externalize_messages,
             prefer_existing_externalized=prefer_existing_externalized,
         )
-        replay_messages = self._copy_active_replay_messages_preserving_generated_ids(replay_messages)
-        replay_messages = self._apply_ignored_active_replay_placeholders(
-            messages,
-            replay_messages,
-            scan_start=scan_start,
-            ignored_messages=ignored_original_messages,
-        )
+        replay_messages = self._copy_active_replay_messages(replay_messages)
         if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = [
-                original_msg
-                if (
-                    self._compiled_ignore_message_patterns
-                    and ignored_original_messages[idx]
-                )
-                else replay_msg
-                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-            ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(replay_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
@@ -3816,7 +3484,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ]
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
-                        self._copy_active_replay_messages_preserving_generated_ids(
+                        self._copy_active_replay_messages(
                             cached_active_replay_messages[:cursor]
                         )
                         + replay_messages[cursor:]
@@ -3831,243 +3499,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not new_messages:
             cached_replay = self._cached_active_replay_messages(messages)
-            self._compression_boundary_ingest_pending = False
-            self._compression_boundary_active_placeholder_digest_budget = {}
-            self._compression_boundary_active_placeholder_digest_ordinals = {}
-            self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
 
-        active_replay_messages = replay_messages
-        compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
-        empty_session_placeholder_budget: dict[str, int] = {}
-        empty_session_placeholder_ordinals: dict[str, set[int]] = {}
-        if not compression_boundary_ingest_pending and self._session_id:
-            try:
-                if self._store.get_session_count(self._session_id) == 0:
-                    empty_session_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
-                    empty_session_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
-            except Exception:
-                empty_session_placeholder_budget = {}
-                empty_session_placeholder_ordinals = {}
-        messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
-            (cursor + offset, replay_msg)
-            for offset, replay_msg in enumerate(new_messages)
-        ]
-        if messages_to_store_with_index:
-            kept: list[tuple[int, Dict[str, Any]]] = []
-            boundary_placeholder_seen: dict[str, int] = {}
-            boundary_seen_synthetic_summary_before = False
-            empty_session_placeholder_seen: dict[str, int] = {}
-            if empty_session_placeholder_ordinals and cursor > 0:
-                for replay_msg in replay_messages[:cursor]:
-                    replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
-                    digest = self._active_replay_placeholder_digest(replay_text)
-                    if digest:
-                        empty_session_placeholder_seen[digest] = empty_session_placeholder_seen.get(digest, 0) + 1
-            boundary_all_placeholder_replay_batch = (
-                compression_boundary_ingest_pending
-                and len(new_messages) > 1
-                and all(
-                    self._is_ignored_active_replay_placeholder(
-                        msg,
-                        text_content_for_pattern_matching(msg.get("content")) or "",
-                    )
-                    for msg in new_messages
+        messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = []
+        for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
+            absolute_idx = cursor + offset
+            replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+            original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+            volatile_digest = self._active_replay_placeholder_digest(replay_text)
+            generated_volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
+                replay_msg,
+                replay_text,
+            ) and (
+                original_text != replay_text
+                or (
+                    volatile_digest is not None
+                    and volatile_digest in self._load_generated_ignored_placeholder_hashes()
                 )
             )
-            if compression_boundary_ingest_pending:
-                boundary_budget = self._compression_boundary_active_placeholder_digest_budget
-                stored_counts = self._compression_boundary_stored_placeholder_digest_counts
-                if boundary_budget and stored_counts:
-                    incoming_counts: dict[str, int] = {}
-                    relevant_digests = set(boundary_budget) | set(stored_counts)
-                    for msg in new_messages:
-                        text = text_content_for_pattern_matching(msg.get("content")) or ""
-                        digest = self._active_replay_placeholder_digest(text)
-                        if digest in relevant_digests:
-                            incoming_counts[digest] = incoming_counts.get(digest, 0) + 1
-                    adjusted_budget: dict[str, int] = {}
-                    for digest, count in boundary_budget.items():
-                        parsed_count = max(0, int(count or 0))
-                        incoming_count = max(0, int(incoming_counts.get(digest, 0) or 0))
-                        stored_count = max(0, int(stored_counts.get(digest, 0) or 0))
-                        remaining = min(parsed_count, max(0, incoming_count - stored_count))
-                        if remaining > 0:
-                            adjusted_budget[digest] = remaining
-                    self._compression_boundary_active_placeholder_digest_budget = adjusted_budget
-            empty_session_all_placeholder_replay_batch = (
-                bool(empty_session_placeholder_ordinals)
-                and len(new_messages) > 1
-                and all(
-                    self._is_ignored_active_replay_placeholder(
-                        msg,
-                        text_content_for_pattern_matching(msg.get("content")) or "",
-                    )
-                    for msg in new_messages
+            if generated_volatile_placeholder:
+                if volatile_digest is not None:
+                    self._remember_generated_ignored_placeholder_hash(volatile_digest)
+                logger.debug(
+                    "LCM did not store a generated quarantine placeholder for %s message: %r",
+                    original_msg.get("role", "unknown"),
+                    original_text[:80].replace("\n", " "),
                 )
-            )
-            for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
-                absolute_idx = cursor + offset
-                replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
-                original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
-                volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
-                    replay_msg,
-                    replay_text,
+                continue
+            store_msg = replay_msg
+            if (
+                str(original_msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(
+                    normalize_content_value(original_msg.get("content")) or ""
                 )
-                volatile_digest = self._active_replay_placeholder_digest(replay_text)
-                generated_volatile_placeholder = volatile_placeholder and (
-                    original_text != replay_text
-                    or (
-                        volatile_digest is not None
-                        and volatile_digest in self._load_generated_ignored_placeholder_hashes()
-                    )
-                )
-                active_replay_placeholder = self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
-                active_replay_placeholder_digest = self._active_replay_placeholder_digest(replay_text)
-                if not active_replay_placeholder:
-                    replay_text_stripped = replay_text.strip()
-                    if (
-                        self._is_context_summary_content(replay_text)
-                        or replay_text_stripped.startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
-                        or replay_text_stripped.startswith(_PRESERVED_TODO_CONTEXT_PREFIX)
-                    ):
-                        boundary_seen_synthetic_summary_before = True
-                compression_carried_active_placeholder = False
-                metadata_replayed_active_placeholder = False
-                if (
-                    empty_session_placeholder_budget
-                    and empty_session_placeholder_ordinals
-                    and active_replay_placeholder
-                    and active_replay_placeholder_digest is not None
-                ):
-                    empty_session_placeholder_seen[active_replay_placeholder_digest] = (
-                        empty_session_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
-                    )
-                    ordinal = empty_session_placeholder_seen[active_replay_placeholder_digest]
-                    remaining = empty_session_placeholder_budget.get(active_replay_placeholder_digest, 0)
-                    if (
-                        remaining > 0
-                        and ordinal in empty_session_placeholder_ordinals.get(
-                            active_replay_placeholder_digest,
-                            set(),
-                        )
-                        and (ordinal > 1 or empty_session_all_placeholder_replay_batch)
-                    ):
-                        metadata_replayed_active_placeholder = True
-                        if remaining == 1:
-                            empty_session_placeholder_budget.pop(active_replay_placeholder_digest, None)
-                        else:
-                            empty_session_placeholder_budget[active_replay_placeholder_digest] = remaining - 1
-                if (
-                    compression_boundary_ingest_pending
-                    and active_replay_placeholder
-                    and active_replay_placeholder_digest is not None
-                ):
-                    boundary_placeholder_seen[active_replay_placeholder_digest] = (
-                        boundary_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
-                    )
-                    current_placeholder_ordinal = boundary_placeholder_seen[active_replay_placeholder_digest]
-                    boundary_budget = self._compression_boundary_active_placeholder_digest_budget
-                    boundary_ordinals = self._compression_boundary_active_placeholder_digest_ordinals
-                    generated_message_ids = getattr(
-                        self,
-                        "_generated_ignored_active_replay_placeholder_message_ids",
-                        set(),
-                    )
-                    has_generated_provenance = (
-                        id(replay_msg) in generated_message_ids
-                        or id(original_msg) in generated_message_ids
-                    )
-                    ordinal_matches_generated = (
-                        current_placeholder_ordinal in boundary_ordinals.get(
-                            active_replay_placeholder_digest,
-                            set(),
-                        )
-                        and (
-                            current_placeholder_ordinal > 1
-                            or boundary_seen_synthetic_summary_before
-                            or boundary_all_placeholder_replay_batch
-                        )
-                    )
-                    if boundary_budget and (
-                        has_generated_provenance
-                        or (not has_generated_provenance and ordinal_matches_generated)
-                    ):
-                        remaining = boundary_budget.get(active_replay_placeholder_digest, 0)
-                        if remaining > 0:
-                            compression_carried_active_placeholder = True
-                            if remaining == 1:
-                                boundary_budget.pop(active_replay_placeholder_digest, None)
-                            else:
-                                boundary_budget[active_replay_placeholder_digest] = remaining - 1
-                replayed_active_placeholder = active_replay_placeholder and (
-                    self._is_cached_active_replay_message_at_index(absolute_idx, replay_msg)
-                    or compression_carried_active_placeholder
-                    or metadata_replayed_active_placeholder
-                )
-                if (
-                    ignored_original_messages[absolute_idx]
-                    or generated_volatile_placeholder
-                    or replayed_active_placeholder
-                ):
-                    self._ignored_message_count += 1
-                    if generated_volatile_placeholder and volatile_digest is not None:
-                        self._remember_generated_ignored_placeholder_hash(volatile_digest)
-                    replay_preserves_ignore_decision = (
-                        self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
-                        or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
-                    )
-                    if ignored_original_messages[absolute_idx] and not replay_preserves_ignore_decision:
-                        if active_replay_messages is replay_messages:
-                            active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                                replay_messages
-                            )
-                        active_message = dict(active_replay_messages[absolute_idx])
-                        active_message["content"] = self._ignored_active_replay_placeholder(original_text)
-                        active_replay_messages[absolute_idx] = active_message
-                    excerpt = original_text[:80].replace("\n", " ")
-                    if ignored_original_messages[absolute_idx]:
-                        # A raw message matched ignore_message_patterns and is
-                        # discarded here - never persisted anywhere. Count and
-                        # log it (INFO) so an over-broad pattern silently eating
-                        # substantive turns is at least visible to the operator.
-                        self._ignore_pattern_dropped_count += 1
-                        logger.info(
-                            "LCM ignore_message_patterns dropped %s message "
-                            "(not persisted; total dropped=%d): %r",
-                            original_msg.get("role", "unknown"),
-                            self._ignore_pattern_dropped_count,
-                            excerpt,
-                        )
-                    else:
-                        logger.debug(
-                            "LCM ignore_message_patterns dropped %s message: %r",
-                            original_msg.get("role", "unknown"),
-                            excerpt,
-                        )
-                    continue
-                store_msg = replay_msg
-                if (
-                    str(original_msg.get("role") or "") == "tool"
-                    and _is_hermes_persisted_output_marker(
-                        normalize_content_value(original_msg.get("content")) or ""
-                    )
-                ):
-                    store_msg = original_msg
-                kept.append((absolute_idx, store_msg))
-            messages_to_store_with_index = kept
+            ):
+                store_msg = original_msg
+            messages_to_store_with_index.append((absolute_idx, store_msg))
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
-            self._compression_boundary_ingest_pending = False
-            self._compression_boundary_active_placeholder_digest_budget = {}
-            self._compression_boundary_active_placeholder_digest_ordinals = {}
-            self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            return self._remember_active_replay_messages(messages, active_replay_messages)
+            return self._remember_active_replay_messages(messages, replay_messages)
 
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
@@ -4084,15 +3559,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             conversation_id=self._conversation_id,
         )
         self._ingest_cursor = n
-        self._compression_boundary_ingest_pending = False
-        self._compression_boundary_active_placeholder_digest_budget = {}
-        self._compression_boundary_active_placeholder_digest_ordinals = {}
-        self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         # ``protected_messages`` changes are storage-only: inline media and
         # data/base64 substrings stay provider-usable in active replay.
-        return self._remember_active_replay_messages(messages, active_replay_messages)
+        return self._remember_active_replay_messages(messages, replay_messages)
 
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
@@ -4594,15 +4065,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if not isinstance(message, dict):
                 continue
             content_text = text_content_for_pattern_matching(message.get("content")) or ""
-            if (
-                self._matches_ignore_message_patterns(message)
-                or self._mapped_stored_row_matches_ignore_message_patterns(message)
-                or self._is_volatile_ignored_quarantine_placeholder(
-                    message,
-                    content_text,
-                )
-                or self._is_ignored_active_replay_placeholder(message, content_text)
-            ):
+            if self._is_volatile_ignored_quarantine_placeholder(message, content_text):
                 continue
             if self._preserved_objective_context_content(message):
                 return None
@@ -4996,10 +4459,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if self._is_context_summary_content(content):
                 continue
             text = (text_content_for_pattern_matching(content) or "").strip()
-            if self._matches_ignore_message_patterns(msg) or self._is_volatile_ignored_quarantine_placeholder(
-                msg,
-                text,
-            ) or self._is_ignored_active_replay_placeholder(msg, text):
+            if self._is_volatile_ignored_quarantine_placeholder(msg, text):
                 continue
             if not text:
                 continue
@@ -5110,10 +4570,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         Refusal/no-op reason codes (returned as ``reason``):
 
         - ``no_active_session``: engine has no bound session or conversation.
-        - ``session_ignored``: foreground session matched
-          ``LCM_IGNORE_SESSION_PATTERNS``.
-        - ``session_stateless``: foreground session matched
-          ``LCM_STATELESS_SESSION_PATTERNS``.
+        - ``session_stateless``: the bound session bypasses LCM storage.
         - ``no_pre_tail_content``: no stored messages precede the resolved
           count/token-bounded fresh tail; nothing to rotate.
         - ``empty_tail``: tail query returned no rows despite a non-zero
@@ -5129,8 +4586,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not session_id or not conversation_id:
             return {"ok": False, "reason": "no_active_session"}
-        if self._session_ignored:
-            return {"ok": False, "reason": "session_ignored", "session_id": session_id}
         if self._session_stateless:
             return {"ok": False, "reason": "session_stateless", "session_id": session_id}
 

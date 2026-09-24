@@ -151,7 +151,6 @@ def _status_text(engine) -> str:
         # When a side channel is in flight, get_status() reports the bound
         # session's flags; we read the engine properties instead so this row
         # stays consistent with the session_id row above.
-        f"session_ignored: {_fmt_bool(engine.current_session_ignored)}",
         f"session_stateless: {_fmt_bool(engine.current_session_stateless)}",
         f"side_channel_active: {_fmt_bool(engine.side_channel_active)}",
         f"conversation_id: {runtime_identity.get('conversation_id', '') or '(unbound)'}",
@@ -188,14 +187,6 @@ def _status_text(engine) -> str:
             "note: no active Hermes session has initialized LCM in this process yet — after a fresh restart, send one normal message first if you want live per-session runtime details"
         )
 
-    if "ignore_session_patterns_source" in status:
-        lines.append(
-            f"ignore_session_patterns_source: {status.get('ignore_session_patterns_source')}"
-        )
-    if "stateless_session_patterns_source" in status:
-        lines.append(
-            f"stateless_session_patterns_source: {status.get('stateless_session_patterns_source')}"
-        )
     if config_source_warnings:
         lines.append("config_source_warnings: " + "; ".join(config_source_warnings))
     if ignored_config_yaml_lcm_keys:
