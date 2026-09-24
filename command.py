@@ -14,11 +14,7 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     repair_external_content_fts,
 )
-from .diagnostics import (
-    _has_lifecycle_fragmentation,
-    _state_db_path_for_engine,
-    doctor_guidance_for_checks,
-)
+from .diagnostics import doctor_guidance_for_checks
 from .dag import build_nodes_fts_spec
 from .ingest_protection import scan_ingest_side_file_integrity
 from .presets import (
@@ -146,12 +142,6 @@ def _status_text(engine) -> str:
         f"last_cache_write_tokens: {status.get('last_cache_write_tokens', 0)}",
         f"last_reasoning_tokens: {status.get('last_reasoning_tokens', 0)}",
         f"cache_read_ratio: {float(status.get('cache_read_ratio', 0.0) or 0.0) * 100:.1f}%",
-        # Filter classification for current_session_id (the foreground view).
-        # When a side channel is in flight, get_status() reports the bound
-        # session's flags; we read the engine properties instead so this row
-        # stays consistent with the session_id row above.
-        f"session_stateless: {_fmt_bool(engine.current_session_stateless)}",
-        f"side_channel_active: {_fmt_bool(engine.side_channel_active)}",
         f"conversation_id: {runtime_identity.get('conversation_id', '') or '(unbound)'}",
         f"lifecycle_current_session_id: {runtime_identity.get('lifecycle_current_session_id', '') or '(none)'}",
         f"lifecycle_last_finalized_session_id: {runtime_identity.get('lifecycle_last_finalized_session_id', '') or '(none)'}",
@@ -627,54 +617,6 @@ def _doctor_text(engine) -> str:
             "legacy blank-source rows are normalized as `source=unknown` for back-compat filters"
         )
 
-    try:
-        lifecycle_stats = engine._lifecycle.get_fragmentation_stats(
-            state_db_path=_state_db_path_for_engine(engine)
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        issues.append("lifecycle_fragmentation")
-        lifecycle_stats = {"error": str(exc)}
-    else:
-        observations.append(
-            "lifecycle_fragmentation: "
-            f"lifecycle_rows={lifecycle_stats['lifecycle_rows']} "
-            f"empty_lifecycle_rows={lifecycle_stats.get('empty_lifecycle_rows', 0)} "
-            f"message_sessions={lifecycle_stats['distinct_message_sessions']} "
-            f"node_sessions={lifecycle_stats['distinct_node_sessions']} "
-            f"current_missing_in_lcm_any={lifecycle_stats['lifecycle_current_missing_in_lcm_any']} "
-            f"last_finalized_missing_in_lcm_any={lifecycle_stats['lifecycle_last_finalized_missing_in_lcm_any']} "
-            f"current_missing_in_state={lifecycle_stats['lifecycle_current_missing_in_state']} "
-            f"last_finalized_missing_in_state={lifecycle_stats['lifecycle_last_finalized_missing_in_state']} "
-            f"message_sessions_missing_in_state={lifecycle_stats['lcm_message_sessions_missing_in_state']} "
-            f"node_sessions_missing_in_state={lifecycle_stats['lcm_node_sessions_missing_in_state']} "
-            f"message_sessions_without_lifecycle_current={lifecycle_stats['message_sessions_without_lifecycle_current']} "
-            f"message_sessions_without_lifecycle_reference={lifecycle_stats['message_sessions_without_lifecycle_reference']} "
-            f"node_sessions_without_lifecycle_reference={lifecycle_stats['node_sessions_without_lifecycle_reference']} "
-            f"state_sessions_missing_in_lcm_any={lifecycle_stats['state_sessions_missing_in_lcm_any']}"
-        )
-        if lifecycle_stats.get("state_db_error"):
-            observations.append(f"lifecycle_fragmentation_state_db_error: {lifecycle_stats['state_db_error']}")
-        classification = lifecycle_stats.get("classification") or {}
-        categories = classification.get("categories") or []
-        if classification:
-            observations.append(
-                "lifecycle_fragmentation_classification: "
-                f"{classification.get('status', 'unknown')}; {len(categories)} categories need review"
-            )
-            for category in categories:
-                sample = ",".join(category.get("sample_session_ids") or []) or "(none)"
-                observations.append(
-                    "lifecycle_category "
-                    f"{category.get('name')}: count={category.get('count', 0)} sample={sample}"
-                )
-        if _has_lifecycle_fragmentation(lifecycle_stats):
-            recommended_actions.append(
-                "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state"
-            )
-            recommended_actions.append(
-                "treat this as read-only evidence; do not infer every mismatch is harmful"
-            )
-
     triage_checks: list[dict[str, Any]] = []
     if integrity != "ok":
         triage_checks.append({"check": "database_integrity", "status": "fail", "detail": integrity})
@@ -703,9 +645,6 @@ def _doctor_text(engine) -> str:
         })
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
-    if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
-        lifecycle_status = "fail" if lifecycle_stats.get("error") else "warn"
-        triage_checks.append({"check": "lifecycle_fragmentation", "status": lifecycle_status, "detail": lifecycle_stats})
     triage_guidance = doctor_guidance_for_checks(triage_checks)
 
     doctor_status = "issues-found" if integrity != "ok" or issues else (

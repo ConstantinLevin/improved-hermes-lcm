@@ -56,13 +56,7 @@ def _host_forwards_registered_tool_messages(ctx) -> bool:
 
 
 def _engine_bound_session_id(engine) -> str:
-    """Return the lifecycle/ingest session bound on an LCM engine.
-
-    ``current_session_id`` is an operator-facing foreground view and can differ
-    from the bound ingest session while an auxiliary side channel is active.
-    Post-turn ingest rebinding must use the bound id or it can append a resumed
-    foreground turn to a stale auxiliary child.
-    """
+    """Return the host session identifier an LCM engine copy is bound to."""
     return str(
         getattr(engine, "bound_session_id", "")
         or getattr(engine, "_session_id", "")
@@ -116,7 +110,6 @@ def _command_engine_for_current_session(engine, resolve_active_lcm_engine):
         active_engine = resolve_active_lcm_engine(
             session_id=session_id,
             conversation_id=conversation_id,
-            allow_foreground=True,
         )
         if active_engine is not None:
             return active_engine
@@ -188,24 +181,8 @@ def register(ctx):
                 exc,
             )
 
-    # Subscribe to the host's explicit subagent lifecycle events when available.
-    # These carry the child_session_id/parent_session_id linkage directly, so LCM
-    # can identify a subagent session from the host's own signal instead of
-    # walking the call stack and reading private agent attributes. Hosts without
-    # a plugin hook bus simply skip this and fall back to the legacy frame walk.
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
-        from .aux_session import record_subagent_start, record_subagent_stop
-        try:
-            register_hook("subagent_start", lambda **payload: record_subagent_start(payload))
-            register_hook("subagent_stop", lambda **payload: record_subagent_stop(payload))
-        except Exception as exc:
-            logger.info(
-                "LCM explicit subagent-lineage hooks unavailable on this Hermes "
-                "host; auxiliary detection uses the legacy frame-walk fallback: %s",
-                exc,
-            )
-
         # Hermes invokes this hook after the context engine has received
         # on_session_start(). Resolve through LCM's own registry so merely
         # loading the plugin cannot inject guidance when another context
