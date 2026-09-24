@@ -5415,7 +5415,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         This is provider-replay-only. It never mutates the input messages, raw
         SQLite rows, or DAG lineage. The newest ``fresh_tail_count`` messages
-        stay inline, matching Lossless Claw's protected-tail contract.
+        stay inline.
         """
         if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
             return messages
