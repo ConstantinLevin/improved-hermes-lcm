@@ -37,12 +37,13 @@ An engine copy writes only for its own plugin session.
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .record_store import RET_KEY, InputEntry, parse_ret_key
+from .record_store import RET_KEY, InputEntry, parse_ret_key, raw_json
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,28 @@ try:  # host internals; see the module docstring
 except Exception:  # pragma: no cover - older or absent host
     _HOST_ATTEMPT_GENERATION = None
     _host_working_attempt_is_current = None
+
+try:  # the host's own list of fields that are bookkeeping, not message content
+    from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS as _HOST_PERSISTENCE_ONLY  # type: ignore
+except Exception:  # pragma: no cover - as at Hermes 130b8f2c5d, agent/message_metadata.py:14
+    _HOST_PERSISTENCE_ONLY = frozenset({"timestamp", "display_kind", "display_metadata", "_row_id"})
+
+# Left out of the rewrite comparison (ruling 6): the host's persistence-only fields,
+# its persist marker, and the plugin's own key. The host stamps _row_id and timestamp
+# on every dict it commits, so they differ without the row having been rewritten.
+_NOT_COMPARED = frozenset(_HOST_PERSISTENCE_ONLY) | {"_db_persisted", RET_KEY}
+
+
+def _comparable(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in message.items() if key not in _NOT_COMPARED}
+
+
+def rewritten(message: Dict[str, Any], raw: str) -> bool:
+    """Whether an identified row differs from what the store holds for it, as JSON
+    values. Only ever asked of a row already identified by key or _row_id."""
+    current = json.loads(json.dumps(_comparable(message), ensure_ascii=False, allow_nan=False))
+    return current != _comparable(json.loads(raw))
+
 
 _ATTEMPT: contextvars.ContextVar = contextvars.ContextVar("lcm_compress_attempt", default=None)
 
@@ -185,59 +208,15 @@ class RecordWriteMixin:
         messages = attempt.messages or []
         try:
             self._settle_from_list(messages)
-            store = self._records
-            effective = store.effective_compaction(attempt.session)
-            returned = store.return_entries(effective) if effective is not None else {}
-            bound = store.bound_rows(effective) if effective is not None else {}
-            insertions = store.bound_insertions(effective) if effective is not None else set()
-            reusable = store.unconfirmed_inputs(attempt.session, effective)
-            entries: List[Optional[InputEntry]] = [None] * len(messages)
-            last_bound = -1
-            for index, message in enumerate(messages):
-                row_id = message.get("_row_id")
-                position = None
-                key = parse_ret_key(message.get(RET_KEY))
-                if effective is not None and key is not None and key[0] == effective:
-                    position = key[1]
-                elif effective is not None and isinstance(row_id, int) and row_id in bound:
-                    position = bound[row_id]
-                if position is None:
-                    continue
-                kind, record, _derivation = returned.get(position, ("", None, None))
-                entries[index] = InputEntry(index, row_id if isinstance(row_id, int) else None, "bound",
-                                            record=record if kind == "record" else None)
-                last_bound = index
-            if effective is not None and last_bound < 0:
-                self._shadow_failed(
-                    attempt,
-                    "return_not_found",
-                    f"none of the {len(messages)} entries is bound to compaction {effective}; "
-                    "the list carries no identity for it (see ask A1)",
-                )
+            classified = self._classify(attempt, messages)
+            if classified is None:
                 return
-            for index, message in enumerate(messages):
-                if entries[index] is not None:
-                    continue
-                row_id = message.get("_row_id")
-                row_id = row_id if isinstance(row_id, int) else None
-                if index == 0 and message.get("role") == "system":
-                    klass, record = "system", None
-                elif row_id is not None and row_id in insertions:
-                    klass, record = "host_insertion", None  # bound as the host's insertion
-                elif row_id is not None and row_id in reusable:
-                    klass, record = "reused", reusable[row_id]
-                elif index < last_bound:
-                    klass, record = "host_insertion", None
-                else:
-                    klass, record = "transcript", None
-                entries[index] = InputEntry(index, row_id, klass, record=record, message=message)
-            compaction, records = store.begin_compaction(
+            compaction, records = self._records.begin_compaction(
                 session=attempt.session,
                 kind="full" if force else "threshold",
                 host_session_before=self._session_id or None,
                 attempt_generation=attempt.generation if isinstance(attempt.generation, int) else None,
-                entries=[entry for entry in entries if entry is not None],
-                head=store.head(effective),
+                entries=classified,
             )
         except Exception as exc:
             logger.warning("LCM shadow write of the compaction failed", exc_info=True)
@@ -245,6 +224,195 @@ class RecordWriteMixin:
             return
         attempt.compaction = compaction
         attempt.records = records
+
+    def _classify(self, attempt: CompressAttempt, messages: List[Dict[str, Any]]) -> Optional[List[InputEntry]]:
+        """Classify the list against the session's effective return (#29 W3, W4).
+
+        Every entry is identified first, by the plugin's key or the host's _row_id, and
+        only an identified row is compared with what the store holds for it. An error
+        is recorded as an event and nothing is written for this compaction (None).
+        """
+        store = self._records
+        effective = store.effective_compaction(attempt.session)
+        returned = store.return_entries(effective) if effective is not None else {}
+        bound = store.bound_rows(effective) if effective is not None else {}
+        insertions = store.bound_insertions(effective) if effective is not None else set()
+        reusable = store.unconfirmed_inputs(attempt.session, effective)
+
+        def fail(kind: str, detail: Any) -> None:
+            self._shadow_failed(attempt, kind, detail)
+
+        # 1. Where the effective return stands in the list, by identity.
+        found: Dict[int, int] = {}      # list index -> returned position
+        at_position: Dict[int, int] = {}
+        for index, message in enumerate(messages):
+            row_id = message.get("_row_id")
+            key = parse_ret_key(message.get(RET_KEY))
+            position = None
+            if effective is not None and key is not None and key[0] == effective:
+                position = key[1]
+            elif effective is not None and isinstance(row_id, int) and row_id in bound:
+                position = bound[row_id]
+            if position is None or position not in returned:
+                continue
+            if position in at_position:
+                fail("bound_entry_twice", {"compaction": effective, "position": position})
+                return None
+            found[index] = position
+            at_position[position] = index
+        if effective is not None and not found:
+            fail("return_not_found",
+                 f"none of the {len(messages)} entries is bound to compaction {effective}; "
+                 "the list carries no identity for it (see ask A1)")
+            return None
+
+        # 2. Known rows the host merged into another: its sequence repair records the
+        # absorbed ids on the survivor, in memory only. An absorbed id names a returned
+        # row (by its binding) or a row an unconfirmed attempt recorded (reusable).
+        absorbed_positions: set = set()
+        absorbed_records: Dict[int, List[str]] = {}  # survivor's list index -> originals
+        for index, message in enumerate(messages):
+            for row_id in message.get("_absorbed_row_ids") or ():
+                if not isinstance(row_id, int):
+                    continue
+                if row_id in bound:
+                    position = bound[row_id]
+                    absorbed_positions.add(position)
+                    record = returned[position][1] if returned[position][0] == "record" else None
+                else:
+                    record = reusable.get(row_id)
+                if record:
+                    absorbed_records.setdefault(index, []).append(record)
+
+        # 3. What is missing: a summary is an error; a record is a revert only as a
+        # suffix of the return, anything else is an error. A row merged into a survivor
+        # stands in the list through it, so it counts as present.
+        present = set(at_position) | absorbed_positions
+        missing = sorted(p for p in returned if p not in present)
+        for position in missing:
+            kind = returned[position][0]
+            if kind == "summary":
+                fail("bound_summary_missing", {"compaction": effective, "position": position})
+                return None
+            if any(p > position for p in present):
+                fail("bound_record_missing_interior", {
+                    "compaction": effective, "position": position,
+                    "host_row_id": next((r for r, p in bound.items() if p == position), None),
+                })
+                return None
+        reverted = [p for p in missing if returned[p][0] == "record"]
+
+        # 4. A row flagged as a summary that is not the plugin's bound return.
+        for index, message in enumerate(messages):
+            if index not in found and message.get("_compressed_summary") is True:
+                fail("unbound_summary_row", {"index": index, "host_row_id": message.get("_row_id")})
+                return None
+
+        # 5. Facts about the records the comparisons and predecessors need, and which
+        # of them stand beside the chain (F8: a host insertion never becomes a
+        # predecessor, whenever it is met again).
+        wanted = [returned[p][1] for p in returned if returned[p][1]] + list(reusable.values())
+        wanted += [r for records in absorbed_records.values() for r in records]
+        facts = store.record_facts(wanted)
+        side = store.beside(wanted)
+
+        def predecessor_of(record: Optional[str]) -> Optional[tuple]:
+            if record is None or record not in facts:
+                return None
+            pred = facts[record][0]
+            return ("record", pred) if pred else None
+
+        def earliest(records: List[str]) -> str:
+            return min(records, key=lambda r: facts[r][3] if r in facts else 1 << 62)
+
+        def current(record: Optional[str], row_id: Optional[int]) -> Optional[str]:
+            """What the store already holds for a row: an unconfirmed attempt's record
+            for it (a revision it wrote, W2 step 8) comes before the returned one."""
+            if row_id is not None and row_id in reusable:
+                return reusable[row_id]
+            return record
+
+        last_bound_index = max(found) if found else -1
+        surviving = [
+            current(returned[found[i]][1], messages[i].get("_row_id") if isinstance(messages[i].get("_row_id"), int)
+                    else None)
+            for i in sorted(found) if returned[found[i]][0] == "record"
+        ]
+        surviving = [r for r in surviving if r and not side.get(r)]
+        if surviving:
+            fallback: Optional[tuple] = ("record", surviving[-1])
+        elif reverted:
+            fallback = predecessor_of(returned[reverted[0]][1])
+        elif effective is not None and store.chain_end(effective):
+            fallback = ("record", store.chain_end(effective))
+        else:
+            fallback = None
+
+        # 6. The entries, in list order. Chain-bearing entries (records on the active
+        # branch) move the chain; host insertions and summary revisions stand beside it.
+        entries: List[InputEntry] = []
+        chain: Optional[tuple] = None
+
+        def known_row(index: int, row_id: Optional[int], message: Dict[str, Any], base: str,
+                      merged: List[str]) -> None:
+            """A row the store already holds as ``base``: referenced when unchanged,
+            else revised. A record beside the chain keeps its revisions beside it."""
+            nonlocal chain
+            beside_chain = side.get(base, False) and all(side.get(r, False) for r in merged)
+            if merged or (base in facts and rewritten(message, facts[base][1])):
+                originals = [base] + [r for r in merged if r != base]
+                pred = (chain if chain is not None else fallback) if beside_chain \
+                    else predecessor_of(earliest(originals))
+                entries.append(InputEntry(index, row_id, "revision", message=message, pred=pred,
+                                          sources=[("record", r) for r in originals]))
+                if not beside_chain:
+                    chain = ("entry", index)
+            else:
+                entries.append(InputEntry(index, row_id, "reused", record=base))
+                if not beside_chain:
+                    chain = ("record", base)
+
+        for index, message in enumerate(messages):
+            row_id = message.get("_row_id")
+            row_id = row_id if isinstance(row_id, int) else None
+            merged = absorbed_records.get(index, [])
+            beside = chain if chain is not None else fallback
+            if index in found:
+                position = found[index]
+                kind, record, _derivation, raw = returned[position]
+                if kind == "summary":
+                    prior = current(None, row_id)
+                    if prior is not None:
+                        known_row(index, row_id, message, prior, merged)
+                    elif merged or (raw is not None and rewritten(message, raw)):
+                        entries.append(InputEntry(
+                            index, row_id, "revision", message=message, pred=beside,
+                            sources=[("return", effective, position)] + [("record", r) for r in merged]))
+                    else:
+                        entries.append(InputEntry(index, row_id, "bound_summary"))
+                    continue
+                known_row(index, row_id, message, current(record, row_id), merged)
+                continue
+            if index == 0 and message.get("role") == "system":
+                entries.append(InputEntry(index, row_id, "system"))
+            elif row_id is not None and row_id in insertions:
+                entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
+            elif row_id is not None and row_id in reusable:
+                known_row(index, row_id, message, reusable[row_id], merged)
+            elif index < last_bound_index:
+                entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
+            elif merged:
+                # A new row that absorbed known rows: it holds their content.
+                beside_chain = all(side.get(r, False) for r in merged)
+                pred = beside if beside_chain else predecessor_of(earliest(merged))
+                entries.append(InputEntry(index, row_id, "revision", message=message, pred=pred,
+                                          sources=[("record", r) for r in merged]))
+                if not beside_chain:
+                    chain = ("entry", index)
+            else:
+                entries.append(InputEntry(index, row_id, "transcript", message=message, pred=beside))
+                chain = ("entry", index)
+        return entries
 
     def _shadow_chunk(self, attempt: Optional[CompressAttempt], working_members: List[Dict[str, Any]]) -> Optional[str]:
         if attempt is None or not attempt.shadow_ok or attempt.compaction is None:
@@ -294,25 +462,26 @@ class RecordWriteMixin:
         if attempt is None or not attempt.shadow_ok or attempt.compaction is None:
             return
         by_object = {id(message): pos for pos, message in enumerate(attempt.messages or [])}
-        entries: list[tuple[int, str, Optional[str], Optional[str]]] = []
-        for position, message in enumerate(result):
-            input_position = by_object.get(id(message))
-            if input_position is not None and input_position in attempt.records:
-                entries.append((position, "record", attempt.records[input_position], None))
-            elif message.get("_compressed_summary") is True and input_position is None:
-                entries.append((position, "summary", None, None))
-            elif input_position == 0 and message.get("role") == "system":
-                continue  # the host's system row, returned in place, not recorded
-            else:
-                self._shadow_failed(attempt, "return_entry_unknown", {"position": position, "role": message.get("role")})
-                return
+        entries: list[tuple[int, str, Optional[str], Optional[str], Optional[str]]] = []
         try:
+            for position, message in enumerate(result):
+                input_position = by_object.get(id(message))
+                if input_position is not None and input_position in attempt.records:
+                    entries.append((position, "record", attempt.records[input_position], None, None))
+                elif message.get("_compressed_summary") is True and input_position is None:
+                    entries.append((position, "summary", None, None, raw_json(message)))
+                elif input_position == 0 and message.get("role") == "system":
+                    continue  # the host's system row, returned in place, not recorded
+                else:
+                    self._shadow_failed(attempt, "return_entry_unknown",
+                                        {"position": position, "role": message.get("role")})
+                    return
             self._records.write_returns(attempt.compaction, entries)
         except Exception as exc:
             logger.warning("LCM shadow write of the return failed", exc_info=True)
             self._shadow_failed(attempt, "return_write_failed", repr(exc))
             return
-        for position, kind, _record, _derivation in entries:
+        for position, kind, _record, _derivation, _raw in entries:
             message = result[position]
             message[RET_KEY] = f"{attempt.compaction}:{position}"
             attempt.objects[position] = message
