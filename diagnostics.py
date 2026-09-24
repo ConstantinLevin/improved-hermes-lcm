@@ -94,33 +94,6 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
             rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
     elif name == "sqlite_storage":
         command = "inspect journal/quick_check output and database/WAL size; restore from backup if SQLite reports corruption"
-    elif name == "payload_storage":
-        missing_refs = 0
-        heartbeat_rows = 0
-        suspicious_rows = 0
-        if isinstance(detail, dict):
-            missing_refs = int(detail.get("externalized_payload_refs_missing", 0) or 0)
-            heartbeat_rows = len(detail.get("heartbeat_noise_rows") or [])
-            suspicious_rows = sum(
-                len(detail.get(key) or [])
-                for key in (
-                    "suspicious_data_uri_content_rows",
-                    "suspicious_data_uri_tool_calls_rows",
-                    "suspicious_base64_like_rows",
-                    "suspicious_repetitive_assistant_rows",
-                )
-            )
-        if status == "warn" and heartbeat_rows and not missing_refs and not suspicious_rows:
-            action = DOCTOR_ACTION_SAFE_IGNORE
-            command = "safe to ignore unless heartbeat/progress noise is crowding useful recall; consider message/session filters for future rows"
-            rationale = "heartbeat rows are read-only noise diagnostics, not corruption"
-        else:
-            command = "inspect payload rows/refs; restore missing externalized payload files from backup before deleting or rewriting anything"
-            if status == "warn":
-                warning_only = True
-                rationale = "payload warnings may represent preserved user/tool data"
-            else:
-                rationale = "payload diagnostic failures mean doctor could not read storage risk state reliably"
     elif name == "orphaned_dag_nodes":
         command = "inspect affected DAG/source IDs; do not auto-delete summaries without confirming recall impact"
         if status == "warn":

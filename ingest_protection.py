@@ -23,13 +23,8 @@ from typing import Any, Dict, List
 
 from .externalize import (
     externalize_ingest_payload,
-    extract_externalized_ref,
-    extract_externalized_refs,
     find_externalized_payload_for_message,
-    get_large_output_storage_dir,
-    is_externalized_placeholder,
     load_externalized_payload,
-    maybe_externalize_payload,
 )
 from .message_content import normalize_content_value
 
@@ -68,15 +63,6 @@ def _contains_media_payload(value: Any) -> bool:
     return False
 
 
-def _externalization_kind_for_message(message: Dict[str, Any]) -> str:
-    role = str(message.get("role") or "unknown")
-    if role == "tool":
-        return "tool_result"
-    if _contains_media_payload(message.get("content")):
-        return "media_payload"
-    return "raw_payload"
-
-
 # Any data URI base64 payload, not just image/audio/video. Keep the trailing
 # payload alphabet conservative so we do not slurp surrounding JSON/markdown.
 # Raw scans can see JSON-escaped slashes before decoding, including both `\/`
@@ -105,16 +91,8 @@ _QUARANTINED_ASSISTANT_MIN_CHARS = 65_536
 _QUARANTINED_ASSISTANT_MIN_TOKENS = 1_000
 _WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _REPETITION_SEGMENT_SPLIT_RE = re.compile(r"(?:\n+|(?<=[.!?])\s+)")
-_HEARTBEAT_NOISE_RE = re.compile(
-    r"^(?:still\s+working|working\s+on\s+it|processing|checking|one\s+moment|ping|heartbeat|no\s+update)(?:[.!…\s-]*)$",
-    re.IGNORECASE,
-)
-_HEARTBEAT_NOISE_MAX_CHARS = 256
 _GENERIC_BASE64_MIN_CHARS = 4096
 _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*ref=([^;\]\s]+)\]")
-_EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
-    r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
-)
 _PERSISTED_OUTPUT_TAG = "<persisted-output>"
 _PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 _PERSISTED_OUTPUT_SAVED_TO_RE = re.compile(r"^Full output saved to:\s*(?P<path>.+?)\s*$", re.MULTILINE)
@@ -130,9 +108,6 @@ _PERSISTED_OUTPUT_INLINE_PREVIEW_SHA256_RE = re.compile(
 )
 _PERSISTED_OUTPUT_INLINE_GENERATION_RE = re.compile(
     r"\r?\n\[LCM persisted-output file generation: size=(?P<size>\d+); mtime_ns=(?P<mtime_ns>\d+); ctime_ns=(?P<ctime_ns>\d+)\]\r?\n</persisted-output>\s*$"
-)
-_PERSISTED_OUTPUT_INLINE_METADATA_RE = re.compile(
-    r"\r?\n\[LCM persisted-output (?:file generation|marker identity):[^\r\n]*\]\s*$"
 )
 _UNRECOVERABLE_TRUNCATION_RE = re.compile(
     r"\[Truncated:\s*tool response was [\d,]+ chars\.\s*Full output could not be saved to sandbox\.\]",
@@ -465,23 +440,6 @@ def _add_inline_persisted_output_identity_metadata(text: str, preview_sha256: st
     return text.replace("</persisted-output>", f"{identity}\n</persisted-output>", 1)
 
 
-def contains_data_uri_base64(text: str) -> bool:
-    return isinstance(text, str) and bool(_DATA_URI_BASE64_RE.search(text))
-
-
-def contains_long_base64_run(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_CHARS) -> bool:
-    if not isinstance(text, str) or len(text) < min_chars:
-        return False
-    if any(looks_like_long_base64(match.group(1), min_chars=min_chars) for match in _BASE64_RUN_RE.finditer(text)):
-        return True
-    # Also catch line-wrapped base64 blocks (MIME/PEM), which never form a
-    # single contiguous run.
-    return any(
-        looks_like_long_base64(payload, min_chars=min_chars)
-        for _start, _end, payload in _iter_wrapped_base64_blocks(text)
-    )
-
-
 def extract_ingest_externalized_refs(text: str) -> list[str]:
     if not isinstance(text, str) or not text:
         return []
@@ -502,7 +460,7 @@ def extract_all_externalized_payload_refs(text: str) -> list[str]:
     if not isinstance(text, str) or not text:
         return []
     refs: list[str] = []
-    for ref in extract_ingest_externalized_refs(text) + extract_externalized_refs(text):
+    for ref in extract_ingest_externalized_refs(text):
         if _is_basename_ref(ref) and ref not in refs:
             refs.append(ref)
     return refs
@@ -521,25 +479,6 @@ def _normalized_repetition_segments(text: str) -> list[str]:
         if len(normalized) >= 32:
             segments.append(normalized)
     return segments
-
-
-def heartbeat_noise_reason(role: str, text: str) -> str | None:
-    """Return a read-only doctor category for short heartbeat/progress noise.
-
-    This intentionally does not drive ingest protection or cleanup. It only
-    surfaces metadata-only candidates for operator review.
-    """
-    role = str(role or "")
-    if role not in {"assistant", "tool", "system"}:
-        return None
-    if not isinstance(text, str):
-        return None
-    normalized = re.sub(r"\s+", " ", text.strip())
-    if not normalized or len(normalized) > _HEARTBEAT_NOISE_MAX_CHARS:
-        return None
-    if _HEARTBEAT_NOISE_RE.match(normalized):
-        return "heartbeat_progress"
-    return None
 
 
 def assistant_output_quarantine_reason(text: str) -> str | None:
@@ -1014,10 +953,8 @@ def protect_message_for_ingest(
 ) -> Dict[str, Any]:
     """Return a copy of ``message`` safe to persist in SQLite.
 
-    Payloads are externalized losslessly when they are inline media/base64-like
-    strings before they hit ``messages.content`` or ``messages.tool_calls``.
-    When the opt-in generic large-output externalization setting is enabled,
-    whole-message content still follows the existing threshold-based behavior.
+    Inline media/base64-like strings are moved to side files before they hit
+    ``messages.content`` or ``messages.tool_calls``.
     """
     msg = dict(message or {})
     role = str(msg.get("role") or "unknown")
@@ -1027,41 +964,12 @@ def protect_message_for_ingest(
     normalized_content = normalize_content_value(original_content)
     recovered_with_stat = recover_hermes_persisted_output_with_file_stat(raw_normalized_content) if role == "tool" else None
     recovered_file_stat = None
-    recovered_externalized = None
     if recovered_with_stat is not None:
-        recovered_persisted_output, recovered_file_stat = recovered_with_stat
-        normalized_recovered_content = normalize_content_value(recovered_persisted_output)
-        if normalized_recovered_content:
-            persisted_output_source_path = _persisted_output_saved_path(raw_normalized_content)
-            persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(raw_normalized_content)
-            persisted_output_metadata = {
-                "persisted_output_source_path": persisted_output_source_path,
-                "persisted_output_expected_chars": _expected_persisted_output_chars(raw_normalized_content),
-                "persisted_output_redacted_preview_sha256": _persisted_output_preview_prefix_digest(normalized_content),
-                "persisted_output_file_size": recovered_file_stat["size"],
-                "persisted_output_file_mtime_ns": recovered_file_stat["mtime_ns"],
-                "persisted_output_file_ctime_ns": recovered_file_stat["ctime_ns"],
-            }
-            if persisted_output_preview_sha256:
-                persisted_output_metadata["persisted_output_preview_sha256"] = persisted_output_preview_sha256
-            recovered_externalized = maybe_externalize_payload(
-                normalized_recovered_content,
-                kind="tool_result",
-                tool_call_id=str(msg.get("tool_call_id") or ""),
-                session_id=session_id,
-                role=role,
-                config=config,
-                hermes_home=hermes_home,
-                force=True,
-                metadata=persisted_output_metadata,
-            )
+        _recovered_persisted_output, recovered_file_stat = recovered_with_stat
 
-    # A host-side truncation marker without durable recovered storage is not
-    # lossless. Keep the marker/preview visible inline instead of hiding it
-    # behind an LCM externalized-payload ref that would look recoverable.
+    # A host-side truncation marker stays visible inline.
     preserve_truncation_marker_inline = (
         role == "tool"
-        and recovered_externalized is None
         and isinstance(normalized_content, str)
         and (
             _is_hermes_persisted_output_marker(normalized_content)
@@ -1069,17 +977,8 @@ def protect_message_for_ingest(
         )
     )
 
-    # Preserve the pre-existing opt-in large-output behavior on message content.
-    # The always-on storage-boundary sanitizer below is a narrower safety net for
-    # inline media/base64 substrings, including cases below the generic threshold
-    # or when generic externalization is disabled.
     if normalized_content:
-        if recovered_externalized:
-            msg["content"] = recovered_externalized["placeholder"]
-        elif (
-            is_externalized_ingest_placeholder(normalized_content)
-            or is_externalized_placeholder(normalized_content)
-        ):
+        if is_externalized_ingest_placeholder(normalized_content):
             msg["content"] = original_content
         elif preserve_truncation_marker_inline:
             protected_content = _protect_value(
@@ -1091,11 +990,7 @@ def protect_message_for_ingest(
                 hermes_home=hermes_home,
                 parse_json_strings=False,
             )
-            if (
-                role == "tool"
-                and not bool(getattr(config, "large_output_externalization_enabled", True))
-                and _is_hermes_persisted_output_marker(raw_normalized_content)
-            ):
+            if role == "tool" and _is_hermes_persisted_output_marker(raw_normalized_content):
                 protected_content = _add_inline_persisted_output_identity_metadata(
                     normalize_content_value(protected_content) or "",
                     _persisted_output_marker_identity_digest(raw_normalized_content),
@@ -1124,17 +1019,6 @@ def protect_message_for_ingest(
                 )
                 if placeholder:
                     externalized = {"placeholder": placeholder}
-            if externalized is None:
-                kind = _externalization_kind_for_message(msg)
-                externalized = maybe_externalize_payload(
-                    normalized_content,
-                    kind=kind,
-                    tool_call_id=str(msg.get("tool_call_id") or ""),
-                    session_id=session_id,
-                    role=role,
-                    config=config,
-                    hermes_home=hermes_home,
-                )
             if externalized:
                 msg["content"] = externalized["placeholder"]
             else:
@@ -1256,465 +1140,3 @@ def protect_messages_for_ingest(
     ]
 
 
-def _append_unique_refs(target: list[str], refs: list[str]) -> None:
-    for ref in refs:
-        if ref not in target:
-            target.append(ref)
-
-
-def _walk_string_values(value: Any):
-    if isinstance(value, str):
-        yield value
-        parsed = _maybe_parse_json_string(value)
-        if parsed is not None and not (isinstance(parsed, str) and parsed == value):
-            yield from _walk_string_values(parsed)
-    elif isinstance(value, dict):
-        for key, nested in value.items():
-            if isinstance(key, str):
-                yield key
-            yield from _walk_string_values(nested)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_string_values(item)
-
-
-def _walk_tool_call_argument_values(value: Any):
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key == "arguments":
-                yield nested
-            yield from _walk_tool_call_argument_values(nested)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk_tool_call_argument_values(item)
-
-
-def _is_inside_token_quote_span(text: str, start: int, token: str) -> bool:
-    in_span = False
-    i = 0
-    while i < start:
-        if text.startswith(token, i):
-            in_span = not in_span
-            i += len(token)
-        else:
-            i += 1
-    return in_span
-
-
-def _looks_like_example_quote_context(context: str) -> bool:
-    return re.search(r"(?:pytest\s+output|log|example|traceback|failure)\s*:\s*$", context.lower()) is not None
-
-
-def _has_local_escaped_quote_before(text: str, start: int) -> bool:
-    boundary = max(text.rfind(delimiter, 0, start) for delimiter in (",", "{", "["))
-    segment = text[boundary + 1:start]
-    matches = list(re.finditer(r"\\+[\"']", segment))
-    if not matches:
-        return False
-    quote = matches[-1]
-    context = segment[max(0, quote.start() - 80):quote.start()]
-    return _looks_like_example_quote_context(context)
-
-
-def _is_escaped_placeholder_example(text: str, start: int) -> bool:
-    prefix = text[max(0, start - 8):start]
-    return prefix.endswith("\\") or _has_local_escaped_quote_before(text, start)
-
-
-def _is_quoted_placeholder_example(text: str, start: int) -> bool:
-    for quote_token in ('"', "'"):
-        if not _is_inside_token_quote_span(text, start, quote_token):
-            continue
-        quote = text.rfind(quote_token, 0, start)
-        if quote < 0:
-            continue
-        context = text[max(0, quote - 80):quote]
-        if _looks_like_example_quote_context(context):
-            return True
-    return False
-
-
-def _looks_like_json_container_string(text: str) -> bool:
-    stripped = text.lstrip()
-    return stripped.startswith("{") or stripped.startswith("[")
-
-
-def _looks_like_example_payload_ref(ref: str) -> bool:
-    name = Path(ref).name.lower()
-    return name.startswith(("example-", "example_", "fake-", "fake_", "dummy-", "dummy_", "placeholder-", "placeholder_"))
-
-
-def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
-    refs: list[str] = []
-    for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
-        for match in pattern.finditer(text):
-            ref = match.group(1).strip()
-            if not _is_basename_ref(ref):
-                continue
-            if _looks_like_example_payload_ref(ref) and _is_escaped_placeholder_example(text, match.start()):
-                continue
-            if (
-                ignore_quoted_spans
-                and _looks_like_example_payload_ref(ref)
-                and _is_quoted_placeholder_example(text, match.start())
-            ):
-                continue
-            if ref not in refs:
-                refs.append(ref)
-    return refs
-
-
-def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) -> list[str]:
-    """Return refs that plausibly came from LCM storage-boundary placeholders.
-
-    Tool outputs and tool-call arguments often contain escaped code snippets,
-    pytest failures, or docs that mention placeholder examples. Counting those
-    as live payload references turns doctor into a false-positive machine. Exact
-    placeholders are still counted everywhere; embedded unescaped placeholders
-    are counted for message content, raw JSON-container tool-call argument
-    strings, and raw free-form tool-call argument strings so ingestion-produced
-    refs do not disappear while quoted examples stay ignored.
-    """
-    if not isinstance(value, str) or not value:
-        return []
-    stripped = value.strip()
-    if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
-        return extract_all_externalized_payload_refs(stripped)
-    if field == "tool_calls":
-        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
-        parsed = _maybe_parse_json_string(value)
-        if parsed is None:
-            return refs
-        for argument in _walk_tool_call_argument_values(parsed):
-            if isinstance(argument, str):
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True))
-                parsed_argument = _maybe_parse_json_string(argument)
-                if parsed_argument is not None:
-                    for nested in _walk_string_values(parsed_argument):
-                        nested_stripped = nested.strip()
-                        if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
-                            _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
-                        else:
-                            _append_unique_refs(
-                                refs,
-                                _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True),
-                            )
-            else:
-                for nested in _walk_string_values(argument):
-                    nested_stripped = nested.strip()
-                    if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
-                        _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
-                    else:
-                        _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
-        for nested in _walk_string_values(parsed):
-            nested_stripped = nested.strip()
-            if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
-                _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
-            else:
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
-        return refs
-    if role == "tool":
-        refs = _extract_unescaped_externalized_payload_refs(value)
-        parsed = _maybe_parse_json_string(value)
-        if parsed is not None:
-            for nested in _walk_string_values(parsed):
-                nested_stripped = nested.strip()
-                if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
-                    _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
-                else:
-                    _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
-        return refs
-    return extract_all_externalized_payload_refs(value)
-
-
-def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
-    """Compare externalized payload refs stored in messages with JSON files.
-
-    This is intentionally read-only and metadata-only. It does not open payload
-    files except through directory metadata, and row samples never include raw
-    message content or tool-call arguments.
-    """
-
-    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
-    existing_files: set[str] = set()
-    if storage_dir.exists() and storage_dir.is_dir():
-        existing_files = {path.name for path in storage_dir.glob("*.json") if path.is_file()}
-
-    referenced_refs: set[str] = set()
-    first_location_by_ref: dict[str, dict[str, Any]] = {}
-    for store_id, session_id, source, role, content, tool_calls in conn.execute(
-        """
-        SELECT store_id, session_id, source, role, content, tool_calls
-        FROM messages
-        WHERE COALESCE(content, '') LIKE '%ref=%]%'
-           OR COALESCE(tool_calls, '') LIKE '%ref=%]%'
-        ORDER BY store_id ASC
-        """
-    ).fetchall():
-        for field, value in (("content", content), ("tool_calls", tool_calls)):
-            if not isinstance(value, str):
-                continue
-            for ref in _refs_for_externalized_integrity_scan(value, role=str(role or ""), field=field):
-                referenced_refs.add(ref)
-                first_location_by_ref.setdefault(
-                    ref,
-                    {
-                        "store_id": int(store_id),
-                        "session_id": session_id,
-                        "source": source,
-                        "role": role,
-                        "field": field,
-                        "externalized_ref": ref,
-                    },
-                )
-
-    missing_refs = sorted(ref for ref in referenced_refs if ref not in existing_files)
-    existing_ref_count = sum(1 for ref in referenced_refs if ref in existing_files)
-    unreferenced_files = sorted(ref for ref in existing_files if ref not in referenced_refs)
-
-    return {
-        "externalized_payload_refs_total": len(referenced_refs),
-        "externalized_payload_refs_existing": existing_ref_count,
-        "externalized_payload_refs_missing": len(missing_refs),
-        "externalized_payload_files_unreferenced": len(unreferenced_files),
-        "missing_externalized_payload_refs": [
-            first_location_by_ref[ref] for ref in missing_refs[:limit] if ref in first_location_by_ref
-        ],
-        "unreferenced_externalized_payload_files": [
-            {"externalized_ref": ref} for ref in unreferenced_files[:limit]
-        ],
-    }
-
-
-def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
-    """Return bounded diagnostics for suspicious inline payload storage.
-
-    Diagnostics intentionally omit previews/raw payload text. Rows include only
-    metadata needed for triage and a recoverability ref when a compact
-    externalized placeholder is present.
-    """
-
-    def make_row(row, *, field: str, length_key: str, category: str) -> dict[str, Any]:
-        store_id, session_id, source, role, length, value = row
-        value = value or ""
-        result = {
-            "store_id": int(store_id),
-            "session_id": session_id,
-            "source": source,
-            "role": role,
-            "field": field,
-            "length": int(length or 0),
-            length_key: int(length or 0),
-            "suspicious_category": category,
-        }
-        refs = extract_ingest_externalized_refs(value) if isinstance(value, str) else []
-        ref = refs[0] if refs else (extract_externalized_ref(value) if isinstance(value, str) else None)
-        if ref:
-            result["externalized_ref"] = ref
-        return result
-
-    largest_content = conn.execute(
-        """
-        SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
-        FROM messages
-        ORDER BY content_len DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    largest_tool_calls = conn.execute(
-        """
-        SELECT store_id, session_id, source, role, COALESCE(length(tool_calls), 0) AS tool_calls_len, tool_calls
-        FROM messages
-        ORDER BY tool_calls_len DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    candidate_cap = max(limit * 20, limit)
-    # Pre-filter broadly in SQL, then apply the same conservative Python regex
-    # used by ingest externalization. This avoids false positives from code or
-    # doctor text that quotes scaffolds such as "data:%;base64,%" or
-    # `DATA_URI = "data:image/png;base64," + DATA_PAYLOAD`.
-    data_uri_content_candidates = conn.execute(
-        """
-        SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
-        FROM messages
-        WHERE lower(content) GLOB '*data:*;base64,*'
-        ORDER BY content_len DESC
-        LIMIT ?
-        """,
-        (candidate_cap,),
-    ).fetchall()
-    data_uri_tool_call_candidates = conn.execute(
-        """
-        SELECT store_id, session_id, source, role, COALESCE(length(tool_calls), 0) AS tool_calls_len, tool_calls
-        FROM messages
-        WHERE lower(tool_calls) GLOB '*data:*;base64,*'
-        ORDER BY tool_calls_len DESC
-        LIMIT ?
-        """,
-        (candidate_cap,),
-    ).fetchall()
-    data_uri_content = [
-        row for row in data_uri_content_candidates if isinstance(row[-1], str) and contains_data_uri_base64(row[-1])
-    ][:limit]
-    data_uri_tool_calls = [
-        row for row in data_uri_tool_call_candidates if isinstance(row[-1], str) and contains_data_uri_base64(row[-1])
-    ][:limit]
-
-    generic_rows = []
-    for store_id, session_id, source, role, content, tool_calls in conn.execute(
-        """
-        SELECT store_id, session_id, source, role, content, tool_calls
-        FROM messages
-        WHERE COALESCE(length(content), 0) >= ? OR COALESCE(length(tool_calls), 0) >= ?
-        ORDER BY MAX(COALESCE(length(content), 0), COALESCE(length(tool_calls), 0)) DESC
-        LIMIT ?
-        """,
-        (_GENERIC_BASE64_MIN_CHARS, _GENERIC_BASE64_MIN_CHARS, candidate_cap),
-    ).fetchall():
-        for field, value in (("content", content), ("tool_calls", tool_calls)):
-            if isinstance(value, str) and contains_long_base64_run(value):
-                result = {
-                    "store_id": int(store_id),
-                    "session_id": session_id,
-                    "source": source,
-                    "role": role,
-                    "field": field,
-                    "length": len(value),
-                    "suspicious_category": "base64_like",
-                }
-                refs = extract_ingest_externalized_refs(value)
-                ref = refs[0] if refs else extract_externalized_ref(value)
-                if ref:
-                    result["externalized_ref"] = ref
-                generic_rows.append(result)
-                break
-        if len(generic_rows) >= limit:
-            break
-
-    quarantined_assistant_rows = [
-        make_row(row, field="content", length_key="content_len", category=_QUARANTINED_ASSISTANT_KIND)
-        for row in conn.execute(
-            """
-            SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
-            FROM messages
-            WHERE role = 'assistant'
-              AND content LIKE '%Externalized LCM ingest payload:%quarantined_assistant_output%'
-            ORDER BY store_id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    ]
-
-    suspicious_repetitive_assistant_rows = []
-    for row in conn.execute(
-        """
-        SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
-        FROM messages
-        WHERE role = 'assistant'
-          AND COALESCE(length(content), 0) >= ?
-          AND content NOT LIKE '%Externalized LCM ingest payload:%quarantined_assistant_output%'
-        ORDER BY content_len DESC
-        LIMIT ?
-        """,
-        (_QUARANTINED_ASSISTANT_MIN_CHARS, candidate_cap),
-    ).fetchall():
-        value = row[-1]
-        if isinstance(value, str):
-            reason = assistant_output_quarantine_reason(value)
-            if reason:
-                suspicious_repetitive_assistant_rows.append(
-                    make_row(row, field="content", length_key="content_len", category=reason)
-                )
-        if len(suspicious_repetitive_assistant_rows) >= limit:
-            break
-
-    heartbeat_noise_rows = []
-    for row in conn.execute(
-        """
-        SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
-        FROM messages
-        WHERE role IN ('assistant', 'tool', 'system')
-          AND COALESCE(length(content), 0) BETWEEN 1 AND ?
-          AND (
-            lower(trim(content)) GLOB 'still working*'
-            OR lower(trim(content)) GLOB 'working on it*'
-            OR lower(trim(content)) GLOB 'processing*'
-            OR lower(trim(content)) GLOB 'checking*'
-            OR lower(trim(content)) GLOB 'one moment*'
-            OR lower(trim(content)) GLOB 'ping*'
-            OR lower(trim(content)) GLOB 'heartbeat*'
-            OR lower(trim(content)) GLOB 'no update*'
-          )
-        ORDER BY store_id ASC
-        LIMIT ?
-        """,
-        (_HEARTBEAT_NOISE_MAX_CHARS, candidate_cap),
-    ).fetchall():
-        _store_id, _session_id, _source, role, _length, value = row
-        reason = heartbeat_noise_reason(str(role or ""), value if isinstance(value, str) else "")
-        if reason:
-            heartbeat_noise_rows.append(
-                make_row(row, field="content", length_key="content_len", category=reason)
-            )
-        if len(heartbeat_noise_rows) >= limit:
-            break
-
-    return {
-        "largest_content_rows": [
-            make_row(row, field="content", length_key="content_len", category="largest_content")
-            for row in largest_content
-        ],
-        "largest_tool_calls_rows": [
-            make_row(row, field="tool_calls", length_key="tool_calls_len", category="largest_tool_calls")
-            for row in largest_tool_calls
-        ],
-        "suspicious_data_uri_content_rows": [
-            make_row(row, field="content", length_key="content_len", category="data_uri_base64")
-            for row in data_uri_content
-        ],
-        "suspicious_data_uri_tool_calls_rows": [
-            make_row(row, field="tool_calls", length_key="tool_calls_len", category="data_uri_base64")
-            for row in data_uri_tool_calls
-        ],
-        "suspicious_base64_like_rows": generic_rows,
-        "quarantined_assistant_rows": quarantined_assistant_rows,
-        "suspicious_repetitive_assistant_rows": suspicious_repetitive_assistant_rows,
-        "heartbeat_noise_rows": heartbeat_noise_rows,
-    }
-
-def externalized_payload_stats(config, hermes_home: str = "") -> dict[str, Any]:
-    from .externalize import get_large_output_storage_dir
-
-    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
-    count = 0
-    total_bytes = 0
-    total_chars = 0
-    latest_path = ""
-    latest_mtime = 0.0
-    if storage_dir.exists() and storage_dir.is_dir():
-        for path in storage_dir.glob("*.json"):
-            if not path.is_file():
-                continue
-            count += 1
-            try:
-                stat = path.stat()
-                total_bytes += int(stat.st_size)
-                if stat.st_mtime > latest_mtime:
-                    latest_mtime = stat.st_mtime
-                    latest_path = str(path)
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                total_chars += int(payload.get("content_chars") or len(payload.get("content", "") or ""))
-            except Exception:
-                continue
-    return {
-        "externalized_payload_dir": str(storage_dir),
-        "externalized_payload_count": count,
-        "externalized_payload_bytes": total_bytes,
-        "externalized_payload_chars": total_chars,
-        "latest_externalized_payload_path": latest_path,
-        "latest_externalized_payload_mtime": latest_mtime,
-    }

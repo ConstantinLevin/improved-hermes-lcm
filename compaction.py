@@ -213,10 +213,6 @@ class CompactionMixin:
             if original_text != replay_text:
                 if replay_text.startswith("[Externalized LCM ingest payload:"):
                     return True
-                if replay_text.startswith("[Externalized payload: kind=raw_payload;"):
-                    return True
-                if replay_text.startswith("[Externalized tool output:"):
-                    return True
                 if replay_text.startswith("[LCM active replay placeholder: assistant output quarantined;"):
                     return True
                 if replay_text.startswith("[LCM active replay placeholder: message ignored;"):
@@ -763,7 +759,6 @@ class CompactionMixin:
                 expand_hint=self._extract_expand_hint(summary_text),
             )
             self._dag.add_node(node)
-            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             self._persist_frontier_marker()
 

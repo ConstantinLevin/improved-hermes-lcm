@@ -21,11 +21,6 @@ from .diagnostics import (
     _state_db_path_for_engine,
     doctor_guidance_for_checks,
 )
-from .ingest_protection import (
-    externalized_payload_stats,
-    scan_externalized_payload_integrity,
-    scan_sqlite_payload_risks,
-)
 from .dag import SummaryDAG, build_nodes_fts_spec
 from .presets import (
     explicit_operator_overrides,
@@ -841,44 +836,6 @@ def _doctor_text(engine) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         quick_check = f"error: {exc}"
         issues.append("sqlite_quick_check")
-    payload_storage_error = ""
-    try:
-        payload_risks = scan_sqlite_payload_risks(store_conn)
-        externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
-        externalized_integrity = scan_externalized_payload_integrity(
-            store_conn,
-            engine._config,
-            hermes_home=engine._hermes_home,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        payload_storage_error = str(exc)
-        payload_risks = {
-            "largest_content_rows": [],
-            "largest_tool_calls_rows": [],
-            "suspicious_data_uri_content_rows": [],
-            "suspicious_data_uri_tool_calls_rows": [],
-            "suspicious_base64_like_rows": [],
-            "quarantined_assistant_rows": [],
-            "suspicious_repetitive_assistant_rows": [],
-            "heartbeat_noise_rows": [],
-        }
-        externalized_stats = {
-            "externalized_payload_count": 0,
-            "externalized_payload_bytes": 0,
-            "externalized_payload_chars": 0,
-            "externalized_payload_dir": "",
-            "latest_externalized_payload_path": "",
-            "latest_externalized_payload_mtime": 0,
-        }
-        externalized_integrity = {
-            "externalized_payload_refs_total": 0,
-            "externalized_payload_refs_existing": 0,
-            "externalized_payload_refs_missing": 0,
-            "externalized_payload_files_unreferenced": 0,
-            "missing_externalized_payload_refs": [],
-            "unreferenced_externalized_payload_files": [],
-        }
-        issues.append("payload_storage")
     clean_scan = _scan_clean_candidates(engine)
 
     debt_rows = []
@@ -898,16 +855,6 @@ def _doctor_text(engine) -> str:
             debt_rows = [(f"error: {exc}", "error", 0)]
 
     observations: list[str] = []
-    missing_externalized_refs = int(externalized_integrity.get("externalized_payload_refs_missing", 0) or 0)
-    suspicious_payload_rows = sum(
-        len(payload_risks.get(key) or [])
-        for key in (
-            "suspicious_data_uri_content_rows",
-            "suspicious_data_uri_tool_calls_rows",
-            "suspicious_base64_like_rows",
-            "suspicious_repetitive_assistant_rows",
-        )
-    )
 
     if schema_health.get("error"):
         observations.append(f"schema_core_tables: error: {schema_health['error']}")
@@ -943,25 +890,6 @@ def _doctor_text(engine) -> str:
         recommended_actions.append("create a safety snapshot first with `/lcm backup`")
     else:
         observations.append("cleanup_candidates: none")
-
-    if missing_externalized_refs:
-        issues.append("payload_storage")
-        observations.append(
-            f"payload_storage: {missing_externalized_refs} externalized payload ref(s) point to missing JSON files"
-        )
-        recommended_actions.append(
-            "inspect missing externalized payload refs and restore from backups if needed"
-        )
-    if suspicious_payload_rows:
-        observations.append(
-            f"payload_storage: {suspicious_payload_rows} suspicious inline/base64 payload row(s) need review"
-        )
-        recommended_actions.append(
-            "inspect suspicious payload rows before cleanup; restore payload files from backup before deleting or rewriting anything"
-        )
-    if payload_storage_error:
-        observations.append(f"payload_storage_error: {payload_storage_error}")
-        recommended_actions.append("inspect payload storage diagnostics before cleanup or deletion")
 
     try:
         source_stats = engine._store.get_source_stats()
@@ -1090,21 +1018,6 @@ def _doctor_text(engine) -> str:
         })
     if clean_scan["candidates"]:
         triage_checks.append({"check": "cleanup_candidates", "status": "warn", "detail": clean_scan})
-    if payload_storage_error or missing_externalized_refs or any(payload_risks.get(key) for key in (
-        "suspicious_data_uri_content_rows",
-        "suspicious_data_uri_tool_calls_rows",
-        "suspicious_base64_like_rows",
-        "suspicious_repetitive_assistant_rows",
-        "heartbeat_noise_rows",
-    )):
-        detail = {**payload_risks, **externalized_integrity}
-        if payload_storage_error:
-            detail["error"] = payload_storage_error
-        triage_checks.append({
-            "check": "payload_storage",
-            "status": "fail" if payload_storage_error else "warn",
-            "detail": detail,
-        })
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
     if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
@@ -1143,25 +1056,6 @@ def _doctor_text(engine) -> str:
         f"messages_fts_rows: {store_fts_count}",
         f"nodes_fts: {node_fts}",
         f"nodes_fts_rows: {node_fts_count}",
-        f"largest_content_rows: {payload_risks['largest_content_rows']}",
-        f"largest_tool_calls_rows: {payload_risks['largest_tool_calls_rows']}",
-        f"suspicious_data_uri_content_rows: {payload_risks['suspicious_data_uri_content_rows']}",
-        f"suspicious_data_uri_tool_calls_rows: {payload_risks['suspicious_data_uri_tool_calls_rows']}",
-        f"suspicious_base64_like_rows: {payload_risks['suspicious_base64_like_rows']}",
-        f"quarantined_assistant_rows: {payload_risks['quarantined_assistant_rows']}",
-        f"suspicious_repetitive_assistant_rows: {payload_risks['suspicious_repetitive_assistant_rows']}",
-        f"heartbeat_noise_rows: {payload_risks['heartbeat_noise_rows']}",
-        f"externalized_payload_dir: {externalized_stats['externalized_payload_dir']}",
-        f"externalized_payload_count: {externalized_stats['externalized_payload_count']}",
-        f"externalized_payload_bytes: {externalized_stats['externalized_payload_bytes']}",
-        f"externalized_payload_chars: {externalized_stats['externalized_payload_chars']}",
-        f"latest_externalized_payload_path: {externalized_stats['latest_externalized_payload_path'] or '(none)'}",
-        f"externalized_payload_refs_total: {externalized_integrity['externalized_payload_refs_total']}",
-        f"externalized_payload_refs_existing: {externalized_integrity['externalized_payload_refs_existing']}",
-        f"externalized_payload_refs_missing: {externalized_integrity['externalized_payload_refs_missing']}",
-        f"externalized_payload_files_unreferenced: {externalized_integrity['externalized_payload_files_unreferenced']}",
-        f"missing_externalized_payload_refs: {externalized_integrity['missing_externalized_payload_refs']}",
-        f"unreferenced_externalized_payload_files: {externalized_integrity['unreferenced_externalized_payload_files']}",
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")

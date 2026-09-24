@@ -6,8 +6,7 @@ LCM_GREP = {
         "Full-text search over the current session's past conversation content in the LCM database. "
         "Returns both raw messages and summary nodes across all depths. "
         "Use lcm_expand(store_id=...) on a message hit or lcm_expand(node_id=...) on a summary hit "
-        "to drill into its full content. Set content_scope='externalized' or 'both' to opt into bounded "
-        "search over recoverable payload sidecars."
+        "to drill into its full content."
     ),
     "parameters": {
         "type": "object",
@@ -36,25 +35,6 @@ LCM_GREP = {
                     "and 'hybrid' keeps strong older matches competitive while still boosting newer context."
                 ),
                 "default": "recency",
-            },
-            "content_scope": {
-                "type": "string",
-                "enum": ["history", "externalized", "both"],
-                "description": (
-                    "Content stores to search. 'history' (default) preserves current raw-message and summary behavior. "
-                    "'externalized' searches only bounded externalized-payload prefixes owned by the active session. "
-                    "'both' searches history and those payloads."
-                ),
-                "default": "history",
-            },
-            "externalized_refs": {
-                "type": "array",
-                "items": {"type": "string"},
-                "maxItems": 256,
-                "description": (
-                    "Optional externalized ref filenames to search. Valid only with content_scope='externalized' or 'both'. "
-                    "Every ref must be a regular payload owned by the active session."
-                ),
             },
             "role": {
                 "type": "string",

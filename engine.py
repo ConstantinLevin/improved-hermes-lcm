@@ -38,34 +38,20 @@ from .escalation import (
     SummarySpendGuard,
     summarize_with_escalation,
 )
-from .externalize import (
-    build_transcript_gc_placeholder,
-    extract_externalized_ref,
-    find_externalized_payload_for_message,
-    find_externalized_tool_result_content_for_call,
-    is_externalized_placeholder,
-    load_externalized_payload,
-    maybe_externalize_tool_output,
-)
+from .externalize import load_externalized_payload
 from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
-    _expected_persisted_output_chars,
-    _contains_media_payload,
     _is_hermes_persisted_output_marker,
-    _persisted_output_inline_preview_sha256,
-    _persisted_output_preview_prefix_digest,
-    _persisted_output_saved_path,
     assistant_output_quarantine_reason,
     extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
-    recover_hermes_persisted_output_with_file_stat,
     restore_ingest_payload_placeholders,
 )
 from .runtime_identity import (
@@ -2516,20 +2502,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     content = payload.get("content")
                     if isinstance(content, str):
                         return content
-
-        if is_externalized_placeholder(stripped):
-            ref = extract_externalized_ref(stripped)
-            payload = load_externalized_payload(
-                ref or "",
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-            if payload is not None:
-                payload_session_id = str(payload.get("session_id") or "")
-                if not session_id or not payload_session_id or payload_session_id == session_id:
-                    content = payload.get("content")
-                    if isinstance(content, str):
-                        return content
         return text
 
     def _session_end_prefix_compare_content(
@@ -3662,7 +3634,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return False
 
     def _content_has_externalized_placeholder_ref(self, content: str) -> bool:
-        return bool(extract_externalized_ref(content) or extract_ingest_externalized_refs(content))
+        return bool(extract_ingest_externalized_refs(content))
 
     def _has_prior_raw_externalized_placeholder_row(self, store_id: int, msg: Dict[str, Any]) -> bool:
         if not self._session_id:
@@ -3829,36 +3801,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_id=session_id,
         )
 
-    def _recovered_content_matches_durable_identity(self, recovered_content: str, durable_content: str) -> bool:
-        return normalize_content_value(recovered_content) == durable_content
-
-    @staticmethod
-    def _persisted_output_marker_replay_proof(content: str) -> str | None:
-        preview_sha256 = _persisted_output_inline_preview_sha256(content) or _persisted_output_preview_prefix_digest(content)
-        return preview_sha256 or None
-
-    def _has_any_durable_persisted_output_payload_for_marker(self, msg: Dict[str, Any]) -> bool:
-        role = str(msg.get("role") or "unknown")
-        content = normalize_content_value(msg.get("content")) or ""
-        if role != "tool" or not _is_hermes_persisted_output_marker(content):
-            return False
-        expected_chars = _expected_persisted_output_chars(content)
-        persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256 = self._persisted_output_marker_replay_proof(content)
-        if expected_chars is None or not persisted_output_source_path or not persisted_output_preview_sha256:
-            return False
-        if recover_hermes_persisted_output_with_file_stat(content) is None:
-            return False
-        durable_content = find_externalized_tool_result_content_for_call(
-            tool_call_id=str(msg.get("tool_call_id") or ""),
-            session_id=str(msg.get("session_id") or self._session_id or ""),
-            expected_chars=expected_chars,
-            persisted_output_source_path=persisted_output_source_path,
-            persisted_output_preview_sha256=persisted_output_preview_sha256,
-            config=self._config,
-            hermes_home=self._hermes_home,
-        )
-        return durable_content is not None
 
     @classmethod
     def _is_active_context_droppable_identity(cls, identity: tuple[str, str, str, str]) -> bool:
@@ -3954,17 +3896,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             reconcile_messages = [
                 original_msg
                 if (
-                    (
-                        str(original_msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(original_msg.get("content")) or ""
-                        )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
-                    )
-                    or (
-                        self._compiled_ignore_message_patterns
-                        and ignored_original_messages[idx]
-                    )
+                    self._compiled_ignore_message_patterns
+                    and ignored_original_messages[idx]
                 )
                 else replay_msg
                 for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
@@ -4245,35 +4178,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=self._config,
             hermes_home=self._hermes_home,
         )
-        recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(
-            active_replay_messages
-        )
-        for (absolute_idx, _replay_msg), protected_msg in zip(
-            messages_to_store_with_index,
-            protected_messages,
-        ):
-            if self._protected_message_uses_raw_payload_active_stub(protected_msg):
-                if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
-                    )
-                active_message = dict(active_replay_messages[absolute_idx])
-                active_message["content"] = protected_msg["content"]
-                active_replay_messages[absolute_idx] = active_message
-                continue
-
-            active_message = active_replay_messages[absolute_idx]
-            stubbed_message = self._maybe_stub_active_tool_result(
-                active_message,
-                recovery_tool_call_ids=recovery_tool_call_ids,
-            )
-            if stubbed_message is not None:
-                if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
-                    )
-                active_replay_messages[absolute_idx] = stubbed_message
-
         estimates = [count_message_tokens(m) for m in protected_messages]
         self._store._append_protected_batch(
             self._session_id,
@@ -4289,18 +4193,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-        # Most ``protected_messages`` changes are storage-only: inline media and
-        # data/base64 substrings stay provider-usable in active replay. The
-        # exceptions are whole-message ``raw_payload`` externalization and the
-        # separately opt-in textual tool-result interceptor above.
+        # ``protected_messages`` changes are storage-only: inline media and
+        # data/base64 substrings stay provider-usable in active replay.
         return self._remember_active_replay_messages(messages, active_replay_messages)
 
-    @staticmethod
-    def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
-        content = message.get("content")
-        return isinstance(content, str) and content.startswith(
-            "[Externalized payload: kind=raw_payload;"
-        )
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
@@ -4308,70 +4204,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: summarization -------------------------------------------
 
-
-    def _maybe_gc_compacted_tool_results(
-        self,
-        compacted_chunk: List[Dict[str, Any]],
-        source_store_ids: List[int],
-    ) -> None:
-        if not getattr(self._config, "large_output_transcript_gc_enabled", False):
-            return
-        if not compacted_chunk or not source_store_ids:
-            return
-
-        stored_by_id = self._store.get_batch(source_store_ids)
-
-        for store_id in source_store_ids:
-            stored = stored_by_id.get(store_id)
-            if not stored or stored.get("session_id") != self._session_id:
-                continue
-            if stored.get("role") != "tool":
-                continue
-            content = stored.get("content", "") or ""
-            tool_call_id = stored.get("tool_call_id", "") or ""
-            if not content:
-                continue
-
-            # Only take the fast ref-branch when the ENTIRE row is the
-            # externalized placeholder. A ref merely embedded in surrounding
-            # text (e.g. a recall-tool result that quotes a placeholder) must
-            # fall through to the content-equality lookup below, which tombstones
-            # only when the full row content matches the stored payload -
-            # otherwise the surrounding, never-externalized text is lost.
-            ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
-            if ref:
-                externalized = load_externalized_payload(
-                    ref,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
-                    placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(store_id, placeholder)
-                    continue
-
-            lookup_candidates = []
-            sanitized_content = sanitize_pre_compaction_content(content)
-            if sanitized_content and sanitized_content != content:
-                lookup_candidates.append(sanitized_content)
-            lookup_candidates.append(content)
-
-            externalized = None
-            for candidate in lookup_candidates:
-                externalized = find_externalized_payload_for_message(
-                    candidate,
-                    tool_call_id=tool_call_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized is not None:
-                    break
-            if externalized is None:
-                continue
-
-            placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(store_id, placeholder)
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
@@ -4382,19 +4214,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             content = msg.get("content") or ""
             if role == "tool":
                 tool_id = str(msg.get("tool_call_id") or "").strip()
-                externalized = maybe_externalize_tool_output(
-                    content,
-                    tool_call_id=tool_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized:
-                    content = externalized["placeholder"]
-                else:
-                    content = sanitize_pre_compaction_content(content)
-                    if len(content) > 3000:
-                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                content = sanitize_pre_compaction_content(content)
+                if len(content) > 3000:
+                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
@@ -4479,187 +4301,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             insert_missing_tool_stubs=insert_missing_tool_stubs,
         )
 
-    @staticmethod
-    def _active_tool_stub_content(original_content: Any, placeholder: str) -> Any:
-        """Preserve compatible structured text-block shape when inserting a ref."""
-        if not isinstance(original_content, list):
-            return placeholder
-        for block in original_content:
-            if isinstance(block, str):
-                return [placeholder]
-            if not isinstance(block, dict):
-                continue
-            block_type = str(block.get("type") or "").lower()
-            if block_type not in {"text", "input_text", "output_text"}:
-                continue
-            for value_key in ("text", "content"):
-                text_value = block.get(value_key)
-                if isinstance(text_value, str):
-                    return [{"type": block_type, value_key: placeholder}]
-                if not isinstance(text_value, dict):
-                    continue
-                for nested_key in ("value", "content"):
-                    if isinstance(text_value.get(nested_key), str):
-                        return [{
-                            "type": block_type,
-                            value_key: {nested_key: placeholder},
-                        }]
-        # _is_textual_tool_result_content() only admits supported shapes, so
-        # this fallback is defensive rather than a normal provider path.
-        return [{"type": "text", "text": placeholder}]
-
-    @staticmethod
-    def _structured_text_block_value(block: Dict[str, Any]) -> str | None:
-        for value_key in ("text", "content"):
-            text_value = block.get(value_key)
-            if isinstance(text_value, str):
-                return text_value
-            if not isinstance(text_value, dict):
-                continue
-            for nested_key in ("value", "content"):
-                nested = text_value.get(nested_key)
-                if isinstance(nested, str):
-                    return nested
-        return None
-
-    @staticmethod
-    def _is_textual_tool_result_content(content: Any) -> bool:
-        """Return whether active stubbing can preserve provider semantics."""
-        if _contains_media_payload(content):
-            return False
-        if isinstance(content, str):
-            return True
-        if not isinstance(content, list) or not content:
-            return False
-        for block in content:
-            if isinstance(block, str):
-                continue
-            if not isinstance(block, dict):
-                return False
-            if str(block.get("type") or "").lower() not in {
-                "text",
-                "input_text",
-                "output_text",
-            }:
-                return False
-            if LCMEngine._structured_text_block_value(block) is None:
-                return False
-        return True
-
-    def _active_replay_recovery_tool_call_ids(
-        self,
-        messages: List[Dict[str, Any]],
-    ) -> set[str]:
-        recovery_tool_call_ids: set[str] = set()
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            for tool_call in message.get("tool_calls") or []:
-                if not isinstance(tool_call, dict):
-                    continue
-                call_id = _tool_call_id(tool_call)
-                function = tool_call.get("function") or {}
-                tool_name = str(function.get("name") or "") if isinstance(function, dict) else ""
-                if call_id and tool_name in {"lcm_describe", "lcm_expand"}:
-                    recovery_tool_call_ids.add(call_id)
-        return recovery_tool_call_ids
-
-    def _maybe_stub_active_tool_result(
-        self,
-        message: Dict[str, Any],
-        *,
-        recovery_tool_call_ids: set[str],
-    ) -> Dict[str, Any] | None:
-        if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
-            return None
-        if not getattr(self._config, "large_output_externalization_enabled", False):
-            return None
-        if not isinstance(message, dict) or message.get("role") != "tool":
-            return None
-        tool_call_id = str(message.get("tool_call_id") or "").strip()
-        if not tool_call_id or tool_call_id in recovery_tool_call_ids:
-            return None
-        content = message.get("content")
-        if not self._is_textual_tool_result_content(content):
-            return None
-        normalized_content = normalize_content_value(content) or ""
-        if not normalized_content or is_externalized_placeholder(normalized_content):
-            return None
-        threshold = max(
-            1,
-            int(
-                getattr(
-                    self._config,
-                    "large_output_active_replay_stub_threshold_tokens",
-                    25_000,
-                )
-                or 0
-            ),
-        )
-        if count_tokens(normalized_content) <= threshold:
-            return None
-        externalized = maybe_externalize_tool_output(
-            normalized_content,
-            tool_call_id=tool_call_id,
-            session_id=self._session_id,
-            config=self._config,
-            hermes_home=self._hermes_home,
-            force=True,
-        )
-        if externalized is None:
-            return None
-        replacement = dict(message)
-        replacement["content"] = self._active_tool_stub_content(
-            content,
-            externalized["placeholder"],
-        )
-        return replacement
-
-    def _stub_large_tool_results_for_active_replay(
-        self,
-        messages: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Replace eligible old tool payloads with durable refs for assembly.
-
-        This is provider-replay-only. It never mutates the input messages, raw
-        SQLite rows, or DAG lineage. The newest ``fresh_tail_count`` messages
-        stay inline.
-        """
-        if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
-            return messages
-        if not getattr(self._config, "large_output_externalization_enabled", False):
-            return messages
-        protected_tail_count = max(0, int(getattr(self._config, "fresh_tail_count", 0) or 0))
-        eligible_end = max(0, len(messages) - protected_tail_count)
-        if eligible_end <= 0:
-            return messages
-
-        recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(messages)
-
-        result = list(messages)
-        stubbed_count = 0
-        tokens_saved = 0
-        for idx, message in enumerate(messages[:eligible_end]):
-            replacement = self._maybe_stub_active_tool_result(
-                message,
-                recovery_tool_call_ids=recovery_tool_call_ids,
-            )
-            if replacement is None:
-                continue
-            result[idx] = replacement
-            stubbed_count += 1
-            tokens_saved += max(
-                0,
-                count_message_tokens(message) - count_message_tokens(replacement),
-            )
-
-        if stubbed_count:
-            logger.info(
-                "LCM active replay stubbing: replaced %d evictable tool result(s), saved about %d tokens",
-                stubbed_count,
-                tokens_saved,
-            )
-        return result
 
     def _sanitize_tool_pairs(
         self,
@@ -5131,11 +4772,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             else self._effective_assembly_token_cap()
         )
 
-        # Stub durably externalized evictable tool payloads before the assembly
-        # budget pass so the selector sees their reduced provider-visible cost.
-        # The helper protects the configured fresh tail and is fail-open.
-        assembly_tail_messages = self._stub_large_tool_results_for_active_replay(tail_messages)
-        tail_selected = assembly_tail_messages
+        tail_selected = tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
             anchor_source = tail_messages
@@ -5146,7 +4783,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
             tail_for_selection = self._sanitize_active_context_messages(
-                assembly_tail_messages,
+                tail_messages,
                 insert_missing_tool_stubs=False,
             )
             skipped_tail_gap = False

@@ -12,13 +12,9 @@ from typing import Any, Dict, TYPE_CHECKING
 
 from .externalize import (
     _inspect_top_level_json_string_fields_before_content as _externalized_top_level_fields_before_content,
-    extract_externalized_ref,
-    extract_externalized_refs,
-    find_externalized_payload_for_message,
     get_large_output_storage_dir,
     load_externalized_payload,
     read_externalized_payload_metadata_prefix,
-    read_externalized_payload_search_prefix,
 )
 from .diagnostics import (
     _has_lifecycle_fragmentation,
@@ -31,14 +27,7 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     load_integrity_failed,
 )
-from .extraction import sanitize_pre_compaction_content
-from .ingest_protection import (
-    externalized_payload_stats,
-    extract_ingest_externalized_refs,
-    restore_ingest_payload_placeholders,
-    scan_externalized_payload_integrity,
-    scan_sqlite_payload_risks,
-)
+from .ingest_protection import extract_ingest_externalized_refs
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 from .presets import preset_status_payload
@@ -59,10 +48,6 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     rank_value = float(rank) if rank is not None else float("inf")
     directness = float(result.get("_sort_directness") or 0.0)
     type_bias = 0 if result.get("type") == "message" else 1
-    # BM25 ranks and payload byte offsets are incomparable. Keep the existing
-    # history ordering in tier 0; sidecars follow in tier 1 and use byte offset
-    # only as their native in-tier tie-break.
-    rank_tier = 1 if result.get("type") == "externalized" else 0
     role = result.get("role")
     if role == "user":
         role_bias = 0
@@ -76,7 +61,7 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     effective_directness = directness if result.get("type") == "message" else (directness * 0.8)
 
     if sort == "relevance":
-        return (rank_tier, rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
+        return (rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
 
     if sort == "hybrid":
         age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
@@ -84,7 +69,6 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
         summary_override = int(result.get("_hybrid_summary_override") or 0)
         return (
             -summary_override,
-            rank_tier,
             blended,
             -effective_directness,
             role_bias,
@@ -93,8 +77,8 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
         )
 
     if result.get("type") == "message":
-        return (rank_tier, -sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
-    return (rank_tier, -sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
+        return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
+    return (-sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
     engine = kwargs.get("engine")
@@ -162,15 +146,6 @@ def _parse_positive_int(value: Any, default: int) -> int:
     return max(1, _parse_int_value(value, default))
 
 
-def _parse_optional_float(value: Any, name: str) -> tuple[float | None, str | None]:
-    if value is None:
-        return None, None
-    try:
-        return float(value), None
-    except (TypeError, ValueError, OverflowError):
-        return None, f"{name} must be a number"
-
-
 def _parse_optional_timestamp(value: Any, name: str) -> tuple[float | None, str | None]:
     if value is None:
         return None, None
@@ -217,14 +192,7 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
         return None, f"{name} must be an integer"
 
 
-_LCM_GREP_VALID_CONTENT_SCOPES = frozenset({"history", "externalized", "both"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
-_LCM_GREP_EXTERNALIZED_FILE_CAP = 256
-_LCM_GREP_EXTERNALIZED_DISCOVERY_CAP = 4096
-_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES = 64 * 1024
-_LCM_GREP_EXTERNALIZED_CONTENT_BYTES = 512_000
-_LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES = 64 * 1024
-_LCM_GREP_RESPONSE_CHAR_CAP = 64_000
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
@@ -413,38 +381,12 @@ def _full_content_slice(content: str, content_offset: int = 0) -> dict[str, Any]
     }
 
 
-def _restore_ingest_placeholder_for_lookup(
-    content: str,
-    ref: str | None,
-    payload: dict[str, Any] | None,
-    *,
-    config,
-    hermes_home: str,
-    session_id: str,
-) -> str | None:
-    if not content or not ref or not payload or payload.get("kind") != "ingest_payload":
-        return None
-    restored = restore_ingest_payload_placeholders(
-        content,
-        config=config,
-        hermes_home=hermes_home,
-        session_id=session_id,
-    )
-    return restored if restored != content else None
-
-
 def _is_compact_externalized_marker(content: str, ref: str | None) -> bool:
     if not ref or not content:
         return False
     if len(content) > 512:
         return False
-    return (
-        content.startswith("[Externalized tool output:")
-        or content.startswith("[GC'd externalized tool output:")
-        or content.startswith("[Externalized payload:")
-        or content.startswith("[GC'd externalized payload:")
-        or "[Externalized LCM ingest payload:" in content
-    )
+    return "[Externalized LCM ingest payload:" in content
 
 
 def _pagination_payload(
@@ -485,7 +427,6 @@ def _expand_message_sources(
     source_offset: int = 0,
     source_limit: int | None = None,
     content_offset: int = 0,
-    hydrate_externalized_content: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -520,26 +461,11 @@ def _expand_message_sources(
             next_content_offset = 0
             has_more = next_source_offset < total_sources
             continue
-        transcript_content = stored.get("content", "")
-        content = transcript_content
-        content_source = "message"
-        externalized = None
-        ref_payload = None
-        ingest_refs = extract_ingest_externalized_refs(transcript_content)
-        ref = ingest_refs[0] if ingest_refs else extract_externalized_ref(transcript_content)
-        if ref:
-            ref_payload = _get_externalized_payload(
-                engine,
-                ref,
-                allowed_session_ids={engine.current_session_id, stored.get("session_id", "")},
-            )
-            if ref_payload is not None and ref_payload.get("kind") != "ingest_payload":
-                externalized = ref_payload
-        if hydrate_externalized_content and externalized is not None:
-            content = externalized.get("content", "")
-            content_source = "externalized_payload"
+        content = stored.get("content", "")
+        ingest_refs = extract_ingest_externalized_refs(content)
+        ref = ingest_refs[0] if ingest_refs else None
         effective_content_offset = content_offset if source_index == source_offset else 0
-        if not hydrate_externalized_content and _is_compact_externalized_marker(content, ref):
+        if _is_compact_externalized_marker(content, ref):
             sliced = _full_content_slice(content, effective_content_offset)
         else:
             sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset)
@@ -556,44 +482,8 @@ def _expand_message_sources(
             "content_returned_chars": sliced["content_returned_chars"],
             "content_truncated": sliced["content_truncated"],
             "next_content_offset": sliced["next_content_offset"],
-            "content_source": content_source,
+            "content_source": "message",
         }
-        if content_source == "externalized_payload":
-            expanded["transcript_content"] = transcript_content
-        if stored.get("role") == "tool":
-            if externalized is not None:
-                externalized_summary = dict(externalized)
-                externalized_summary.pop("content", None)
-                expanded["externalized"] = externalized_summary
-            if "externalized" not in expanded:
-                lookup_candidates = [transcript_content]
-                restored_ingest_content = _restore_ingest_placeholder_for_lookup(
-                    transcript_content,
-                    ref,
-                    ref_payload,
-                    config=engine._config,
-                    hermes_home=engine._hermes_home,
-                    session_id=stored.get("session_id", ""),
-                )
-                if restored_ingest_content is not None:
-                    lookup_candidates.insert(0, restored_ingest_content)
-                    sanitized_restored = sanitize_pre_compaction_content(restored_ingest_content)
-                    if sanitized_restored != restored_ingest_content:
-                        lookup_candidates.insert(0, sanitized_restored)
-                sanitized_content = sanitize_pre_compaction_content(transcript_content)
-                if sanitized_content != transcript_content:
-                    lookup_candidates.insert(0, sanitized_content)
-                for candidate in lookup_candidates:
-                    externalized = find_externalized_payload_for_message(
-                        candidate,
-                        tool_call_id=stored.get("tool_call_id", ""),
-                        session_id=stored.get("session_id", ""),
-                        config=engine._config,
-                        hermes_home=engine._hermes_home,
-                    )
-                    if externalized is not None:
-                        expanded["externalized"] = externalized
-                        break
         messages.append(expanded)
         budget_used += count_tokens(sliced["content"])
         if sliced["has_more"]:
@@ -711,7 +601,6 @@ def _collect_descendant_evidence_blocks(
     node,
     max_tokens: int,
     *,
-    hydrate_externalized_content: bool = False,
     visited_node_ids: set[int] | None = None,
     source_path: list[dict[str, int]] | None = None,
     remaining_node_visits: list[int] | None = None,
@@ -760,7 +649,6 @@ def _collect_descendant_evidence_blocks(
                 engine,
                 child,
                 max_tokens=remaining_tokens,
-                hydrate_externalized_content=hydrate_externalized_content,
             )
             if messages or pagination.get("has_more"):
                 block = {
@@ -801,8 +689,6 @@ def _collect_context_blocks_for_node(
     engine: "LCMEngine",
     node,
     max_tokens: int,
-    *,
-    hydrate_externalized_content: bool = False,
 ) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -825,7 +711,6 @@ def _collect_context_blocks_for_node(
             engine,
             node,
             max_tokens=remaining_tokens,
-            hydrate_externalized_content=hydrate_externalized_content,
         )
         if messages or pagination.get("has_more"):
             block = {
@@ -854,7 +739,6 @@ def _collect_context_blocks_for_node(
                     engine,
                     node,
                     max_tokens=descendant_tokens,
-                    hydrate_externalized_content=hydrate_externalized_content,
                 )
             )
 
@@ -971,7 +855,6 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
         if block.get("type") in {"messages", "child_messages", "raw_messages"}:
             for message in block.get("messages", []):
                 total += count_tokens(str(message.get("content") or ""))
-                total += count_tokens(str(message.get("transcript_content") or ""))
         elif block.get("type") in {"child_nodes", "descendant_child_nodes"}:
             total += sum(count_tokens(str(child.get("summary") or "")) for child in block.get("children", []))
     return total
@@ -1073,6 +956,8 @@ _LCM_GREP_REMOVED_ARGUMENTS = (
     "session_id",
     "source",
     "conversation_id",
+    "content_scope",
+    "externalized_refs",
 )
 
 
@@ -1108,32 +993,6 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
 
-    content_scope = str(args.get("content_scope") or "history").strip().lower()
-    if content_scope not in _LCM_GREP_VALID_CONTENT_SCOPES:
-        return json.dumps({"error": "content_scope must be one of: history, externalized, both"})
-    raw_externalized_refs = args.get("externalized_refs")
-    if raw_externalized_refs is not None and content_scope == "history":
-        return json.dumps({"error": "externalized_refs requires content_scope=externalized or both"})
-    externalized_refs: list[str] | None = None
-    if raw_externalized_refs is not None:
-        if not isinstance(raw_externalized_refs, list):
-            return json.dumps({"error": "externalized_refs must be an array of ref filenames"})
-        if len(raw_externalized_refs) > _LCM_GREP_EXTERNALIZED_FILE_CAP:
-            return json.dumps({"error": f"externalized_refs is limited to {_LCM_GREP_EXTERNALIZED_FILE_CAP} refs"})
-        externalized_refs = []
-        for value in raw_externalized_refs:
-            ref = str(value or "").strip()
-            if (
-                not ref
-                or Path(ref).name != ref
-                or "/" in ref
-                or "\\" in ref
-                or not ref.endswith(".json")
-            ):
-                return json.dumps({"error": f"Invalid externalized ref: {ref or '<empty>'}"})
-            if ref not in externalized_refs:
-                externalized_refs.append(ref)
-
     role, role_error = _parse_grep_role(args.get("role"))
     if role_error:
         return json.dumps({"error": role_error})
@@ -1150,7 +1009,6 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         or time_from is not None
         or time_to is not None
     )
-    externalized_filter_active = raw_message_filter_active
 
     # MessageStore.search and SummaryDAG.search treat session_id="" as a
     # literal scoped filter, so an unbound engine returns zero results rather
@@ -1159,37 +1017,32 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     # does not redirect the search away from the operator's conversation.
     search_session_id: str = engine.current_session_id
 
-    searches_externalized = content_scope in {"externalized", "both"}
-    if searches_externalized and not engine.current_session_id:
-        return json.dumps({"error": "Externalized payload search requires an active session"})
-
     current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
 
-    if content_scope in {"history", "both"}:
-        try:
-            msg_hits = engine._store.search(
-                query,
-                session_id=search_session_id,
-                limit=source_limit,
-                sort=sort,
-                role=role,
-                time_from=time_from,
-                time_to=time_to,
-            )
-            for hit in msg_hits:
-                results.append(
-                    _shape_message_hit(
-                        hit,
-                        current_session_id=current_session_id,
-                        has_current_session=has_current_session,
-                    )
+    try:
+        msg_hits = engine._store.search(
+            query,
+            session_id=search_session_id,
+            limit=source_limit,
+            sort=sort,
+            role=role,
+            time_from=time_from,
+            time_to=time_to,
+        )
+        for hit in msg_hits:
+            results.append(
+                _shape_message_hit(
+                    hit,
+                    current_session_id=current_session_id,
+                    has_current_session=has_current_session,
                 )
-        except Exception as exc:
-            logger.warning("Message search failed: %s", exc)
+            )
+    except Exception as exc:
+        logger.warning("Message search failed: %s", exc)
 
-    if content_scope in {"history", "both"} and not raw_message_filter_active:
+    if not raw_message_filter_active:
         try:
             node_hits = engine._dag.search(
                 query,
@@ -1201,193 +1054,6 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 results.append(_shape_summary_hit(node))
         except Exception as exc:
             logger.warning("Node search failed: %s", exc)
-
-    externalized_scan: dict[str, Any] | None = None
-    externalized_results_omitted = False
-    if searches_externalized and externalized_filter_active:
-        # Externalized sidecars are tool/ingest payloads, not raw messages, and
-        # carry no role/timestamp/source/conversation lane comparable to history
-        # rows. Suppress sidecar search whenever one of those filters is active
-        # rather than leak unscoped payloads. Source remains valid for summary
-        # search above, so it intentionally does not affect summary omission.
-        externalized_results_omitted = True
-    elif searches_externalized:
-        try:
-            storage_dir = get_large_output_storage_dir(
-                engine._config,
-                hermes_home=engine._hermes_home,
-                create=False,
-            )
-        except (OSError, ValueError) as exc:
-            return json.dumps({
-                "error": f"Externalized payload storage is unavailable: {exc}",
-            })
-        scan_counts = {
-            "candidate_files": 0,
-            "discovery_files": 0,
-            "discovery_truncated": False,
-            "scanned_files": 0,
-            "matched_files": 0,
-            "rejected_symlink": 0,
-            "rejected_invalid_or_unreadable": 0,
-            "rejected_session_mismatch": 0,
-        }
-        if externalized_refs is None:
-            discovered_refs = []
-            try:
-                for entries_seen, path in enumerate(storage_dir.iterdir(), start=1):
-                    if entries_seen > _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP:
-                        scan_counts["discovery_truncated"] = True
-                        break
-                    if not path.name.endswith(".json"):
-                        continue
-                    discovered_refs.append(path.name)
-            except OSError:
-                discovered_refs = []
-            # Bound directory consumption before sorting so one busy payload
-            # directory cannot make a search materialize every sidecar name.
-            discovered_refs.sort(reverse=True)
-            candidate_refs = []
-            for ref in discovered_refs:
-                scan_counts["discovery_files"] += 1
-                path = storage_dir / ref
-                if path.is_symlink():
-                    scan_counts["rejected_symlink"] += 1
-                    continue
-                metadata = _inspect_externalized_payload_metadata(
-                    engine,
-                    ref,
-                    engine.current_session_id,
-                    max_read_bytes=_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
-                )
-                if metadata.get("readable"):
-                    try:
-                        payload = read_externalized_payload_search_prefix(
-                            ref,
-                            config=engine._config,
-                            hermes_home=engine._hermes_home,
-                            # Re-open with no-follow/inode checks after strict
-                            # metadata validation; the candidate scan reads content.
-                            max_content_bytes=1,
-                        )
-                    except (OSError, ValueError) as exc:
-                        return json.dumps({
-                            "error": f"Externalized payload storage is unavailable: {exc}",
-                        })
-                    status = payload.get("status")
-                    if status == "symlink":
-                        scan_counts["rejected_symlink"] += 1
-                    elif status != "ok":
-                        scan_counts["rejected_invalid_or_unreadable"] += 1
-                    elif payload.get("session_id") != engine.current_session_id:
-                        scan_counts["rejected_session_mismatch"] += 1
-                    else:
-                        candidate_refs.append(ref)
-                        if len(candidate_refs) >= _LCM_GREP_EXTERNALIZED_FILE_CAP:
-                            break
-                elif metadata.get("error") == "session_mismatch":
-                    scan_counts["rejected_session_mismatch"] += 1
-                else:
-                    scan_counts["rejected_invalid_or_unreadable"] += 1
-        else:
-            candidate_refs = externalized_refs
-        scan_counts["candidate_files"] = len(candidate_refs)
-
-        externalized_matches: list[dict[str, Any]] = []
-        for ref in candidate_refs:
-            if externalized_refs is not None:
-                path = storage_dir / ref
-                if path.is_symlink():
-                    scan_counts["rejected_symlink"] += 1
-                    return json.dumps({"error": f"Externalized ref is a symlink: {ref}"})
-                metadata = _inspect_externalized_payload_metadata(
-                    engine,
-                    ref,
-                    engine.current_session_id,
-                    max_read_bytes=_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
-                    require_valid_document_tail=True,
-                )
-                if not metadata.get("readable"):
-                    if metadata.get("error") == "session_mismatch":
-                        scan_counts["rejected_session_mismatch"] += 1
-                        return json.dumps({"error": f"Externalized ref is not owned by the active session: {ref}"})
-                    scan_counts["rejected_invalid_or_unreadable"] += 1
-                    return json.dumps({"error": f"Externalized ref is not readable: {ref}"})
-            try:
-                payload = read_externalized_payload_search_prefix(
-                    ref,
-                    config=engine._config,
-                    hermes_home=engine._hermes_home,
-                    max_content_bytes=_LCM_GREP_EXTERNALIZED_CONTENT_BYTES,
-                )
-            except (OSError, ValueError) as exc:
-                return json.dumps({
-                    "error": f"Externalized payload storage is unavailable: {exc}",
-                })
-            status = payload.get("status")
-            if status == "symlink":
-                scan_counts["rejected_symlink"] += 1
-                if externalized_refs is not None:
-                    return json.dumps({"error": f"Externalized ref is a symlink: {ref}"})
-                continue
-            if status != "ok":
-                scan_counts["rejected_invalid_or_unreadable"] += 1
-                if externalized_refs is not None:
-                    return json.dumps({"error": f"Externalized ref is not readable: {ref}"})
-                continue
-            scan_counts["scanned_files"] += 1
-            if payload.get("session_id") != engine.current_session_id:
-                scan_counts["rejected_session_mismatch"] += 1
-                if externalized_refs is not None:
-                    return json.dumps({"error": f"Externalized ref is not owned by the active session: {ref}"})
-                continue
-            content = str(payload.get("content") or "")
-            match = re.search(re.escape(query), content, flags=re.IGNORECASE)
-            if match is None:
-                continue
-            byte_position = len(content[: match.start()].encode("utf-8"))
-            line = content.count("\n", 0, match.start()) + 1
-            snippet_start = max(0, match.start() - 120)
-            snippet_end = min(len(content), match.end() + 180)
-            item = {
-                "type": "externalized",
-                "depth": "payload",
-                "ref": ref,
-                "tool_call_id": payload.get("tool_call_id") or "",
-                "snippet": content[snippet_start:snippet_end],
-                "line": line,
-                "byte_position": byte_position,
-                "original_content_bytes": payload.get("original_content_bytes"),
-                "original_content_chars": payload.get("original_content_chars"),
-                "scan_truncated": bool(payload.get("scan_truncated")),
-                "content_scanned_bytes": payload.get("content_scanned_bytes", 0),
-                "from_current_session": True,
-                "_sort_ts": payload.get("created_at") or 0,
-                "_sort_rank": byte_position,
-                "_sort_directness": 10.0,
-            }
-            externalized_matches.append(item)
-            scan_counts["matched_files"] += 1
-
-        # Search every file in the bounded candidate set before truncating.
-        # Discovery order is not a ranking signal: relevance and hybrid use the
-        # payload's native byte position, while recency uses its timestamp.
-        externalized_matches.sort(key=lambda result: _combined_result_sort_key(result, sort))
-        response_chars = 0
-        for item in externalized_matches:
-            item_chars = len(json.dumps(item, ensure_ascii=False))
-            if response_chars + item_chars > _LCM_GREP_RESPONSE_CHAR_CAP:
-                break
-            response_chars += item_chars
-            results.append(item)
-        externalized_scan = {
-            **scan_counts,
-            "file_limit": _LCM_GREP_EXTERNALIZED_FILE_CAP,
-            "discovery_limit": _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP,
-            "content_bytes_per_file": _LCM_GREP_EXTERNALIZED_CONTENT_BYTES,
-            "response_char_limit": _LCM_GREP_RESPONSE_CHAR_CAP,
-            "active_session_only": True,
-        }
 
     if sort == "hybrid":
         max_message_directness = max(
@@ -1408,7 +1074,6 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     response: Dict[str, Any] = {
         "query": query,
         "sort": sort,
-        "content_scope": content_scope,
         "limit": limit,
         "total_results": len(results),
         "results": results[:limit],
@@ -1421,14 +1086,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         response["time_to"] = time_to
     if raw_message_filter_active:
         response["summary_results_omitted"] = True
-    if externalized_results_omitted:
-        response["externalized_results_omitted"] = True
     if requested_limit > limit_cap:
         response["limit_clamped_from"] = requested_limit
-    if externalized_refs is not None:
-        response["externalized_refs"] = externalized_refs
-    if externalized_scan is not None:
-        response["externalized_scan"] = externalized_scan
     return json.dumps(response)
 
 
@@ -1557,9 +1216,6 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             for found_ref in extract_ingest_externalized_refs(value):
                 if found_ref not in refs:
                     refs.append(found_ref)
-            legacy_ref = extract_externalized_ref(value)
-            if legacy_ref and legacy_ref not in refs:
-                refs.append(legacy_ref)
         if refs:
             result["externalized_refs"] = refs
             result["externalized_ref"] = refs[0]
@@ -1700,7 +1356,6 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             engine,
             node,
             max_tokens=remaining_context_tokens,
-            hydrate_externalized_content=True,
         )
         context_blocks.extend(node_blocks)
         context_budget_used += _context_content_token_count(node_blocks)
@@ -1768,22 +1423,11 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             if truncated_message:
                 item["source_index"] = truncated_message.get("source_index")
                 item["content_source"] = truncated_message.get("content_source")
-                externalized = truncated_message.get("externalized") or {}
-                externalized_ref = externalized.get("ref")
-                if externalized_ref:
-                    item["externalized_ref"] = externalized_ref
-                    item["tool_call_id"] = externalized.get("tool_call_id")
-                if truncated_message.get("content_source") == "externalized_payload" and externalized_ref:
-                    item["expand_args"] = {
-                        "externalized_ref": externalized_ref,
-                        "content_offset": pagination.get("next_content_offset") or 0,
-                    }
-                else:
-                    item["expand_args"] = {
-                        "node_id": block.get("node_id"),
-                        "source_offset": pagination.get("next_source_offset") or 0,
-                        "content_offset": pagination.get("next_content_offset") or 0,
-                    }
+                item["expand_args"] = {
+                    "node_id": block.get("node_id"),
+                    "source_offset": pagination.get("next_source_offset") or 0,
+                    "content_offset": pagination.get("next_content_offset") or 0,
+                }
             else:
                 item["expand_args"] = {
                     "node_id": block.get("node_id"),
@@ -1996,7 +1640,7 @@ def _inspect_externalized_refs_from_value(value: Any) -> list[str]:
 
     refs: list[str] = []
     for source in sources:
-        for ref in extract_ingest_externalized_refs(source) + extract_externalized_refs(source):
+        for ref in extract_ingest_externalized_refs(source):
             if ref not in refs:
                 refs.append(ref)
     return refs
@@ -2100,51 +1744,12 @@ def _read_externalized_payload_metadata_prefix(
     )
 
 
-def _validate_externalized_payload_json_tail(
-    path: Path,
-    metadata_prefix_text: str,
-    *,
-    max_tail_bytes: int = _LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES,
-) -> dict[str, Any] | None:
-    """Validate the closing JSON structure using only a bounded tail window."""
-    metadata_prefix = metadata_prefix_text.encode("utf-8")
-    try:
-        file_size = path.stat().st_size
-        tail_offset = max(len(metadata_prefix), file_size - max_tail_bytes)
-        with path.open("rb") as handle:
-            handle.seek(tail_offset)
-            tail = handle.read(max_tail_bytes + 1)
-    except OSError:
-        return None
-    if len(tail) > max_tail_bytes:
-        return None
-
-    for index, byte in enumerate(tail):
-        if byte != ord('"'):
-            continue
-        backslashes = 0
-        cursor = index - 1
-        while cursor >= 0 and tail[cursor] == ord("\\"):
-            backslashes += 1
-            cursor -= 1
-        if backslashes % 2:
-            continue
-        try:
-            payload = json.loads((metadata_prefix + b'"' + tail[index + 1 :]).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if isinstance(payload, dict):
-            return payload
-    return None
-
-
 def _inspect_externalized_payload_metadata(
     engine: "LCMEngine",
     ref: str,
     session_id: str,
     *,
     max_read_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
-    require_valid_document_tail: bool = False,
 ) -> dict[str, Any]:
     if not ref or Path(ref).name != ref:
         return {"readable": False, "error": "invalid_ref"}
@@ -2178,13 +1783,6 @@ def _inspect_externalized_payload_metadata(
         error = "metadata_prefix_truncated" if prefix_truncated else "invalid_payload"
         return {"readable": False, "error": error}
 
-    if require_valid_document_tail:
-        full_payload = _validate_externalized_payload_json_tail(path, metadata_prefix_text)
-        if full_payload is None:
-            return {"readable": False, "error": "invalid_payload"}
-        if (full_payload.get("session_id") or "") != session_id:
-            return {"readable": False, "error": "session_mismatch"}
-
     try:
         stat = path.stat()
     except FileNotFoundError:
@@ -2196,7 +1794,7 @@ def _inspect_externalized_payload_metadata(
         "readable": True,
         "file_size_bytes": stat.st_size,
         "modified_at": stat.st_mtime,
-        "payload_validation": "document_tail" if require_valid_document_tail else "metadata_prefix",
+        "payload_validation": "metadata_prefix",
     }
     if payload_session_id:
         metadata["payload_session_id"] = payload_session_id
@@ -2681,7 +2279,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 },
             })
 
-    # 2. SQLite storage posture and payload diagnostics
+    # 2. SQLite storage posture
     try:
         journal_mode_row = engine._store.connection.execute("PRAGMA journal_mode").fetchone()
         quick_check_row = engine._store.connection.execute("PRAGMA quick_check").fetchone()
@@ -2699,33 +2297,9 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
             },
         })
-        payload_risks = scan_sqlite_payload_risks(engine._store.connection)
-        externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
-        externalized_integrity = scan_externalized_payload_integrity(
-            engine._store.connection,
-            engine._config,
-            hermes_home=engine._hermes_home,
-        )
-        suspicious_count = (
-            len(payload_risks["suspicious_data_uri_content_rows"])
-            + len(payload_risks["suspicious_data_uri_tool_calls_rows"])
-            + len(payload_risks["suspicious_base64_like_rows"])
-            + len(payload_risks["suspicious_repetitive_assistant_rows"])
-            + len(payload_risks["heartbeat_noise_rows"])
-        )
-        missing_externalized_refs = int(externalized_integrity.get("externalized_payload_refs_missing", 0) or 0)
-        checks.append({
-            "check": "payload_storage",
-            "status": "warn" if suspicious_count or missing_externalized_refs else "pass",
-            "detail": {
-                **payload_risks,
-                **externalized_stats,
-                **externalized_integrity,
-            },
-        })
     except Exception as e:
         checks.append({
-            "check": "payload_storage",
+            "check": "sqlite_storage",
             "status": "fail",
             "detail": str(e),
         })
