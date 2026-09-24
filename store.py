@@ -118,12 +118,13 @@ def _restrict_created_sqlite_directory(path: Path) -> None:
 def _prepare_private_sqlite_storage(db_path: Path) -> None:
     """Create a new store file with mode 0600 before SQLite opens it.
 
-    An existing file is left alone: it is never opened and closed here, because
-    closing a descriptor on a live database releases SQLite's locks on it for every
-    connection in the process. Whether an existing file is a store of this plugin
-    is decided by its identity row when SQLite opens it.
+    An existing regular file is left alone: it is never opened and closed here,
+    because closing a descriptor on a live database releases SQLite's locks on it
+    for every connection in the process. Whether an existing file is a store of
+    this plugin is decided by its identity row when SQLite opens it. Anything else
+    at the path (a directory, a symbolic link to a missing file) is refused.
     """
-    if db_path.exists():
+    if os.path.isfile(db_path):
         return
     refuse_cross_vm_filesystem(db_path)
     try:
@@ -1289,13 +1290,6 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
 

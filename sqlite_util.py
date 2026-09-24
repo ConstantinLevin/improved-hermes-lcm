@@ -181,24 +181,51 @@ def _prepare_private_sqlite_file(path: Path) -> None:
 
 
 def _create_private_sqlite_file(path: Path) -> bool:
-    """Create a new database file with mode 0600, or leave an existing one alone.
+    """Create a new database file with mode 0600 atomically, or leave an existing one alone.
 
-    The file is created with ``O_CREAT | O_EXCL``: an existing file is never opened
-    here, because closing any descriptor on a live database releases the POSIX
-    locks SQLite holds on it through every connection in the process. SQLite
-    creates the ``-wal`` and ``-shm`` files with the database file's mode.
-    Returns True when this call created the file.
+    The final path is never opened by the plugin outside SQLite: closing any
+    descriptor on a database releases the POSIX locks SQLite holds on it through
+    every connection in the process, and another thread may open the path through
+    SQLite the moment it exists. So a uniquely named temporary file is created in
+    the same directory (``O_CREAT | O_EXCL``, 0600) and closed, then hard-linked
+    to the final name, and the temporary name is removed. SQLite creates the
+    ``-journal`` file with the database file's mode.
+
+    Returns True when this call created the file. When the name already exists,
+    it must be a regular file (symbolic links followed); anything else raises.
     """
     directory_fd = _open_private_sqlite_directory(path)
+    temporary = f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
     try:
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
-        except FileExistsError:
-            return False
+        fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
         os.close(fd)
-        return True
+        try:
+            os.link(
+                temporary,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            created = True
+        except FileExistsError:
+            created = False
+        finally:
+            os.unlink(temporary, dir_fd=directory_fd)
+        if not created:
+            try:
+                existing = os.stat(path.name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                existing = None
+            if existing is None or not stat.S_ISREG(existing.st_mode):
+                raise _sqlite_artifact_error(
+                    path,
+                    "the name is taken by something that is not a regular file "
+                    "(for example a directory or a symbolic link to a missing file)",
+                )
+        return created
     finally:
         os.close(directory_fd)
 

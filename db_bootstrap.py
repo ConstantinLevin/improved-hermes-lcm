@@ -241,12 +241,23 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
 
 # --- Journal mode -------------------------------------------------------------
 #
-# The store runs in WAL: it is the plugin's own choice, because every Hermes
-# process on one home writes into the same store. It is never taken from the
-# host's database settings. WAL needs coherent shared memory for its -shm file;
-# across a VM boundary (virtiofs, 9p) it is not coherent and WAL corrupts
-# silently, so a store on such a filesystem is refused. The filesystem type is
-# read from /proc/self/mountinfo, the way the host detects it.
+# The store runs with a rollback journal (journal_mode=DELETE), in every process
+# and with every SQLite version, so that no process ever switches the mode for
+# the others. It is the plugin's own choice, never taken from the host's
+# settings. WAL is not used: every SQLite from 3.7.0 through 3.51.2 (fixed in
+# 3.51.3, backported to 3.50.7 and 3.44.6) can corrupt a WAL database when two or
+# more connections in separate threads or processes checkpoint and commit
+# concurrently (sqlite.org/wal.html#walresetbug), which is exactly how the Hermes
+# processes of one home share this store. The store is written rarely, so it
+# does not need WAL's concurrency.
+#
+# A rollback journal depends on POSIX advisory locks being honoured by every
+# process that opens the file; SQLite names filesystems whose locking is broken
+# as a cause of corruption (sqlite.org/howtocorrupt.html, 2.1). A store whose
+# directory is on a filesystem shared across a VM boundary (virtiofs, 9p) is
+# refused, because the plugin cannot establish that locks taken on one side of
+# that boundary are seen on the other. The filesystem type is read from
+# /proc/self/mountinfo, the way the host detects it.
 
 _CROSS_VM_FSTYPES = frozenset({"virtiofs", "fuse.virtiofs", "9p", "9p2000", "9p2000.l", "9p2000.u"})
 _MOUNTINFO_PATH = "/proc/self/mountinfo"
@@ -284,53 +295,31 @@ def refuse_cross_vm_filesystem(db_path: str | Path) -> None:
         raise _refuse(
             db_path,
             f"its directory is on a {fstype} filesystem shared across a VM boundary, "
-            f"where SQLite's WAL shared memory is not coherent and corrupts silently",
+            f"where it is not established that SQLite's POSIX advisory locks are "
+            f"honoured across processes on both sides, and a rollback journal "
+            f"corrupts when they are not",
         )
 
 
-def _execute_wal_conversion_with_lock_retry(
-    conn: sqlite3.Connection,
-    *,
-    budget_ms: int = SQLITE_BUSY_TIMEOUT_MS,
-) -> str:
-    """Run ``PRAGMA journal_mode=WAL`` with a bounded lock-contention retry.
-
-    Converting a new database to WAL needs the exclusive lock, and SQLite can
-    return ``SQLITE_BUSY`` for that upgrade without consulting the busy handler
-    when other connections are mid-setup on the same file. Once the database is
-    in WAL mode the pragma is a plain read. Returns the mode SQLite reports.
-    """
-    deadline = time.monotonic() + budget_ms / 1000.0
-    delay_seconds = 0.005
-    while True:
-        try:
-            row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-            return str(row[0]).lower() if row and row[0] is not None else ""
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                raise
-        time.sleep(delay_seconds)
-        delay_seconds = min(delay_seconds * 2, 0.25)
-
-
 def configure_connection(conn: sqlite3.Connection, db_path: str | Path) -> None:
-    """Configure one store connection: WAL, verified, and durable commits.
+    """Configure one store connection: rollback journal, verified, durable commits.
 
-    - journal_mode=WAL, and the mode SQLite reports is checked: a filesystem that
-      silently keeps another mode is refused, never used as if it were WAL.
-    - synchronous=FULL: fsync the WAL and its index before every commit.
-    - wal_autocheckpoint=500, journal_size_limit=64 MiB: WAL hygiene hints.
-    - mmap_size=256 MiB: memory-mapped reads.
+    - journal_mode=DELETE, and the mode SQLite reports is checked: a database
+      that stays in another mode (for example WAL held by another connection) is
+      refused, never used as if it were in rollback mode.
+    - synchronous=FULL: fsync the database and the journal at every commit.
+    - busy_timeout=30 s: writers wait for each other and for readers.
+    - No memory-mapped I/O: SQLite documents that it needs a correct unified
+      buffer cache when several processes share the file, and that an I/O error
+      on a mapped file crashes the process instead of raising (sqlite.org/mmap.html).
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     refuse_cross_vm_filesystem(db_path)
-    mode = _execute_wal_conversion_with_lock_retry(conn)
-    if mode != "wal":
-        raise _refuse(db_path, f"SQLite kept journal_mode={mode or 'unknown'} when WAL was requested")
+    row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+    mode = str(row[0]).lower() if row and row[0] is not None else ""
+    if mode != "delete":
+        raise _refuse(db_path, f"SQLite kept journal_mode={mode or 'unknown'} when DELETE was requested")
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
-    conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
 
 
 # --- Identity and creation ----------------------------------------------------
@@ -339,7 +328,7 @@ def _schema_object_names(conn: sqlite3.Connection) -> set[str]:
     return {
         str(row[0])
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
         ).fetchall()
     }
 
@@ -417,6 +406,8 @@ def open_store(conn: sqlite3.Connection, db_path: str | Path, *, check_fts: bool
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     state = _identity_state(conn, db_path)
+    if state == "empty":
+        _refuse_foreign_empty_file(db_path)
     configure_connection(conn, db_path)
     if state == "empty":
         _create_store(conn, db_path)
@@ -425,12 +416,31 @@ def open_store(conn: sqlite3.Connection, db_path: str | Path, *, check_fts: bool
             repaired = ensure_fts_intact(conn, spec)
             if repaired["rebuilt"] or repaired["triggers_recreated"]:
                 logger.warning(
-                    "LCM repaired the full-text index %s at %s: rebuilt=%s triggers_recreated=%s",
+                    "LCM repaired the full-text index %s at %s: triggers_recreated=%s; "
+                    "the index was rebuilt from the stored rows",
                     spec.table_name,
                     db_path,
-                    repaired["rebuilt"],
                     repaired["triggers_recreated"],
                 )
+
+
+def _refuse_foreign_empty_file(db_path: str | Path) -> None:
+    """Refuse an empty file that the plugin did not create.
+
+    The plugin creates every store file with mode 0600. An empty file whose mode
+    gives group or others any permission was made by someone else, so the plugin
+    does not adopt it.
+    """
+    try:
+        mode = os.stat(str(db_path)).st_mode
+    except OSError as exc:
+        raise _refuse(db_path, f"its mode cannot be read ({exc})") from exc
+    if mode & 0o077:
+        raise _refuse(
+            db_path,
+            f"it is an empty file with mode {mode & 0o777:04o}; the plugin creates its "
+            f"store files with mode 0600, so this file is someone else's",
+        )
 
 
 # --- Diagnostics --------------------------------------------------------------
@@ -720,27 +730,30 @@ def _repair_fts(
     *,
     force_rebuild: bool = False,
 ) -> dict[str, bool]:
-    """Rebuild a damaged index and recreate stale triggers, under the write lock.
+    """Recreate stale triggers and rebuild the index, under the write lock.
 
-    Another process may have repaired it while this one waited, so the state is
-    checked again once the write lock is held.
+    A trigger that drifted may already have indexed text other than the stored
+    rows, so recreating triggers always rebuilds the index from the content table
+    in the same transaction. A structurally damaged index is dropped and created
+    again first. Another process may have repaired it while this one waited, so
+    the state is checked again once the write lock is held.
     """
     rebuilt = False
+    table = quote_sql_identifier(spec.table_name)
     with _fts_repair_ownership(conn):
-        rebuild = force_rebuild or _fts_needs_rebuild_structural(conn, spec)
+        structural = force_rebuild or _fts_needs_rebuild_structural(conn, spec)
         stale = _fts_stale_triggers(conn, spec)
-        if rebuild:
+        if structural:
             _drop_fts_table(conn, spec.table_name)
             _create_fts_table(conn, spec)
-            conn.execute(
-                f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
-            )
-            rebuilt = True
         for trigger_sql in spec.trigger_sqls:
             name = _extract_trigger_name(trigger_sql)
             if name in stale:
                 conn.execute(f"DROP TRIGGER IF EXISTS {quote_sql_identifier(name)}")
                 conn.execute(trigger_sql)
+        if structural or stale:
+            conn.execute(f"INSERT INTO {table}({table}) VALUES('rebuild')")
+            rebuilt = True
     return {"rebuilt": rebuilt, "degraded": False, "triggers_recreated": bool(stale)}
 
 
