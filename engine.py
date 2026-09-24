@@ -48,7 +48,6 @@ from .externalize import (
     maybe_externalize_tool_output,
 )
 from .extraction import (
-    extract_before_compaction,
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
     strip_injected_context_blocks,
@@ -4377,34 +4376,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
 
     # -- Internal: summarization -------------------------------------------
-
-    def _run_pre_compaction_extraction(
-        self,
-        messages: List[Dict[str, Any]],
-        *,
-        timeout_seconds: Optional[float] = None,
-    ) -> None:
-        """Best-effort extraction of decisions before compaction."""
-        try:
-            serialized = self._serialize_messages(messages)
-            output_path = self._config.extraction_output_path
-            if not output_path:
-                base = self._hermes_home or os.path.expanduser("~/.hermes")
-                output_path = os.path.join(base, "lcm-extractions")
-            extraction_model = self._config.extraction_model or self._config.summary_model
-            extract_before_compaction(
-                serialized_messages=serialized,
-                output_path=output_path,
-                session_id=self._session_id or "",
-                model=extraction_model,
-                timeout=(
-                    timeout_seconds
-                    if timeout_seconds is not None
-                    else self._config.summary_timeout_ms / 1000
-                ),
-            )
-        except Exception as e:
-            logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
 
 
     def _maybe_gc_compacted_tool_results(

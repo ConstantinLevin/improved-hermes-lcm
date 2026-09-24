@@ -710,18 +710,6 @@ class CompactionMixin:
                 _level = 0
                 _rescue_attempts = 0
             else:
-                # Pre-compaction extraction: best-effort, never blocks compaction.
-                # Use the same dependency-filtered view as summarization so ignored
-                # turns cannot leak through derived assistant/tool replies.
-                if self._config.extraction_enabled:
-                    extraction_timeout = None
-                    if threshold_full_sweep_active:
-                        extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
-                    self._run_pre_compaction_extraction(
-                        summary_input_chunk,
-                        timeout_seconds=extraction_timeout,
-                    )
-
                 try:
                     summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
                     if threshold_full_sweep_active:

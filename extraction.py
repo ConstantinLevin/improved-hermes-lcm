@@ -1,17 +1,13 @@
-"""Pre-compaction extraction — extract decisions and commitments before summarization.
+"""Sanitisers for the summariser's serialised input.
 
-Best-effort: failures never block compaction. Extracted content is written to
-daily note files so key decisions survive even if the DAG summary loses nuance.
+Despite the file name, nothing here extracts anything: the pre-compaction
+extraction subsystem is gone and only these sanitisers remain.
 """
 
 import json
 import logging
 import re
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-from .model_routing import apply_lcm_model_route
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -48,47 +44,6 @@ def _at_line_end(text: str, index: int) -> bool:
     if line_end == -1:
         line_end = len(text)
     return not text[index:line_end].strip()
-
-
-EXTRACTION_PROMPT = """Extract decisions, commitments, outcomes, and rules from this conversation segment.
-
-Format as a flat list of bullet points. Each bullet should be self-contained and understandable
-without the surrounding conversation. Include:
-- Decisions made (what was chosen, and why if stated)
-- Commitments (who will do what)
-- Outcomes (what happened as a result of an action)
-- Rules or constraints discovered
-
-Skip: greetings, meta-discussion, reasoning that led nowhere, repeated information.
-If there is nothing worth extracting, respond with exactly: NOTHING_TO_EXTRACT
-
-CONTENT:
-{text}"""
-
-
-def _call_extraction_llm(prompt: str, model: str = "",
-                          timeout: float | None = None) -> Optional[str]:
-    """Call the Hermes auxiliary LLM for extraction."""
-    try:
-        from agent.auxiliary_client import call_llm
-        call_kwargs = {
-            "task": "extraction",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "max_tokens": 2000,
-        }
-        apply_lcm_model_route(call_kwargs, model)
-        if timeout is not None:
-            call_kwargs["timeout"] = timeout
-        response = call_llm(**call_kwargs)
-        content = response.choices[0].message.content
-        if not isinstance(content, str):
-            content = str(content) if content else ""
-        from .escalation import _strip_reasoning_blocks
-        return _strip_reasoning_blocks(content).strip()
-    except Exception as e:
-        logger.debug("Extraction LLM call failed: %s", e)
-        return None
 
 
 def _sanitize_string_media(text: str) -> str:
@@ -309,45 +264,3 @@ def sanitize_pre_compaction_tool_arguments(arguments: Any) -> str:
     return json.dumps(_sanitize_json_like(parsed), ensure_ascii=False)
 
 
-def extract_before_compaction(
-    serialized_messages: str,
-    output_path: str,
-    session_id: str = "",
-    model: str = "",
-    timeout: float | None = None,
-) -> bool:
-    """Extract decisions from messages about to be compacted and write to a daily file.
-
-    Returns True if extraction succeeded, False otherwise.
-    Never raises — failures are logged and swallowed.
-    """
-    try:
-        prompt = EXTRACTION_PROMPT.format(text=serialized_messages)
-        result = _call_extraction_llm(prompt, model=model, timeout=timeout)
-
-        if not result or result.strip() == "NOTHING_TO_EXTRACT":
-            logger.debug("Pre-compaction extraction: nothing to extract")
-            return True
-
-        output_dir = Path(output_path)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        file_path = output_dir / f"{date_str}.md"
-
-        header = f"\n\n## Extraction — {datetime.now().strftime('%H:%M')}"
-        if session_id:
-            header += f" ({session_id})"
-        header += "\n\n"
-
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(header)
-            f.write(result)
-            f.write("\n")
-
-        logger.info("Pre-compaction extraction written to %s", file_path)
-        return True
-
-    except Exception as e:
-        logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
-        return False
