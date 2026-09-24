@@ -814,7 +814,7 @@ def _rotate_text(engine) -> str:
         lines.append("note: read-only preview — rotate apply would be a no-op for this session")
     else:
         lines.append("note: read-only preview — use `/lcm rotate apply` to advance the frontier (backup-first)")
-        lines.append("note: pre-tail raw messages remain in the store and recoverable via lcm_load_session")
+        lines.append("note: pre-tail raw messages remain in the store")
     return "\n".join(lines)
 
 
@@ -901,7 +901,7 @@ def _rotate_apply_text(engine) -> str:
         lines.append(f"reason: {result.get('reason', 'no_change')}")
         lines.append("note: lifecycle state already at or ahead of the target frontier")
     else:
-        lines.append("note: pre-tail raw messages remain in the store and recoverable via lcm_load_session")
+        lines.append("note: pre-tail raw messages remain in the store")
         lines.append("note: rolling backup overwrites the previous rotate-latest slot")
     return "\n".join(lines)
 

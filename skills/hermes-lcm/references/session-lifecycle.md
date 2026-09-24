@@ -15,7 +15,7 @@ Do not promise that `/new` deletes historical LCM data. Earlier rows remain in `
 - it advances the lifecycle frontier past older raw messages so bootstrap does not replay them into active context;
 - it does not delete raw source rows or call a summarization model.
 
-Run normal compaction before rotate when older material must be represented in summary nodes. Even without a summary, pre-tail raw rows remain recoverable through `lcm_load_session` and `lcm_expand`.
+Run normal compaction before rotate when older material must be represented in summary nodes. Without a summary, pre-tail raw rows remain in the store but no summary points at them.
 
 Rotate refuses ignored or stateless sessions. Repeating an already-satisfied rotate reports a no-op and preserves the previous known-good rolling backup.
 

@@ -15,8 +15,6 @@ Raw messages are source truth. Summary nodes, embeddings, temporal rollups, quer
 ## Scope model
 
 - Current-session DAG operations use the active engine/session binding.
-- `lcm_recall` searches all conversations already stored in the local LCM database.
-- `lcm_load_session` enumerates a known LCM session.
 - Hermes `session_search` covers host-tracked history outside `lcm.db`.
 
 Do not silently treat those stores or scopes as interchangeable.
