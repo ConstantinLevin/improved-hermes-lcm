@@ -180,6 +180,29 @@ def _prepare_private_sqlite_file(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _create_private_sqlite_file(path: Path) -> bool:
+    """Create a new database file with mode 0600, or leave an existing one alone.
+
+    The file is created with ``O_CREAT | O_EXCL``: an existing file is never opened
+    here, because closing any descriptor on a live database releases the POSIX
+    locks SQLite holds on it through every connection in the process. SQLite
+    creates the ``-wal`` and ``-shm`` files with the database file's mode.
+    Returns True when this call created the file.
+    """
+    directory_fd = _open_private_sqlite_directory(path)
+    try:
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            return False
+        os.close(fd)
+        return True
+    finally:
+        os.close(directory_fd)
+
+
 def _is_sqlite_locked_error(exc: BaseException) -> bool:
     """Return True when an exception chain represents SQLite lock contention."""
     seen: set[int] = set()

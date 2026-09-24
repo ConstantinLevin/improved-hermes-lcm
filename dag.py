@@ -21,12 +21,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
+    NODES_FTS_SPEC,
     ExternalContentFtsSpec,
-    add_column_if_missing,
-    configure_connection,
-    ensure_external_content_fts,
-    refuse_schema_version_too_new,
-    run_versioned_migrations,
+    open_store,
 )
 from .search_query import (
     AGE_DECAY_RATE,
@@ -110,28 +107,7 @@ def _fts_primary_value(node: "SummaryNode", sort: str | None) -> float:
 
 
 def build_nodes_fts_spec() -> ExternalContentFtsSpec:
-    return ExternalContentFtsSpec(
-        table_name="nodes_fts",
-        content_table="summary_nodes",
-        content_rowid="node_id",
-        indexed_column="summary",
-        trigger_sqls=(
-            """
-            CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
-                AFTER INSERT ON summary_nodes BEGIN
-                INSERT INTO nodes_fts(rowid, summary)
-                    VALUES (new.node_id, new.summary);
-            END;
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS nodes_fts_delete
-                AFTER DELETE ON summary_nodes BEGIN
-                INSERT INTO nodes_fts(nodes_fts, rowid, summary)
-                    VALUES('delete', old.node_id, old.summary);
-            END;
-            """,
-        ),
-    )
+    return NODES_FTS_SPEC
 
 
 @dataclass
@@ -176,66 +152,12 @@ class SummaryDAG:
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS summary_nodes (
-                node_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                depth INTEGER NOT NULL DEFAULT 0,
-                summary TEXT NOT NULL,
-                token_count INTEGER DEFAULT 0,
-                source_token_count INTEGER DEFAULT 0,
-                source_ids TEXT NOT NULL DEFAULT '[]',
-                source_type TEXT NOT NULL DEFAULT 'messages',
-                created_at REAL NOT NULL,
-                earliest_at REAL,
-                latest_at REAL,
-                expand_hint TEXT DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
-                ON summary_nodes(session_id, depth, created_at);
-            CREATE INDEX IF NOT EXISTS idx_nodes_session_node
-                ON summary_nodes(session_id, node_id);
-            CREATE INDEX IF NOT EXISTS idx_nodes_session_depth_node
-                ON summary_nodes(session_id, depth, node_id);
-
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-        ensure_external_content_fts(
-            self._conn,
-            build_nodes_fts_spec(),
-        )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_window_columns()
-        self._conn.commit()
-
-    def _ensure_source_window_columns(self) -> None:
-        columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
-        }
-        add_column_if_missing(
-            self._conn, columns, "earliest_at",
-            "ALTER TABLE summary_nodes ADD COLUMN earliest_at REAL",
-        )
-        add_column_if_missing(
-            self._conn, columns, "latest_at",
-            "ALTER TABLE summary_nodes ADD COLUMN latest_at REAL",
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session_node "
-            "ON summary_nodes(session_id, node_id)"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session_depth_node "
-            "ON summary_nodes(session_id, depth, node_id)"
-        )
+        try:
+            open_store(self._conn, self.db_path)
+        except BaseException:
+            self._conn.close()
+            self._conn = None
+            raise
 
     # -- Write --------------------------------------------------------------
 

@@ -30,5 +30,5 @@ Working rules:
 - Prefer newer source-backed evidence when it conflicts with an older summary.
 - Start with the narrowest useful scope and expand only when exact detail is needed.
 - Do not infer exact commands, paths, timestamps, values, counts, or causal chains from summaries alone.
-- Keep current-session LCM history and Hermes history outside `lcm.db` distinct.
+- Keep current-session LCM history and Hermes history outside `lcm-record.db` distinct.
 - Do not treat open-cardinality results as complete without product-verifiable enumeration or coverage.

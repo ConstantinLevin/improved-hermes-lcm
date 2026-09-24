@@ -24,6 +24,7 @@ from .codex_routing import (
 )
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
+from .db_bootstrap import STORE_FILENAME, StoreRefusedError
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
@@ -379,12 +380,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return clone
 
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
-        """Resolve the SQLite path for the active Hermes profile/home."""
+        """Resolve the store's path: ``LCM_DATABASE_PATH``, else the host-given home.
+
+        With neither, the location is not known, and the plugin does not guess one.
+        """
         if self._config.database_path:
             return Path(self._config.database_path)
         if hermes_home:
-            return Path(hermes_home) / "lcm.db"
-        return Path.home() / ".hermes" / "lcm.db"
+            return Path(hermes_home) / STORE_FILENAME
+        message = (
+            "LCM has no store location: the host gave no Hermes home and "
+            "LCM_DATABASE_PATH is not set."
+        )
+        logger.error(message)
+        raise StoreRefusedError(message)
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
