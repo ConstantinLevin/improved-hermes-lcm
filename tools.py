@@ -2228,7 +2228,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "detail": {
                     "flagged_at": failed_flag.get("at"),
                     "detail": failed_flag.get("detail"),
-                    "guidance": "background integrity scan flagged this index; run `/lcm doctor repair apply`",
+                    "guidance": "background integrity scan flagged this index; it needs a rebuild from the stored rows",
                 },
             })
 
