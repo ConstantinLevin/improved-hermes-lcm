@@ -1,13 +1,14 @@
 """The plugin's record of what happened at each compaction (#29, W1-W3; #1, #2, #3).
 
-Every table here is insert-only. A compaction is written in short transactions, none
-held open across a summariser call:
+It is the only store: the summariser reads from it, the return is emitted from it,
+and the tools read views over it. Every table here is insert-only. A compaction is
+written in short transactions, none held open across a summariser call:
 
 1. the compaction, its inputs, a record for every input entry the store does not
-   hold yet (the fresh tail included), and their tool calls;
-2. each chunk with its members, before its summariser call;
-3. each summary, as a derivation of its chunk, when it arrives;
-4. what the plugin returned.
+   hold yet (the fresh tail included), their tool calls, and every chunk with its
+   members, all before the first summariser call;
+2. each summary, as a derivation of its chunk, when it arrives;
+3. what the plugin returned.
 
 The host confirms a compaction with ``on_session_start(boundary_reason="compression")``
 (the record line) or rejects it with ``record_rejected_compaction()``; the host rows
@@ -33,6 +34,7 @@ from typing import Any, Iterable, Optional, Sequence
 from .db_bootstrap import open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .message_content import text_content_for_pattern_matching
+from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -195,14 +197,30 @@ class RecordStore:
         """The session's latest compaction that took effect and was not rejected: the
         host confirmed it, or its return was found adopted without a confirmation."""
         rows = self._q(
-            "SELECT c.compaction_id FROM compactions c WHERE c.session = ? "
-            "AND (EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
-            "OR EXISTS (SELECT 1 FROM adoptions a WHERE a.compaction = c.compaction_id)) "
-            "AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.compaction = c.compaction_id) "
-            "ORDER BY c.compaction_id DESC LIMIT 1",
+            "SELECT compaction_id FROM effective_compactions WHERE session = ? "
+            "ORDER BY compaction_id DESC LIMIT 1",
             (session,),
         )
         return int(rows[0][0]) if rows else None
+
+    def effective_count(self, session: str) -> int:
+        """How many of the session's compactions took effect."""
+        rows = self._q("SELECT COUNT(*) FROM effective_compactions WHERE session = ?", (session,))
+        return int(rows[0][0]) if rows else 0
+
+    def derivations(self, handles: Iterable[str]) -> dict[str, tuple[int, str, Optional[str]]]:
+        """handle -> (derivation id, text, expand hint)."""
+        wanted = [h for h in set(handles) if h]
+        found: dict[str, tuple[int, str, Optional[str]]] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            rows = self._q(
+                "SELECT handle, derivation_id, text, expand_hint FROM derivations "
+                f"WHERE handle IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+            found.update({str(h): (int(i), str(t), e) for h, i, t, e in rows})
+        return found
 
     def is_settled(self, compaction: int) -> bool:
         """Confirmed, adopted or rejected: the host's handling of it is known."""
@@ -228,7 +246,7 @@ class RecordStore:
         }
 
     def record_facts(self, handles: Iterable[str]) -> dict[str, tuple[Optional[str], str, str, int]]:
-        """handle -> (predecessor, raw, kind, order written)."""
+        """handle -> (predecessor, raw, kind, record id); the id is also the order written."""
         wanted = [h for h in set(handles) if h]
         facts: dict[str, tuple[Optional[str], str, str, int]] = {}
         for start in range(0, len(wanted), 500):
@@ -341,16 +359,21 @@ class RecordStore:
         host_session_before: Optional[str],
         attempt_generation: Optional[int],
         entries: Sequence[InputEntry],
-    ) -> tuple[int, dict[int, str]]:
-        """Transaction 1: the compaction, its inputs, the new records and their tool calls.
+        chunks: Sequence[Sequence[int]] = (),
+    ) -> tuple[int, dict[int, str], list[str]]:
+        """Transaction 1: the compaction, its inputs, the new records, their tool calls
+        and the chunks.
 
-        Returns the compaction id and the record of every input position that has one.
-        Each new record takes the predecessor its entry names (the classification
-        decides it, #29 W3/W4); a revision also gets its ``revision_sources``. Tool
-        calls are written for new transcript and host insertions; a revision keeps
-        its original's calls.
+        Returns the compaction id, the record of every input position that has one,
+        and the chunk handles in the order given. Each new record takes the
+        predecessor its entry names (the classification decides it, #29 W3/W4); a
+        revision also gets its ``revision_sources``. Tool calls are written for new
+        transcript and host insertions; a revision keeps its original's calls. A chunk
+        is given as the input positions of its members, in order; every member must
+        have a record.
         """
         records: dict[int, str] = {}
+        chunk_handles: list[str] = []
         with self._tx() as conn:
             cid = conn.execute(
                 "INSERT INTO compactions(session, kind, host_session_before, attempt_generation, began_at) "
@@ -373,7 +396,7 @@ class RecordStore:
                         conn,
                         MESSAGE,
                         "INSERT INTO records(handle, session, predecessor, compaction, kind, raw, "
-                        "role, tool_call_id, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "role, tool_call_id, text, est_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             session,
                             predecessor,
@@ -383,6 +406,7 @@ class RecordStore:
                             message.get("role"),
                             message.get("tool_call_id"),
                             text_content_for_pattern_matching(message.get("content")),
+                            count_message_tokens(message),
                         ),
                     )
                     records[entry.position] = handle
@@ -418,7 +442,20 @@ class RecordStore:
                     (cid, entry.position, entry.host_row_id, records.get(entry.position)),
                 )
             self._write_tool_calls(conn, session, cid, written)
-        return int(cid), records
+            for positions in chunks:
+                members = [records[position] for position in positions]
+                handle = self._insert_with_handle(
+                    conn,
+                    CHUNK,
+                    "INSERT INTO chunks(handle, session, compaction) VALUES (?, ?, ?)",
+                    (session, cid),
+                )
+                conn.executemany(
+                    "INSERT INTO chunk_members(chunk, ordinal, record) VALUES (?, ?, ?)",
+                    [(handle, ordinal, record) for ordinal, record in enumerate(members)],
+                )
+                chunk_handles.append(handle)
+        return int(cid), records, chunk_handles
 
     def _write_tool_calls(
         self,
@@ -474,20 +511,6 @@ class RecordStore:
                         (row[0], result, cid),
                     )
 
-    def write_chunk(self, *, session: str, compaction: int, members: Sequence[str]) -> str:
-        with self._tx() as conn:
-            handle = self._insert_with_handle(
-                conn,
-                CHUNK,
-                "INSERT INTO chunks(handle, session, compaction) VALUES (?, ?, ?)",
-                (session, compaction),
-            )
-            conn.executemany(
-                "INSERT INTO chunk_members(chunk, ordinal, record) VALUES (?, ?, ?)",
-                [(handle, ordinal, record) for ordinal, record in enumerate(members)],
-            )
-        return handle
-
     def write_derivation(
         self,
         *,
@@ -499,15 +522,17 @@ class RecordStore:
         level: Optional[int],
         budget: Optional[int],
         est_tokens: Optional[int],
+        expand_hint: Optional[str] = None,
     ) -> str:
         with self._tx() as conn:
             handle = self._insert_with_handle(
                 conn,
                 DERIVATION,
                 "INSERT INTO derivations(handle, kind, text, compaction, model, provider, effort, prompt, "
-                "budget, finish_reason, level, est_tokens, created_at) "
-                "VALUES (?, 'summary', ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?)",
-                (text, compaction, model or None, provider or None, budget, level, est_tokens, time.time()),
+                "budget, finish_reason, level, est_tokens, expand_hint, created_at) "
+                "VALUES (?, 'summary', ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?)",
+                (text, compaction, model or None, provider or None, budget, level, est_tokens,
+                 expand_hint, time.time()),
             )
             conn.execute(
                 "INSERT INTO derivation_sources(derivation, ordinal, chunk, source_derivation) VALUES (?, 0, ?, NULL)",
@@ -520,8 +545,9 @@ class RecordStore:
         compaction: int,
         entries: Iterable[tuple[int, str, Optional[str], Optional[str], Optional[str]]],
     ) -> None:
-        """(position, kind, record, derivation, raw): a returned summary keeps its dict
-        as returned, verbatim, since it is what the agent's context held."""
+        """(position, kind, record, derivation, raw): a returned summary names the
+        derivation it was emitted from and keeps its dict as returned, verbatim, since
+        it is what the agent's context held."""
         with self._tx() as conn:
             conn.executemany(
                 "INSERT INTO compaction_returns(compaction, position, kind, record, derivation, raw) "

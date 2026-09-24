@@ -26,8 +26,10 @@ from typing import Iterable, Sequence
 logger = logging.getLogger(__name__)
 
 
-# The layout this build writes. A store with any other format is refused.
-STORE_FORMAT = "ihl-store/3"
+# The layout this build writes. A store with any other format is refused. Format 4
+# makes the record the only store: the old path's tables are gone, and what the
+# tools read are views over the record (#29, #1).
+STORE_FORMAT = "ihl-store/4"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -35,10 +37,13 @@ REQUIRED_CORE_TABLES = (
     "store_identity",
     "sessions",
     "session_facts",
-    "messages",
-    "metadata",
-    "summary_nodes",
-    "lcm_lifecycle_state",
+    "compactions",
+    "records",
+    "chunks",
+    "chunk_members",
+    "derivations",
+    "derivation_sources",
+    "compaction_returns",
     "messages_fts",
     "nodes_fts",
 )
@@ -79,33 +84,21 @@ class ExternalContentFtsSpec:
         self.trigger_sqls = tuple(trigger_sqls)
 
 
+# The full-text indexes are derived from the record and only grow with it (#29 W1):
+# one over the records' text, one over the derivations' text. Both tables are
+# insert-only, so an insert trigger is all an index needs. The tools join them to
+# the ``messages`` and ``summary_nodes`` views by id, which scope what is visible.
 MESSAGES_FTS_SPEC = ExternalContentFtsSpec(
     table_name="messages_fts",
-    content_table="messages",
-    content_rowid="store_id",
-    indexed_column="content",
+    content_table="records",
+    content_rowid="record_id",
+    indexed_column="text",
     trigger_sqls=(
         """
-        CREATE TRIGGER IF NOT EXISTS msg_fts_insert
-            AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content)
-                VALUES (new.store_id, new.content);
-        END;
-        """,
-        """
-        CREATE TRIGGER IF NOT EXISTS msg_fts_delete
-            AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content)
-                VALUES('delete', old.store_id, old.content);
-        END;
-        """,
-        """
-        CREATE TRIGGER IF NOT EXISTS msg_fts_update
-            AFTER UPDATE OF content ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content)
-                VALUES('delete', old.store_id, old.content);
-            INSERT INTO messages_fts(rowid, content)
-                VALUES (new.store_id, new.content);
+        CREATE TRIGGER IF NOT EXISTS records_fts_insert
+            AFTER INSERT ON records BEGIN
+            INSERT INTO messages_fts(rowid, text)
+                VALUES (new.record_id, new.text);
         END;
         """,
     ),
@@ -113,22 +106,15 @@ MESSAGES_FTS_SPEC = ExternalContentFtsSpec(
 
 NODES_FTS_SPEC = ExternalContentFtsSpec(
     table_name="nodes_fts",
-    content_table="summary_nodes",
-    content_rowid="node_id",
-    indexed_column="summary",
+    content_table="derivations",
+    content_rowid="derivation_id",
+    indexed_column="text",
     trigger_sqls=(
         """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
-            AFTER INSERT ON summary_nodes BEGIN
-            INSERT INTO nodes_fts(rowid, summary)
-                VALUES (new.node_id, new.summary);
-        END;
-        """,
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_delete
-            AFTER DELETE ON summary_nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, summary)
-                VALUES('delete', old.node_id, old.summary);
+        CREATE TRIGGER IF NOT EXISTS derivations_fts_insert
+            AFTER INSERT ON derivations BEGIN
+            INSERT INTO nodes_fts(rowid, text)
+                VALUES (new.derivation_id, new.text);
         END;
         """,
     ),
@@ -208,7 +194,8 @@ CREATE TABLE compactions (
 CREATE INDEX idx_compactions_session ON compactions(session, compaction_id);
 
 CREATE TABLE records (
-    handle TEXT PRIMARY KEY,
+    record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    handle TEXT NOT NULL UNIQUE,
     session TEXT NOT NULL REFERENCES sessions(handle),
     predecessor TEXT REFERENCES records(handle),
     compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
@@ -216,9 +203,10 @@ CREATE TABLE records (
     raw TEXT NOT NULL,
     role TEXT,
     tool_call_id TEXT,
-    text TEXT
+    text TEXT,
+    est_tokens INTEGER
 );
-CREATE INDEX idx_records_session ON records(session);
+CREATE INDEX idx_records_session ON records(session, record_id);
 
 CREATE TABLE tool_calls (
     handle TEXT PRIMARY KEY,
@@ -245,6 +233,7 @@ CREATE TABLE compaction_inputs (
     PRIMARY KEY (compaction, position)
 );
 CREATE INDEX idx_compaction_inputs_row ON compaction_inputs(host_row_id);
+CREATE INDEX idx_compaction_inputs_record ON compaction_inputs(record);
 
 CREATE TABLE chunks (
     handle TEXT PRIMARY KEY,
@@ -261,7 +250,8 @@ CREATE TABLE chunk_members (
 );
 
 CREATE TABLE derivations (
-    handle TEXT PRIMARY KEY,
+    derivation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    handle TEXT NOT NULL UNIQUE,
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
     compaction INTEGER REFERENCES compactions(compaction_id),
@@ -273,6 +263,7 @@ CREATE TABLE derivations (
     finish_reason TEXT,
     level INTEGER,
     est_tokens INTEGER,
+    expand_hint TEXT,
     created_at REAL NOT NULL
 );
 
@@ -285,16 +276,21 @@ CREATE TABLE derivation_sources (
     CHECK ((chunk IS NULL) != (source_derivation IS NULL))
 );
 
+-- A summary entry names the derivation it was emitted from and keeps its dict as
+-- returned; a record entry names its record. The kind for #14's in-turn
+-- re-insertion is added with #14.
 CREATE TABLE compaction_returns (
     compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
     position INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('summary', 'record', 'reinsertion')),
+    kind TEXT NOT NULL CHECK (kind IN ('summary', 'record')),
     record TEXT REFERENCES records(handle),
     derivation TEXT REFERENCES derivations(handle),
     raw TEXT,
     PRIMARY KEY (compaction, position),
-    CHECK ((kind = 'summary') = (raw IS NOT NULL))
+    CHECK ((kind = 'summary' AND derivation IS NOT NULL AND raw IS NOT NULL AND record IS NULL)
+           OR (kind = 'record' AND record IS NOT NULL AND derivation IS NULL AND raw IS NULL))
 );
+CREATE INDEX idx_compaction_returns_derivation ON compaction_returns(derivation);
 
 CREATE TABLE revision_sources (
     revision TEXT NOT NULL REFERENCES records(handle),
@@ -308,6 +304,7 @@ CREATE TABLE revision_sources (
            != (source_compaction IS NOT NULL AND source_position IS NOT NULL)),
     CHECK ((source_compaction IS NULL) = (source_position IS NULL))
 );
+CREATE INDEX idx_revision_sources_record ON revision_sources(source_record);
 
 CREATE TABLE confirmations (
     compaction INTEGER NOT NULL UNIQUE REFERENCES compactions(compaction_id),
@@ -352,73 +349,85 @@ CREATE TABLE store_events (
 );
 """
 
-_SCHEMA_SQL = _RECORD_SQL + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + """
+# What the tools read, as read-only views over the record, so that they run
+# unchanged (integer ids until #18). Only what took effect is visible:
+# - a compaction took effect when the host confirmed it, or its return was found
+#   adopted without a confirmation, and the host did not reject it;
+# - a record is visible when an effective compaction names it among its inputs,
+#   unless an effective revision stands in its place (its revision_sources);
+# - a summary is visible when an effective compaction returned it.
+# A record's ``timestamp`` is the time the record was written, as the old store's
+# was its write time; the host's own time is ``observed_at``, where the host gave one.
+_VIEWS_SQL = """
+CREATE VIEW effective_compactions AS
+SELECT c.compaction_id AS compaction_id, c.session AS session, c.began_at AS began_at
+FROM compactions c
+WHERE (EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id)
+       OR EXISTS (SELECT 1 FROM adoptions a WHERE a.compaction = c.compaction_id))
+  AND NOT EXISTS (SELECT 1 FROM rejections j WHERE j.compaction = c.compaction_id);
 
-CREATE TABLE messages (
-    store_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    source TEXT DEFAULT '',
-    conversation_id TEXT DEFAULT '',
-    role TEXT NOT NULL,
-    content TEXT,
-    tool_call_id TEXT,
-    tool_calls TEXT,
-    tool_name TEXT,
-    timestamp REAL NOT NULL,
-    token_estimate INTEGER DEFAULT 0,
-    pinned INTEGER DEFAULT 0,
-    ingested_at REAL,
-    observed_at REAL,
-    observed_at_source TEXT
-);
-CREATE INDEX idx_msg_session ON messages(session_id, store_id);
-CREATE INDEX idx_msg_session_ts ON messages(session_id, timestamp);
-CREATE INDEX idx_msg_source_session ON messages(source, session_id, store_id);
-CREATE INDEX idx_msg_conversation_session ON messages(conversation_id, session_id, store_id);
+CREATE VIEW messages AS
+SELECT r.record_id AS store_id,
+       r.session AS session_id,
+       '' AS source,
+       '' AS conversation_id,
+       r.role AS role,
+       json_extract(r.raw, '$.content') AS content,
+       r.tool_call_id AS tool_call_id,
+       json_extract(r.raw, '$.tool_calls') AS tool_calls,
+       json_extract(r.raw, '$.tool_name') AS tool_name,
+       c.began_at AS timestamp,
+       r.est_tokens AS token_estimate,
+       0 AS pinned,
+       c.began_at AS ingested_at,
+       CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
+            THEN json_extract(r.raw, '$.timestamp') END AS observed_at,
+       CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
+            THEN 'host_message_timestamp' END AS observed_at_source
+FROM records r
+JOIN compactions c ON c.compaction_id = r.compaction
+WHERE EXISTS (
+        SELECT 1 FROM compaction_inputs i
+        JOIN effective_compactions e ON e.compaction_id = i.compaction
+        WHERE i.record = r.handle)
+  AND NOT EXISTS (
+        SELECT 1 FROM revision_sources s
+        JOIN compaction_inputs i ON i.record = s.revision
+        JOIN effective_compactions e ON e.compaction_id = i.compaction
+        WHERE s.source_record = r.handle);
 
-CREATE TABLE metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-
-CREATE TABLE summary_nodes (
-    node_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    depth INTEGER NOT NULL DEFAULT 0,
-    summary TEXT NOT NULL,
-    token_count INTEGER DEFAULT 0,
-    source_token_count INTEGER DEFAULT 0,
-    source_ids TEXT NOT NULL DEFAULT '[]',
-    source_type TEXT NOT NULL DEFAULT 'messages',
-    created_at REAL NOT NULL,
-    earliest_at REAL,
-    latest_at REAL,
-    expand_hint TEXT DEFAULT ''
-);
-CREATE INDEX idx_nodes_session_depth ON summary_nodes(session_id, depth, created_at);
-CREATE INDEX idx_nodes_session_node ON summary_nodes(session_id, node_id);
-CREATE INDEX idx_nodes_session_depth_node ON summary_nodes(session_id, depth, node_id);
-CREATE INDEX idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at);
-
-CREATE TABLE lcm_lifecycle_state (
-    conversation_id TEXT PRIMARY KEY,
-    current_session_id TEXT,
-    last_finalized_session_id TEXT,
-    current_frontier_store_id INTEGER NOT NULL DEFAULT 0,
-    last_finalized_frontier_store_id INTEGER NOT NULL DEFAULT 0,
-    debt_kind TEXT,
-    debt_size_estimate INTEGER NOT NULL DEFAULT 0,
-    current_bound_at REAL,
-    last_finalized_at REAL,
-    debt_updated_at REAL,
-    last_maintenance_attempt_at REAL,
-    last_rollover_at REAL,
-    last_reset_at REAL,
-    updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
-);
-CREATE INDEX idx_lcm_lifecycle_current_session ON lcm_lifecycle_state(current_session_id);
-CREATE INDEX idx_lcm_lifecycle_last_finalized_session ON lcm_lifecycle_state(last_finalized_session_id);
+CREATE VIEW summary_nodes AS
+SELECT d.derivation_id AS node_id,
+       ch.session AS session_id,
+       0 AS depth,
+       d.text AS summary,
+       d.est_tokens AS token_count,
+       (SELECT SUM(r.est_tokens) FROM chunk_members m JOIN records r ON r.handle = m.record
+        WHERE m.chunk = ch.handle) AS source_token_count,
+       (SELECT json_group_array(x.record_id) FROM (
+            SELECT r.record_id AS record_id FROM chunk_members m JOIN records r ON r.handle = m.record
+            WHERE m.chunk = ch.handle ORDER BY m.ordinal) x) AS source_ids,
+       'messages' AS source_type,
+       d.created_at AS created_at,
+       (SELECT MIN(CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
+                        THEN json_extract(r.raw, '$.timestamp') END)
+        FROM chunk_members m JOIN records r ON r.handle = m.record
+        WHERE m.chunk = ch.handle) AS earliest_at,
+       (SELECT MAX(CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
+                        THEN json_extract(r.raw, '$.timestamp') END)
+        FROM chunk_members m JOIN records r ON r.handle = m.record
+        WHERE m.chunk = ch.handle) AS latest_at,
+       d.expand_hint AS expand_hint
+FROM derivations d
+JOIN derivation_sources s ON s.derivation = d.handle AND s.ordinal = 0
+JOIN chunks ch ON ch.handle = s.chunk
+WHERE EXISTS (
+        SELECT 1 FROM compaction_returns cr
+        JOIN effective_compactions e ON e.compaction_id = cr.compaction
+        WHERE cr.derivation = d.handle);
 """
+
+_SCHEMA_SQL = _RECORD_SQL + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + "\n" + _VIEWS_SQL
 
 
 def _is_sqlite_lock_error(exc: BaseException) -> bool:

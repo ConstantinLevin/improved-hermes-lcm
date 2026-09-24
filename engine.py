@@ -74,7 +74,6 @@ from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
-from .lifecycle_state import LifecycleStateStore
 from .plugin_sessions import PluginSessions
 from .record_store import RecordStore
 from .record_write import RecordWriteMixin
@@ -90,7 +89,7 @@ logger = logging.getLogger(__name__)
 
 
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
-_TOTAL_COMPACTIONS_SCOPE = "current_conversation"
+_TOTAL_COMPACTIONS_SCOPE = "plugin_session"
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
 # real user turns so that summarization can prioritise current user intent.
@@ -265,6 +264,10 @@ class LCMEngine(
         }
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        # Read by the host after compress(): an aborted compaction returned its input
+        # unchanged, and the host shows "⚠ Compression aborted: <_last_summary_error>".
+        self._last_compress_aborted = False
+        self._last_summary_error: Optional[str] = None
         # Ingest-failure tracking. The core promise is that nothing is ever
         # lost, but a swallowed persistence error (disk full, DB locked,
         # corruption) silently breaks it: the turn continues while messages
@@ -342,7 +345,7 @@ class LCMEngine(
 
         Hermes core may deepcopy plugin context engines while creating isolated
         AIAgent instances. A default object deepcopy walks into MessageStore,
-        SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
+        SummaryDAG, PluginSessions and RecordStore sqlite3.Connection handles, which
         cannot be pickled. LCM already exposes clone_for_agent() as the safe
         boundary: share durable configuration/database path, but allocate fresh
         per-agent runtime/storage helper objects.
@@ -368,7 +371,8 @@ class LCMEngine(
         raise StoreRefusedError(message)
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
-        """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        """Bind the store's helpers to one SQLite database: the record and its
+        sessions, and the tools' readers over its views."""
         try:
             self._store = MessageStore(
                 db_path,
@@ -376,7 +380,6 @@ class LCMEngine(
                 hermes_home=hermes_home,
             )
             self._dag = SummaryDAG(db_path)
-            self._lifecycle = LifecycleStateStore(db_path)
             self._sessions = PluginSessions(db_path)
             self._records = RecordStore(db_path)
         except Exception:
@@ -388,7 +391,6 @@ class LCMEngine(
         for attr in (
             "_store",
             "_dag",
-            "_lifecycle",
             "_sessions",
             "_records",
         ):
@@ -602,8 +604,9 @@ class LCMEngine(
 
     @property
     def current_session_id(self) -> str:
-        """The session this engine copy serves; the tools read this one."""
-        return self._session_id
+        """The plugin session this engine copy serves; the tools read this one. It
+        spans the host identifiers a compaction rotates through."""
+        return self._plugin_session
 
     @property
     def current_session_platform(self) -> str:
@@ -631,7 +634,6 @@ class LCMEngine(
         self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
         self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
-        self._record_turn_compaction_telemetry()
 
     @property
     def cache_read_ratio(self) -> float:
@@ -1505,43 +1507,35 @@ class LCMEngine(
             self._record_confirmation(old_session_id, session_id)
         previous_session_id = self._session_id
         previous_conversation_id = self._conversation_id
-        requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
+        requested_conversation_id = str(kwargs.get("conversation_id") or "")
         # Every session is an ordinary session: a delegate, a background fork or
-        # a cron agent is bound and compacted like any other. The host's
-        # compaction boundary under a new identifier is followed below; every
-        # other start binds the session it names.
-        if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
-            self._continue_compression_boundary(session_id, old_session_id, kwargs)
+        # a cron agent is bound and compacted like any other.
+        if boundary_reason == "compression":
+            # A compaction boundary is not a beginning: the plugin session continues
+            # under the host's new identifier, and the record line is the
+            # confirmation above. Nothing is carried over; the store holds it.
+            self._apply_session_start_metadata(session_id, kwargs)
+            self._conversation_id = requested_conversation_id or previous_conversation_id or session_id
+            self._register_active_engine_binding()
             return
 
         if previous_session_id and previous_session_id != session_id:
-            self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
         else:
             if (
                 previous_conversation_id
-                and requested_conversation_id != previous_conversation_id
+                and (requested_conversation_id or session_id) != previous_conversation_id
             ):
                 self._reset_session_counters()
-            self._clear_pending_reset_boundary()
-            self._ingest_cursor = 0
-            self._last_compacted_store_id = 0
             self._last_overflow_recovery_failed = False
-            self._last_condensation_suppressed_reason = ""
         self._apply_session_start_metadata(session_id, kwargs)
-        self._bind_lifecycle_state(
+        self._conversation_id = requested_conversation_id or session_id
+        self._register_active_engine_binding()
+        self._name_plugin_session(
             session_id,
-            conversation_id=kwargs.get("conversation_id"),
+            signal="on_session_start",
+            platform=str(kwargs.get("platform") or "") or None,
         )
-        self._schedule_ingest_cursor_reconciliation()
-        # A compaction boundary is not a beginning: it continues the plugin session,
-        # and its record line is written with the compaction record.
-        if boundary_reason != "compression":
-            self._name_plugin_session(
-                session_id,
-                signal="on_session_start",
-                platform=str(kwargs.get("platform") or "") or None,
-            )
 
     def _name_plugin_session(self, host_session_id: str, *, signal: str, platform: str | None) -> None:
         """Bind this engine copy to the plugin session a host session id names.
@@ -1597,11 +1591,8 @@ class LCMEngine(
         return None
 
     def on_session_reset(self) -> None:
-        self._pending_reset_session_id = self._session_id
-        self._pending_reset_conversation_id = self._conversation_id
-        self._pending_reset_frontier_store_id = self._last_compacted_store_id
+        """/new or /reset: the next session is a new one; nothing is carried over."""
         super().on_session_reset()
-        self._lifecycle.record_reset(self._conversation_id)
         self._reset_session_scoped_runtime_state()
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
@@ -1627,16 +1618,8 @@ class LCMEngine(
         ]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
-        # Ingest live messages if passed (enables current-turn search)
-        messages = kwargs.get("messages")
-
-        if name != "lcm_inspect" and messages and self._session_id:
-            try:
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-            except Exception as e:
-                self._record_ingest_failure("tool-call ingest", e)
-
+        # The tools read the store, which is filled at compaction; what the agent's
+        # context holds now is in its context.
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
             "lcm_expand": lcm_tools.lcm_expand,
@@ -1663,14 +1646,6 @@ class LCMEngine(
         git_identity = _git_runtime_identity(_PLUGIN_ROOT)
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
-        lifecycle_state = None
-        lifecycle_error = ""
-        if conversation_id:
-            try:
-                lifecycle_state = self._lifecycle.get_by_conversation(conversation_id)
-            except Exception as exc:  # pragma: no cover - defensive
-                lifecycle_error = str(exc)
-
         identity: Dict[str, Any] = {
             "engine": self.name,
             "plugin_name": metadata.get("name", "hermes-lcm"),
@@ -1681,20 +1656,12 @@ class LCMEngine(
             "database_path": str(self._store.db_path),
             "database_path_source": self._database_path_source(),
             "session_id": session_id,
+            "host_session_id": self._session_id,
             "session_platform": self.current_session_platform,
             "session_bound": bool(session_id),
             "conversation_id": conversation_id,
-            "lifecycle_current_session_id": "",
-            "lifecycle_last_finalized_session_id": "",
         }
         identity.update(git_identity)
-        if lifecycle_state is not None:
-            identity.update({
-                "lifecycle_current_session_id": lifecycle_state.current_session_id or "",
-                "lifecycle_last_finalized_session_id": lifecycle_state.last_finalized_session_id or "",
-            })
-        if lifecycle_error:
-            identity["lifecycle_error"] = lifecycle_error
         return identity
 
     def get_status(self) -> Dict[str, Any]:
@@ -1718,6 +1685,8 @@ class LCMEngine(
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "last_compress_aborted": self._last_compress_aborted,
+            "last_summary_error": self._last_summary_error,
             "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
@@ -1736,23 +1705,11 @@ class LCMEngine(
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
-        lifecycle_state = self._lifecycle.get_by_conversation(conversation_id) if conversation_id else None
+        # The compactions of this plugin session that took effect, from the store.
         try:
-            telemetry = self._store.read_compaction_telemetry(conversation_id)
-        except Exception:
-            telemetry = None
-        total_compactions = _normalize_total_compactions(
-            telemetry.get("total_compactions", 0) if telemetry else 0
-        )
-        if conversation_id and conversation_id == self._conversation_id:
-            try:
-                _, _, pending_compactions = self._compaction_telemetry_counter_delta(
-                    telemetry or {}
-                )
-            except (TypeError, ValueError):
-                pending_compactions = 0
-            total_compactions += pending_compactions
-        status["total_compactions"] = total_compactions
+            status["total_compactions"] = self._records.effective_count(session_id) if session_id else 0
+        except Exception as exc:  # pragma: no cover - defensive
+            status["total_compactions"] = f"error: {exc}"
         status["total_compactions_scope"] = _TOTAL_COMPACTIONS_SCOPE
         status["engine"] = "lcm"
         status["runtime_identity"] = self.get_runtime_identity()
@@ -1768,44 +1725,6 @@ class LCMEngine(
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
             status["conversation_id"] = conversation_id
-            if lifecycle_state is not None:
-                status["lifecycle"] = {
-                    "conversation_id": lifecycle_state.conversation_id,
-                    "current_session_id": lifecycle_state.current_session_id,
-                    "last_finalized_session_id": lifecycle_state.last_finalized_session_id,
-                    "current_frontier_store_id": lifecycle_state.current_frontier_store_id,
-                    "last_finalized_frontier_store_id": lifecycle_state.last_finalized_frontier_store_id,
-                    "current_bound_at": lifecycle_state.current_bound_at,
-                    "last_finalized_at": lifecycle_state.last_finalized_at,
-                    "last_rollover_at": lifecycle_state.last_rollover_at,
-                    "last_reset_at": lifecycle_state.last_reset_at,
-                    "updated_at": lifecycle_state.updated_at,
-                }
-            if telemetry:
-                status["compaction_telemetry"] = {
-                    "cache_state": telemetry.get("cache_state", "unknown"),
-                    "consecutive_cold_observations": telemetry.get(
-                        "consecutive_cold_observations", 0
-                    ),
-                    "turns_since_leaf_compaction": telemetry.get(
-                        "turns_since_leaf_compaction", 0
-                    ),
-                    "peak_prompt_tokens_since_leaf_compaction": telemetry.get(
-                        "peak_prompt_tokens_since_leaf_compaction", 0
-                    ),
-                    "last_observed_prompt_tokens": telemetry.get(
-                        "last_observed_prompt_tokens", 0
-                    ),
-                    "last_observed_cache_read": telemetry.get("last_observed_cache_read", 0),
-                    "last_observed_cache_write": telemetry.get("last_observed_cache_write", 0),
-                    "activity_band": telemetry.get("activity_band", "low"),
-                    "total_compactions": total_compactions,
-                    "last_leaf_compaction_at": telemetry.get("last_leaf_compaction_at"),
-                    "last_compaction_duration_ms": telemetry.get("last_compaction_duration_ms"),
-                    "provider": telemetry.get("provider"),
-                    "model": telemetry.get("model"),
-                    "last_api_call_at": telemetry.get("last_api_call_at"),
-                }
         return status
 
     def update_model(self, model: str, context_length: int,
@@ -2966,4 +2885,3 @@ class LCMEngine(
         self._unregister_active_engine_binding()
         self._store.close()
         self._dag.close()
-        self._lifecycle.close()

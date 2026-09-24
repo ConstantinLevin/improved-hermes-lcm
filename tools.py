@@ -1682,28 +1682,6 @@ def _inspect_message_metadata(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _inspect_lifecycle_state(engine: "LCMEngine", session_id: str, conversation_id: str) -> dict[str, Any] | None:
-    state = None
-    if conversation_id:
-        state = engine._lifecycle.get_by_conversation(conversation_id)
-    if state is None and session_id:
-        state = engine._lifecycle.get_by_session(session_id)
-    if state is None:
-        return None
-    return {
-        "conversation_id": state.conversation_id,
-        "current_session_id": state.current_session_id,
-        "last_finalized_session_id": state.last_finalized_session_id,
-        "current_frontier_store_id": state.current_frontier_store_id,
-        "last_finalized_frontier_store_id": state.last_finalized_frontier_store_id,
-        "current_bound_at": state.current_bound_at,
-        "last_finalized_at": state.last_finalized_at,
-        "last_rollover_at": state.last_rollover_at,
-        "last_reset_at": state.last_reset_at,
-        "updated_at": state.updated_at,
-    }
-
-
 def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: str) -> int:
     highest = 0
     rows = engine._dag.connection.execute(
@@ -1880,7 +1858,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
 
     full_status = engine.get_status()
     runtime_identity = full_status.get("runtime_identity") or engine.get_runtime_identity()
-    lifecycle = _inspect_lifecycle_state(engine, session_id, conversation_id)
 
     store_totals_row = engine._store.connection.execute(
         """
@@ -1935,9 +1912,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     ]
 
     highest_compacted_source_store_id = _inspect_highest_compacted_source_store_id(engine, session_id)
-    lifecycle_current_frontier = int((lifecycle or {}).get("current_frontier_store_id") or 0)
-    lifecycle_finalized_frontier = int((lifecycle or {}).get("last_finalized_frontier_store_id") or 0)
-    runtime_last_compacted = int(getattr(engine, "_last_compacted_store_id", 0) or 0)
 
     platform = engine.current_session_platform
 
@@ -1951,7 +1925,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "session_id": session_id,
             "conversation_id": conversation_id,
             "session_platform": platform,
-            "lifecycle": lifecycle,
             "source_lineage": full_status.get("source_lineage"),
         },
         "messages": {
@@ -1981,10 +1954,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
                 "threshold_tokens": engine.threshold_tokens,
             },
             "frontier": {
-                "runtime_last_compacted_store_id": runtime_last_compacted,
                 "highest_compacted_source_store_id": highest_compacted_source_store_id,
-                "lifecycle_current_frontier_store_id": lifecycle_current_frontier,
-                "lifecycle_last_finalized_frontier_store_id": lifecycle_finalized_frontier,
             },
         },
         "dag": {
@@ -2026,7 +1996,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     total_dag_nodes = sum(d["count"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
     full_status = engine.get_status()
-    lifecycle = full_status.get("lifecycle")
     source_lineage = full_status.get("source_lineage")
     runtime_identity = full_status.get("runtime_identity")
     ingest_reconciliation = full_status.get("ingest_reconciliation")
@@ -2105,7 +2074,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "preset_suggestion": preset_status_payload(engine),
         "ingest_reconciliation": ingest_reconciliation,
         "runtime_identity": runtime_identity,
-        "lifecycle": lifecycle,
     })
 
 
