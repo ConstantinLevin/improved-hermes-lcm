@@ -377,14 +377,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     automatic LCM passes silent unless the user explicitly asks for diagnostics.
 
     Architecture:
-      1. Every message is persisted verbatim in an immutable MessageStore
-      2. When context pressure builds, older messages outside the fresh tail
+      1. When context pressure builds, older messages outside the fresh tail
          are summarized into leaf nodes (D0) in a SummaryDAG
-      3. When enough nodes accumulate at a depth, they're condensed into
+      2. When enough nodes accumulate at a depth, they're condensed into
          higher-depth nodes (D1, D2, ...)
-      4. The agent gets tools (lcm_grep, lcm_load_session, lcm_describe,
+      3. The agent gets tools (lcm_grep, lcm_load_session, lcm_describe,
          lcm_expand) to search and drill into compacted history
-      5. Active context = system prompt + DAG summaries + fresh tail
+      4. Active context = system prompt + DAG summaries + fresh tail
     """
 
     def __init__(self, config: LCMConfig | None = None,
