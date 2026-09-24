@@ -230,17 +230,6 @@ def _create_private_sqlite_file(path: Path) -> bool:
         os.close(directory_fd)
 
 
-def _is_sqlite_locked_error(exc: BaseException) -> bool:
-    """Return True when an exception chain represents SQLite lock contention."""
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        message = str(current).lower()
-        if isinstance(current, sqlite3.Error) and "locked" in message:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
 
 
 def _sqlite_busy_timeout_ms(conn: sqlite3.Connection) -> int:
