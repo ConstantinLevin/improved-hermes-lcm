@@ -21,7 +21,7 @@ from .diagnostics import (
     _state_db_path_for_engine,
     doctor_guidance_for_checks,
 )
-from .dag import SummaryDAG, build_nodes_fts_spec
+from .dag import build_nodes_fts_spec
 from .presets import (
     explicit_operator_overrides,
     get_preset,
@@ -34,7 +34,6 @@ from .presets import (
     unsupported_runtime_fields_text,
 )
 from .maintenance import backup_database, rotate_backup_database
-from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
 
 
@@ -64,16 +63,9 @@ def _help_text(error: str | None = None) -> str:
         "LCM command help",
         "- /lcm or /lcm status: show current LCM runtime/session status",
         "- /lcm doctor: run read-only LCM health checks",
-        "- /lcm doctor clean: best-effort scan of obvious junk/noise session candidates without deleting anything",
-        "- /lcm doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
-        "- /lcm doctor clean lifecycle: read-only scan for lifecycle rows with zero messages/nodes",
-        "- /lcm doctor clean lifecycle apply: backup-first cleanup of empty lifecycle rows only",
         "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
         "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
-        "- /lcm doctor source: read-only scan for legacy blank-source rows",
-        "- /lcm doctor source apply: backup-first normalization of legacy blank-source rows to unknown",
-        "- /lcm doctor retention: read-only retention analysis for stored session footprint and age",
-        "- /lcm backup: create a timestamped SQLite backup before any future cleanup workflow",
+        "- /lcm backup: create a timestamped SQLite backup",
         "- /lcm rotate: preview a tail-preserving in-place compact of the active session (read-only)",
         "- /lcm rotate apply: backup-first rotate that advances the lifecycle frontier past pre-tail raw messages",
         "- /lcm preset show [name]: inspect shipped preset metadata and benchmark provenance",
@@ -214,175 +206,6 @@ def _status_text(engine) -> str:
     if source_stats.get("error"):
         lines.append(f"source_lineage_error: {source_stats['error']}")
     return "\n".join(lines)
-
-
-def _scan_clean_candidates(engine) -> dict[str, Any]:
-    try:
-        rows = engine._store.scan_session_cleanup_stats()
-    except Exception as exc:  # pragma: no cover - defensive
-        return {
-            "error": str(exc),
-            "candidates": [],
-            "ignored_count": 0,
-            "stateless_count": 0,
-            "protected_count": 0,
-        }
-
-    candidates = []
-    ignored_count = 0
-    stateless_count = 0
-    protected_count = 0
-
-    for session_id, message_count, token_total, node_count in rows:
-        keys = build_session_match_keys(session_id)
-        matched_classes = []
-        if matches_session_pattern(keys, engine._compiled_ignore_session_patterns):
-            matched_classes.append("ignored-pattern")
-            ignored_count += 1
-        elif matches_session_pattern(keys, engine._compiled_stateless_session_patterns):
-            matched_classes.append("stateless-pattern")
-            stateless_count += 1
-        if not matched_classes:
-            continue
-        # Protect the actively-bound session from cleanup, not the foreground
-        # view. While a cron tick has rebound the engine, _session_id points
-        # at the cron session and the engine is actively writing through it
-        # via lifecycle hooks; deleting that data mid-flight would corrupt
-        # the cleanup pass. current_session_id (foreground) is the wrong
-        # field here.
-        if session_id == getattr(engine, "_session_id", ""):
-            protected_count += 1
-            continue
-        candidates.append(
-            {
-                "session_id": session_id,
-                "classes": matched_classes,
-                "message_count": int(message_count),
-                "node_count": int(node_count),
-                "token_total": int(token_total),
-            }
-        )
-
-    return {
-        "error": None,
-        "candidates": candidates,
-        "ignored_count": ignored_count,
-        "stateless_count": stateless_count,
-        "protected_count": protected_count,
-    }
-
-
-def _scan_retention_candidates(engine) -> dict[str, Any]:
-    now = datetime.now().timestamp()
-    # SQL is scoped to the foreground session so /lcm doctor retention
-    # reports the operator's real conversation rather than whatever side
-    # channel (cron tick, debug probe) currently owns engine._session_id.
-    # The "protected" flag below still keys off engine._session_id (the
-    # actively-bound row) because that is the row receiving live writes
-    # from the concurrent run.
-    session_id = engine.current_session_id
-    if not session_id:
-        return {
-            "error": None,
-            "sessions": [],
-            "sessions_analyzed": 0,
-            "stale_sessions_30d": 0,
-            "stale_sessions_90d": 0,
-            "retained_tokens_30d": 0,
-            "retained_tokens_90d": 0,
-            "protected_count": 0,
-        }
-    try:
-        rows = engine._store.scan_session_retention_stats(session_id)
-    except Exception as exc:  # pragma: no cover - defensive
-        return {
-            "error": str(exc),
-            "sessions": [],
-            "sessions_analyzed": 0,
-            "stale_sessions_30d": 0,
-            "stale_sessions_90d": 0,
-            "retained_tokens_30d": 0,
-            "retained_tokens_90d": 0,
-            "protected_count": 0,
-        }
-
-    sessions = []
-    protected_count = 0
-    stale_sessions_30d = 0
-    stale_sessions_90d = 0
-    retained_tokens_30d = 0
-    retained_tokens_90d = 0
-
-    for row in rows:
-        (
-            session_id,
-            message_count,
-            token_total,
-            node_count,
-            node_token_total,
-            first_message_at,
-            last_message_at,
-            first_node_at,
-            last_node_at,
-        ) = row
-        timestamps = [
-            ts for ts in (first_message_at, last_message_at, first_node_at, last_node_at)
-            if ts is not None
-        ]
-        if not timestamps:
-            continue
-        first_activity_at = min(float(ts) for ts in (first_message_at, first_node_at) if ts is not None)
-        last_activity_at = max(float(ts) for ts in (last_message_at, last_node_at) if ts is not None)
-        age_days = max(0.0, (now - last_activity_at) / 86400.0)
-        # Bound (not foreground): protect the live session from retention
-        # bookkeeping while the engine may still be writing to it.
-        protected = session_id == getattr(engine, "_session_id", "")
-        total_footprint_tokens = int(token_total) + int(node_token_total)
-        if protected:
-            protected_count += 1
-        if age_days >= 30.0:
-            stale_sessions_30d += 1
-            retained_tokens_30d += total_footprint_tokens
-        if age_days >= 90.0:
-            stale_sessions_90d += 1
-            retained_tokens_90d += total_footprint_tokens
-        sessions.append(
-            {
-                "session_id": session_id,
-                "protected": protected,
-                "message_count": int(message_count),
-                "node_count": int(node_count),
-                "token_total": total_footprint_tokens,
-                "raw_token_total": int(token_total),
-                "summary_token_total": int(node_token_total),
-                "first_activity_at": float(first_activity_at),
-                "last_activity_at": float(last_activity_at),
-                "age_days": age_days,
-            }
-        )
-
-    sessions.sort(
-        key=lambda item: (
-            1 if item["protected"] else 0,
-            0 if item["age_days"] >= 30.0 else 1,
-            -item["token_total"],
-            -item["node_count"],
-            -item["message_count"],
-            item["last_activity_at"],
-            item["session_id"],
-        )
-    )
-
-    return {
-        "error": None,
-        "sessions": sessions,
-        "sessions_analyzed": len(sessions),
-        "stale_sessions_30d": stale_sessions_30d,
-        "stale_sessions_90d": stale_sessions_90d,
-        "retained_tokens_30d": retained_tokens_30d,
-        "retained_tokens_90d": retained_tokens_90d,
-        "protected_count": protected_count,
-    }
 
 
 def _rotate_text(engine) -> str:
@@ -627,105 +450,6 @@ def _doctor_repair_apply_text(engine) -> str:
     ])
 
 
-def _doctor_source_text(engine) -> str:
-    try:
-        plan = engine._store.get_source_normalization_plan()
-    except Exception as exc:  # pragma: no cover - defensive
-        return "\n".join([
-            "LCM doctor source",
-            "status: error",
-            f"error: source-lineage scan failed: {exc}",
-            "note: read-only scan only — no source rows were updated",
-        ])
-
-    stats = plan["stats_before"]
-    would_update = int(plan["would_update_messages"])
-    lines = [
-        "LCM doctor source",
-        f"status: {'normalization-needed' if would_update else 'ok'}",
-        f"messages_total: {stats['messages_total']}",
-        f"attributed_messages: {stats['attributed_messages']}",
-        f"unknown_messages: {stats['normalized_unknown_messages']}",
-        f"legacy_blank_messages: {stats['legacy_blank_source_messages']}",
-        f"effective_unknown_messages: {stats['effective_unknown_messages']}",
-        f"target_source: {plan['target_source']}",
-        f"would_update_messages: {would_update}",
-        f"affected_sessions: {plan['affected_sessions']}",
-        "note: read-only scan only — no source rows were updated",
-    ]
-    if would_update:
-        lines.append(
-            "note: use `/lcm doctor source apply` to create a backup and normalize legacy blank-source rows"
-        )
-    else:
-        lines.append("note: no legacy blank-source rows need normalization")
-    return "\n".join(lines)
-
-
-def _doctor_source_apply_text(engine) -> str:
-    try:
-        plan = engine._store.get_source_normalization_plan()
-    except Exception as exc:  # pragma: no cover - defensive
-        return "\n".join([
-            "LCM doctor source apply",
-            "status: error",
-            f"error: source-lineage scan failed: {exc}",
-            "note: source normalization apply aborted before any rows were updated",
-        ])
-
-    if int(plan["would_update_messages"]) == 0:
-        stats = plan["stats_before"]
-        return "\n".join([
-            "LCM doctor source apply",
-            "status: ok",
-            f"target_source: {plan['target_source']}",
-            "updated_messages: 0",
-            f"legacy_blank_before: {stats['legacy_blank_source_messages']}",
-            f"legacy_blank_after: {stats['legacy_blank_source_messages']}",
-            "note: no legacy blank-source rows needed normalization",
-        ])
-
-    backup = backup_database(engine)
-    if not backup["ok"]:
-        return "\n".join([
-            "LCM doctor source apply",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"error: backup failed: {backup['error']}",
-            "note: source normalization apply aborted before any rows were updated",
-        ])
-
-    try:
-        result = engine._store.normalize_legacy_blank_sources()
-    except sqlite3.Error as exc:
-        return "\n".join([
-            "LCM doctor source apply",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"backup_path: {backup['backup_path']}",
-            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-            f"error: source normalization failed: {exc}",
-            "note: backup was created before source normalization apply",
-        ])
-
-    before = result["stats_before"]
-    after = result["stats_after"]
-    return "\n".join([
-        "LCM doctor source apply",
-        "status: ok",
-        f"database_path: {backup['db_path']}",
-        f"backup_path: {backup['backup_path']}",
-        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-        f"target_source: {result['target_source']}",
-        f"updated_messages: {result['updated_messages']}",
-        f"legacy_blank_before: {before['legacy_blank_source_messages']}",
-        f"legacy_blank_after: {after['legacy_blank_source_messages']}",
-        f"unknown_before: {before['normalized_unknown_messages']}",
-        f"unknown_after: {after['normalized_unknown_messages']}",
-        "note: backup created before source normalization apply",
-    ])
-
-
 def _doctor_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     runtime_identity = engine.get_runtime_identity()
@@ -836,7 +560,6 @@ def _doctor_text(engine) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         quick_check = f"error: {exc}"
         issues.append("sqlite_quick_check")
-    clean_scan = _scan_clean_candidates(engine)
 
     debt_rows = []
     lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "connection", None)
@@ -877,19 +600,8 @@ def _doctor_text(engine) -> str:
             f"maintenance_debt: {len(debt_rows)} conversation(s) currently carry deferred maintenance debt; first={first[0]} kind={first[1]} size={first[2]}"
         )
         recommended_actions.append(
-            "let normal compaction turns reduce maintenance debt before attempting broader cleanup"
+            "let normal compaction turns reduce maintenance debt"
         )
-
-    if clean_scan["error"]:
-        observations.append(f"cleanup_candidates: scan error: {clean_scan['error']}")
-    elif clean_scan["candidates"]:
-        observations.append(
-            f"cleanup_candidates: {len(clean_scan['candidates'])} pattern-matched junk/noise session candidate(s) detected"
-        )
-        recommended_actions.append("inspect candidate sessions with `/lcm doctor clean`")
-        recommended_actions.append("create a safety snapshot first with `/lcm backup`")
-    else:
-        observations.append("cleanup_candidates: none")
 
     try:
         source_stats = engine._store.get_source_stats()
@@ -965,11 +677,6 @@ def _doctor_text(engine) -> str:
                 "treat this as read-only evidence; do not infer every mismatch is harmful"
             )
 
-    if clean_scan.get("protected_count"):
-        observations.append(
-            f"protected_sessions: skipped {clean_scan['protected_count']} currently bound session(s) from cleanup candidates"
-        )
-
     if store_fts_failed_flag:
         observations.append(
             "messages_fts_integrity: a background integrity scan flagged corruption "
@@ -1016,8 +723,6 @@ def _doctor_text(engine) -> str:
             "status": "fail",
             "detail": {"status": "fail", "background_flag": node_fts_failed_flag},
         })
-    if clean_scan["candidates"]:
-        triage_checks.append({"check": "cleanup_candidates", "status": "warn", "detail": clean_scan})
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
     if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
@@ -1082,397 +787,6 @@ def _doctor_text(engine) -> str:
     else:
         lines.append("- none")
     return "\n".join(lines)
-
-
-def _doctor_clean_text(engine) -> str:
-    scan = _scan_clean_candidates(engine)
-    if scan["error"]:
-        return "\n".join([
-            "LCM doctor clean",
-            "status: error",
-            f"error: {scan['error']}",
-            "note: read-only scan only — no rows were deleted",
-        ])
-
-    candidates = scan["candidates"]
-    lines = [
-        "LCM doctor clean",
-        f"status: {'candidates-found' if candidates else 'ok'}",
-        f"candidate_sessions: {len(candidates)}",
-        f"ignored_pattern_matches: {scan['ignored_count']}",
-        f"stateless_pattern_matches: {scan['stateless_count']}",
-    ]
-    if scan["protected_count"]:
-        lines.append(f"protected_sessions_skipped: {scan['protected_count']}")
-
-    if not candidates:
-        lines.append("result: no obvious junk/noise session candidates detected")
-        return "\n".join(lines)
-
-    lines.append("candidates:")
-    for item in candidates[:20]:
-        classes = ", ".join(item["classes"])
-        lines.append(
-            "- "
-            f"{item['session_id']} | class={classes} | messages={item['message_count']} | "
-            f"nodes={item['node_count']} | tokens={item['token_total']}"
-        )
-    if len(candidates) > 20:
-        lines.append(f"... {len(candidates) - 20} more candidate session(s) omitted")
-    lines.append("note: best-effort stored-session scan only — platform-only matches may not be reconstructable from the SQLite state")
-    lines.append("note: read-only scan only — no rows were deleted")
-    lines.append("note: use `/lcm doctor clean apply` only after a backup-first review of these safe candidates")
-    return "\n".join(lines)
-
-
-def _doctor_retention_text(engine) -> str:
-    scan = _scan_retention_candidates(engine)
-    if scan["error"]:
-        return "\n".join([
-            "LCM doctor retention",
-            "status: error",
-            f"error: {scan['error']}",
-            "note: read-only analysis only — no rows were deleted",
-        ])
-
-    sessions = scan["sessions"]
-    lines = [
-        "LCM doctor retention",
-        f"status: {'analysis-ready' if sessions else 'ok'}",
-        f"sessions_analyzed: {scan['sessions_analyzed']}",
-        f"stale_sessions_30d: {scan['stale_sessions_30d']}",
-        f"stale_sessions_90d: {scan['stale_sessions_90d']}",
-        f"retained_tokens_30d: {scan['retained_tokens_30d']}",
-        f"retained_tokens_90d: {scan['retained_tokens_90d']}",
-    ]
-    if scan["protected_count"]:
-        lines.append(f"protected_sessions: {scan['protected_count']}")
-
-    if not sessions:
-        lines.append("result: no stored sessions found for retention analysis")
-        lines.append("note: read-only analysis only — no rows were deleted")
-        return "\n".join(lines)
-
-    lines.append("retention_candidates:")
-    for item in sessions[:20]:
-        lines.append(
-            "- "
-            f"{item['session_id']} | protected={'yes' if item['protected'] else 'no'} | "
-            f"messages={item['message_count']} | nodes={item['node_count']} | "
-            f"tokens={item['token_total']} | age_days={item['age_days']:.1f}"
-        )
-    if len(sessions) > 20:
-        lines.append(f"... {len(sessions) - 20} more session(s) omitted")
-    lines.append("note: retention analysis is scoped to the active session only")
-    lines.append("note: stale sessions are listed before fresh ones; within each bucket, candidates are sorted by footprint (tokens/nodes/messages), with protected current-session entries listed after non-protected ones")
-    lines.append("note: read-only analysis only — no rows were deleted")
-    lines.append("note: if you prune later, create a safety snapshot first with `/lcm backup`")
-    return "\n".join(lines)
-
-
-def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[str, int]:
-    """Delete cleanup candidates in one SQLite transaction.
-
-    All LCM tables live in the same SQLite database, but the store, DAG, and
-    lifecycle helpers use separate connections and commit internally. Cleanup
-    apply is destructive, so do the coordinated deletes on one connection to
-    avoid half-cleaned state if a later table delete fails.
-    """
-    conn = engine._store.connection
-    # Protect the actively-bound session id, not current_session_id. While a
-    # cron tick has rebound the engine, _session_id is the row the engine is
-    # actively writing to via lifecycle hooks; deleting it during cleanup
-    # would race with that ingest.
-    protected_session_ids = {getattr(engine, "_session_id", "")}
-    protected_session_ids = {str(s) for s in protected_session_ids if s}
-    session_ids = {str(s) for s in session_ids if s and str(s) not in protected_session_ids}
-    if not session_ids:
-        return {
-            "messages_deleted": 0,
-            "nodes_deleted": 0,
-            "lifecycle_deleted": 0,
-            "lifecycle_skipped": 0,
-        }
-
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        SummaryDAG.stage_delete_session_scope(conn, session_ids)
-        scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
-        # Capture the store_ids about to be deleted so their raw-history chunks
-        # can be archived in this same transaction (chunks map to messages by
-        # store_id; a deleted message's chunks must drop from ranking).
-        deleted_store_ids = [
-            int(row[0])
-            for row in conn.execute(
-                f"SELECT store_id FROM messages WHERE EXISTS ("
-                f"SELECT 1 FROM {scope_table} AS scope "
-                "WHERE scope.session_id = messages.session_id)"
-            ).fetchall()
-        ]
-        msg_cur = conn.execute(
-            f"DELETE FROM messages WHERE EXISTS ("
-            f"SELECT 1 FROM {scope_table} AS scope "
-            "WHERE scope.session_id = messages.session_id)"
-        )
-        archive_chunks = getattr(engine, "_archive_chunks_for_messages", None)
-        if callable(archive_chunks) and deleted_store_ids:
-            archive_chunks(deleted_store_ids, connection=conn)
-        nodes_deleted = 0
-        purge = getattr(engine, "_purge_embeddings_for_nodes", None)
-        while True:
-            deleted_ids = SummaryDAG.delete_node_batch(
-                conn,
-                (),
-                staged_scope=True,
-            )
-            if not deleted_ids:
-                break
-            nodes_deleted += len(deleted_ids)
-            if callable(purge):
-                purge(deleted_ids, connection=conn)
-
-        lifecycle_scope = "temp_lcm_delete_lifecycle_scope"
-        conn.execute(
-            f"CREATE TEMP TABLE IF NOT EXISTS {lifecycle_scope}("
-            "conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
-        )
-        conn.execute(f"DELETE FROM {lifecycle_scope}")
-        conn.execute(
-            f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
-            f"SELECT state.conversation_id FROM {scope_table} AS scope "
-            "JOIN lcm_lifecycle_state AS state "
-            "INDEXED BY idx_lcm_lifecycle_current_session "
-            "ON state.current_session_id = scope.session_id"
-        )
-        conn.execute(
-            f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
-            f"SELECT state.conversation_id FROM {scope_table} AS scope "
-            "JOIN lcm_lifecycle_state AS state "
-            "INDEXED BY idx_lcm_lifecycle_last_finalized_session "
-            "ON state.last_finalized_session_id = scope.session_id"
-        )
-
-        protected = next(iter(protected_session_ids), "")
-        deletable_where = f"""
-            scoped.conversation_id = state.conversation_id
-            AND (state.current_session_id IS NULL OR state.current_session_id = ''
-                 OR EXISTS (SELECT 1 FROM {scope_table} AS current_scope
-                            WHERE current_scope.session_id = state.current_session_id))
-            AND (state.last_finalized_session_id IS NULL
-                 OR state.last_finalized_session_id = ''
-                 OR EXISTS (SELECT 1 FROM {scope_table} AS finalized_scope
-                            WHERE finalized_scope.session_id = state.last_finalized_session_id))
-            AND (? = '' OR COALESCE(state.current_session_id, '') != ?)
-            AND (? = '' OR COALESCE(state.last_finalized_session_id, '') != ?)
-        """
-        scoped_count = int(
-            conn.execute(f"SELECT COUNT(*) FROM {lifecycle_scope}").fetchone()[0]
-        )
-        lifecycle_deleted = 0
-        while True:
-            rows = conn.execute(
-                f"SELECT state.conversation_id FROM lcm_lifecycle_state AS state "
-                f"JOIN {lifecycle_scope} AS scoped ON {deletable_where} "
-                "ORDER BY state.conversation_id LIMIT 256",
-                (protected, protected, protected, protected),
-            ).fetchall()
-            if not rows:
-                break
-            conversation_ids = [str(row[0]) for row in rows]
-            placeholders = ",".join("?" for _ in conversation_ids)
-            cur = conn.execute(
-                f"DELETE FROM lcm_lifecycle_state "
-                f"WHERE conversation_id IN ({placeholders})",
-                conversation_ids,
-            )
-            lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
-        lifecycle_skipped = scoped_count - lifecycle_deleted
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
-    return {
-        "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,
-        "nodes_deleted": nodes_deleted,
-        "lifecycle_deleted": lifecycle_deleted,
-        "lifecycle_skipped": lifecycle_skipped,
-    }
-
-
-def _doctor_clean_apply_text(engine) -> str:
-    if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
-        return "\n".join([
-            "LCM doctor clean apply",
-            "status: denied",
-            "error: destructive cleanup is disabled by default",
-            "note: set LCM_DOCTOR_CLEAN_APPLY_ENABLED=true only in trusted operator environments",
-            "note: no rows were deleted",
-        ])
-
-    scan = _scan_clean_candidates(engine)
-    if scan["error"]:
-        return "\n".join([
-            "LCM doctor clean apply",
-            "status: error",
-            f"error: {scan['error']}",
-            "note: cleanup apply aborted before any rows were deleted",
-        ])
-
-    candidates = scan["candidates"]
-    if not candidates:
-        return "\n".join([
-            "LCM doctor clean apply",
-            "status: ok",
-            "candidate_sessions: 0",
-            "result: no safe cleanup candidates detected",
-            "note: nothing was deleted",
-        ])
-
-    backup = backup_database(engine)
-    if not backup["ok"]:
-        return "\n".join([
-            "LCM doctor clean apply",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"error: backup failed: {backup['error']}",
-            "note: cleanup apply aborted before any rows were deleted",
-        ])
-
-    session_ids = {item["session_id"] for item in candidates}
-    try:
-        deleted = _delete_clean_candidates_atomically(engine, session_ids)
-    except sqlite3.Error as exc:
-        return "\n".join([
-            "LCM doctor clean apply",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"backup_path: {backup['backup_path']}",
-            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-            f"error: cleanup apply failed: {exc}",
-            "note: cleanup apply rolled back; restore from the backup if you need to inspect pre-apply state",
-        ])
-
-    return "\n".join([
-        "LCM doctor clean apply",
-        "status: ok",
-        f"database_path: {backup['db_path']}",
-        f"backup_path: {backup['backup_path']}",
-        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-        f"candidate_sessions: {len(candidates)}",
-        f"messages_deleted: {deleted['messages_deleted']}",
-        f"nodes_deleted: {deleted['nodes_deleted']}",
-        f"lifecycle_rows_deleted: {deleted['lifecycle_deleted']}",
-        f"lifecycle_rows_skipped: {deleted['lifecycle_skipped']}",
-        "note: backup created before cleanup apply",
-    ])
-
-
-def _doctor_clean_lifecycle_text(engine) -> str:
-    count = engine._lifecycle.row_count()
-    protected = {str(getattr(engine, "_session_id", "") or "")}
-    protected = {s for s in protected if s}
-
-    conn = engine._lifecycle.connection
-    sessions_with_data: set[str] = set()
-    for row in conn.execute("SELECT DISTINCT session_id FROM messages").fetchall():
-        sessions_with_data.add(str(row[0]))
-    for row in conn.execute("SELECT DISTINCT session_id FROM summary_nodes").fetchall():
-        sessions_with_data.add(str(row[0]))
-
-    empty_current = 0
-    empty_finalized = 0
-    empty_protected = 0
-    rows = conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
-    for row in rows:
-        cur = str(row["current_session_id"] or "")
-        fin = str(row["last_finalized_session_id"] or "")
-        if ((cur and cur in sessions_with_data)
-                or (fin and fin in sessions_with_data)):
-            continue
-        refs = {r for r in (cur, fin) if r}
-        if refs & protected:
-            empty_protected += 1
-            continue
-        if cur and not fin:
-            empty_current += 1
-        else:
-            empty_finalized += 1
-
-    total_empty = empty_current + empty_finalized
-    if total_empty == 0:
-        return "\n".join([
-            "LCM doctor clean lifecycle",
-            "status: ok",
-            f"lifecycle_rows: {count}",
-            "empty_rows: 0",
-            "note: no empty lifecycle rows to prune",
-        ])
-
-    return "\n".join([
-        "LCM doctor clean lifecycle",
-        "status: candidates-found",
-        f"lifecycle_rows: {count}",
-        f"empty_rows: {total_empty}",
-        f"  empty_current: {empty_current}",
-        f"  empty_finalized: {empty_finalized}",
-        f"  empty_protected: {empty_protected}",
-        "note: read-only scan — no rows were deleted",
-        "note: empty rows reference sessions with zero messages and zero nodes",
-        "note: use `/lcm doctor clean lifecycle apply` to delete empty rows",
-    ])
-
-
-def _doctor_clean_lifecycle_apply_text(engine) -> str:
-    if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
-        return "\n".join([
-            "LCM doctor clean lifecycle apply",
-            "status: denied",
-            "error: destructive cleanup is disabled by default",
-            "note: set LCM_DOCTOR_CLEAN_APPLY_ENABLED=true only in trusted operator environments",
-            "note: no rows were deleted",
-        ])
-
-    backup = backup_database(engine)
-    if not backup["ok"]:
-        return "\n".join([
-            "LCM doctor clean lifecycle apply",
-            "status: error",
-            "error: failed to create backup before destructive cleanup",
-            f"database_path: {backup['db_path']}",
-            f"backup_error: {backup['error']}",
-            "note: no rows were deleted",
-        ])
-
-    before = engine._lifecycle.row_count()
-    protected = {str(getattr(engine, "_session_id", "") or "")}
-    protected = {s for s in protected if s}
-
-    try:
-        deleted = engine._lifecycle.prune_empty_sessions(
-            protected_session_ids=protected,
-        )
-    except Exception as exc:
-        return "\n".join([
-            "LCM doctor clean lifecycle apply",
-            "status: error",
-            "error: failed to prune empty sessions",
-            f"backup_path: {backup['backup_path']}",
-            f"prune_error: {exc}",
-            "note: no rows were deleted",
-        ])
-
-    after = engine._lifecycle.row_count()
-    return "\n".join([
-        "LCM doctor clean lifecycle apply",
-        "status: ok",
-        f"lifecycle_rows_before: {before}",
-        f"lifecycle_rows_deleted: {deleted}",
-        f"lifecycle_rows_remaining: {after}",
-        f"backup_path: {backup['backup_path']}",
-        f"backup_size_bytes: {backup['backup_size']}",
-        "note: only empty lifecycle rows were deleted — messages and nodes untouched",
-    ])
 
 
 def _backup_text(engine) -> str:
@@ -1659,25 +973,11 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
     if head == "doctor":
         if not rest:
             return _doctor_text(engine)
-        if len(rest) == 1 and rest[0].lower() == "clean":
-            return _doctor_clean_text(engine)
         if len(rest) == 1 and rest[0].lower() == "repair":
             return _doctor_repair_text(engine)
-        if len(rest) == 1 and rest[0].lower() == "source":
-            return _doctor_source_text(engine)
-        if len(rest) == 1 and rest[0].lower() == "retention":
-            return _doctor_retention_text(engine)
-        if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "apply":
-            return _doctor_clean_apply_text(engine)
-        if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "lifecycle":
-            return _doctor_clean_lifecycle_text(engine)
-        if len(rest) == 3 and rest[0].lower() == "clean" and rest[1].lower() == "lifecycle" and rest[2].lower() == "apply":
-            return _doctor_clean_lifecycle_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
             return _doctor_repair_apply_text(engine)
-        if len(rest) == 2 and rest[0].lower() == "source" and rest[1].lower() == "apply":
-            return _doctor_source_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention` as extra subcommands.")
+        return _help_text("`/lcm doctor` currently supports `repair` and `repair apply` as extra subcommands.")
 
     if head == "backup":
         if rest:

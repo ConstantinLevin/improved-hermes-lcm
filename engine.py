@@ -1441,31 +1441,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
 
-        # Garbage-collect empty lifecycle rows when the table exceeds threshold.
-        # Gateway restarts, ephemeral cron ticks, and crash-loops all create
-        # lifecycle rows that never ingest data — prune them here so they
-        # don't accumulate forever.
-        if (
-            self._config.empty_lifecycle_gc_enabled
-            and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
-        ):
-            protected = {str(self._session_id)} if self._session_id else None
-            max_age = self._config.empty_lifecycle_gc_max_age_hours
-            try:
-                deleted = self._lifecycle.prune_empty_sessions(
-                    protected_session_ids=protected,
-                    max_age_hours=max_age,
-                )
-            except Exception:
-                deleted = 0
-            if deleted:
-                logger.info(
-                    "LCM pruned %d lifecycle rows with zero stored data "
-                    "(table exceeded threshold of %d rows)",
-                    deleted,
-                    self._config.empty_lifecycle_gc_threshold,
-                )
-
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
         conversation_id = str(self._conversation_id or "")
@@ -3124,18 +3099,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lifecycle.record_reset(self._conversation_id)
         self._reset_session_scoped_runtime_state()
 
-        # Retain DAG nodes across sessions based on config.
-        #   -1  → keep all nodes
-        #    0  → delete everything
-        #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
-        retain = self._config.new_session_retain_depth
-        if self._session_id and retain != -1:
-            if retain == 0:
-                self._dag.delete_session_nodes(self._session_id)
-            else:
-                self._dag.delete_below_depth(self._session_id, retain)
-
-
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
         """Move retained summaries from the old session into the new one.
 
@@ -3155,72 +3118,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return 0
         return self._dag.reassign_session_nodes(old_session_id, new_session_id)
 
-    def rollover_session(
-        self,
-        old_session_id: str,
-        new_session_id: str,
-        previous_messages: List[Dict[str, Any]] | None = None,
-        carry_over_context: bool = True,
-        **kwargs,
-    ) -> int:
-        """Complete a Hermes-style `/new` rollover for this engine.
-
-        This is a small helper for host/runtime integrations that need the
-        correct lifecycle ordering in one call:
-        1. flush old-session messages into the store
-        2. prune/reset retained DAG state on the old session
-        3. bind the engine to the new session
-        4. optionally move retained summaries into the new session
-        """
-        previous_messages = previous_messages or []
-        boundary_reason = str(kwargs.get("boundary_reason") or "")
-        conversation_id = self._conversation_id or old_session_id or new_session_id
-        bound_session_id = self._session_id
-        can_carry_over = bool(
-            old_session_id and bound_session_id and old_session_id == bound_session_id
-        )
-
-        if carry_over_context and boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
-            before_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
-            if can_carry_over:
-                self.on_session_end(old_session_id, previous_messages)
-            else:
-                logger.warning(
-                    "LCM compression rollover old_session_id=%s does not match bound session=%s; using boundary handler fallback",
-                    old_session_id,
-                    bound_session_id,
-                )
-            self.on_session_start(
-                new_session_id,
-                old_session_id=old_session_id,
-                **kwargs,
-            )
-            after_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
-            return len(after_node_ids - before_node_ids)
-
-        if old_session_id and can_carry_over:
-            self.on_session_end(old_session_id, previous_messages)
-            self.on_session_reset()
-        elif old_session_id and not carry_over_context:
-            logger.warning(
-                "LCM rollover skipped old-session finalization: old_session_id=%s does not match bound session=%s",
-                old_session_id,
-                bound_session_id,
-            )
-        elif old_session_id and not can_carry_over:
-            logger.warning(
-                "LCM carry-over skipped: old_session_id=%s does not match bound session=%s",
-                old_session_id,
-                bound_session_id,
-            )
-
-        self.on_session_start(new_session_id, conversation_id=conversation_id, **kwargs)
-
-        if not carry_over_context:
-            return 0
-        if old_session_id and not can_carry_over:
-            return 0
-        return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [

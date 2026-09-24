@@ -105,10 +105,6 @@ class LifecycleStateStore:
         """
         return getattr(self, "_conn", None)
 
-    def row_count(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()
-        return int(row["count"] if row else 0)
-
     def _row_to_state(self, row: sqlite3.Row | None) -> LifecycleState | None:
         if row is None:
             return None
@@ -306,69 +302,6 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(state.conversation_id)
 
-    @_synchronized
-    def record_rollover(
-        self,
-        conversation_id: str,
-        *,
-        old_session_id: str,
-        new_session_id: str,
-        finalized_frontier_store_id: int = 0,
-    ) -> LifecycleState:
-        state = self.get_by_conversation(conversation_id)
-        if (
-            state is not None
-            and state.current_session_id == new_session_id
-            and state.last_finalized_session_id == old_session_id
-        ):
-            return state
-
-        now = time.time()
-        last_finalized_frontier = max(
-            int(finalized_frontier_store_id or 0),
-            state.last_finalized_frontier_store_id if state else 0,
-        )
-        self._conn.execute(
-            """
-            INSERT INTO lcm_lifecycle_state(
-                conversation_id,
-                current_session_id,
-                last_finalized_session_id,
-                current_frontier_store_id,
-                last_finalized_frontier_store_id,
-                current_bound_at,
-                last_finalized_at,
-                last_rollover_at,
-                last_reset_at,
-                updated_at
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(conversation_id) DO UPDATE SET
-                current_session_id = excluded.current_session_id,
-                last_finalized_session_id = excluded.last_finalized_session_id,
-                current_frontier_store_id = 0,
-                last_finalized_frontier_store_id = excluded.last_finalized_frontier_store_id,
-                current_bound_at = excluded.current_bound_at,
-                last_finalized_at = excluded.last_finalized_at,
-                last_rollover_at = excluded.last_rollover_at,
-                last_reset_at = excluded.last_reset_at,
-                updated_at = excluded.updated_at
-            """,
-            (
-                conversation_id,
-                new_session_id,
-                old_session_id,
-                last_finalized_frontier,
-                now,
-                now,
-                now,
-                now,
-                now,
-            ),
-        )
-        self._conn.commit()
-        updated = self.get_by_conversation(conversation_id)
-        assert updated is not None
-        return updated
 
     def get_fragmentation_stats(self, state_db_path: str | Path | None = None) -> dict[str, Any]:
         """Return read-only lifecycle/session fragmentation diagnostics.
@@ -537,14 +470,14 @@ class LifecycleStateStore:
             lifecycle_current_sessions - lcm_any_sessions,
             severity="warn",
             description="Lifecycle current-session references that no longer have raw messages or summary nodes in LCM.",
-            recommended_action="Inspect samples before cleanup; these are often old or ephemeral lifecycle rows, not automatic corruption.",
+            recommended_action="Inspect samples; these are often old or ephemeral lifecycle rows, not automatic corruption.",
         )
         add_category(
             "stale_lifecycle_finalized",
             lifecycle_last_finalized_sessions - lcm_any_sessions,
             severity="warn",
             description="Lifecycle finalized-session references that no longer have raw messages or summary nodes in LCM.",
-            recommended_action="Inspect samples before cleanup; only remove with an explicit backup-first lifecycle cleanup flow.",
+            recommended_action="Inspect samples; these are often old or ephemeral lifecycle rows, not automatic corruption.",
         )
         if lifecycle_rows > 0:
             add_category(
@@ -691,159 +624,6 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
-    @_synchronized
-    def prune_empty_sessions(
-        self,
-        *,
-        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
-        max_age_hours: float | None = None,
-    ) -> int:
-        """Delete lifecycle rows for sessions with no stored data.
-
-        A row is eligible when BOTH referenced session IDs
-        (``current_session_id`` and ``last_finalized_session_id``)
-        have zero messages AND zero summary_nodes in the main store.
-
-        Only the lifecycle table is modified — messages, nodes, and FTS
-        indexes are untouched (they already contain no data for these sessions).
-
-        Args:
-            protected_session_ids: Sessions that must never be deleted
-                (typically the actively-bound engine session).
-            max_age_hours: Only delete rows older than this many hours.
-                ``None`` means delete all eligible rows regardless of age.
-
-        Returns:
-            Number of rows deleted.
-        """
-        conn = self._conn
-        assert conn is not None
-        protected = {str(s) for s in (protected_session_ids or ()) if s}
-
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            sessions_with_data: set[str] = set()
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-
-            def _session_has_data(session_id: str) -> bool:
-                if not session_id:
-                    return False
-                if "messages" in tables and conn.execute(
-                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                if "summary_nodes" in tables and conn.execute(
-                    "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                return False
-
-            if "messages" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM messages"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-            if "summary_nodes" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM summary_nodes"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-
-            now = time.time()
-            max_age_seconds = (
-                float(max_age_hours) * 3600.0
-                if max_age_hours is not None
-                else None
-            )
-            deleted = 0
-
-            rows = conn.execute(
-                "SELECT * FROM lcm_lifecycle_state"
-            ).fetchall()
-            for row in rows:
-                cur = str(row["current_session_id"] or "")
-                fin = str(row["last_finalized_session_id"] or "")
-
-                if ((cur and cur in sessions_with_data)
-                        or (fin and fin in sessions_with_data)):
-                    continue
-
-                refs = {r for r in (cur, fin) if r}
-                if refs & protected:
-                    continue
-
-                if max_age_seconds is not None:
-                    row_age = (
-                        row["current_bound_at"]
-                        or row["last_finalized_at"]
-                        or row["updated_at"]
-                    )
-                    if row_age is not None and (now - float(row_age)) < max_age_seconds:
-                        continue
-
-                # Recheck against the tables right before deletion. BEGIN
-                # IMMEDIATE blocks concurrent writers while this transaction is
-                # open; this fresh query also keeps the safety check honest if
-                # the broad snapshot logic above changes later.
-                if _session_has_data(cur) or _session_has_data(fin):
-                    continue
-
-                conn.execute(
-                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (row["conversation_id"],),
-                )
-                deleted += 1
-
-            if deleted:
-                conn.commit()
-            else:
-                conn.rollback()
-            return deleted
-        except Exception:
-            conn.rollback()
-            raise
-
-    def delete_safe_rows_for_sessions(
-        self,
-        session_ids: set[str] | list[str] | tuple[str, ...],
-        *,
-        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
-    ) -> tuple[int, int]:
-        candidates = {str(s) for s in session_ids if s}
-        if not candidates:
-            return 0, 0
-        protected = {str(s) for s in (protected_session_ids or ()) if s}
-        deleted = 0
-        skipped = 0
-        rows = self._conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
-        for row in rows:
-            refs = {
-                str(value)
-                for value in (row["current_session_id"], row["last_finalized_session_id"])
-                if value
-            }
-            if not refs or not (refs & candidates):
-                continue
-            if refs & protected:
-                skipped += 1
-                continue
-            if refs <= candidates:
-                self._conn.execute(
-                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (row["conversation_id"],),
-                )
-                deleted += 1
-                continue
-            skipped += 1
-        if deleted:
-            self._conn.commit()
-        return deleted, skipped
 
     def advance_frontier(
         self,

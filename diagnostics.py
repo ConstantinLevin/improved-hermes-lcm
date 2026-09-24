@@ -48,16 +48,12 @@ def state_db_path_for_engine(engine: Any) -> Path:
 def has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
     """Return whether lifecycle diagnostics should be treated as warning evidence.
 
-    Retained-history drift is intentionally read-only diagnostic context. Keep the
-    doctor warning for concrete operator action (empty lifecycle rows that the
-    explicit backup-first cleanup path can prune) or diagnostic unreadability, but
-    do not make overall health unhealthy solely because historical LCM/state
-    indexes no longer agree.
+    Retained-history drift, including lifecycle rows with no stored data, is
+    read-only diagnostic context. Warn only when the diagnostic could not read the
+    host state database; do not make overall health unhealthy solely because
+    historical LCM/state indexes no longer agree.
     """
-    empty_lifecycle_rows = int(stats.get("empty_lifecycle_rows", 0) or 0)
-    return empty_lifecycle_rows > 0 or (
-        bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
-    )
+    return bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
 
 
 def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
@@ -110,13 +106,13 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = "inspect LCM_* environment/config values and adjust only intentional operator overrides"
     elif name == "source_lineage_hygiene" and status == "warn":
         action = DOCTOR_ACTION_SAFE_IGNORE
-        command = "safe to ignore legacy blank-source observations; use `/lcm doctor source` only when you intentionally want backup-first normalization"
-        rationale = "legacy blank sources are normalized to unknown for compatibility"
+        command = "safe to ignore legacy blank-source observations"
+        rationale = "legacy blank sources are read as unknown for compatibility"
     elif name == "source_lineage_hygiene":
-        command = "inspect source-lineage diagnostics and SQLite read errors before running any source normalization workflow"
+        command = "inspect source-lineage diagnostics and SQLite read errors"
         rationale = "source-lineage failures indicate the doctor could not read attribution state reliably"
     elif name == "lifecycle_fragmentation":
-        command = "inspect lifecycle categories; only use explicit backup-first lifecycle cleanup for empty lifecycle rows"
+        command = "inspect lifecycle categories and the host state database path"
         if status == "warn":
             warning_only = True
             rationale = "not every lifecycle/state mismatch is harmful or safe to mutate"
@@ -127,10 +123,6 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = "safe to ignore if compaction proceeds normally; inspect lcm_status only if pressure stays high or compaction loops"
         warning_only = True
         rationale = "context pressure is an operating state, not persisted-state corruption"
-    elif name == "cleanup_candidates":
-        action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
-        command = "run `/lcm doctor clean` first; if candidates are expected junk/noise, run `/lcm backup` before `/lcm doctor clean apply`"
-        rationale = "candidate cleanup deletes rows and must stay preview-and-backup gated"
 
     return {
         "check": name,

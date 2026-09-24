@@ -18,7 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -28,9 +28,6 @@ from .db_bootstrap import (
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
-
-_DELETE_SESSION_SCOPE_TABLE = "temp_lcm_delete_session_scope"
-_DELETE_SESSION_SCOPE_INSERT_CHUNK = 512
 from .search_query import (
     AGE_DECAY_RATE,
     compute_search_candidate_cap,
@@ -159,8 +156,6 @@ class SummaryNode:
 class SummaryDAG:
     """SQLite-backed DAG of summary nodes."""
 
-    DELETE_SESSION_SCOPE_TABLE = _DELETE_SESSION_SCOPE_TABLE
-
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
@@ -270,123 +265,6 @@ class SummaryDAG:
             node.node_id = cur.lastrowid
             return node.node_id
 
-    @staticmethod
-    def stage_delete_session_scope(
-        conn: sqlite3.Connection,
-        session_ids: Sequence[str],
-    ) -> int:
-        """Stage an arbitrarily large caller-owned session scope in TEMP SQL."""
-        normalized = tuple(sorted({str(value) for value in session_ids if value}))
-        conn.execute(
-            f"CREATE TEMP TABLE IF NOT EXISTS {_DELETE_SESSION_SCOPE_TABLE}("
-            "session_id TEXT PRIMARY KEY) WITHOUT ROWID"
-        )
-        conn.execute(f"DELETE FROM {_DELETE_SESSION_SCOPE_TABLE}")
-        for offset in range(0, len(normalized), _DELETE_SESSION_SCOPE_INSERT_CHUNK):
-            conn.executemany(
-                f"INSERT INTO {_DELETE_SESSION_SCOPE_TABLE}(session_id) VALUES(?)",
-                ((value,) for value in normalized[offset:offset + _DELETE_SESSION_SCOPE_INSERT_CHUNK]),
-            )
-        return len(normalized)
-
-    @staticmethod
-    def delete_node_batch(
-        conn: sqlite3.Connection,
-        session_ids: Sequence[str],
-        *,
-        min_depth: int | None = None,
-        batch_size: int = 256,
-        staged_scope: bool = False,
-    ) -> list[int]:
-        """Delete and return one deterministic, SQL-bounded node-id batch.
-
-        The caller owns transaction boundaries. Temporal invalidation remains
-        trigger-owned; the returned exact ids are for external consumers such
-        as the embedding purge and are never pre-enumerated corpus-wide.
-        """
-        limit = max(1, min(256, int(batch_size)))
-        if not staged_scope and not SummaryDAG.stage_delete_session_scope(conn, session_ids):
-            return []
-        where = "1 = 1"
-        args: list[object] = []
-        order = "n.session_id, n.node_id"
-        if min_depth is not None:
-            where += " AND n.depth < ?"
-            args.append(int(min_depth))
-            order = "n.session_id, n.depth, n.node_id"
-        rows = conn.execute(
-            f"SELECT n.node_id FROM summary_nodes AS n "
-            f"JOIN {_DELETE_SESSION_SCOPE_TABLE} AS scope "
-            f"ON scope.session_id = n.session_id WHERE {where} "
-            f"ORDER BY {order} LIMIT ?",
-            (*args, limit),
-        ).fetchall()
-        node_ids = [int(row[0]) for row in rows]
-        if node_ids:
-            id_placeholders = ",".join("?" for _ in node_ids)
-            conn.execute(
-                f"DELETE FROM summary_nodes WHERE node_id IN ({id_placeholders})",
-                node_ids,
-            )
-        return node_ids
-
-    def _delete_nodes_batched(
-        self,
-        session_id: str,
-        *,
-        min_depth: int | None,
-        on_deleted_batch: Callable[[list[int]], None] | None,
-    ) -> int:
-        deleted = 0
-        while True:
-            with self._db_lock:
-                try:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    node_ids = self.delete_node_batch(
-                        self._conn,
-                        (session_id,),
-                        min_depth=min_depth,
-                    )
-                    self._conn.commit()
-                except Exception:
-                    self._conn.rollback()
-                    raise
-            if not node_ids:
-                return deleted
-            deleted += len(node_ids)
-            if on_deleted_batch is not None:
-                on_deleted_batch(node_ids)
-
-    def delete_below_depth(
-        self,
-        session_id: str,
-        min_depth: int,
-        *,
-        on_deleted_batch: Callable[[list[int]], None] | None = None,
-    ) -> int:
-        """Delete all nodes for a session with depth < min_depth.
-
-        Returns the number of deleted nodes. Used during session reset
-        to retain only high-level summaries across sessions.
-        """
-        return self._delete_nodes_batched(
-            session_id,
-            min_depth=min_depth,
-            on_deleted_batch=on_deleted_batch,
-        )
-
-    def delete_session_nodes(
-        self,
-        session_id: str,
-        *,
-        on_deleted_batch: Callable[[list[int]], None] | None = None,
-    ) -> int:
-        """Delete all nodes for a session. Returns count deleted."""
-        return self._delete_nodes_batched(
-            session_id,
-            min_depth=None,
-            on_deleted_batch=on_deleted_batch,
-        )
 
     def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:
         """Move all nodes from one session_id to another.
@@ -432,29 +310,6 @@ class SummaryDAG:
                 ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
-    def get_session_node_ids_below_depth(
-        self, session_id: str, min_depth: int | None
-    ) -> List[int]:
-        """All node ids for a session that a reset would delete, UNBOUNDED.
-
-        ``min_depth=None`` returns every node id (the retain=0 case); otherwise it
-        returns ids with ``depth < min_depth``. Unlike :meth:`get_session_nodes`
-        (which caps at ``limit=1000``), this returns the complete set so
-        deletion-driven rollup staleness covers every removed node, not just the
-        first 1000.
-        """
-        with self._db_lock:
-            if min_depth is None:
-                rows = self._conn.execute(
-                    "SELECT node_id FROM summary_nodes WHERE session_id = ?",
-                    (session_id,),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT node_id FROM summary_nodes WHERE session_id = ? AND depth < ?",
-                    (session_id, min_depth),
-                ).fetchall()
-        return [int(r[0]) for r in rows if r[0] is not None]
 
     def count_at_depth(self, session_id: str, depth: int) -> int:
         """Count nodes at a specific depth for a session."""
