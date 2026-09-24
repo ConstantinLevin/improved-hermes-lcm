@@ -51,11 +51,13 @@ jobs:
     # It proves import, registration and selection; nothing about compaction, the tools,
     # the hooks, or a session.
     runs-on: ubuntu-latest
-    env:
-      HERMES_HOME: ${{ runner.temp }}/hermes-home
-      HERMES_SRC: ${{ runner.temp }}/hermes-agent
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set scratch paths
+        run: |
+          echo "HERMES_HOME=$RUNNER_TEMP/hermes-home" >> "$GITHUB_ENV"
+          echo "HERMES_SRC=$RUNNER_TEMP/hermes-agent" >> "$GITHUB_ENV"
 
       - name: Clone the latest Hermes main
         run: |
@@ -85,6 +87,9 @@ jobs:
           printf 'plugins:\n  enabled:\n    - hermes-lcm\ncontext:\n  engine: lcm\n' > "$HERMES_HOME/config.yaml"
 
       - name: Load the plugin and let the host select its context engine
+        # Run outside the checkout: from its root, the plugin's own tools.py would shadow
+        # the host's `tools` package on sys.path.
+        working-directory: ${{ runner.temp }}
         env:
           PYTHONPATH: ${{ runner.temp }}/hermes-agent
         run: |
