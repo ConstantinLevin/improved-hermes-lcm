@@ -221,6 +221,18 @@ class CompactionMixin:
             used += msg_tokens
         return selected
 
+    def _unchanged_return(self, messages: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
+        """No compaction: the host's own list, the same object with the same dicts.
+
+        Nothing is re-assembled, sanitised or dropped: when no compaction happens the
+        context stays untouched. The host then logs "made no progress" and commits
+        nothing (``_candidate_rejected``, ``agent/conversation_compression.py:3547-3563``).
+        """
+        self._publish("_last_compression_status", "noop")
+        self._publish("_last_compression_noop_reason", reason)
+        logger.info("LCM compression no-op: %s", reason)
+        return messages
+
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
@@ -319,35 +331,19 @@ class CompactionMixin:
                     "working_list_misaligned",
                     f"{len(working_messages)} working entries for {len(messages)} host entries",
                 )
-        ingest_cleanup_changed_active_context = working_messages != messages
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
             and not force_overflow
         )
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
         if cleanup_only_due_to_boundary_cooldown:
-            sanitized_messages = self._sanitize_active_context_messages(
-                working_messages,
-                insert_missing_tool_stubs=False,
+            return self._unchanged_return(
+                messages,
+                "boundary cooldown: no compaction, so the context is returned unchanged",
             )
-            self._publish("_ingest_cursor", len(sanitized_messages))
-            self._publish("_last_compression_status", "sanitized")
-            self._publish("_last_compression_noop_reason", "")
-            self._write_generated_ignored_placeholder_hash_counts(
-                self._generated_placeholder_digest_budget_for_active_replay(
-                    sanitized_messages
-                )
-            )
-            self._write_generated_ignored_placeholder_hash_ordinals(
-                self._generated_placeholder_digest_ordinals_for_active_replay(
-                    sanitized_messages
-                )
-            )
-            return sanitized_messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
-        dropped_replayed_scaffold_messages = False
         leaf_passes = 0
         estimated_active_tokens = (
             observed_prompt_tokens
@@ -423,7 +419,6 @@ class CompactionMixin:
             ):
                 candidate_start += 1
             if candidate_start > leading_anchor_count:
-                dropped_replayed_scaffold_messages = True
                 working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
                 pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
                 candidate_start = leading_anchor_count
@@ -459,7 +454,6 @@ class CompactionMixin:
                     kept_working.append(working_msg)
                     kept_pressure.append(pressure_msg)
                 if dropped_generated_placeholder:
-                    dropped_replayed_scaffold_messages = True
                     working_messages = (
                         working_messages[:candidate_start]
                         + kept_working
@@ -655,55 +649,10 @@ class CompactionMixin:
             sweep_stop_reason = "pass_budget_exhausted"
 
         if not leaf_compacted_this_turn:
-            if force_overflow and len(messages) >= 1:
-                leading_anchor_count = self._leading_anchor_count(working_messages)
-                compressed = self._assemble_overflow_recovery_context(
-                    working_messages[0] if leading_anchor_count else None,
-                    working_messages[leading_anchor_count:],
-                    assembly_cap_override=recovery_assembly_cap,
-                )
-                return self._finalize_forced_overflow_result(
-                    working_messages,
-                    compressed,
-                    assembly_cap_override=recovery_assembly_cap,
-                    ingest_cleanup_changed_active_context=ingest_cleanup_changed_active_context,
-                )
-            active_context_messages = working_messages
-            if dropped_replayed_scaffold_messages:
-                leading_anchor_count = self._leading_anchor_count(active_context_messages)
-                anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
-                self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
-                try:
-                    sanitized_messages = self._assemble_context(
-                        active_context_messages[0] if leading_anchor_count else None,
-                        active_context_messages[leading_anchor_count:],
-                        assembly_cap_override=recovery_assembly_cap,
-                    )
-                finally:
-                    self._pending_context_anchor_messages = None
-            else:
-                sanitized_messages = self._sanitize_active_context_messages(
-                    active_context_messages,
-                    insert_missing_tool_stubs=False,
-                )
-            if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
-                # _ingest_messages() already advanced the cursor to the original
-                # active-context length. If the host continues from a sanitized
-                # or reassembled context, keeping the old cursor could make the
-                # next appended messages look already ingested. This applies to
-                # content-only cleanup as well as dropped-message cleanup.
-                self._publish("_ingest_cursor", len(sanitized_messages))
-                self._publish("_last_compression_status", "sanitized")
-                self._publish("_last_compression_noop_reason", "")
-            else:
-                if dropped_replayed_scaffold_messages:
-                    # The active context changed even though no new leaf node was
-                    # written. Keep the cursor aligned with the returned context
-                    # so the next appended turn is ingested instead of skipped.
-                    self._publish("_ingest_cursor", len(sanitized_messages))
-                self._publish("_last_compression_status", "noop")
-                self._publish("_last_compression_noop_reason", noop_reason)
-                logger.info("LCM compression no-op: %s", noop_reason)
+            if force_overflow:
+                # No leaf pass: nothing is cut, dropped or truncated to fit.
+                self._publish("_last_overflow_recovery_failed", True)
+                noop_reason = f"forced overflow recovery made no leaf pass ({noop_reason})"
             if threshold_full_sweep_active:
                 duration_ms = (time.perf_counter() - _compress_started) * 1000.0
                 self._publish("_last_threshold_full_sweep", {
@@ -714,13 +663,7 @@ class CompactionMixin:
                     "budget_exhausted": sweep_stop_reason
                     in {"pass_budget_exhausted", "time_budget_exhausted"},
                 })
-            self._write_generated_ignored_placeholder_hash_counts(
-                self._generated_placeholder_digest_budget_for_active_replay(sanitized_messages)
-            )
-            self._write_generated_ignored_placeholder_hash_ordinals(
-                self._generated_placeholder_digest_ordinals_for_active_replay(sanitized_messages)
-            )
-            return sanitized_messages
+            return self._unchanged_return(messages, noop_reason)
 
         # Step 6: Check if condensation is needed. A threshold full sweep only
         # condenses after the eligible raw prefix has been drained, and shares

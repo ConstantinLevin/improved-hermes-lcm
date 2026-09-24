@@ -2586,7 +2586,6 @@ class LCMEngine(
         system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
-        include_lcm_note: bool = True,
     ) -> List[Dict[str, Any]]:
         """Build the active context from DAG summaries + fresh tail.
 
@@ -2605,7 +2604,6 @@ class LCMEngine(
             if (
                 leading_msg.get("role") == "system"
                 and self.compression_count == 0
-                and include_lcm_note
             ):
                 leading_msg["content"] = self._append_lcm_note_to_content(
                     leading_msg.get("content", "")
@@ -2791,48 +2789,6 @@ class LCMEngine(
             return False
         return True
 
-    def _finalize_forced_overflow_result(
-        self,
-        original_messages: List[Dict[str, Any]],
-        compressed: List[Dict[str, Any]],
-        assembly_cap_override: Optional[int] = None,
-        ingest_cleanup_changed_active_context: bool = False,
-    ) -> List[Dict[str, Any]]:
-        if compressed != original_messages or ingest_cleanup_changed_active_context:
-            self._publish("_last_compression_status", "overflow_recovery")
-            self._publish("_last_compression_noop_reason", "")
-            self._publish("_ingest_cursor", len(compressed))
-            self._publish("_ingest_cursor_needs_reconcile", False)
-            logger.info(
-                "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
-                len(original_messages),
-                len(compressed),
-            )
-        else:
-            self._publish("_last_compression_status", "noop")
-            self._publish(
-                "_last_compression_noop_reason",
-                "forced overflow recovery found no droppable active-context messages",
-            )
-
-        effective_cap = (
-            assembly_cap_override
-            if assembly_cap_override is not None
-            else self._effective_assembly_token_cap()
-        )
-        if effective_cap is None:
-            self._publish("_last_overflow_recovery_failed", False)
-        else:
-            overflow_recovery_failed = count_messages_tokens(compressed) > effective_cap
-            self._publish("_last_overflow_recovery_failed", overflow_recovery_failed)
-            if overflow_recovery_failed:
-                logger.warning(
-                    "LCM overflow recovery could not get under cap=%d; returning best-effort context (%d tokens)",
-                    effective_cap,
-                    count_messages_tokens(compressed),
-                )
-        return compressed
-
     def _should_force_overflow_recovery(
         self,
         observed_tokens: Optional[int] = None,
@@ -2908,53 +2864,6 @@ class LCMEngine(
         return max(1, min(caps))
 
     # -- Internal: helpers -------------------------------------------------
-
-    def _assemble_overflow_recovery_context(
-        self,
-        system_msg: Optional[Dict[str, Any]],
-        tail_messages: List[Dict[str, Any]],
-        assembly_cap_override: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        if tail_messages:
-            first = tail_messages[0]
-            content = first.get("content") or ""
-            role = first.get("role") or ""
-            if role == "assistant" and self._looks_like_active_summary_blob(content):
-                candidate = self._assemble_context(
-                    system_msg,
-                    tail_messages[1:],
-                    assembly_cap_override=assembly_cap_override,
-                    include_lcm_note=False,
-                )
-                if any(
-                    (msg.get("content") or "") == content
-                    for msg in (candidate[1:] if system_msg is not None else candidate)
-                ):
-                    return candidate
-
-        candidate = self._assemble_context(
-            system_msg,
-            tail_messages,
-            assembly_cap_override=assembly_cap_override,
-            include_lcm_note=False,
-        )
-        minimum_candidate_len = 1 if system_msg is not None else 0
-        if len(candidate) == minimum_candidate_len and tail_messages:
-            fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
-            return self._sanitize_active_context_messages(fallback)
-        return candidate
-
-    @staticmethod
-    def _looks_like_active_summary_blob(content: str) -> bool:
-        if not isinstance(content, str) or not content:
-            return False
-        block = (
-            r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]\n"
-            r".*?\n"
-            r"\[Expand for details: .*?\]"
-        )
-        pattern = rf"^{block}(?:\n\n---\n\n{block})*$"
-        return re.fullmatch(pattern, content, flags=re.DOTALL) is not None
 
     def _derive_auto_focus_topic(
         self,
