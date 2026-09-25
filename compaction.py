@@ -41,8 +41,9 @@ In order:
    one exception is a run below c/4 standing before or between kept chunks, which
    joins one of them (D1), with an event each time: the join recurs where the joined
    chunk is never dispatched. A chunk not found again, a dispatched one below c/4 by
-   today's estimate, and one with members that came without a host id (the gateway,
-   ask A1) are cut again, visibly: a warning and a store event. When only a rest below
+   today's estimate, and one with rows that came without a host identity (the
+   gateway's replayed history, host scaffolding never persisted; the ask to Hermes is
+   A1) are cut again, visibly: a warning and a store event. When only a rest below
    c/4 stands outside the tail, nothing is compacted (a no-op, not a failure); where
    such a rest would begin before the plugin's last summary (D3's shape), the
    compaction is aborted, unchanged, with an event. The compaction,
@@ -180,8 +181,8 @@ class TailPlan:
 class FrozenCandidates:
     """The earlier attempts' chunks found in this list (``found``, each as
     (``FrozenChunk``, positions)), those not found (``recut``, each as
-    (``FrozenChunk``, why)), and the chunks that carry a member without a host id
-    (``unidentified``, each as (chunk, attempt); ruling 3 on #61)."""
+    (``FrozenChunk``, why)), and the chunks with rows that came without a host identity
+    (``unidentified``, each as (chunk, attempt, those member records); ruling 3 on #61)."""
 
     found: List[tuple] = field(default_factory=list)
     recut: List[tuple] = field(default_factory=list)
@@ -547,7 +548,7 @@ class CompactionMixin:
         for rows the store already holds) each position must hold that very record,
         so that a row the host rewrote since makes a different chunk. Where no id
         matches, as after a commit by another path, nothing is kept. A chunk that is
-        not found, and one whose members came without a host id, are re-cut: the
+        not found, and one with rows that came without a host identity, are re-cut: the
         caller says so visibly (ruling 3 on #61). Nothing is matched by content."""
         result = FrozenCandidates()
         if not self._plugin_session:
@@ -865,27 +866,34 @@ class CompactionMixin:
             return DEFAULT_CALLS_PER_ENDPOINT
 
     def _judge_failure(self, attempt, chunk_handle: str, number: int, total: int, records: List[str],
-                       unidentified: bool, failure: str, kind: str, record: bool = True) -> str:
+                       unidentified: List[str], failure: str, kind: str,
+                       record: bool = True) -> tuple[str, bool]:
         """Record a chunk's failure with its kind and say what the host shows for it,
         where the failure is recorded, whether or not an attempt still waits for it
-        (ruling on #61, 4). A call several attempts joined is one trial of the chunk:
-        only the subscriber that ``record``s writes its failure and the events; the
-        others read the streak it left and name the chunk the same way.
+        (ruling on #61, 4). Returns (the cause, whether this call wrote the failure).
+        A call several attempts joined is one trial of the chunk: only the subscriber
+        asked to ``record`` writes its failure and the events; the others read the
+        streak it left and name the chunk the same way. Where the write raises, the
+        failure is not recorded and the next subscriber of the call is asked.
 
         Only the chunk's own failures count (ruling on #61, 2): a reply the checks
         rejected, or a request the provider rejected. Where a chunk of exactly these
         members failed by its own fault in ``_KEEPS_FAILING_ATTEMPTS`` consecutive
         attempts, this one included, the chunk keeps failing (#7, #33): a store event
-        names it, and so does the cause. Where a member came without a host id (ruling
-        3 on #61, ask A1), the chunk's records are new at every attempt and its
-        earlier failures cannot be counted: each own failure of it is named. Nothing
-        else changes: the next occasion retries it."""
+        names it, and so does the cause. ``unidentified`` are the chunk's member records
+        whose rows came without a host identity (``_row_id``): the gateway's replayed
+        history, or host scaffolding the host never persists. Such a chunk's records
+        are new at every attempt, so its earlier failures cannot be counted: each own
+        failure of it is named, with those rows. Nothing else changes: the next
+        occasion retries it."""
         name = (f"chunk {chunk_handle} ({len(records)} message{'' if len(records) == 1 else 's'}, records "
                 f"{records[0]} to {records[-1]})" if records else f"chunk {chunk_handle}")
+        recorded = False
         try:
             if record:
                 streak = self._records.chunk_failed(chunk_handle, failure, kind=kind, session=attempt.session,
                                                     records=records)
+                recorded = True
             else:
                 streak = self._records.failure_streak(attempt.session, records)
         except Exception as exc:
@@ -896,23 +904,24 @@ class CompactionMixin:
             whose = {"route": "another route answered or was resolved (#33 D9)",
                      "endpoint": "the endpoint failed"}.get(kind, "a failure of no kind known as the chunk's own")
             return (f"the summary of {name}, {number} of {total}, failed ({failure}): {whose}, which does not "
-                    f"count toward the chunk's own failures")
+                    f"count toward the chunk's own failures"), recorded
         detail = {"chunk": chunk_handle, "members": len(records), "first_record": records[0] if records else None,
                   "last_record": records[-1] if records else None, "error": failure}
         if unidentified:
-            if record:
-                self._record_event(attempt, "chunk_failed_unidentified", detail)
-            return (f"{name} failed with: {failure}. Its members came without a host id (the host's list carries "
-                    f"none, ask A1), so whether it failed before cannot be counted")
+            if recorded:
+                self._record_event(attempt, "chunk_failed_unidentified", {**detail, "without_identity": unidentified})
+            return (f"{name} failed with: {failure}. It has rows without a host identity (records "
+                    f"{', '.join(unidentified)}), so whether it failed before cannot be counted (the ask to "
+                    f"Hermes: A1)"), recorded
         if streak is not None and streak >= _KEEPS_FAILING_ATTEMPTS:
-            if record:
+            if recorded:
                 self._record_event(attempt, "chunk_keeps_failing", {**detail, "attempts": streak})
             return (f"{name} failed in {streak} consecutive attempts, the last with: {failure}. A chunk that keeps "
-                    f"failing is a defect to debug (#7); the next occasion retries it as the same chunk")
-        return f"the summary of {name}, {number} of {total}, failed ({failure})"
+                    f"failing is a defect to debug (#7); the next occasion retries it as the same chunk"), recorded
+        return f"the summary of {name}, {number} of {total}, failed ({failure})", recorded
 
     def _deliver_for(self, attempt, chunk_handle: str, number: int, total: int, records: List[str],
-                     unidentified: bool):
+                     unidentified: List[str]):
         """How one attempt's chunk receives its call's outcome, on whichever thread has
         it: the summary is written as a derivation of this chunk (#33 Q17a: not fenced,
         a fact about the chunk's content); a failure is recorded and judged there
@@ -945,9 +954,9 @@ class CompactionMixin:
                 logger.warning("LCM summary of chunk %d of %d failed (%s): %s", number, total, kind, failure)
                 self._record_event(attempt, "summary_failed",
                                    {"chunk": chunk_handle, "number": number, "kind": kind, "error": failure})
-                cause = self._judge_failure(attempt, chunk_handle, number, total, records, unidentified,
-                                            failure or "", kind, record)
-                return Outcome(failure=failure, cause=cause)
+                cause, recorded = self._judge_failure(attempt, chunk_handle, number, total, records,
+                                                      unidentified, failure or "", kind, record)
+                return Outcome(failure=failure, cause=cause, recorded=recorded)
             return Outcome(failure=failure)
 
         return deliver
@@ -1199,14 +1208,19 @@ class CompactionMixin:
             self._record_event(attempt, "frozen_cut_unreadable", repr(exc))
             return self._abort(messages, f"the chunks of the earlier attempt could not be read ({exc})")
         if frozen.unidentified:
-            # One line per attempt: without host ids no earlier chunk is ever found again,
-            # and a line per chunk would grow with every attempt (the gateway, ask A1).
-            attempts = sorted({compaction for _chunk, compaction in frozen.unidentified})
-            logger.warning("LCM cuts again %d dispatched or summarised chunks of %d earlier attempts: their members "
-                           "came without a host id (the host's list carries none, ask A1), so they cannot be found "
-                           "in this list", len(frozen.unidentified), len(attempts))
+            # One line and one event per attempt: a chunk with rows that came without a
+            # host identity (the gateway's replayed history, or host scaffolding the host
+            # never persists) is never found again by identity.
+            attempts = sorted({compaction for _chunk, compaction, _rows in frozen.unidentified})
+            named = "; ".join(f"chunk {chunk} (rows without identity: records {', '.join(rows)})"
+                              for chunk, _compaction, rows in frozen.unidentified)
+            logger.warning("LCM cuts again %d dispatched or summarised chunks of %d earlier attempts, each with rows "
+                           "that came without a host identity, so they cannot be found in this list by identity: %s. "
+                           "The ask to Hermes: A1", len(frozen.unidentified), len(attempts), named)
             self._record_event(attempt, "frozen_cut_unidentified",
-                               {"chunks": len(frozen.unidentified), "attempts": attempts})
+                               {"attempts": attempts,
+                                "chunks": [{"chunk": chunk, "attempt": compaction, "without_identity": list(rows)}
+                                           for chunk, compaction, rows in frozen.unidentified]})
         try:
             plan = self._tail_plan(messages, mechanism, occasion, frozen.found)
         except ToolPairingError as exc:
@@ -1393,9 +1407,11 @@ class CompactionMixin:
                 raise AttemptCancelled()
             records = [attempt.records[index] for index in chunk]
             chunk_messages = [json.loads(facts[record][1]) for record in records]
-            # A member without a host id is recorded anew at every attempt, so this
-            # chunk's earlier failures cannot be counted (ruling 3 on #61).
-            unidentified = any(not isinstance(messages[index].get("_row_id"), int) for index in chunk)
+            # A member whose row has no host identity (the gateway's replayed history, or
+            # host scaffolding the host never persists) is recorded anew at every attempt,
+            # so this chunk's earlier failures cannot be counted (ruling 3 on #61).
+            unidentified = [attempt.records[index] for index in chunk
+                            if not isinstance(messages[index].get("_row_id"), int)]
             subscriber = Subscriber(wanted=still_wanted, hook=hook, deadline=deadline,
                                     deliver=self._deliver_for(attempt, chunk_handle, number, len(chunks),
                                                               records, unidentified),

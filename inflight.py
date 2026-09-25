@@ -195,6 +195,9 @@ class Outcome:
     derivation: Optional[str] = None
     failure: Optional[str] = None
     cause: Optional[str] = None
+    # Whether this subscriber wrote the call's failure into the store: only then is the
+    # call's failure recorded, and no later subscriber records it again.
+    recorded: bool = False
 
 
 class Subscriber:
@@ -205,8 +208,9 @@ class Subscriber:
     progress hook and deadline read on its ``compress()`` thread; ``deliver`` writes the
     summary as a derivation of the attempt's own chunk, or records why there is none,
     and returns the ``Outcome``. It runs on the thread that has the result. A call's
-    failure is recorded once, by the first subscriber it is delivered to (``record``):
-    one call is one trial of the chunk, however many attempts joined it."""
+    failure is recorded once (``record``): one call is one trial of the chunk, however
+    many attempts joined it. The subscriber asked to record it says whether the write
+    succeeded (``Outcome.recorded``); where it did not, the next subscriber is asked."""
 
     def __init__(self, *, wanted: Callable[[], bool], hook: Optional[Callable[[], Any]],
                  deadline: Optional[float],
@@ -230,8 +234,8 @@ class Subscriber:
                kind: Optional[str] = None, record: bool = True) -> None:
         """Deliver, then say so: the outcome is set before ``on_done`` is called, so
         whoever is told reads a complete outcome. ``kind`` is a failure's kind
-        (``escalation.FAILURE_KINDS``); ``record`` whether this subscriber records the
-        call's failure (the first one it reaches) or only reads what was recorded."""
+        (``escalation.FAILURE_KINDS``); ``record`` whether this subscriber is to record
+        the call's failure (no earlier one has) or only read what was recorded."""
         try:
             self.outcome = self._deliver(summary, failure, abandoned, kind, record)
         except BaseException as exc:  # a store closed meanwhile, or anything else: never swallowed silently
@@ -257,8 +261,8 @@ class ChunkCall:
         # provider (``sent``; #33 D14: a dispatched chunk is kept on a retry).
         self._on_sent = on_sent
         self._sent = False
-        # Whether the call's failure has been handed to a subscriber to record.
-        self._failure_recorder_taken = False
+        # Whether a subscriber has written the call's failure into the store.
+        self._failure_recorded = False
         self._lock = threading.Lock()
         self._subscribers: list[Subscriber] = []
         self._delivered = 0
@@ -313,20 +317,28 @@ class ChunkCall:
 
     def sent(self) -> None:
         """The host dispatched a request of this call to the provider (its dispatch
-        stamp, ``escalation._DispatchStamp``): ``on_sent`` is told the first time. It
-        runs on the thread the host sends from (the worker, or the host's protected
-        provider thread, which carries the hook over)."""
+        stamp, ``escalation._DispatchStamp``): ``on_sent`` records it, until once it has
+        succeeded. A write that raises leaves the dispatch unrecorded, so the host's next
+        stamp of this call (a retry, level 2) records it; the exception goes on to the
+        stamp, which warns. It runs on the thread the host sends from (the worker, or the
+        host's protected provider thread, which carries the hook over)."""
         with self._lock:
-            first, self._sent = not self._sent, True
-        if first and self._on_sent is not None:
+            if self._sent:
+                return
+        if self._on_sent is not None:
             self._on_sent()
-
-    def take_failure_recorder(self) -> bool:
-        """True exactly once per call: the subscriber that gets it records the call's
-        failure; every later one only reads what was recorded (one call, one trial)."""
         with self._lock:
-            first, self._failure_recorder_taken = not self._failure_recorder_taken, True
-        return first
+            self._sent = True
+
+    def failure_recorded(self) -> bool:
+        """Whether a subscriber has written the call's failure into the store."""
+        with self._lock:
+            return self._failure_recorded
+
+    def mark_failure_recorded(self) -> None:
+        """The call's failure is in the store: later subscribers only read it."""
+        with self._lock:
+            self._failure_recorded = True
 
     def still_needed(self) -> bool:
         """Whether any attempt still wants the call. Where none does, the call leaves
@@ -393,7 +405,12 @@ def _close(call: ChunkCall, summary: Optional[ChunkSummary], failure: Optional[s
                     del _REGISTRY[call.key]
                 return
         for subscriber in pending:
-            subscriber.finish(summary, failure, abandoned, kind, record=call.take_failure_recorder())
+            # The right to record is used up only by a write that succeeded: where the
+            # store refused it, the next subscriber records the failure.
+            record = not call.failure_recorded()
+            subscriber.finish(summary, failure, abandoned, kind, record=record)
+            if record and subscriber.outcome is not None and subscriber.outcome.recorded:
+                call.mark_failure_recorded()
 
 
 def _worker(call: ChunkCall, run: Callable[[ChunkCall], ChunkSummary],

@@ -31,8 +31,9 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 
 Each failure carries a kind (``FAILURE_KINDS``). Only a reply the checks rejected and a
 request the provider rejected (HTTP 400, 413, 422) are the chunk's own and count toward
-"keeps failing"; another model answering (D9), a rate limit, a deadline and every other
-failure of the endpoint do not (ruling on #61, 2).
+"keeps failing"; another model answering (D9), a rate limit, a deadline, a malformed
+response and every other failure of the endpoint do not (ruling on #61, 2). Where level 1
+failed by the chunk's own kind and level 2 by another, the failure is still the chunk's.
 
 A call is dispatched when the host says so: ``latency_info``'s ``provider_dispatch_ms``,
 stamped immediately before the request goes to the provider's client
@@ -247,7 +248,8 @@ def configured_route_problem(config: Any) -> Optional[str]:
 
 
 # What a failure says about its chunk (#33; ruling on #61, 2): ``reply``, a reply the
-# plugin's checks rejected; ``request``, the provider rejecting the request (HTTP 400,
+# plugin's checks rejected (a well-formed reply; a malformed one is the endpoint's);
+# ``request``, the provider rejecting the request (HTTP 400,
 # 413, 422); ``route``, another model answered or the host resolved another route (D9);
 # ``endpoint``, a rate limit, a timeout, a connection error, no time left, any other
 # status; ``other``, an exception that is none of these. Only the first two are the
@@ -430,8 +432,9 @@ class _DispatchStamp(dict):
             try:
                 self._sent()
             except Exception as exc:
-                logger.warning("LCM could not record that a summariser call was dispatched (%s: %s); a retry "
-                               "cuts its chunk again", type(exc).__name__, exc)
+                logger.warning("LCM could not record that a summariser call was dispatched (%s: %s); the "
+                               "call's next send records it, else a retry cuts its chunk again",
+                               type(exc).__name__, exc)
 
 
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
@@ -489,7 +492,10 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         choice = response.choices[0]
         message = choice.message
     except Exception as exc:
-        raise SummaryFailure("malformed reply", transient=False, kind="reply",
+        # The endpoint's fault, not the chunk's (orchestrator ruling on a3f2505): the
+        # response has no shape to read. A well-formed reply with no summary in it is the
+        # chunk's ("reply carries no summary" below): the model answered and wrote nothing.
+        raise SummaryFailure("malformed reply", transient=False, kind="endpoint",
                              detail=f"no choices[0].message ({type(exc).__name__})") from None
     finish_reason = getattr(choice, "finish_reason", None)
     content = getattr(message, "content", None)
@@ -645,10 +651,19 @@ def summarize_chunk(
             content, finish_reason = _call_with_retries(
                 l2, source=source, settings=settings, path=path)
         except SummaryFailure as second:
+            # The chunk's own failure is not lost to what level 2 met (orchestrator ruling
+            # on a3f2505): where either level failed by the chunk's own kind, the combined
+            # failure is the chunk's, level 2's own kind first, else level 1's.
+            if second.kind in OWN_FAILURE_KINDS:
+                kind = second.kind
+            elif first.kind in OWN_FAILURE_KINDS:
+                kind = first.kind
+            else:
+                kind = second.kind
             raise SummaryFailure(
                 f"level 1: {first}; level 2: {second.reason}",
                 transient=second.transient,
-                kind=second.kind,
+                kind=kind,
                 detail=second.detail,
                 retry_after=second.retry_after,
             ) from second

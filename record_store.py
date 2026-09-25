@@ -349,7 +349,8 @@ class RecordStore:
             return "dispatched"
         return None
 
-    def frozen_chunks(self, session: str, after: Optional[int]) -> tuple[list[FrozenChunk], list[tuple[str, int]]]:
+    def frozen_chunks(self, session: str, after: Optional[int]
+                      ) -> tuple[list[FrozenChunk], list[tuple[str, int, tuple[str, ...]]]]:
         """The chunks a retry keeps (#33 D14, #31): those of the session's attempts
         after its effective compaction that the host neither confirmed, adopted nor
         rejected, whose members were summarised or dispatched, the newest attempt's cut
@@ -357,9 +358,11 @@ class RecordStore:
         member carries the ``_row_id`` its row had in that attempt's list: ids hold
         until a commit (#29 W2 step 8), so the retry recognises the chunk by identity.
 
-        A chunk with a member whose row came without a ``_row_id`` (the gateway's
-        history; ruling 3 on #61, ask A1) can never be found again. Such chunks are
-        returned apart, as (chunk, compaction), and none is kept."""
+        A chunk with a member whose row came without a host identity (``_row_id``) can
+        never be found again by identity: the gateway's replayed history carries none,
+        and host scaffolding the host never persists has none on the CLI either (ruling
+        3 on #61; the ask to Hermes is A1). Such chunks are returned apart, as (chunk,
+        compaction, the member records without identity), and none is kept."""
         compactions = [int(c) for (c,) in self._q(
             "SELECT c.compaction_id FROM compactions c WHERE c.session = ? AND c.compaction_id > ? "
             "AND NOT EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
@@ -370,7 +373,7 @@ class RecordStore:
         )]
         taken: set = set()
         frozen: list[FrozenChunk] = []
-        unidentified: list[tuple[str, int]] = []
+        unidentified: list[tuple[str, int, tuple[str, ...]]] = []
         for compaction in compactions:
             for (chunk,) in self._q("SELECT handle FROM chunks WHERE compaction = ? ORDER BY rowid", (compaction,)):
                 members = tuple(
@@ -389,8 +392,9 @@ class RecordStore:
                 if state is None:
                     continue
                 taken.update(records)
-                if any(row_id is None for _record, row_id in members):
-                    unidentified.append((str(chunk), compaction))
+                without = tuple(record for record, row_id in members if row_id is None)
+                if without:
+                    unidentified.append((str(chunk), compaction, without))
                     continue
                 frozen.append(FrozenChunk(str(chunk), compaction, members, state))
         return frozen, unidentified

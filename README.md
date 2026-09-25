@@ -31,8 +31,9 @@ summarised keeps its summary, a chunk whose call the host dispatched is retried 
 and only the rest is cut again, visibly. A chunk of the same messages failing by its own fault
 (its reply rejected, or its request refused) in three consecutive attempts is shown as an error
 naming it, and is still retried; rate limits, deadlines and other endpoint failures do not count
-(#33, #7). Where the host's list carries no message ids, as in the gateway, a retry cannot find
-the earlier cut, and says so (ask A1). Compaction runs
+(#33, #7). A chunk with rows that came without a host identity (the gateway's replayed
+history, or host scaffolding the host never persists) cannot be found again by a retry, which
+cuts it again and names those rows (the ask to Hermes: A1). Compaction runs
 at a threshold derived from the model's window, raised by a margin while a turn runs, and
 brings the context down to a target G (#11, #31, #32); the material outside the tail is split
 into equal chunks of 50k provider tokens (#12), and the tail takes what the target leaves,
