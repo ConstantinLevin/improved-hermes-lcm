@@ -371,7 +371,32 @@ def _doctor_text(engine) -> str:
         quick_check = f"error: {exc}"
         issues.append("sqlite_quick_check")
 
+    # The record's invariant (#29 W7, #34 D5) and what the plugin could not do.
+    try:
+        store_identity = engine._records.identity()
+        invariant_reports = engine._records.check_invariant()
+        store_events = engine._records.recent_events()
+        invariant_error = ""
+    except Exception as exc:  # pragma: no cover - defensive
+        store_identity, invariant_reports, store_events = {}, [], []
+        invariant_error = str(exc)
+    invariant_failing = [report for report in invariant_reports if report["status"] != "pass"]
+    if invariant_error or invariant_failing:
+        issues.append("record_invariant")
+
     observations: list[str] = []
+    if invariant_error:
+        observations.append(f"record_invariant: error: {invariant_error}")
+    for report in invariant_failing:
+        observations.append(
+            f"record_invariant: session {report['session']} (compaction {report['compaction']}): "
+            f"{report['problem_count']} problem(s): " + "; ".join(report["problems"])
+        )
+    if store_events:
+        observations.append(
+            "store_events (newest first): "
+            + "; ".join(f"{event['kind']} ({event['session'] or '-'}): {event['detail'] or ''}" for event in store_events)
+        )
 
     if schema_health.get("error"):
         observations.append(f"schema_core_tables: error: {schema_health['error']}")
@@ -433,6 +458,9 @@ def _doctor_text(engine) -> str:
         })
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
+    if invariant_error or invariant_failing:
+        triage_checks.append({"check": "record_invariant", "status": "fail",
+                              "detail": invariant_error or invariant_failing})
     triage_guidance = doctor_guidance_for_checks(triage_checks)
 
     doctor_status = "issues-found" if integrity != "ok" or issues else (
@@ -466,6 +494,12 @@ def _doctor_text(engine) -> str:
         f"messages_fts_rows: {store_fts_count}",
         f"nodes_fts: {node_fts}",
         f"nodes_fts_rows: {node_fts_count}",
+        f"store_format: {store_identity.get('format', '(unknown)')}",
+        f"store_uuid: {store_identity.get('store_uuid', '(unknown)')}",
+        "record_invariant: "
+        + ("error" if invariant_error else "fail" if invariant_failing else "pass")
+        + f" ({len(invariant_reports)} session(s) checked)",
+        f"store_events_recent: {len(store_events)}",
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")

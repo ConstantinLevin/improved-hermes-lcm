@@ -50,6 +50,15 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
             warning_only = True
         else:
             rationale = "DAG diagnostic failures mean doctor could not read summary/source state reliably"
+    elif name == "record_invariant":
+        command = (
+            "inspect the named records, chunks and summary entries of the failing session's latest "
+            "compaction; the record is insert-only, so nothing is repaired in place"
+        )
+        rationale = (
+            "a record on the branch that nothing reaches, or reaches twice, means the context and the "
+            "store disagree about what the agent holds (#29 W7)"
+        )
     elif name == "summary_quality":
         command = "inspect worst_nodes and retrieval behavior; treat as summary quality evidence, not cleanup input"
         if status == "warn":
