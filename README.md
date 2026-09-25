@@ -21,7 +21,10 @@ fails the compaction: nothing is truncated in its place, the context stays as it
 shows the cause, and compaction is tried again at the next occasion (#7). The summariser is the
 model running the session, called on the route the host names for it, unless another is
 configured (`LCM_SUMMARY_MODEL` with `LCM_SUMMARY_PROVIDER`); a reply from any other model is a
-failed summary (#9). The rest of its behaviour is
+failed summary (#9). The summariser reads a chunk's stored records as the messages they were, in
+full: tool calls and results whole, readable reasoning marked, images only where it reads them;
+encrypted reasoning is withheld until the plugin knows which provider produced it (#8). The rest
+of its behaviour is
 upstream's, including every loss listed below. The fork is not usable for its purpose yet; the
 work is the issues in this repository's tracker.
 
@@ -29,10 +32,6 @@ work is the issues in this repository's tracker.
 
 Each line was read in this tree's code.
 
-- **Cuts the summariser's input.** Before the summariser sees a chunk, every message over 3,000
-  characters is cut to its first 2,000 and its last 800, and every tool call's arguments over 500
-  characters to their first 400 (`engine.py`, `_serialize_messages`). The fork's summariser will
-  read the store's originals in full (#8).
 - **Sizes the fresh tail by message count.** The verbatim tail is the newest 32 messages; a token
   cap exists but is off by default (`fresh_tail.py`, `config.py`). The fork will size the tail in
   tokens, as a weight of the real window (#13).

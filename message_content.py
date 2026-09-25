@@ -126,6 +126,37 @@ def describe_image_part(part: dict) -> str:
     return f"{kind} of another shape"
 
 
+def image_media_type(part: dict) -> str:
+    """An image part's media type, read from its structure: the data URL's header or
+    the Anthropic source's ``media_type``; "remote URL" or "file id" where the part
+    carries no data. Never the data itself."""
+    source = part.get("source")
+    if isinstance(source, dict):
+        if source.get("type") == "base64":
+            return str(source.get("media_type") or "no media type")
+        return "remote URL" if source.get("type") == "url" else f"source of type {source.get('type')}"
+    value = part.get("image_url", part.get("url"))
+    if isinstance(value, dict):
+        value = value.get("url")
+    if isinstance(value, str) and value.startswith("data:"):
+        return value[5:].partition(",")[0].split(";")[0] or "no media type"
+    if isinstance(value, str) and value:
+        return "remote URL"
+    if part.get("file_id"):
+        return "file id"
+    return "unknown shape"
+
+
+def content_parts(content: Any) -> list | None:
+    """The content's list of parts, looking inside the ``_multimodal`` envelope; None
+    for a string or no content."""
+    return _parts(content)
+
+
+def is_image_part(part: Any) -> bool:
+    return _is_image_part(part)
+
+
 def _index_parts(parts: list) -> list[str]:
     pieces: list[str] = []
     for part in parts:

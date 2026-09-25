@@ -29,10 +29,6 @@ from .engine_registry import (
     resolve_active_lcm_engine,  # noqa: F401  (re-exported: hosts import it from .engine)
 )
 from .escalation import configured_route_problem
-from .extraction import (
-    sanitize_pre_compaction_content,
-    sanitize_pre_compaction_tool_arguments,
-)
 from .runtime_identity import (
     _PLUGIN_ROOT,
     _git_runtime_identity,
@@ -45,11 +41,6 @@ from .schemas import (
     LCM_GREP,
     LCM_INSPECT,
     LCM_STATUS,
-)
-from .message_analysis import (
-    _is_synthetic_assistant_noise,
-    _matched_tool_call_ids,
-    _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .backup import DailyBackup
@@ -978,58 +969,6 @@ class LCMEngine(
         self.api_mode = str(api_mode or "")
         self._set_context_length(context_length, source="update_model")
         self._update_model_pending_session_start = True
-
-    # -- Internal: summarization -------------------------------------------
-
-    def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
-        """Serialize messages into labeled text for the summarizer."""
-        parts = []
-        matched_tool_ids = _matched_tool_call_ids(messages)
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
-            if role == "tool":
-                tool_id = str(msg.get("tool_call_id") or "").strip()
-                content = sanitize_pre_compaction_content(content)
-                if len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
-                continue
-
-            content = sanitize_pre_compaction_content(content)
-
-            if role == "assistant":
-                tool_calls = msg.get("tool_calls", [])
-                matched_tool_calls = [
-                    tc for tc in tool_calls
-                    if not _tool_call_id(tc) or _tool_call_id(tc) in matched_tool_ids
-                ]
-                if _is_synthetic_assistant_noise(content):
-                    if not matched_tool_calls:
-                        continue
-                    content = ""
-                if len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                if matched_tool_calls:
-                    tc_parts = []
-                    for tc in matched_tool_calls:
-                        if isinstance(tc, dict):
-                            fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = fn.get("arguments", "")
-                            args = sanitize_pre_compaction_tool_arguments(args)
-                            if len(args) > 500:
-                                args = args[:400] + "..."
-                            tc_parts.append(f"  {name}({args})")
-                    content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-                parts.append(f"[ASSISTANT]: {content}")
-                continue
-
-            if len(content) > 3000:
-                content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-            parts.append(f"[{role.upper()}]: {content}")
-
-        return "\n\n".join(parts)
 
     # -- Internal: overflow recovery ----------------------------------------
 

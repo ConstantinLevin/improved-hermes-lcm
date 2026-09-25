@@ -1,4 +1,7 @@
-"""The summariser call for one chunk (#7, #9).
+"""The summariser call for one chunk (#7, #8, #9).
+
+The summariser reads the chunk's records as the messages they were, between its
+instructions (today's text) and a closing request; ``summariser_input`` builds that.
 
 The call names its whole route: provider, model, base URL, key and API mode, either
 the session's own as the host handed it to ``update_model`` or the one configured for
@@ -50,9 +53,9 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Optional
 
-from .prompt_boundary import build_untrusted_data_messages
+from .summariser_input import WireFacts, summariser_messages
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -470,33 +473,35 @@ def _call_with_retries(
 
 
 def summarize_chunk(
-    text: str,
+    records: list[tuple[str, dict]],
     token_budget: int,
     *,
     source_tokens: int,
     settings: CallSettings,
+    facts: WireFacts,
     depth: int = 0,
     focus_topic: str = "",
     custom_instructions: str = "",
-    source_provenance: Mapping[str, Any] | None = None,
     wait: Callable[[float], None] = _default_wait,
 ) -> tuple[str, int, str]:
     """Summarise one chunk: (summary, level, finish_reason), or ``SummaryFailure``.
 
-    ``source_tokens`` is the count of the chunk's records, what the summary replaces
-    in the context; a reply must come in below it, by the same counter (R6).
+    ``records`` are the chunk's records as (handle, the host's dict as stored); the
+    summariser reads them as the messages they were (#8, ``summariser_input``).
+    ``source_tokens`` is their count, what the summary replaces in the context; a
+    reply must come in below it, by the same counter (R6).
 
     Level 1; after a non-transient failure of level 1, level 2 once (today's texts,
     until #10). A transient failure that outlasts the deadline is not retried at
     level 2: the next level would meet the same provider with no time left.
     """
-    l1 = _build_l1_prompt(
-        text,
-        token_budget,
-        depth,
-        focus_topic=focus_topic,
-        custom_instructions=custom_instructions,
-        source_provenance=source_provenance,
+    request = _summary_request(focus_topic=focus_topic, custom_instructions=custom_instructions)
+    l1 = summariser_messages(
+        records,
+        instructions=_l1_instructions(token_budget, depth, focus_topic=focus_topic,
+                                      custom_instructions=custom_instructions),
+        request=request,
+        facts=facts,
     )
     try:
         content, finish_reason = _call_with_retries(
@@ -506,13 +511,12 @@ def summarize_chunk(
         if first.transient:
             raise
         logger.warning("LCM level-1 summary failed (%s); trying level 2", first)
-        l2 = _build_l2_prompt(
-            text,
-            int(token_budget * _L2_BUDGET_RATIO),
-            focus_topic=focus_topic,
-            custom_instructions=custom_instructions,
-            source_provenance=source_provenance,
-            source_depth=depth,
+        l2 = summariser_messages(
+            records,
+            instructions=_l2_instructions(int(token_budget * _L2_BUDGET_RATIO), focus_topic=focus_topic,
+                                          custom_instructions=custom_instructions),
+            request=request,
+            facts=facts,
         )
         try:
             content, finish_reason = _call_with_retries(
@@ -554,25 +558,6 @@ _HISTORICAL_HEADING_MARKERS = (
 )
 
 
-def _summary_source(
-    text: str,
-    *,
-    depth: int,
-    source_provenance: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    if source_provenance is None:
-        provenance = {
-            "source_type": "messages" if depth == 0 else "summary_nodes",
-            "source_depth": depth,
-        }
-    else:
-        provenance = dict(source_provenance)
-    # Session identifiers remain in the local DAG lineage. They are not needed
-    # for summarization and can contain stable platform or account identifiers.
-    provenance.pop("session_id", None)
-    return {"provenance": provenance, "content": text}
-
-
 def _summary_request(
     *,
     focus_topic: str,
@@ -587,15 +572,13 @@ def _summary_request(
     return request
 
 
-def _build_l1_prompt(
-    text: str,
+def _l1_instructions(
     token_budget: int,
     depth: int,
     focus_topic: str = "",
     custom_instructions: str = "",
-    source_provenance: Mapping[str, Any] | None = None,
-) -> list[dict[str, str]]:
-    """Build a role-separated Level 1 prompt over untrusted source data."""
+) -> str:
+    """Level 1's instructions, today's text (#10 owns the words)."""
     depth_guidance = {
         0: "Preserve decisions, rationale, constraints, active tasks, file paths, commands, and specific values.",
         1: "Distill into arc-level outcomes: what evolved, what was decided, current state. Drop per-turn detail.",
@@ -624,32 +607,15 @@ historical sections."""
 Remove repetition and conversational filler.
 End with: "Expand for details about: <what was compressed>"
 Target approximately {int(token_budget)} tokens.{focus_guidance}{custom_guidance}"""
-    return build_untrusted_data_messages(
-        operation="lcm_summary_l1",
-        system_instructions=system_instructions,
-        request=_summary_request(
-            focus_topic=focus_topic,
-            custom_instructions=custom_instructions,
-        ),
-        sources=[
-            _summary_source(
-                text,
-                depth=depth,
-                source_provenance=source_provenance,
-            )
-        ],
-    )
+    return system_instructions
 
 
-def _build_l2_prompt(
-    text: str,
+def _l2_instructions(
     token_budget: int,
     focus_topic: str = "",
     custom_instructions: str = "",
-    source_provenance: Mapping[str, Any] | None = None,
-    source_depth: int = 0,
-) -> list[dict[str, str]]:
-    """Build a role-separated Level 2 prompt over untrusted source data."""
+) -> str:
+    """Level 2's instructions, today's text (#10 owns the words)."""
     focus_guidance = ""
     if focus_topic:
         markers = " / ".join(f"'{marker}'" for marker in _HISTORICAL_HEADING_MARKERS)
@@ -668,18 +634,4 @@ Reduce resolved topics to one-liners or drop. Keep active blockers and pending h
     system_instructions = f"""Compress the supplied source into bullet points. Maximum {int(token_budget)} tokens.
 Keep only decisions made, files changed, errors hit, blockers, and current state.
 Drop reasoning, alternatives considered, and process detail.{focus_guidance}{custom_guidance}"""
-    return build_untrusted_data_messages(
-        operation="lcm_summary_l2",
-        system_instructions=system_instructions,
-        request=_summary_request(
-            focus_topic=focus_topic,
-            custom_instructions=custom_instructions,
-        ),
-        sources=[
-            _summary_source(
-                text,
-                depth=source_depth,
-                source_provenance=source_provenance,
-            )
-        ],
-    )
+    return system_instructions
