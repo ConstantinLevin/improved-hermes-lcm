@@ -41,7 +41,6 @@ from .schemas import (
     LCM_INSPECT,
     LCM_STATUS,
 )
-from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .backup import DailyBackup
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
@@ -364,6 +363,9 @@ class LCMEngine(
         if self._closed_reason is not None:
             return
         self._closed_reason = reason
+        if not getattr(self, "_review_fork", False):
+            # The list its session's last request sent is not kept past the engine (R10).
+            turn_signals.drop_request_list(self._session_id)
         self._unregister_active_engine_binding()
         self._close_storage(reason)
 
@@ -664,6 +666,7 @@ class LCMEngine(
             # when this prompt is below threshold_tokens.
             self.awaiting_real_usage_after_compression = False
             self._verify_compaction_cleared_threshold = False
+            self._measure_fixed_prefix()
 
         cache_keys = {"cache_read_tokens", "cache_write_tokens"}
         self.cache_metrics_available = any(key in usage for key in cache_keys)
@@ -713,18 +716,61 @@ class LCMEngine(
             echo = False
         return Estimator(image_model=self.model, reasoning_sent=echo)
 
-    def _fresh_tail_boundary(self, messages: List[Dict[str, Any]]) -> FreshTailBoundary:
-        # The newest message is always in the tail (#31's floor): no setting makes
-        # the tail empty, so the return always ends with the host's own newest dict.
-        return resolve_fresh_tail_boundary(
-            messages,
-            fresh_tail_count=max(1, int(self._config.fresh_tail_count or 0)),
-            fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
-            estimator=self._estimator(),
-        )
+    def _fixed_prefix_fact(self) -> Optional[Dict[str, Any]]:
+        """The session's latest ``fixed_prefix`` fact: {"F", "list_estimate",
+        "error_bound", ...}, or None."""
+        if not self._plugin_session:
+            return None
+        value = self._sessions.latest_fact(self._plugin_session, "fixed_prefix")
+        if value is None:
+            return None
+        try:
+            fact = json.loads(value)
+        except ValueError:
+            return None
+        return fact if isinstance(fact, dict) and isinstance(fact.get("F"), int) else None
 
-    def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
-        return self._fresh_tail_boundary(messages).start
+    def _measure_fixed_prefix(self) -> None:
+        """R10: F, the fixed prefix (the system prompt, tool schemas and whatever else
+        the request carries beside the list), measured at every response of the plugin
+        session: the provider's prompt count less the list that request sent
+        (``pre_api_request``), the list's estimate converted by #31's p50.
+
+        The estimate's error scales with the list, so F is best where the list is
+        smallest. A new ``fixed_prefix`` fact is appended only when this response's list
+        is smaller by the estimate than the list behind the current F: the first
+        measurement always; after a compaction a better one replaces a worse one; a
+        larger list never. The latest fact wins. Each fact records its list estimate
+        and its error bound, (p99 − p50) × that list in provider tokens: F reads that
+        much too high where the provider counts the list at #31's p99 instead of its
+        p50. Until the first measurement F is the 32k hypothesis."""
+        if self._review_fork or self.last_prompt_tokens <= 0:
+            return
+        # The list is taken: this response measures it once, and it is not kept after.
+        sent = turn_signals.take_request_list(self._session_id)
+        if sent is None or not self._plugin_session:
+            return
+        try:
+            estimate = self._estimator().messages([m for m in sent if isinstance(m, dict)]).tokens
+            current = self._fixed_prefix_fact()
+            if current is not None and estimate >= int(current.get("list_estimate", 0)):
+                return
+            ratio = float(self._config.estimate_ratio)
+            spread = max(0.0, float(self._config.estimate_ratio_p99) - ratio)
+            fixed = int(self.last_prompt_tokens - estimate * ratio)
+            fact = {"F": max(0, fixed), "prompt_tokens": int(self.last_prompt_tokens), "list_estimate": estimate,
+                    "entries": len(sent), "error_bound": int(estimate * spread),
+                    "ratio": ratio, "ratio_p99": float(self._config.estimate_ratio_p99)}
+            self._sessions.add_fact(self._plugin_session, "fixed_prefix", json.dumps(fact),
+                                    signal="response", host_session_id=self._session_id or None)
+            logger.info("LCM measured F %d provider tokens (up to %d too high): the prompt's %d less %d by the "
+                        "estimate × %s, %d entries sent%s%s", fact["F"], fact["error_bound"], fact["prompt_tokens"],
+                        estimate, ratio, len(sent),
+                        f"; it replaces F {current['F']} measured with a list of {current.get('list_estimate')}"
+                        if current is not None else "",
+                        "; the difference was negative and is recorded as 0" if fixed < 0 else "")
+        except Exception:
+            logger.warning("LCM could not measure the fixed prefix", exc_info=True)
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
@@ -930,8 +976,11 @@ class LCMEngine(
         if session_id:
             previous = str(self._session_id or "")
             if previous and previous != session_id:
-                if not self._review_fork and turn_signals.turn_ended(previous, None):
-                    logger.info("LCM closed the turn left open under %s at the switch to %s", previous, session_id)
+                if not self._review_fork:
+                    if turn_signals.turn_ended(previous, None):
+                        logger.info("LCM closed the turn left open under %s at the switch to %s", previous,
+                                    session_id)
+                    turn_signals.drop_request_list(previous)
                 self._reset_session_scoped_runtime_state()
                 if not self._conversation_id or self._conversation_id == previous:
                     self._conversation_id = session_id
@@ -1072,6 +1121,7 @@ class LCMEngine(
             "tau_raised": self._geometry.tau_raised if self._geometry is not None else None,
             "target": self._geometry.target if self._geometry is not None else None,
             "turn": self._turn_label(),
+            "fixed_prefix": self._fixed_prefix()[1],
             "host_native_compaction": self._native_compaction_on,
             "native_compaction_refused": self._native_compaction_refusal or None,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),

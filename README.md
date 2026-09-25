@@ -23,18 +23,17 @@ model running the session, called on the route the host names for it, unless ano
 configured (`LCM_SUMMARY_MODEL` with `LCM_SUMMARY_PROVIDER`); a reply from any other model is a
 failed summary (#9). The summariser reads a chunk's stored records as the messages they were, in
 full: tool calls and results whole, readable reasoning marked, images only where it reads them;
-encrypted reasoning is withheld until the plugin knows which provider produced it (#8). The rest
-of its behaviour is
-upstream's, including every loss listed below. The fork is not usable for its purpose yet; the
-work is the issues in this repository's tracker.
-
-## What upstream does badly, and what the fork will do instead
-
-Each line was read in this tree's code.
-
-- **Sizes the fresh tail by message count.** The verbatim tail is the newest 32 messages; a token
-  cap exists but is off by default (`fresh_tail.py`, `config.py`). The fork will size the tail in
-  tokens, as a weight of the real window (#13).
+encrypted reasoning is withheld until the plugin knows which provider produced it (#8). A
+compaction's summariser calls, one per chunk, run at once, through one limiter per endpoint
+(#33). Compaction runs
+at a threshold derived from the model's window, raised by a margin while a turn runs, and
+brings the context down to a target G (#11, #31, #32); the material outside the tail is split
+into equal chunks of 50k provider tokens (#12), and the tail takes what the target leaves,
+sized in tokens, in whole tool groups (#13). The plugin counts by its own estimate, characters
+divided by four, converted to provider tokens by a measured ratio and labelled as an estimate
+wherever it is shown (#21). The fork is not usable for its purpose yet: condensation (#34), the
+re-insertion inside a turn (#14) and the rest of the issues in this repository's tracker are
+still to come.
 
 ## Working on it
 

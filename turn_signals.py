@@ -11,6 +11,8 @@ The hooks arrive on threads of their own, and the host clones the engine per age
   results (the host appends every result before the occasion after the round, #32 §3).
 - ``post_api_request`` of the same turn: a response arrived after them, so the list no
   longer ends with tool results.
+- ``pre_api_request`` of the same turn: the list a request sends, for the fixed prefix F
+  measured at each response (R10).
 - ``on_turn_complete`` (an engine method): the turn ended. The host skips it on some
   early exits (#32 P1), so a stale "in a turn" is possible; the list's structure then
   disagrees, and the occasion is a gap (D1).
@@ -74,6 +76,8 @@ def turn_began(session_id: str, turn_id: str, conversation_history: Optional[Lis
     with _LOCK:
         _STATES[str(session_id)] = TurnState(in_turn=True, turn_id=str(turn_id or ""),
                                              opening=_opening_row(conversation_history))
+        # A list of an earlier turn (one whose end the host skipped) is no request of this one.
+        _REQUEST_LISTS.pop(str(session_id), None)
 
 
 def _event(session_id: str, turn_id: str, event: str) -> None:
@@ -107,14 +111,51 @@ def turn_ended(session_id: str, turn_id: Optional[str]) -> bool:
         if turn_id is not None and str(turn_id) and current.turn_id and str(turn_id) != current.turn_id:
             return False
         _STATES[str(session_id)] = TurnState()
+        _REQUEST_LISTS.pop(str(session_id), None)
         return True
 
 
 def carry(old_session_id: str, new_session_id: str) -> None:
-    """A compaction boundary renamed the host session: its turn goes on under the new id."""
+    """A compaction boundary renamed the host session: its turn goes on under the new id.
+    The list the last request sent under the old id is dropped: it holds the dicts the
+    compaction replaced, and the next request under the new id sends its own."""
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return
     with _LOCK:
         current = _STATES.get(str(old_session_id))
         if current is not None:
             _STATES[str(new_session_id)] = current
+        _REQUEST_LISTS.pop(str(old_session_id), None)
+
+
+# R10: the list the newest request of a session sent (``pre_api_request``'s
+# ``conversation_history``, a shallow copy whose dicts are the live ones), for the
+# fixed prefix measured at its response. At most one per host session id, replaced at
+# every request, and dropped once its response is measured (``take_request_list``),
+# when the turn ends or a new one begins, when a compaction renames the id
+# (``carry``), and when the session leaves the engine (``drop_request_list``: a
+# switch, the engine's close). It never outlives the request it describes.
+_REQUEST_LISTS: Dict[str, List[Any]] = {}
+
+
+def request_sent(session_id: str, turn_id: str, conversation_history: Any) -> None:
+    """Only a request of the turn ``pre_llm_call`` opened for the session counts: the
+    review fork reuses its parent's id with turns of its own (C1)."""
+    if not session_id or not isinstance(conversation_history, list):
+        return
+    with _LOCK:
+        current = _STATES.get(str(session_id))
+        if current is None or not current.in_turn or current.turn_id != str(turn_id or ""):
+            return
+        _REQUEST_LISTS[str(session_id)] = conversation_history
+
+
+def take_request_list(session_id: str) -> Optional[List[Any]]:
+    """The list the session's newest request sent, removed: a response measures it once."""
+    with _LOCK:
+        return _REQUEST_LISTS.pop(str(session_id or ""), None)
+
+
+def drop_request_list(session_id: str) -> None:
+    with _LOCK:
+        _REQUEST_LISTS.pop(str(session_id or ""), None)
