@@ -1,39 +1,70 @@
-"""What the summariser reads for a chunk (#8): the chunk's records as the messages they
-were, never a serialisation of them (R1).
+"""What the summariser reads for a chunk (#8): the chunk's records as the messages the
+provider saw, never a serialisation of them (R1).
 
-Each message is read from the store's ``raw`` (the host's dict as it came) and handed
-over as the provider saw it, a reader over the raw that changes nothing stored:
+Each record's ``raw`` (the host's dict as it came) is made into the message the host
+would send for it, by the host's own rules, and then the plugin's own rules are
+applied on top. Nothing stored changes.
 
-- ``api_content``, the exact bytes the host sent where it differs from ``content``,
-  replaces ``content`` for user and assistant messages, as the host's own request
-  builder does (``substitute_api_content``, agent/turn_context.py at 7b761da);
-- the host's bookkeeping fields go: its persistence-only fields
-  (``PERSISTENCE_ONLY_MESSAGE_FIELDS``) and every key starting with an underscore,
-  which no provider receives;
-- tool calls, their arguments and their results stay whole;
-- readable reasoning, the host's merged ``reasoning`` field (else a non-blank
-  ``reasoning_content``), goes into the message as a text part of its own under a
-  neutral label (R2; the label's words are #10's);
-- encrypted reasoning is withheld: the plugin does not know which provider produced
-  a record, and encrypted items go only to a summariser of that provider (R3). Every
-  reasoning field is dropped after the readable account is taken. That is a named
-  loss, asked of Hermes (A-P: stamp the answering provider and model on each
-  assistant message);
-- an image, found by structure, goes in only when the model table says the
-  summariser reads images; otherwise it is replaced by a placeholder naming its media
-  type and the record it belongs to. The placeholder exists only in this input and is
-  never stored.
+**The host's rules** are those of ``build_api_messages`` (agent/turn_context.py at
+Hermes 7b761da, lines 1216-1268), which cannot be called here because it needs a live
+agent. Its field rules are reproduced exactly, calling the host's own functions where
+they take a message:
+
+1. a structural clone (``agent.conversation_loop._clone_message_for_send``);
+2. ``api_content`` popped, and for a user or assistant row a non-empty string sidecar
+   becomes ``content`` (the exact bytes sent);
+3. the host's ``PERSISTENCE_ONLY_MESSAGE_FIELDS`` popped;
+4. the reasoning field the summariser's provider needs, decided by the host:
+   ``apply_reasoning_content_policy`` with ``needs_reasoning_echo`` for the
+   summariser's route (agent/message_sanitization.py): DeepSeek, Kimi and MiMo get
+   ``reasoning_content`` on every assistant turn exactly as the host would send it,
+   every other provider gets none;
+5. ``reasoning`` and ``finish_reason`` popped;
+6. an empty non-final user or assistant message filled by the host's
+   ``fill_empty_non_final_wire_payload``;
+7. ``_length_continuation_fragment`` and ``_length_continuation_nudge`` popped.
+
+``build_api_messages`` keeps every other field (underscore keys and
+``reasoning_details`` included); so does this input. The host's own adapter on the way
+to the provider then applies its rules, as on the main request path: the Chat
+Completions transport strips underscore keys, native carriers and, except on
+OpenRouter and Nous, ``reasoning_details``; the Anthropic and Bedrock converters
+rebuild the message from their carriers. Not reproduced: the host's
+``canonicalize_replay_history``, which rewrites old rows by the time of the request
+(a dangerous-command confirmation older than a minute becomes a sentinel); the
+summariser reads what the row said. And the strict-API tool-call scrub, which the Chat
+Completions transport repeats on the way.
+
+**The plugin's rules** on top:
+
+- R2: readable reasoning (the host's merged ``reasoning``, else a non-blank
+  ``reasoning_content``) is also given as a labelled text part of its message, so that
+  the summariser reads it whatever the provider does with the reasoning field; where
+  the message is rebuilt from a native carrier, the part goes into the carrier too;
+- R3: encrypted items are withheld, and only those: signed or encrypted
+  ``reasoning_details`` entries, ``codex_reasoning_items`` carrying encrypted content,
+  and the signed or redacted thinking blocks of ``anthropic_content_blocks`` and
+  ``bedrock_content_blocks``, whose other blocks stay in their order (ask A-P);
+- an image, found by structure, goes in only where the model table says the
+  summariser reads images, else a placeholder naming its media type and record; where
+  the summariser's wire is the host's Anthropic converter, the images the converter
+  would evict for its per-request limit are replaced the same way, oldest first as the
+  host picks them (ask A-8.2); the placeholder is the mechanism's layer, never stored;
+- a tool call whose arguments are not valid JSON, which the host's Anthropic and
+  Bedrock converters replace with ``{}``, gets a labelled text part carrying the stored
+  string verbatim (ask A-8.3).
 
 The chunk stands between the summariser's instructions (the system message, today's
 text) and a closing user message that asks for the summary. A user turn inside the
-chunk can read to the summariser as an instruction; the JSON envelope answered that,
-and how the chunk is framed so that it is summarised and not continued is #10's.
+chunk can read to the summariser as an instruction; how the chunk is framed so that
+it is summarised and not continued is #10's.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from .message_content import content_parts, image_media_type, is_image_part
@@ -43,74 +74,252 @@ try:  # the host's own set of bookkeeping fields no provider receives
 except Exception:  # pragma: no cover - as at Hermes 7b761da, agent/message_metadata.py:14
     _PERSISTENCE_ONLY = frozenset({"timestamp", "display_kind", "display_metadata", "_row_id"})
 
-# Every field that carries a provider's reasoning on a host message.
-_REASONING_FIELDS = (
-    "reasoning",
-    "reasoning_content",
-    "reasoning_details",
-    "codex_reasoning_items",
-    "codex_message_items",
-    "anthropic_content_blocks",
-    "bedrock_content_blocks",
-)
-
-# The neutral label of the readable-reasoning part (R2; the words are #10's).
+# Labels of the mechanism's layer in the input (the words are #10's).
 READABLE_REASONING_LABEL = "[Reasoning the provider returned with this message, as it returned it]"
-
-# The closing request (#10 owns the words).
 CLOSING_REQUEST = "Summarize the conversation above, as the system instructions say."
+_ONLY_WITHHELD_REASONING = ("[This message carried only reasoning the summariser is not given: "
+                            "encrypted, and its producer is not known]")
 
 
-def _readable_reasoning(message: dict) -> Optional[str]:
+@dataclass(frozen=True)
+class WireFacts:
+    """What the summariser's route means for its input, from the host's own rules."""
+
+    reads_images: bool
+    needs_reasoning_echo: bool
+    anthropic_converter: bool
+
+
+def _host_clone(message: dict) -> dict:
+    try:
+        from agent.conversation_loop import _clone_message_for_send  # type: ignore
+        return _clone_message_for_send(message)
+    except Exception:
+        return copy.deepcopy(message)
+
+
+def _host_reasoning_policy(source: dict, message: dict, needs_echo: bool) -> None:
+    try:
+        from agent.message_sanitization import apply_reasoning_content_policy  # type: ignore
+    except Exception:
+        message.pop("reasoning_content", None)
+        return
+    apply_reasoning_content_policy(source, message, needs_echo)
+
+
+def _host_fill_empty(message: dict) -> None:
+    try:
+        from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload  # type: ignore
+    except Exception:
+        return
+    fill_empty_non_final_wire_payload(message, is_final=False)
+
+
+def wire_facts(provider: str, model: str, base_url: str, api_mode: str, reads_images: bool) -> WireFacts:
+    """The route's facts for the input: whether the host sends ``reasoning_content``
+    to it (``needs_reasoning_echo``, agent/message_sanitization.py at 7b761da) and
+    whether its wire is the host's Anthropic converter (provider anthropic, or the
+    anthropic_messages API mode)."""
+    try:
+        from agent.message_sanitization import needs_reasoning_echo  # type: ignore
+        echo = bool(needs_reasoning_echo(provider, model, base_url))
+    except Exception:
+        echo = False
+    try:
+        from hermes_cli.config_providers import _canonical_api_mode  # type: ignore
+        mode = str(_canonical_api_mode(str(api_mode or ""))).lower()
+    except Exception:
+        mode = str(api_mode or "").strip().lower()
+    try:
+        from agent.auxiliary_client import _normalize_aux_provider  # type: ignore
+        dispatched = str(_normalize_aux_provider(provider))
+    except Exception:
+        dispatched = str(provider or "").strip().lower()
+    anthropic = mode == "anthropic_messages" or (dispatched == "anthropic" and mode in ("", "anthropic_messages"))
+    return WireFacts(reads_images=reads_images, needs_reasoning_echo=echo, anthropic_converter=anthropic)
+
+
+# --- The host's build_api_messages, field by field (see the module docstring) -------------
+
+def _as_the_host_sends_it(raw: dict, *, needs_echo: bool) -> dict:
+    message = _host_clone(raw)
+    sidecar = message.pop("api_content", None)
+    for key in _PERSISTENCE_ONLY:
+        message.pop(key, None)
+    if isinstance(sidecar, str) and sidecar and raw.get("role") in ("user", "assistant"):
+        message["content"] = sidecar
+    _host_reasoning_policy(raw, message, needs_echo)
+    message.pop("reasoning", None)
+    message.pop("finish_reason", None)
+    _host_fill_empty(message)
+    message.pop("_length_continuation_fragment", None)
+    message.pop("_length_continuation_nudge", None)
+    return message
+
+
+# --- R3: withhold encrypted items only ------------------------------------------------------
+
+def _signed_or_encrypted_detail(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    kind = str(entry.get("type") or "")
+    return bool(entry.get("signature")) or "encrypted" in kind or kind == "redacted_thinking" \
+        or bool(entry.get("data"))
+
+
+def _signed_anthropic_block(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    kind = block.get("type")
+    return kind == "redacted_thinking" or (kind == "thinking" and bool(block.get("signature")))
+
+
+def _signed_bedrock_block(block: Any) -> bool:
+    if not isinstance(block, dict) or not isinstance(block.get("reasoningContent"), dict):
+        return False
+    reasoning = block["reasoningContent"]
+    text = reasoning.get("reasoningText")
+    return "redactedContent" in reasoning or (isinstance(text, dict) and bool(text.get("signature")))
+
+
+def _keep(message: dict, key: str, drop) -> None:
+    values = message.get(key)
+    if isinstance(values, list):
+        kept = [v for v in values if not drop(v)]
+        if kept:
+            message[key] = kept
+        else:
+            message.pop(key, None)
+
+
+def _withhold_encrypted(message: dict) -> None:
+    _keep(message, "reasoning_details", _signed_or_encrypted_detail)
+    _keep(message, "codex_reasoning_items", lambda i: isinstance(i, dict) and bool(i.get("encrypted_content")))
+    _keep(message, "anthropic_content_blocks", _signed_anthropic_block)
+    _keep(message, "_anthropic_content_blocks", _signed_anthropic_block)
+    _keep(message, "bedrock_content_blocks", _signed_bedrock_block)
+
+
+# --- Images ----------------------------------------------------------------------------------
+
+_NOT_READ = "not shown to this summariser, which does not read images"
+_EVICTED = "left out of this call: the host's Anthropic converter drops it for its per-request image limit"
+
+
+def _image_placeholder(part: dict, record: str, why: str) -> dict:
+    return {"type": "text", "text": f"[An image ({image_media_type(part)}) of record {record}, {why}]"}
+
+
+def _replace_images(parts: list, record: str, why: str) -> list:
+    return [_image_placeholder(p, record, why) if is_image_part(p) else p for p in parts]
+
+
+def _replace_images_in_message(message: dict, record: str, why: str) -> None:
+    content = message.get("content")
+    if isinstance(content, dict) and content.get("_multimodal") is True and isinstance(content.get("content"), list):
+        message["content"] = dict(content, content=_replace_images(content["content"], record, why))
+    elif isinstance(content, list):
+        message["content"] = _replace_images(content, record, why)
+    stashed = message.get("_anthropic_content_blocks")
+    if isinstance(stashed, list):
+        message["_anthropic_content_blocks"] = _replace_images(stashed, record, why)
+
+
+def _image_count(message: dict) -> int:
+    count = sum(1 for p in (content_parts(message.get("content")) or []) if is_image_part(p))
+    stashed = message.get("_anthropic_content_blocks")
+    if not count and isinstance(stashed, list):
+        count = sum(1 for p in stashed if is_image_part(p))
+    return count
+
+
+def _evict_as_the_host_would(messages: list[dict], records: list[str]) -> None:
+    """The host's Anthropic converter retires the images of the oldest image-bearing tool
+    results once a request crosses its limit, counting every image, user uploads
+    included, and never touching uploads (``_evict_old_screenshots``,
+    agent/anthropic_message_convert.py:605; ``outbound_image_retire_count`` with
+    ``OUTBOUND_IMAGE_LIMIT`` 20, agent/image_eviction_policy.py at 7b761da). The same
+    count, from the host's own function, picks the same carriers here."""
+    try:
+        from agent.image_eviction_policy import outbound_image_retire_count  # type: ignore
+    except Exception:
+        return
+    carriers = [i for i, m in enumerate(messages) if m.get("role") == "tool" and _image_count(m)]
+    reserved = sum(_image_count(m) for m in messages if m.get("role") != "tool")
+    newest_first = list(reversed(carriers))
+    retire = outbound_image_retire_count([_image_count(messages[i]) for i in newest_first], reserved)
+    for index in (newest_first[len(newest_first) - retire:] if retire else []):
+        _replace_images_in_message(messages[index], records[index], _EVICTED)
+
+
+# --- Labelled parts ---------------------------------------------------------------------------
+
+def _readable_reasoning(raw: dict) -> Optional[str]:
     for key in ("reasoning", "reasoning_content"):
-        value = message.get(key)
+        value = raw.get(key)
         if isinstance(value, str) and value.strip():
             return value
     return None
 
 
-def _image_placeholder(part: dict, record: str) -> dict:
-    return {"type": "text", "text": f"[An image ({image_media_type(part)}) of record {record}, not shown "
-                                     f"to this summariser, which does not read images]"}
+def _malformed_argument_parts(message: dict) -> list[dict]:
+    parts = []
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            continue
+        try:
+            json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            parts.append({"type": "text", "text": (
+                f"[The arguments of tool call {call.get('id') or '?'} ({function.get('name') or '?'}) as stored; "
+                f"they are not valid JSON:]\n{arguments}")})
+    return parts
 
 
-def _content_for_summariser(content: Any, record: str, reads_images: bool) -> Any:
-    parts = content_parts(content)
-    if parts is None:
-        return content
-    out = []
-    for part in parts:
-        if is_image_part(part) and not reads_images:
-            out.append(_image_placeholder(part, record))
-        else:
-            out.append(part)
-    return out
+def _content_as_parts(content: Any) -> list:
+    if isinstance(content, list):
+        return list(content)
+    if isinstance(content, str) and content:
+        return [{"type": "text", "text": content}]
+    return []
 
 
-def summariser_message(raw_message: dict, record: str, *, reads_images: bool) -> dict:
+def _add_parts(message: dict, before: list[dict], after: list[dict]) -> None:
+    if not before and not after:
+        return
+    message["content"] = before + _content_as_parts(message.get("content")) + after
+    blocks = message.get("anthropic_content_blocks")
+    if isinstance(blocks, list):
+        message["anthropic_content_blocks"] = [{"type": "text", "text": p["text"]} for p in before] + blocks
+    blocks = message.get("bedrock_content_blocks")
+    if isinstance(blocks, list):
+        message["bedrock_content_blocks"] = [{"text": p["text"]} for p in before] + blocks
+
+
+def _has_payload(message: dict) -> bool:
+    content = message.get("content")
+    return bool((isinstance(content, str) and content.strip()) or (isinstance(content, list) and content)
+                or message.get("tool_calls") or message.get("anthropic_content_blocks")
+                or message.get("bedrock_content_blocks") or message.get("codex_message_items")
+                or (isinstance(message.get("reasoning_content"), str) and message["reasoning_content"].strip()))
+
+
+def summariser_message(raw: dict, record: str, facts: WireFacts) -> dict:
     """One record's message as the summariser receives it (see the module docstring)."""
-    message = copy.deepcopy(raw_message)
-    sidecar = message.pop("api_content", None)
-    if isinstance(sidecar, str) and sidecar and message.get("role") in ("user", "assistant"):
-        message["content"] = sidecar
-    readable = _readable_reasoning(message)
-    for key in list(message):
-        if key in _PERSISTENCE_ONLY or key in _REASONING_FIELDS or (isinstance(key, str) and key.startswith("_")):
-            del message[key]
-    if "tool_calls" in message and not message["tool_calls"]:
-        # The host's own "no calls" (None or []), which carries nothing a provider reads.
-        del message["tool_calls"]
-    if "content" in message:
-        message["content"] = _content_for_summariser(message["content"], record, reads_images)
-    if readable is not None and message.get("role") == "assistant":
-        reasoning_part = {"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{readable}"}
-        content = message.get("content")
-        if isinstance(content, list):
-            message["content"] = [reasoning_part] + content
-        elif isinstance(content, str) and content:
-            message["content"] = [reasoning_part, {"type": "text", "text": content}]
-        else:
-            message["content"] = [reasoning_part]
+    message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
+    _withhold_encrypted(message)
+    if not facts.reads_images:
+        _replace_images_in_message(message, record, _NOT_READ)
+    if message.get("role") == "assistant":
+        readable = _readable_reasoning(raw)
+        before = [{"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{readable}"}] if readable else []
+        _add_parts(message, before, _malformed_argument_parts(message))
+        if not _has_payload(message):
+            message["content"] = [{"type": "text", "text": _ONLY_WITHHELD_REASONING}]
     return message
 
 
@@ -119,16 +328,16 @@ def summariser_messages(
     *,
     instructions: str,
     request: dict,
-    reads_images: bool,
+    facts: WireFacts,
 ) -> list[dict]:
     """The whole input of one summariser call: the instructions, the chunk's records
     as messages, and the closing request with its fields (focus topic, custom
     instructions) where there are any."""
+    pairs = list(records)
+    body = [summariser_message(raw, record, facts) for record, raw in pairs]
+    if facts.reads_images and facts.anthropic_converter:
+        _evict_as_the_host_would(body, [record for record, _raw in pairs])
     closing = CLOSING_REQUEST
     if request:
         closing += "\nrequest: " + json.dumps(request, ensure_ascii=False)
-    return (
-        [{"role": "system", "content": instructions}]
-        + [summariser_message(raw, record, reads_images=reads_images) for record, raw in records]
-        + [{"role": "user", "content": closing}]
-    )
+    return [{"role": "system", "content": instructions}] + body + [{"role": "user", "content": closing}]

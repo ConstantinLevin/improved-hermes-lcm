@@ -52,6 +52,7 @@ from .escalation import (
     summarize_chunk,
 )
 from .model_table import lookup as lookup_model
+from .summariser_input import wire_facts
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .record_write import _ATTEMPT, AttemptCancelled
@@ -270,13 +271,16 @@ class CompactionMixin:
                 time.sleep(min(_WAIT_SLICE_S, left))
 
         facts = lookup_model(settings.route.model)
+        route = settings.route
         text, level, finish_reason = summarize_chunk(
             list(zip(record_handles, chunk_messages)),
             budget,
             source_tokens=source_tokens,
             settings=settings,
-            # Images go in only where the model table says the summariser reads them.
-            reads_images=bool(facts is not None and facts.reads_images),
+            # Images go in only where the model table says the summariser reads them;
+            # the reasoning field and the converter by the host's rules for the route.
+            facts=wire_facts(route.provider, route.model, route.base_url, route.api_mode,
+                             reads_images=bool(facts is not None and facts.reads_images)),
             depth=0,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,

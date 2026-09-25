@@ -55,7 +55,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
-from .summariser_input import summariser_messages
+from .summariser_input import WireFacts, summariser_messages
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -478,7 +478,7 @@ def summarize_chunk(
     *,
     source_tokens: int,
     settings: CallSettings,
-    reads_images: bool,
+    facts: WireFacts,
     depth: int = 0,
     focus_topic: str = "",
     custom_instructions: str = "",
@@ -501,7 +501,7 @@ def summarize_chunk(
         instructions=_l1_instructions(token_budget, depth, focus_topic=focus_topic,
                                       custom_instructions=custom_instructions),
         request=request,
-        reads_images=reads_images,
+        facts=facts,
     )
     try:
         content, finish_reason = _call_with_retries(
@@ -516,7 +516,7 @@ def summarize_chunk(
             instructions=_l2_instructions(int(token_budget * _L2_BUDGET_RATIO), focus_topic=focus_topic,
                                           custom_instructions=custom_instructions),
             request=request,
-            reads_images=reads_images,
+            facts=facts,
         )
         try:
             content, finish_reason = _call_with_retries(
