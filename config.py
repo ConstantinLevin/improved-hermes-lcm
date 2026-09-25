@@ -234,7 +234,8 @@ class _EnvFieldSpec:
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
-    _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
+    _EnvFieldSpec("chunk_tokens", "LCM_CHUNK_TOKENS", int),
+    _EnvFieldSpec("estimate_ratio", "LCM_ESTIMATE_RATIO", float),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
@@ -264,7 +265,8 @@ _PARSER_BY_TYPE = {
 _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fresh_tail_count",
     "fresh_tail_max_tokens",
-    "leaf_chunk_tokens",
+    "chunk_tokens",
+    "estimate_ratio",
     "context_threshold",
 })
 
@@ -278,9 +280,15 @@ class LCMConfig:
     # Optional token cap for the protected suffix (0 = disabled)
     fresh_tail_max_tokens: int = 0
 
+    # -- The chunk (#31, Decided; #12) ---
+    # c in provider tokens: bound by the summariser only, not scaled with the window.
+    chunk_tokens: int = 50_000
+    # The provider's count over the plugin's estimate (characters / 4), by which a size
+    # in provider tokens is cut in the estimate's unit: #31's measurement on Claude tool
+    # results, p50 (p95 1.95, p99 2.37, n = 201). c in the estimate: 50,000 / 1.51.
+    estimate_ratio: float = 1.51
+
     # -- Compaction thresholds ---
-    # Max source tokens in a leaf chunk before summarization triggers
-    leaf_chunk_tokens: int = 20_000
     # Fraction of context window that triggers compaction (0.0–1.0)
     context_threshold: float = 0.35
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
@@ -362,10 +370,22 @@ class LCMConfig:
         )
         c.fresh_tail_max_tokens = max(0, c.fresh_tail_max_tokens)
         _record("fresh_tail_max_tokens", source, warning)
-        c.leaf_chunk_tokens, source, warning = _parse_int_env_with_source(
-            "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens
+        c.chunk_tokens, source, warning = _parse_int_env_with_source(
+            "LCM_CHUNK_TOKENS", c.chunk_tokens, default_source="default: #31 Decided, c = 50k provider tokens"
         )
-        _record("leaf_chunk_tokens", source, warning)
+        if c.chunk_tokens < 1:
+            warning, c.chunk_tokens, source = (f"LCM_CHUNK_TOKENS={c.chunk_tokens} is not positive; the default "
+                                               f"applies", 50_000, "default: #31 Decided, c = 50k provider tokens")
+        _record("chunk_tokens", source, warning)
+        c.estimate_ratio, source, warning = _parse_float_env_with_source(
+            "LCM_ESTIMATE_RATIO", c.estimate_ratio,
+            default_source="default: #31 measured, p50 of the provider's count over characters / 4 on Claude",
+        )
+        if not c.estimate_ratio > 0:
+            warning, c.estimate_ratio, source = (
+                f"LCM_ESTIMATE_RATIO={c.estimate_ratio} is not positive; the default applies", 1.51,
+                "default: #31 measured, p50 of the provider's count over characters / 4 on Claude")
+        _record("estimate_ratio", source, warning)
         context_default, context_source = _hermes_compression_threshold_with_source(c.context_threshold)
         c.context_threshold, source, warning = _parse_float_env_with_source(
             "LCM_CONTEXT_THRESHOLD",

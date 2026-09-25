@@ -17,13 +17,15 @@ In order:
    where the tail leaves no material it yields down to its floor, the newest message
    or the newest tool group inside a turn; only when the floor alone is left is
    there nothing to compact, and that is shown as an abort.
-3. The material is cut into chunks, in list order, each at most ``leaf_chunk_tokens``
-   (a greedy cut until #12), only between groups: a tool call and its results stay in
-   one chunk, and a group larger than a chunk is a chunk of its own. A run smaller
-   than a quarter of a chunk next to such a group, or at the end of the material,
-   joins the adjacent chunk instead of standing alone. The compaction,
-   its inputs, the new records and every chunk are written before the first
-   summariser call.
+3. The material is cut into chunks of the size c (#31, #12), in list order and only
+   between groups: a tool call and its results stay in one chunk. A group larger than
+   c is a chunk of its own; between such groups, each run of material B is split
+   equally into ceil(B / c) chunks, cut at the group boundaries nearest k·B/n, never
+   a chunk above c. A run smaller than c/4 does not stand alone: it joins the chunk
+   of the adjacent oversized group. c is 50k provider tokens, cut in the plugin's
+   estimate (characters / 4) as 50k / 1.51, #31's p50 of the provider's count over
+   that estimate (``_chunk_limit``). The compaction, its inputs, the new records and
+   every chunk are written before the first summariser call.
 4. Each chunk is summarised from its records as the store holds them. Every chunk's
    call is issued at once, on daemon workers of the plugin's own, through one limiter
    per endpoint and process; a call for the same records already in flight is joined,
@@ -46,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -92,9 +95,53 @@ _SUMMARY_FOOTER = "[Expand for details: {hint}]"
 _WAIT_SLICE_S = 0.25
 
 # "The smallest run that stands alone", as a share of the chunk size c: a value for
-# #22's table (orchestrator ruling on #52). A smaller run next to an oversized group,
-# or at the end of the material, joins the adjacent chunk.
+# #22's table (#31, Decided; orchestrator ruling on #52). A smaller run next to an
+# oversized group, or at the end of the material, joins that group's chunk.
 _SMALLEST_STANDALONE_RUN = 0.25
+
+
+def _fewest_chunks(sizes: List[int], limit: int) -> int:
+    """The fewest chunks of at most ``limit`` that cover ``sizes`` in order, every
+    size at most ``limit``: filling each chunk as far as it goes is optimal."""
+    count, used = 0, 0
+    for size in sizes:
+        if count == 0 or used + size > limit:
+            count, used = count + 1, size
+        else:
+            used += size
+    return count
+
+
+def _split_run(sizes: List[int], limit: int) -> List[int]:
+    """The equal split of one run of groups, each at most ``limit`` (#31): n chunks,
+    n = ceil(B / limit), or more where the groups cannot be packed into that many
+    without a chunk above ``limit``; each cut at the group boundary nearest k·B/n
+    that keeps every chunk within ``limit`` and leaves a rest the remaining chunks
+    can hold. Returns the group index at which each chunk after the first begins."""
+    total = sum(sizes)
+    if total <= limit:
+        return []
+    n = max(-(-total // limit), _fewest_chunks(sizes, limit))
+    prefix = [0]
+    for size in sizes:
+        prefix.append(prefix[-1] + size)
+    fewest_from = [_fewest_chunks(sizes[j:], limit) for j in range(len(sizes))]
+    cuts: List[int] = []
+    previous = 0
+    for k in range(1, n):
+        target = k * total / n
+        best, best_distance = None, None
+        for j in range(previous + 1, len(sizes)):
+            if prefix[j] - prefix[previous] > limit:
+                break
+            if fewest_from[j] > n - k:
+                continue
+            distance = abs(prefix[j] - target)
+            if best is None or distance < best_distance:
+                best, best_distance = j, distance
+        cuts.append(best)
+        previous = best
+    return cuts
 
 
 class CompactionMixin:
@@ -109,11 +156,11 @@ class CompactionMixin:
     def should_compress_preflight(self, messages):
         """Before a request: settle and bind what the list shows, then ask for a
         compaction when the prompt is over the threshold and the material outside the
-        tail reaches a chunk. Nothing else is written here."""
+        tail holds a run that stands alone (c/4). Nothing else is written here."""
         self._bind_from_list(messages)
         # The plugin's estimate (#21), compared with a threshold in provider tokens: on
         # Claude it reads about 1.5 times lower (#31), so this gate fires later than the
-        # host's own pressure would; the conversion is PR-5's (R9).
+        # host's own pressure would; the threshold and its comparison are #11/#32's.
         rough = count_messages_tokens(messages, self._estimator())
         if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
             return self._mark_preflight_compression_requested()
@@ -123,12 +170,14 @@ class CompactionMixin:
             material = self._estimator().messages(
                 [messages[index] for index in range(tail_start) if index not in mechanism]
             )
-            if material.tokens >= self._config.leaf_chunk_tokens:
+            smallest = self._smallest_run()
+            if material.tokens >= smallest:
                 return self._mark_preflight_compression_requested()
             # Here no count of the host's exists yet, so the estimate decides, and says
             # so. The host's count after the request decides again (``compress``).
-            reason = (f"the material outside the fresh tail is below one leaf chunk by the plugin's estimate "
-                      f"({material.tokens} < {self._config.leaf_chunk_tokens} tokens, {material.label()})")
+            reason = (f"the material outside the fresh tail is below the smallest run that stands alone, c/4, "
+                      f"by the plugin's estimate ({material.tokens} < {smallest} tokens, {material.label()}; "
+                      f"{self._chunk_label()})")
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = reason
             logger.info("LCM preflight compression no-op: %s", reason)
@@ -165,6 +214,31 @@ class CompactionMixin:
         entry of the mechanism's layer, which the cover re-emits."""
         boundary = self._fresh_tail_start(messages)
         return max(boundary, max(mechanism) + 1 if mechanism else 0)
+
+    def _chunk_limit(self) -> int:
+        """c in the unit the plugin cuts in, its estimate (characters / 4, #21).
+
+        #31 decides c = 50k provider tokens (``chunk_tokens``). The plugin cannot count
+        provider tokens; it counts by its estimate, and #31 measured the provider's
+        count over that estimate on Claude tool results at p50 1.51 (p95 1.95, p99 2.37,
+        n = 201; ``estimate_ratio``). #12 states the chunk accordingly: "50k provider
+        tokens is about 33k by the estimate". So c is cut at 50,000 / 1.51 = 33,112 by
+        the estimate: a chunk of typical text is then about 50k to the provider, and
+        one at the p99 error about 78k, within every summariser window in the model
+        table (the check against the summariser's window follows the cut)."""
+        config = self._config
+        return max(1, int(config.chunk_tokens / config.estimate_ratio))
+
+    def _smallest_run(self) -> int:
+        """c/4 in the estimate's unit: the smallest run that stands alone (#31). Counts
+        are whole tokens, so the minimum is rounded up: a run of 8,278 is below
+        33,113 / 4 = 8,278.25."""
+        return max(1, math.ceil(self._chunk_limit() * _SMALLEST_STANDALONE_RUN))
+
+    def _chunk_label(self) -> str:
+        config = self._config
+        return (f"c = {self._chunk_limit()} tokens by the plugin's estimate: {config.chunk_tokens} provider tokens "
+                f"/ {config.estimate_ratio}, #31's p50 of the provider's count over characters / 4")
 
     @staticmethod
     def _tail_floor(messages: List[Dict[str, Any]], mechanism: set) -> int:
@@ -393,65 +467,67 @@ class CompactionMixin:
     @classmethod
     def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int,
                     estimator: Optional[Estimator] = None) -> List[List[int]]:
-        """The material cut in list order into chunks of at most ``limit`` tokens, and
-        only between groups: a tool call is never separated from its results. A group
-        larger than the limit is a chunk of its own (#31: a chunk flexes by one group).
+        """The material cut in list order into chunks, only between groups: a tool
+        call is never separated from its results (#31, #12).
 
-        A run smaller than ``limit`` × ``_SMALLEST_STANDALONE_RUN`` does not stand alone
-        where it stands next to such an oversized group, or at the end of the material:
-        it joins the adjacent chunk, never jumping over a group, so the chunks stay
-        contiguous. A chunk exists to bound the summariser's input; a run too small to
-        have a shorter summary would fail on every attempt (#7, orchestrator ruling on
-        #52). Next to an oversized group on both sides, it joins the following one,
-        the work it opened. A run that is the whole material has nothing to join.
+        A group larger than ``limit`` (c) is a chunk of its own: a chunk flexes by one
+        group. The groups between such groups form runs; each run of B tokens is split
+        equally (``_split_run``): ceil(B / c) chunks cut at the group boundaries nearest
+        k·B/n, so that no chunk of a first attempt is tiny and none is above c.
+
+        A run smaller than ``limit`` × ``_SMALLEST_STANDALONE_RUN`` (c/4) does not
+        stand alone: it joins the chunk of the adjacent oversized group, the following
+        one where there is one (the work it opened), else the one before it (a run at
+        the end of the material), never jumping over a group, so the chunks stay
+        contiguous. A summary of a tiny chunk cannot be shorter than its source, so a
+        chunk of it alone would fail on every attempt (#7, orchestrator ruling on #52).
+        A run that is the whole material has nothing to join.
         """
-        chunks: List[List[int]] = []
-        sizes: List[int] = []
-        oversized: List[bool] = []
-        current: List[int] = []
-        used = 0
-        for group in cls._groups(messages, material):
-            tokens = sum(count_message_tokens(messages[index], estimator) for index in group)
-            if current and used + tokens > limit:
-                chunks.append(current)
-                sizes.append(used)
-                oversized.append(False)
-                current, used = [], 0
-            current.extend(group)
-            used += tokens
-            if used > limit and len(current) == len(group):
-                # A group larger than the limit: a chunk of its own.
-                chunks.append(current)
-                sizes.append(used)
-                oversized.append(True)
-                current, used = [], 0
-        if current:
-            chunks.append(current)
-            sizes.append(used)
-            oversized.append(False)
+        groups = cls._groups(messages, material)
+        sizes = [sum(count_message_tokens(messages[index], estimator) for index in group) for group in groups]
+        # The material as items in order: an oversized group, or a run of the others.
+        items: List[tuple] = []
+        run: List[int] = []
+        for number, size in enumerate(sizes):
+            if size > limit:
+                if run:
+                    items.append(("run", run))
+                    run = []
+                items.append(("oversized", [number]))
+            else:
+                run.append(number)
+        if run:
+            items.append(("run", run))
 
+        # A tiny run joins the adjacent oversized group's chunk.
         smallest = limit * _SMALLEST_STANDALONE_RUN
-        at = 0
-        while at < len(chunks):
-            if sizes[at] >= smallest or oversized[at] or len(chunks) == 1:
-                at += 1
-                continue
-            if at + 1 < len(chunks) and oversized[at + 1]:
-                target = at + 1
-            elif at > 0 and oversized[at - 1]:
-                target = at - 1
-            elif at == len(chunks) - 1:
-                target = at - 1
+        attached: Dict[int, tuple] = {}   # item index of an oversized group -> (runs before, runs after)
+        standing: List[bool] = []
+        for at, (kind, members) in enumerate(items):
+            tiny = kind == "run" and len(items) > 1 and sum(sizes[g] for g in members) < smallest
+            if tiny and at + 1 < len(items):
+                before, after = attached.get(at + 1, ([], []))
+                attached[at + 1] = (before + members, after)
+                standing.append(False)
+            elif tiny and at > 0:
+                before, after = attached.get(at - 1, ([], []))
+                attached[at - 1] = (before, after + members)
+                standing.append(False)
             else:
-                at += 1
+                standing.append(True)
+
+        chunks: List[List[int]] = []
+        for at, (kind, members) in enumerate(items):
+            if not standing[at]:
                 continue
-            if target > at:
-                chunks[target] = chunks[at] + chunks[target]
+            if kind == "oversized":
+                before, after = attached.get(at, ([], []))
+                chunk_groups = [before + members + after]
             else:
-                chunks[target] = chunks[target] + chunks[at]
-            sizes[target] += sizes[at]
-            del chunks[at], sizes[at], oversized[at]
-            at = max(0, min(at, target))
+                starts = [0] + _split_run([sizes[g] for g in members], limit) + [len(members)]
+                chunk_groups = [members[a:b] for a, b in zip(starts, starts[1:])]
+            for group_numbers in chunk_groups:
+                chunks.append([index for g in group_numbers for index in groups[g]])
         return chunks
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
@@ -527,12 +603,13 @@ class CompactionMixin:
                 )
             return self._unchanged_return(messages, "no material outside the fresh tail")
         material_estimate = estimator.messages([messages[index] for index in material])
-        if material_estimate.tokens < self._config.leaf_chunk_tokens and not pressure:
+        smallest = self._smallest_run()
+        if material_estimate.tokens < smallest and not pressure:
             return self._unchanged_return(
                 messages,
-                f"without the host's pressure, the material outside the fresh tail is below one leaf chunk "
-                f"by the plugin's estimate ({material_estimate.tokens} < {self._config.leaf_chunk_tokens} "
-                f"tokens, {material_estimate.label()})",
+                f"without the host's pressure, the material outside the fresh tail is below the smallest run "
+                f"that stands alone, c/4, by the plugin's estimate ({material_estimate.tokens} < {smallest} "
+                f"tokens, {material_estimate.label()}; {self._chunk_label()})",
             )
 
         # The summariser, as far as anything can be written: its route and effort (#9).
@@ -541,7 +618,10 @@ class CompactionMixin:
             return self._abort(messages, why_not)
 
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk.
-        chunks = self._cut_chunks(messages, material, max(1, int(self._config.leaf_chunk_tokens)), estimator)
+        limit = self._chunk_limit()
+        chunks = self._cut_chunks(messages, material, limit, estimator)
+        logger.info("LCM cut %d tokens of material into %d chunk%s (%s)", material_estimate.tokens, len(chunks),
+                    "" if len(chunks) == 1 else "s", self._chunk_label())
         # A chunk the summariser cannot read in one call would fail on every attempt; it
         # is never cut (the tiny-chunk rule on #52). Only where the model table knows
         # the window; counted by the plugin's estimate, its images by the summariser's rule.

@@ -35,7 +35,7 @@ Start with:
 
 - `LCM_CONTEXT_THRESHOLD`: when normal context pressure triggers compaction;
 - `LCM_FRESH_TAIL_COUNT`: newest messages kept raw;
-- `LCM_LEAF_CHUNK_TOKENS`: maximum raw material per leaf compaction group;
+- `LCM_CHUNK_TOKENS`: the chunk size in provider tokens (default 50,000); the material outside the fresh tail is split equally into chunks of at most this size, cut by the plugin's estimate as this size divided by `LCM_ESTIMATE_RATIO` (default 1.51);
 - `LCM_DATABASE_PATH`: profile-local SQLite path when the default is unsuitable;
 - summary provider settings only after confirming credentials, cost, and data handling.
 

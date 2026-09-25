@@ -35,7 +35,6 @@ class LCMPreset:
 _PRESET_FIELDS = (
     "context_threshold",
     "fresh_tail_count",
-    "leaf_chunk_tokens",
 )
 _ENV_SPEC_BY_FIELD = {spec.name: spec for spec in ENV_FIELD_SPECS}
 _FIELD_ENV = {name: _ENV_SPEC_BY_FIELD[name].env_key for name in _PRESET_FIELDS}
@@ -50,7 +49,6 @@ _CODEX_GPT_LONG_CONTEXT = LCMPreset(
     runtime_env={
         "context_threshold": 0.75,
         "fresh_tail_count": 24,
-        "leaf_chunk_tokens": 8_000,
     },
     unsupported_runtime_fields={
         "target_after_compaction": 0.55,
@@ -97,7 +95,6 @@ _CODEX_SPARK_CONTEXT = LCMPreset(
     runtime_env={
         "context_threshold": 0.75,
         "fresh_tail_count": 16,
-        "leaf_chunk_tokens": 8_000,
     },
     unsupported_runtime_fields={
         "target_after_compaction": 0.55,
