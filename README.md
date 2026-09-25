@@ -43,7 +43,8 @@ divided by four, converted to provider tokens by a measured ratio and labelled a
 wherever it is shown (#21). The plugin tells the agent what its summaries are in a section of
 the host's system prompt, shown only where LCM is the session's context engine, and registers
 two skills, `hermes-lcm:summaries` and `hermes-lcm:setup`; no hook injects text into the user's
-messages (#16). The fork is not usable for its purpose yet: condensation (#34), the
+messages, and a request of an LCM session whose system prompt lacks the section is recorded
+with its cause (#16). The fork is not usable for its purpose yet: condensation (#34), the
 re-insertion inside a turn (#14) and the rest of the issues in this repository's tracker are
 still to come.
 

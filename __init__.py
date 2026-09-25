@@ -23,7 +23,17 @@ def _instruction_not_delivered(engine, why: str) -> None:
         logger.debug("LCM could not record that its instruction is not delivered", exc_info=True)
 
 
-def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> None:
+class _Instruction:
+    """What the registration established: the section's text and the host's framing, or
+    why the plugin registered no section. The delivery check reads it (#16)."""
+
+    def __init__(self) -> None:
+        self.text = None
+        self.host = None
+        self.refused = None
+
+
+def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> "_Instruction":
     """The plugin's instruction as a section of the host's system prompt, and its two
     skills, ``hermes-lcm:summaries`` and ``hermes-lcm:setup`` (#16).
 
@@ -31,38 +41,69 @@ def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> None:
     renders the prompt: it returns the instruction only for a session this plugin's
     engine serves, found in the engine registry by the host's session id, and "" (which
     the host skips) for any other, so that an agent whose context engine is not LCM is
-    told nothing about LCM's summaries."""
-    from .guidance import SECTION_ID, SECTION_MAX_CHARS, SKILLS, InstructionRefused, instruction_text
+    told nothing about LCM's summaries. Each render that returns the text is noted on the
+    engine copy it was returned for, which the delivery check reads."""
+    from .guidance import SECTION_ID, SKILLS, HostSections, InstructionRefused, instruction_text
 
+    instruction = _Instruction()
     register_section = getattr(ctx, "register_system_prompt_section", None)
     if not callable(register_section):
-        _instruction_not_delivered(engine, "the host offers no register_system_prompt_section to this plugin")
+        instruction.refused = "the host offers no register_system_prompt_section to this plugin"
     else:
         try:
-            text = instruction_text()
+            host = HostSections()
+            text = instruction_text(host.max_chars)
 
             def _section(info):
                 session_id = str((info or {}).get("session_id") or "")
                 active = resolve_active_lcm_engine(session_id=session_id) if session_id else None
                 if active is None or getattr(active, "name", None) != "lcm":
                     return ""
+                active._instruction_rendered = getattr(active, "_instruction_rendered", 0) + 1
                 return text
 
-            register_section(SECTION_ID, _section, position="after_memory", max_chars=SECTION_MAX_CHARS)
+            register_section(SECTION_ID, _section, position="after_memory", max_chars=host.max_chars)
+            instruction.text, instruction.host = text, host
         except InstructionRefused as exc:
-            _instruction_not_delivered(engine, str(exc))
+            instruction.refused = str(exc)
         except Exception as exc:
-            _instruction_not_delivered(engine, f"the host refused the section ({type(exc).__name__}: {exc})")
+            instruction.refused = f"the host refused the section ({type(exc).__name__}: {exc})"
+    if instruction.refused is not None:
+        _instruction_not_delivered(engine, instruction.refused)
 
     register_skill = getattr(ctx, "register_skill", None)
     if not callable(register_skill):
         logger.warning("LCM's skills are not registered: the host offers no register_skill to this plugin")
-        return
+        return instruction
     for name, path, description in SKILLS:
         try:
             register_skill(name, path, description=description)
         except Exception as exc:
             logger.warning("LCM could not register its skill %s (%s): %s", name, path, exc)
+    return instruction
+
+
+def _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload) -> None:
+    """The request's system prompt carries the plugin's section, for a session an LCM
+    engine serves; checked once per distinct prompt (#16). Never raises into the host."""
+    from .guidance import check_delivery
+
+    session_id = str(payload.get("session_id") or "")
+    active = resolve_active_lcm_engine(session_id=session_id) if session_id else None
+    if active is None or getattr(active, "name", None) != "lcm":
+        return
+
+    def _record(kind, detail):
+        try:
+            active._records.event(kind, detail=detail)
+        except Exception:
+            logger.debug("LCM could not record %s", kind, exc_info=True)
+
+    try:
+        check_delivery(active, payload.get("system_prompt"), host_session_id=session_id, text=instruction.text,
+                       host=instruction.host, refused=instruction.refused, record=_record)
+    except Exception:
+        logger.warning("LCM could not check that its instruction reached the agent", exc_info=True)
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -193,7 +234,7 @@ def register(ctx):
     # The instruction to the agent, as a system-prompt section, and the two skills
     # (#16). No hook injects it: a hook's text rides on the user's message and is
     # replayed on every later request, as if the user had written it (#36).
-    _register_instruction(ctx, engine, resolve_active_lcm_engine)
+    instruction = _register_instruction(ctx, engine, resolve_active_lcm_engine)
 
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
@@ -228,6 +269,8 @@ def register(ctx):
             # R10: the list a request sends, until the session's fixed prefix is measured.
             turn_signals.request_sent(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""),
                                       payload.get("conversation_history"))
+            # #16: the system prompt this request sends carries the plugin's section.
+            _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload)
 
         register_hook("pre_api_request", _on_pre_api_request)
         register_hook("pre_llm_call", _on_pre_llm_call_turn)
