@@ -111,6 +111,9 @@ class CompressAttempt:
     ids_at_return: Dict[int, Any] = field(default_factory=dict)
     summary_positions: set = field(default_factory=set)
     bound_positions: set = field(default_factory=set)
+    # Set when compress() has returned: the attempt then wants no further summariser
+    # call; a call already in flight runs to its end and its summary is written (#33 D13).
+    over: bool = False
 
     def cancelled(self) -> bool:
         if not callable(self.check):

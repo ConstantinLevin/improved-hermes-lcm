@@ -39,8 +39,10 @@ can still pass: that is the host's, and asked of Hermes (A-7.1).
 Transient failures (HTTP 408/409/429/5xx, connection errors, timeouts) are retried at
 the same level after the longer of the provider's ``Retry-After`` and 2 s doubling to 30 s
 with jitter, while the host's deadline allows (#33). With no host deadline the retries
-stop once the backoff has reached its 30 s cap a second time. Each wait is sliced and
-calls ``wait`` so that the caller can stop a cancelled attempt at once.
+stop once the backoff has reached its 30 s cap a second time. A ``Retry-After`` also
+holds the endpoint for every other call to it. How each call reaches the provider (the
+limiter, the deadline it is bounded by, the wait that gives up when no attempt wants
+the call any more) is the caller's ``CallPath`` (``inflight``).
 
 The reply's text is taken as the provider returned it in ``content``; nothing in it is
 recognised by pattern (#9, Decided).
@@ -48,12 +50,13 @@ recognised by pattern (#9, Decided).
 
 from __future__ import annotations
 
+import contextlib
 import email.utils
 import logging
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 from .summariser_input import WireFacts, summariser_messages
 from .tokens import Estimate, count_tokens
@@ -314,7 +317,6 @@ class CallSettings:
     route: SummariserRoute
     effort: str
     max_tokens: Optional[int] = None
-    timeout: Optional[float] = None
     # Every secret the plugin knows by value (the route's key when it is a string, the
     # configured key): removed from any text that is logged, stored or shown.
     secrets: tuple = field(default=(), repr=False)
@@ -370,9 +372,13 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
     return forms
 
 
-def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[str, str]:
+def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
+               timeout: Optional[float] = None) -> tuple[str, str]:
     """One call through the host. Returns (content, finish_reason); raises on any
-    failure of the call, a reply from another model, or a reply of the wrong shape."""
+    failure of the call, a reply from another model, or a reply of the wrong shape.
+    ``timeout`` is what is left of the host's deadline at dispatch; with no host
+    deadline none is passed, and the host's own applies (#33: no per-call timeout of
+    the plugin's own)."""
     from agent.auxiliary_client import call_llm
 
     route = settings.route
@@ -387,8 +393,8 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[
     }
     if settings.max_tokens:
         call_kwargs["max_tokens"] = settings.max_tokens
-    if settings.timeout is not None:
-        call_kwargs["timeout"] = settings.timeout
+    if timeout is not None:
+        call_kwargs["timeout"] = timeout
     response = call_llm(**call_kwargs)
     # D9, by the host's own resolution of this route, never by an alias table of the
     # plugin's: the host's label for a provider is not its normalised name (an explicit
@@ -427,12 +433,35 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[
     return content, str(finish_reason) if finish_reason is not None else ""
 
 
+@contextlib.contextmanager
+def _direct_dispatch() -> Iterator[Optional[float]]:
+    yield _deadline()
+
+
+def _no_hold(seconds: float) -> None:
+    return None
+
+
+@dataclass(frozen=True)
+class CallPath:
+    """How the calls of one chunk reach the provider: ``dispatch`` wraps each provider
+    call (a limiter slot, the host's deadline installed) and yields the deadline it is
+    bounded by; ``hold`` passes a provider's ``Retry-After`` on to the endpoint;
+    ``deadline`` is the host's deadline for the decision to retry; ``wait`` is the wait
+    between retries, which may give up. The defaults call directly on this thread."""
+
+    wait: Callable[[float], None] = _default_wait
+    dispatch: Callable[[], Any] = _direct_dispatch
+    hold: Callable[[float], None] = _no_hold
+    deadline: Callable[[], Optional[float]] = _deadline
+
+
 def _call_with_retries(
     messages: list[dict[str, Any]],
     *,
     source: Estimate,
     settings: CallSettings,
-    wait: Callable[[float], None],
+    path: CallPath,
 ) -> tuple[str, str]:
     """One level: transient failures retried while the deadline allows; a reply that
     does not shrink its source is a non-transient failure."""
@@ -440,7 +469,25 @@ def _call_with_retries(
     retries = 0
     while True:
         try:
-            content, finish_reason = _call_once(messages, settings)
+            with path.dispatch() as bound:
+                timeout = None
+                if bound is not None:
+                    timeout = bound - time.monotonic()
+                    if timeout <= 0:
+                        raise SummaryFailure("summariser call not made, no time left before the host's deadline",
+                                             transient=True)
+                try:
+                    content, finish_reason = _call_once(messages, settings, timeout)
+                except SummaryFailure:
+                    raise
+                except Exception as exc:
+                    retry_after = _retry_after_seconds(exc)
+                    if retry_after and _is_transient(exc):
+                        # The endpoint said when: no call to it before then, this one's
+                        # or another's. Held here, inside the dispatch scope, before the
+                        # slot is given back, so no queued call dispatches in between.
+                        path.hold(retry_after)
+                    raise
         except SummaryFailure:
             raise
         except Exception as exc:
@@ -453,7 +500,7 @@ def _call_with_retries(
             # The growing backoff always applies: a provider's Retry-After can only make
             # the wait longer, so a zero or expired one never makes a hot loop.
             delay = max(retry_after or 0.0, backoff * random.uniform(0.8, 1.2))
-            deadline = _deadline()
+            deadline = path.deadline()
             if deadline is not None and time.monotonic() + delay >= deadline:
                 raise SummaryFailure("summariser call failed, no time left before the host's deadline",
                                      transient=True, detail=text, retry_after=retry_after) from None
@@ -461,7 +508,7 @@ def _call_with_retries(
                 raise SummaryFailure("summariser call kept failing", transient=True,
                                      detail=text, retry_after=retry_after) from None
             logger.warning("LCM summariser call failed transiently (%s); retrying in %.1fs", text, delay)
-            wait(delay)
+            path.wait(delay)
             retries += 1
             backoff = min(_BACKOFF_CAP_S, backoff * 2)
             continue
@@ -484,7 +531,7 @@ def summarize_chunk(
     depth: int = 0,
     focus_topic: str = "",
     custom_instructions: str = "",
-    wait: Callable[[float], None] = _default_wait,
+    path: CallPath = CallPath(),
 ) -> tuple[str, int, str]:
     """Summarise one chunk: (summary, level, finish_reason), or ``SummaryFailure``.
 
@@ -507,7 +554,7 @@ def summarize_chunk(
     )
     try:
         content, finish_reason = _call_with_retries(
-            l1, source=source, settings=settings, wait=wait)
+            l1, source=source, settings=settings, path=path)
         return content, 1, finish_reason
     except SummaryFailure as first:
         if first.transient:
@@ -522,7 +569,7 @@ def summarize_chunk(
         )
         try:
             content, finish_reason = _call_with_retries(
-                l2, source=source, settings=settings, wait=wait)
+                l2, source=source, settings=settings, path=path)
         except SummaryFailure as second:
             raise SummaryFailure(
                 f"level 1: {first}; level 2: {second.reason}",

@@ -24,11 +24,15 @@ In order:
    joins the adjacent chunk instead of standing alone. The compaction,
    its inputs, the new records and every chunk are written before the first
    summariser call.
-4. Each chunk is summarised from its records as the store holds them, one call at a
-   time, and the summary is written as a derivation when it arrives. A summary that
-   cannot be written (``escalation.SummaryFailure``: no third level, nothing
-   truncated) fails the compaction as a whole: the context stays as it was, and the
-   host shows the cause.
+4. Each chunk is summarised from its records as the store holds them. Every chunk's
+   call is issued at once, on daemon workers of the plugin's own, through one limiter
+   per endpoint and process; a call for the same records already in flight is joined,
+   a summary of them already written is reused (``inflight``, #33). Each summary is
+   written as a derivation when it arrives, in any order. The ``compress()`` thread
+   waits, asking the attempt's captured check, and returns its input at once when the
+   attempt is cancelled or superseded. A summary that cannot be written
+   (``escalation.SummaryFailure``: no third level, nothing truncated) fails the
+   compaction as a whole: the context stays as it was, and the host shows the cause.
 5. The return is emitted from the record: the host's system row in place, then the
    cover (the previous return's summaries, each re-emitted from its derivation, then
    the new ones in chunk order), then the tail as the host's own dicts. It is
@@ -42,11 +46,13 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .escalation import (
     REASONING_EFFORTS,
+    CallPath,
     CallSettings,
     SummariserRoute,
     SummaryFailure,
@@ -61,6 +67,18 @@ from .summariser_input import wire_facts
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .fresh_tail import _assistant_group_start
+from .inflight import (
+    DEFAULT_CALLS_PER_ENDPOINT,
+    ChunkCall,
+    ChunkSummary,
+    Outcome,
+    Subscriber,
+    endpoint_key,
+    host_deadline,
+    host_progress_hook,
+    join_or_start,
+    limiter_for,
+)
 from .record_write import _ATTEMPT, AttemptCancelled
 from .tokens import Estimator, count_message_tokens, count_messages_tokens
 
@@ -70,7 +88,7 @@ logger = logging.getLogger(__name__)
 _SUMMARY_HEADER = "[Recent Summary (d0, node {node_id})]"
 _SUMMARY_FOOTER = "[Expand for details: {hint}]"
 
-# How often a wait between summariser retries asks the attempt's captured check.
+# How often the compress() thread, waiting for its chunks, asks the attempt's captured check.
 _WAIT_SLICE_S = 0.25
 
 # "The smallest run that stands alone", as a share of the chunk size c: a value for
@@ -219,7 +237,6 @@ class CompactionMixin:
             route=route,
             effort=effort,
             max_tokens=facts.output_cap if facts is not None else None,
-            timeout=config.summary_timeout_ms / 1000,
             secrets=secrets,
         ), ""
 
@@ -254,6 +271,7 @@ class CompactionMixin:
                 self._last_compression_noop_reason = ""
             raise
         finally:
+            attempt.over = True
             _ATTEMPT.reset(token)
         if attempt.cancelled():
             return messages
@@ -261,54 +279,95 @@ class CompactionMixin:
             self._apply_attempt_outcome(attempt)
         return result
 
-    def _summarize_chunk(
+    def _chunk_run(
         self,
         chunk_messages: List[Dict[str, Any]],
         *,
         focus_topic: Optional[str],
         record_handles: List[str],
         settings: CallSettings,
-    ) -> tuple[str, int, int, str]:
-        """One chunk's summary: (text, level, budget, finish_reason), or
-        ``SummaryFailure`` (#7), with the summariser's route and effort (#9).
+    ) -> Callable[[ChunkCall], ChunkSummary]:
+        """What a worker runs for one chunk: its summary, or ``SummaryFailure`` (#7),
+        with the summariser's route and effort (#9). Everything the call needs is read
+        here, on the ``compress()`` thread; the worker reads nothing of the engine.
 
         The summariser reads the chunk's records as the messages they were, whole
-        (#8, ``summariser_input``). The budget is a target in the prompt text, never an output limit. A wait
-        between retries stops at once when the attempt is cancelled or superseded.
+        (#8, ``summariser_input``). The budget is a target in the prompt text, never an
+        output limit.
         """
         # What the summary replaces in the session's context, by the session's estimate
         # (R6): the acceptance compares the reply with this, by the same estimate.
         source = self._estimator().messages(chunk_messages)
         budget = min(max(2000, int(source.tokens * 0.20)), 12000)
-        attempt = _ATTEMPT.get()
-
-        def wait(seconds: float) -> None:
-            end = time.monotonic() + max(0.0, seconds)
-            while True:
-                if not self._live_write_allowed(attempt):
-                    raise AttemptCancelled()
-                left = end - time.monotonic()
-                if left <= 0:
-                    return
-                time.sleep(min(_WAIT_SLICE_S, left))
-
         facts = lookup_model(settings.route.model)
         route = settings.route
-        text, level, finish_reason = summarize_chunk(
-            list(zip(record_handles, chunk_messages)),
-            budget,
-            source=source,
-            settings=settings,
-            # Images go in only where the model table says the summariser reads them;
-            # the reasoning field and the converter by the host's rules for the route.
-            facts=wire_facts(route.provider, route.model, route.base_url, route.api_mode,
-                             reads_images=bool(facts is not None and facts.reads_images)),
-            depth=0,
-            focus_topic=focus_topic or "",
-            custom_instructions=self._config.custom_instructions,
-            wait=wait,
-        )
-        return text, level, budget, finish_reason
+        records = list(zip(record_handles, chunk_messages))
+        # Images go in only where the model table says the summariser reads them; the
+        # reasoning field and the converter by the host's rules for the route.
+        wire = wire_facts(route.provider, route.model, route.base_url, route.api_mode,
+                          reads_images=bool(facts is not None and facts.reads_images))
+        custom_instructions = self._config.custom_instructions
+
+        def run(call: ChunkCall) -> ChunkSummary:
+            text, level, finish_reason = summarize_chunk(
+                records,
+                budget,
+                source=source,
+                settings=settings,
+                facts=wire,
+                depth=0,
+                focus_topic=focus_topic or "",
+                custom_instructions=custom_instructions,
+                path=CallPath(wait=call.wait, dispatch=call.dispatch, hold=call.limiter.hold,
+                              deadline=call.deadline),
+            )
+            return ChunkSummary(text=text, level=level, budget=budget, finish_reason=finish_reason,
+                                model=route.model, provider=route.provenance_provider(), effort=settings.effort)
+
+        return run
+
+    def _calls_in_flight_limit(self, endpoint: str) -> int:
+        """The endpoint's limit: its own where configured, else the default (#33)."""
+        per_endpoint = self._config.summary_calls_per_endpoint or {}
+        value = per_endpoint.get(endpoint, self._config.summary_calls_in_flight)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return DEFAULT_CALLS_PER_ENDPOINT
+
+    def _deliver_for(self, attempt, chunk_handle: str, number: int, total: int):
+        """How one attempt's chunk receives its call's outcome, on whichever thread has
+        it: the summary is written as a derivation of this chunk (#33 Q17a: not fenced,
+        a fact about the chunk's content); a failure is recorded as a store event."""
+
+        def deliver(summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool) -> Outcome:
+            if summary is not None:
+                try:
+                    derivation = self._write_summary(
+                        attempt, chunk_handle, text=summary.text, level=summary.level, budget=summary.budget,
+                        finish_reason=summary.finish_reason, expand_hint=self._extract_expand_hint(summary.text),
+                        model=summary.model, provider=summary.provider, effort=summary.effort,
+                    )
+                except Exception as exc:
+                    logger.warning("LCM could not write the summary of chunk %d of %d (%s: %s)",
+                                   number, total, type(exc).__name__, exc)
+                    try:
+                        self._record_event(attempt, "derivation_write_failed", repr(exc))
+                    except Exception:
+                        pass  # the store itself is gone (closed engine): the warning above says so
+                    return Outcome(failure=f"the store could not write the summary ({exc})")
+                return Outcome(derivation=derivation)
+            if abandoned:
+                logger.info("LCM summary call of chunk %d of %d ended unmade: %s", number, total, failure)
+                self._record_event(attempt, "summary_call_abandoned",
+                                   {"chunk": chunk_handle, "number": number, "reason": failure})
+            else:
+                logger.warning("LCM summary of chunk %d of %d failed: %s", number, total, failure)
+                self._record_event(attempt, "summary_failed",
+                                   {"chunk": chunk_handle, "number": number, "error": failure})
+            return Outcome(failure=failure)
+
+        return deliver
 
     @staticmethod
     def _groups(messages: List[Dict[str, Any]], material: List[int]) -> List[List[int]]:
@@ -507,45 +566,82 @@ class CompactionMixin:
             self._record_event(attempt, "compaction_write_failed", repr(exc))
             return self._abort(messages, f"the store could not write the compaction ({exc})")
 
-        # 4. One summary per chunk, from the chunk's records as stored.
+        # 4. One summary per chunk, from the chunk's records as stored, every chunk's call
+        # issued at once (#12, #33): each joins the call in flight for the same records,
+        # reuses a summary of them already written, or starts on a worker of its own.
         members = [attempt.records[index] for chunk in chunks for index in chunk]
         facts = self._records.record_facts(members)
-        new_derivations: List[str] = []
+        route = settings.route
+        endpoint = endpoint_key(route.provider, route.base_url)
+        limiter, limit = limiter_for(endpoint), self._calls_in_flight_limit(endpoint)
+        # The host's progress hook and deadline, read here on the compress() thread (D10).
+        hook, deadline = host_progress_hook(), host_deadline()
+
+        def still_wanted() -> bool:
+            return not attempt.over and self._live_write_allowed(attempt)
+
+        def describe(exc: BaseException) -> str:
+            # A SummaryFailure, or anything else the call raised: never truncated, never
+            # swallowed. What is logged, stored and shown is the failure's class and
+            # message with every known secret removed; never a traceback, which could
+            # carry request headers.
+            return settings.scrub(str(exc)) if isinstance(exc, SummaryFailure) \
+                else failure_text(exc, settings.secrets)
+
+        subscribers: List[Subscriber] = []
+        ways: Dict[str, int] = {}
+        # Every chunk's outcome arrives here, once, after it is complete: the one place
+        # the compress() thread reads outcomes from.
+        finished: "queue.Queue[int]" = queue.Queue()
         for number, (chunk_handle, chunk) in enumerate(zip(chunk_handles, chunks), start=1):
             # A cancelled or no longer current attempt starts no further call (#29 W2 step 2).
-            if not self._live_write_allowed(attempt):
+            if not still_wanted():
                 raise AttemptCancelled()
             records = [attempt.records[index] for index in chunk]
             chunk_messages = [json.loads(facts[record][1]) for record in records]
+            subscriber = Subscriber(wanted=still_wanted, hook=hook, deadline=deadline,
+                                    deliver=self._deliver_for(attempt, chunk_handle, number, len(chunks)),
+                                    on_done=lambda number=number: finished.put(number))
+            # Attempts share a call only with the same summariser route and effort, the
+            # rule a reuse applies (``summary_of_records``).
+            way = join_or_start(
+                (attempt.session, tuple(records), route.model, route.provenance_provider(), settings.effort),
+                subscriber, limiter=limiter, limit=limit,
+                reuse=lambda records=records, chunk_handle=chunk_handle: self._records.summary_of_records(
+                    attempt.session, records, exclude_chunk=chunk_handle, model=route.model,
+                    provider=route.provenance_provider(), effort=settings.effort),
+                run=self._chunk_run(chunk_messages, focus_topic=focus_topic, record_handles=records,
+                                    settings=settings),
+                describe=describe,
+            )
+            ways[way] = ways.get(way, 0) + 1
+            subscribers.append(subscriber)
+        logger.info("LCM compaction issued %d chunk%s to %s (%s), at most %d calls in flight there",
+                    len(chunks), "" if len(chunks) == 1 else "s", endpoint,
+                    ", ".join(f"{count} {way}" for way, count in sorted(ways.items())), limit)
+
+        # The compress() thread waits for its chunks, asking the attempt's captured check
+        # all the while (R4): cancelled or superseded, it returns its input at once and
+        # sets nothing; the calls in flight run on and their summaries are written (D13).
+        # A chunk that failed, or has no derivation, fails the compaction as a whole, the
+        # context unchanged (#7), through _abort, never an exception; the summaries
+        # written stay for the retry. Each outcome is read once, when its chunk reports
+        # it complete, so no outcome is judged half-written.
+        received: set = set()
+        while len(received) < len(subscribers):
+            if not still_wanted():
+                raise AttemptCancelled()
             try:
-                text, level, budget, finish_reason = self._summarize_chunk(
-                    chunk_messages,
-                    focus_topic=focus_topic,
-                    record_handles=records,
-                    settings=settings,
-                )
-            except Exception as exc:
-                # A SummaryFailure, or anything else the call raised: never truncated,
-                # never swallowed. The context stays as it was (#7). What is logged,
-                # stored and shown is the failure's class and message with every known
-                # secret removed; never a traceback, which could carry request headers.
-                text = settings.scrub(str(exc)) if isinstance(exc, SummaryFailure) \
-                    else failure_text(exc, settings.secrets)
-                logger.warning("LCM summary of chunk %d of %d failed: %s", number, len(chunks), text)
-                self._record_event(attempt, "summary_failed",
-                                   {"chunk": chunk_handle, "number": number, "error": text})
-                return self._abort(messages, f"the summary of chunk {number} of {len(chunks)} failed ({text})")
-            try:
-                new_derivations.append(self._write_summary(
-                    attempt, chunk_handle, text=text, level=level, budget=budget,
-                    finish_reason=finish_reason, expand_hint=self._extract_expand_hint(text),
-                    model=settings.route.model, provider=settings.route.provenance_provider(),
-                    effort=settings.effort,
-                ))
-            except Exception as exc:
-                logger.warning("LCM could not write a summary", exc_info=True)
-                self._record_event(attempt, "derivation_write_failed", repr(exc))
-                return self._abort(messages, f"the store could not write a summary ({exc})")
+                number = finished.get(timeout=_WAIT_SLICE_S)
+            except queue.Empty:
+                continue
+            received.add(number)
+            outcome = subscribers[number - 1].outcome
+            if outcome is None or outcome.failure is not None or not outcome.derivation:
+                why = outcome.failure if outcome is not None and outcome.failure else "no summary was delivered"
+                return self._abort(messages, f"the summary of chunk {number} of {len(chunks)} failed ({why})")
+        # The return is ordered by the chunks, whatever order the summaries arrived in.
+        new_derivations: List[str] = [s.outcome.derivation for s in subscribers]
 
         # 5. The return, emitted from the record (#34 D5).
         previous = attempt.effective_returns

@@ -33,6 +33,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
+from .inflight import ChunkSummary
 from .message_content import base64_like_strings, describe_image_part, image_parts, index_text
 from .tokens import Estimator
 
@@ -248,6 +249,49 @@ class RecordStore:
             )
             found.update({str(h): (int(i), str(t), e) for h, i, t, e in rows})
         return found
+
+    def summary_of_records(
+        self,
+        session: str,
+        records: Sequence[str],
+        *,
+        exclude_chunk: Optional[str],
+        model: Optional[str],
+        provider: Optional[str],
+        effort: Optional[str],
+    ) -> Optional[ChunkSummary]:
+        """The latest summary already written of a chunk of this session with exactly
+        these member records, in this order, by the same summariser route and effort, or
+        None (#33 D12: a second attempt reuses a summary already written). Records are
+        matched by handle, never by content."""
+        if not records:
+            return None
+        wanted = [str(r) for r in records]
+        candidates = self._q(
+            "SELECT m.chunk FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
+            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ?",
+            (session, wanted[0]),
+        )
+        for (chunk,) in candidates:
+            if chunk == exclude_chunk:
+                continue
+            members = [str(r) for (r,) in self._q(
+                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
+            if members != wanted:
+                continue
+            rows = self._q(
+                "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort "
+                "FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
+                "WHERE s.chunk = ? AND s.ordinal = 0 AND d.kind = 'summary' "
+                "AND d.model IS ? AND d.provider IS ? AND d.effort IS ? "
+                "ORDER BY d.derivation_id DESC LIMIT 1",
+                (chunk, model or None, provider or None, effort or None),
+            )
+            if rows:
+                text, level, budget, finish_reason, model_, provider_, effort_ = rows[0]
+                return ChunkSummary(text=str(text), level=level, budget=budget, finish_reason=finish_reason,
+                                    model=model_, provider=provider_, effort=effort_)
+        return None
 
     def is_settled(self, compaction: int) -> bool:
         """Confirmed, adopted or rejected: the host's handling of it is known."""
