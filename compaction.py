@@ -48,6 +48,7 @@ from .escalation import (
     _host_provider,
     configured_route_problem,
     failure_text,
+    session_route,
     summarize_chunk,
 )
 from .model_table import lookup as lookup_model
@@ -181,10 +182,7 @@ class CompactionMixin:
             if not self.base_url and _host_provider(self.provider) == "custom":
                 return None, ("the session's route names provider custom without a base URL: the host "
                               "would borrow an endpoint of its own, which the session did not name")
-            route = SummariserRoute(
-                provider=self.provider, model=self.model, base_url=self.base_url,
-                api_key=self.api_key, api_mode=self.api_mode, source="session",
-            )
+            route = session_route(self.provider, self.model, self.base_url, self.api_key, self.api_mode)
         effort = None
         if self._plugin_session:
             try:
@@ -482,7 +480,8 @@ class CompactionMixin:
                 new_derivations.append(self._write_summary(
                     attempt, chunk_handle, text=text, level=level, budget=budget,
                     finish_reason=finish_reason, expand_hint=self._extract_expand_hint(text),
-                    model=settings.route.model, provider=settings.route.provider, effort=settings.effort,
+                    model=settings.route.model, provider=settings.route.provenance_provider(),
+                    effort=settings.effort,
                 ))
             except Exception as exc:
                 logger.warning("LCM could not write a summary", exc_info=True)

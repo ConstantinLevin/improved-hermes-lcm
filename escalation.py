@@ -90,6 +90,14 @@ class SummariserRoute:
     api_key: Any = field(default="", repr=False)
     api_mode: str = ""
     source: str = "session"
+    # A labelled fact about the endpoint, recorded with the summary's provenance:
+    # "the session's <provider> endpoint" when the session's route is called in the
+    # host's custom form, "endpoint: resolved by the host" when it is passed as given
+    # to a host branch that ignores an explicit base URL (ask A-9.2).
+    endpoint_note: str = ""
+
+    def provenance_provider(self) -> str:
+        return f"{self.provider} [{self.endpoint_note}]" if self.endpoint_note else self.provider
 
     def call_kwargs(self) -> dict[str, Any]:
         fields = {"provider": self.provider, "model": self.model, "base_url": self.base_url,
@@ -148,6 +156,46 @@ def host_ignores_base_url(provider: str) -> Optional[str]:
         return (f"the host builds {dispatched}'s client from its own {auth_type} credentials and endpoint "
                 f"(_resolve_registry_branch)")
     return None
+
+
+# The wires the host's custom branch speaks to an explicit base URL
+# (``resolve_provider_client``: api_mode forces codex_responses, chat_completions or
+# anthropic_messages; agent/auxiliary_client.py at 7b761da).
+_CUSTOM_WIRES = frozenset({"chat_completions", "codex_responses", "anthropic_messages"})
+
+
+def _host_api_mode(api_mode: str) -> str:
+    """The session's API mode as the host names its wire (``_canonical_api_mode``,
+    hermes_cli/config_providers.py at 7b761da)."""
+    try:
+        from hermes_cli.config_providers import _canonical_api_mode  # type: ignore
+        return str(_canonical_api_mode(str(api_mode or ""))).lower()
+    except Exception:
+        return str(api_mode or "").strip().lower()
+
+
+def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mode: str) -> SummariserRoute:
+    """The session's own route as the summariser's (the orchestrator's ruling on #54).
+
+    The summariser is the session's model on the endpoint the session itself uses,
+    which the host named in ``update_model``. Where the host's branch for the provider
+    would ignore that base URL, the route is called in the form the host honours:
+    provider custom, the session's base URL, its wire, and the same key object. Where
+    it cannot be expressed that way (no key the plugin holds, or a wire the custom
+    branch does not speak), it is passed as given, and the summary's provenance says
+    the host resolved the endpoint."""
+    route = SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
+                            api_mode=api_mode, source="session")
+    if not base_url or host_ignores_base_url(provider) is None:
+        return route
+    wire = _host_api_mode(api_mode)
+    has_key = callable(api_key) or (isinstance(api_key, str) and bool(api_key.strip()))
+    if has_key and wire in _CUSTOM_WIRES:
+        return SummariserRoute(provider="custom", model=model, base_url=base_url, api_key=api_key,
+                               api_mode=wire, source="session",
+                               endpoint_note=f"the session's {provider} endpoint")
+    return SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
+                           api_mode=api_mode, source="session", endpoint_note="endpoint: resolved by the host")
 
 
 def _control_characters(value: str) -> bool:
