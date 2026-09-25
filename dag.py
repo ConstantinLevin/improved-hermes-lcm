@@ -119,6 +119,8 @@ class SummaryNode:
     summary: str = ""
     token_count: int = 0
     source_token_count: int = 0  # total tokens of source material
+    # Images in the source the estimate left uncounted (#21, #35).
+    source_uncounted_images: int = 0
     source_ids: List[int] = field(default_factory=list)  # store_ids or node_ids
     source_type: str = "messages"  # "messages" or "nodes"
     created_at: float = 0.0
@@ -210,7 +212,8 @@ class SummaryDAG:
             """SELECT depth,
                       COUNT(*) AS count,
                       COALESCE(SUM(token_count), 0) AS tokens,
-                      COALESCE(SUM(source_token_count), 0) AS source_tokens
+                      COALESCE(SUM(source_token_count), 0) AS source_tokens,
+                      COALESCE(SUM(source_uncounted_images), 0) AS source_uncounted_images
                FROM summary_nodes
                WHERE session_id = ?
                GROUP BY depth
@@ -222,6 +225,7 @@ class SummaryDAG:
                 "count": int(row[1] or 0),
                 "tokens": int(row[2] or 0),
                 "source_tokens": int(row[3] or 0),
+                "source_uncounted_images": int(row[4] or 0),
             }
             for row in rows
         }
@@ -442,14 +446,15 @@ class SummaryDAG:
             summary=row[3],
             token_count=row[4],
             source_token_count=row[5],
-            source_ids=json.loads(row[6]) if row[6] else [],
-            source_type=row[7],
-            created_at=row[8],
-            earliest_at=row[9],
-            latest_at=row[10],
-            expand_hint=row[11] or "",
-            seq=int(row[12] or 0) if len(row) > 12 else 0,
-            search_rank=row[13] if len(row) > 13 else None,
+            source_uncounted_images=int(row[6] or 0),
+            source_ids=json.loads(row[7]) if row[7] else [],
+            source_type=row[8],
+            created_at=row[9],
+            earliest_at=row[10],
+            latest_at=row[11],
+            expand_hint=row[12] or "",
+            seq=int(row[13] or 0) if len(row) > 13 else 0,
+            search_rank=row[14] if len(row) > 14 else None,
         )
 
     def close(self, reason: str = "closed") -> None:

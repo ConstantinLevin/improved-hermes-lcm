@@ -16,8 +16,9 @@ receives:
 
 An image is not counted by the length of its data: it is counted by the rule of the
 model the count concerns, from the plugin's model table (#35), reading its size from
-its header; an image with no rule or no readable size is left out and counted as
-"uncounted". The count is ``ceil(characters / 4)`` plus the images' tokens.
+its header and, on OpenAI, the part's own ``detail``; the algorithms are the providers'
+documented ones, cited where they are implemented. An image with no rule, no readable
+size or a ``detail`` its model does not support is left out and counted as "uncounted". The count is ``ceil(characters / 4)`` plus the images' tokens.
 
 On Claude, for tool results, the provider's count was 1.51 times this estimate at p50
 and 2.37 at p99 (#31); a value compared with provider tokens states its conversion
@@ -64,28 +65,89 @@ def count_tokens(text: Any) -> int:
     return math.ceil(len(text) / CHARS_PER_TOKEN)
 
 
+def _anthropic_resized_size(width: int, height: int, max_edge: int, max_tokens: int) -> tuple[int, int]:
+    """The size Claude resizes an image to before padding: Anthropic's reference
+    implementation, as published in "Coordinates and bounding boxes", section "Resize
+    your image before uploading"
+    (https://platform.claude.com/docs/en/build-with-claude/vision-coordinates, read
+    2026-09-25), with the tier's limits from "Vision", "Resolution and token cost"
+    (https://platform.claude.com/docs/en/build-with-claude/vision)."""
+
+    def fits(w: int, h: int) -> bool:
+        return (
+            math.ceil(w / 28) * 28 <= max_edge
+            and math.ceil(h / 28) * 28 <= max_edge
+            and math.ceil(w / 28) * math.ceil(h / 28) <= max_tokens
+        )
+
+    if fits(width, height):
+        return (width, height)
+    if height > width:
+        resized_h, resized_w = _anthropic_resized_size(height, width, max_edge, max_tokens)
+        return (resized_w, resized_h)
+    # Binary search along the long edge for the largest aspect-preserving size that fits.
+    aspect_ratio = width / height
+    lo, hi = 1, width  # lo always fits; hi never fits
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if fits(mid, max(round(mid / aspect_ratio), 1)):
+            lo = mid
+        else:
+            hi = mid
+    return (lo, max(round(lo / aspect_ratio), 1))
+
+
 def _anthropic_image_tokens(rule, width: int, height: int) -> int:
-    scale = min(1.0, rule.max_edge_px / max(width, height))
-    w, h = width * scale, height * scale
-    tiles = math.ceil(w / 28) * math.ceil(h / 28)
-    if tiles > rule.max_tokens:
-        factor = math.sqrt(rule.max_tokens / tiles)
-        w, h = w * factor, h * factor
-        tiles = min(rule.max_tokens, math.ceil(w / 28) * math.ceil(h / 28))
-    return tiles + rule.measured_constant
+    """``ceil(w/28) * ceil(h/28)`` visual tokens of the resized image ("Vision",
+    "Resolution and token cost"), plus the constant measured on the route (#35).
+    Anthropic's image block has no ``detail``; a part's ``detail`` changes nothing."""
+    w, h = _anthropic_resized_size(width, height, rule.max_edge_px, rule.max_tokens)
+    return math.ceil(w / 28) * math.ceil(h / 28) + rule.measured_constant
 
 
-def _openai_image_tokens(rule, width: int, height: int) -> int:
-    w, h = float(width), float(height)
-    if rule.max_edge_px:
-        scale = min(1.0, rule.max_edge_px / max(w, h))
-        w, h = w * scale, h * scale
+def _openai_image_tokens(rule, width: int, height: int, detail: str = "") -> Optional[int]:
+    """OpenAI's patch-based image tokenization, steps A-D as published in "Images and
+    vision", section "Calculating costs" / "Patch-based image tokenization"
+    (https://developers.openai.com/api/docs/guides/images-vision, read 2026-09-25), with
+    the ``detail`` level's limits from the same page's "Model sizing behavior". A level
+    the model does not support gives None (uncounted).
+
+    An image above 30,000 patches is rejected by the API, not resized; it is counted as
+    computed here, so that the estimate never reads lower than what the list holds."""
+    sizing = rule.for_detail(detail)
+    if sizing is None:
+        return None
+    # First, fit within the level's pixel-dimension limit, preserving aspect ratio,
+    # rounding to integer pixels, never enlarging. The page says "rounding"; it is read
+    # here as rounding to the nearest pixel, halves up.
+    w, h = width, height
+    if max(w, h) > sizing.max_edge_px:
+        scale = sizing.max_edge_px / max(w, h)
+        w, h = max(1, math.floor(w * scale + 0.5)), max(1, math.floor(h * scale + 0.5))
+    # A. Patches covering the image.
     patches = math.ceil(w / 32) * math.ceil(h / 32)
-    if patches > rule.patch_budget:
-        factor = math.sqrt(rule.patch_budget / patches)
-        w, h = w * factor, h * factor
-        patches = min(rule.patch_budget, math.ceil(w / 32) * math.ceil(h / 32))
+    # B. and C. Only where the level has a resizing patch budget and the image exceeds it.
+    if sizing.patch_budget is not None and patches > sizing.patch_budget:
+        shrink = math.sqrt((32 ** 2 * sizing.patch_budget) / (w * h))
+        adjusted = shrink * min(
+            math.floor(w * shrink / 32) / (w * shrink / 32),
+            math.floor(h * shrink / 32) / (h * shrink / 32),
+        )
+        resized_w, resized_h = math.floor(w * adjusted), math.floor(h * adjusted)
+        patches = math.ceil(resized_w / 32) * math.ceil(resized_h / 32)
+    # D. The model's multiplier, rounded up.
     return math.ceil(patches * rule.multiplier)
+
+
+def image_detail(part: dict) -> str:
+    """The ``detail`` a part carries: ``image_url.detail`` (Chat Completions) or the
+    part's own ``detail`` (Responses ``input_image``); "" when it has none."""
+    if not isinstance(part, dict):
+        return ""
+    inner = part.get("image_url")
+    if isinstance(inner, dict) and isinstance(inner.get("detail"), str):
+        return inner["detail"]
+    return part["detail"] if isinstance(part.get("detail"), str) else ""
 
 
 @dataclass(frozen=True)
@@ -112,7 +174,8 @@ class Estimator:
         if isinstance(rule, AnthropicImageRule):
             return _anthropic_image_tokens(rule, *size)
         if isinstance(rule, OpenAIImageRule):
-            return _openai_image_tokens(rule, *size)
+            # The part's own detail decides; the model's default only where it has none.
+            return _openai_image_tokens(rule, *size, detail=image_detail(part))
         return None
 
     def _content(self, content: Any) -> tuple[int, int, int]:

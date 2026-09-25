@@ -16,6 +16,7 @@ from .db_bootstrap import (
     check_external_content_fts_integrity,
     inspect_lcm_schema_health,
 )
+from .message_content import content_parts, is_image_part
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 from .presets import preset_status_payload
@@ -268,15 +269,68 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
     return encoded
 
 
-def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
+def _stored_content_text(row: dict[str, Any]) -> tuple[str, tuple[tuple[int, int], ...]]:
+    """A stored message's content as the tools return it, and where its images stand.
+
+    Text content is returned as it is. Structured content (a list of parts, or the
+    ``_multimodal`` envelope; the view's ``content_type``) is returned as its compact
+    JSON, and each image part (structural, #35) is located in that text as a span, so
+    that a page never cuts through an image. The tools return an image inside that
+    JSON text, and the model reads it as text: a page is counted by the characters it
+    returns. Counting its images by the model table's rule is right once an image is
+    returned as an image (#18), not while it stands inside a string (#35: "base64
+    inside a string is not an image")."""
+    content = row.get("content")
+    if row.get("content_type") not in ("array", "object") or not isinstance(content, str):
+        return (content if isinstance(content, str) else str(content or "")), ()
+    try:
+        value = json.loads(content)
+    except (TypeError, ValueError):
+        return content, ()
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    spans: list[tuple[int, int]] = []
+    at = 0
+    for part in content_parts(value) or []:
+        if not is_image_part(part):
+            continue
+        needle = json.dumps(part, ensure_ascii=False, separators=(",", ":"))
+        start = text.find(needle, at)
+        if start < 0:
+            continue
+        spans.append((start, start + len(needle)))
+        at = start + len(needle)
+    return text, tuple(spans)
+
+
+def _slice_content_for_response(
+    content: str,
+    max_tokens: int,
+    content_offset: int = 0,
+    image_spans: tuple[tuple[int, int], ...] = (),
+) -> dict[str, Any]:
     content = content or ""
     content_offset = min(max(0, content_offset), len(content))
+    # An image is never split across pages (#35): an offset inside one starts at it.
+    for start, stop in image_spans:
+        if start < content_offset < stop:
+            content_offset = start
+            break
     sliced, _ = _truncate_text_to_token_budget(content[content_offset:], max_tokens)
-    if not sliced and content_offset < len(content):
+    end = content_offset + len(sliced)
+    for start, stop in image_spans:
+        if start < end < stop:
+            # The page would end inside an image: it ends before the image, or, where
+            # the image opens the page, the image larger than a page stands alone on it.
+            end = start if start > content_offset else stop
+            break
+    if end == content_offset and content_offset < len(content):
         # A tiny token budget can fail to fit even the next character. Return one
-        # character anyway so callers make deterministic, lossless cursor progress
-        # instead of receiving has_more=true with the same content_offset forever.
-        sliced = content[content_offset:content_offset + 1]
+        # character, or the whole image that begins here, so callers make
+        # deterministic, lossless cursor progress instead of receiving has_more=true
+        # with the same content_offset forever.
+        opening = [stop for start, stop in image_spans if start == content_offset]
+        end = opening[0] if opening else content_offset + 1
+    sliced = content[content_offset:end]
     next_content_offset = content_offset + len(sliced)
     has_more = next_content_offset < len(content)
     return {
@@ -409,9 +463,9 @@ def _expand_message_sources(
             next_content_offset = 0
             has_more = next_source_offset < total_sources
             continue
-        content = stored.get("content", "")
+        content, image_spans = _stored_content_text(stored)
         effective_content_offset = content_offset if source_index == source_offset else 0
-        sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset)
+        sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset, image_spans)
         expanded = {
             "store_id": stored["store_id"],
             "source_index": source_index,
@@ -502,6 +556,7 @@ def _expand_child_nodes(
                 "summary_truncated": summary_truncated or (max_tokens is None and len(child.summary) > 1000),
                 "token_count": child.token_count,
                 "source_token_count": child.source_token_count,
+                "source_uncounted_images": child.source_uncounted_images,
                 "expand_hint": child.expand_hint,
             }
         )
@@ -712,9 +767,10 @@ def _collect_raw_match_context_block(
             has_more = True
             next_store_id = store_id if isinstance(store_id, int) else None
             break
-        content = str(row.get("content") or "")
+        content, image_spans = _stored_content_text(row)
         match_offset = _content_offset_for_query_match(content, query)
-        content_slice = _slice_content_for_response(content, remaining_tokens, content_offset=match_offset)
+        content_slice = _slice_content_for_response(content, remaining_tokens, content_offset=match_offset,
+                                                    image_spans=image_spans)
         content = content_slice["content"]
         item = {
             "store_id": store_id,
@@ -1100,8 +1156,8 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         stored = engine._store.get(store_id)
         if stored is None:
             return json.dumps({"error": f"Message store_id {store_id} not found"})
-        transcript_content = stored.get("content", "") or ""
-        sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset)
+        transcript_content, image_spans = _stored_content_text(stored)
+        sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset, image_spans)
         engine_session_id = engine.current_session_id
         stored_session_id = stored.get("session_id", "")
         result: Dict[str, Any] = {
@@ -1428,7 +1484,7 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
         raise RuntimeError("LCM DAG connection is not initialized")
     rows = conn.execute(
         """
-        SELECT node_id, session_id, depth, token_count, source_token_count
+        SELECT node_id, session_id, depth, token_count, source_token_count, source_uncounted_images
         FROM summary_nodes
         WHERE session_id = ? AND source_token_count > 0
         ORDER BY
@@ -1451,7 +1507,8 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
                       AND token_count < 500 THEN 1 ELSE 0 END),
             SUM(CASE WHEN token_count > 0
                       AND CAST(source_token_count AS REAL) / token_count >= 400
-                     THEN 1 ELSE 0 END)
+                     THEN 1 ELSE 0 END),
+            COALESCE(SUM(source_uncounted_images), 0)
         FROM summary_nodes
         WHERE session_id = ?
         """,
@@ -1462,13 +1519,14 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
     total_summary_tokens = int(totals[2] or 0)
     tiny_large_source_nodes = int(totals[3] or 0)
     extreme_ratio_nodes = int(totals[4] or 0)
+    total_source_uncounted_images = int(totals[5] or 0)
     overall_ratio = (
         round(total_source_tokens / total_summary_tokens, 1)
         if total_summary_tokens > 0
         else 0.0
     )
     worst_nodes = []
-    for node_id, session_id, depth, token_count, source_token_count in rows:
+    for node_id, session_id, depth, token_count, source_token_count, source_uncounted_images in rows:
         ratio = (
             round(float(source_token_count) / float(token_count), 1)
             if token_count and token_count > 0
@@ -1479,6 +1537,7 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
             "session_id": session_id,
             "depth": int(depth),
             "source_token_count": int(source_token_count or 0),
+            "source_uncounted_images": int(source_uncounted_images or 0),
             "token_count": int(token_count or 0),
             "compression_ratio": ratio,
         })
@@ -1486,6 +1545,7 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
         "total_nodes": total_nodes,
         "session_id": session_id,
         "total_source_tokens": total_source_tokens,
+        "total_source_uncounted_images": total_source_uncounted_images,
         "total_summary_tokens": total_summary_tokens,
         "overall_compression_ratio": overall_ratio,
         "extreme_ratio_threshold": 400,
@@ -1515,6 +1575,7 @@ def _inspect_message_metadata(row: dict[str, Any]) -> dict[str, Any]:
         "role": row.get("role") or "unknown",
         "timestamp": row.get("timestamp", 0),
         "token_estimate": row.get("token_estimate", 0),
+        "uncounted_images": int(row.get("uncounted_images") or 0),
         "content_chars": len(content),
     }
     if row.get("tool_call_id"):
@@ -1573,7 +1634,8 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
         """
         SELECT COUNT(*), COALESCE(SUM(token_estimate), 0),
                (SELECT store_id FROM messages WHERE session_id = ? ORDER BY seq ASC LIMIT 1),
-               (SELECT store_id FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1)
+               (SELECT store_id FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1),
+               COALESCE(SUM(uncounted_images), 0)
         FROM messages
         WHERE session_id = ?
         """,
@@ -1583,10 +1645,12 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     estimated_tokens = int(store_totals_row[1] or 0) if store_totals_row else 0
     first_store_id = store_totals_row[2] if store_totals_row else None
     last_store_id = store_totals_row[3] if store_totals_row else None
+    estimated_uncounted_images = int(store_totals_row[4] or 0) if store_totals_row else 0
     fresh_tail_count = max(0, int(engine._config.fresh_tail_count or 0))
     # The fresh tail as the latest effective compaction returned it, in its positions.
     fresh_tail_rows = engine._store.get_returned_tail(session_id)
     fresh_tail_tokens = sum(int(row.get("token_estimate") or 0) for row in fresh_tail_rows)
+    fresh_tail_uncounted_images = sum(int(row.get("uncounted_images") or 0) for row in fresh_tail_rows)
     fresh_tail_display_rows = fresh_tail_rows[-limit:]
     fresh_tail_items = [
         _inspect_message_metadata(row)
@@ -1597,10 +1661,11 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     total_dag_nodes = sum(info["count"] for info in depth_stats.values())
     total_dag_tokens = sum(info["tokens"] for info in depth_stats.values())
     total_dag_source_tokens = sum(info["source_tokens"] for info in depth_stats.values())
+    total_dag_source_uncounted_images = sum(info["source_uncounted_images"] for info in depth_stats.values())
     latest_node_rows = engine._dag.connection.execute(
         """
         SELECT node_id, session_id, depth, token_count, source_token_count,
-               source_type, created_at, earliest_at, latest_at, expand_hint
+               source_type, created_at, earliest_at, latest_at, expand_hint, source_uncounted_images
         FROM summary_nodes
         WHERE session_id = ?
         ORDER BY seq DESC
@@ -1615,6 +1680,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "depth": int(row[2]),
             "token_count": int(row[3] or 0),
             "source_token_count": int(row[4] or 0),
+            "source_uncounted_images": int(row[10] or 0),
             "source_type": row[5],
             "created_at": row[6],
             "earliest_at": row[7],
@@ -1644,12 +1710,14 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
         "messages": {
             "total": message_total,
             "estimated_tokens": estimated_tokens,
+            "estimated_uncounted_images": estimated_uncounted_images,
             "first_store_id": first_store_id,
             "last_store_id": last_store_id,
             "fresh_tail_count": fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
             "effective_fresh_tail_count": len(fresh_tail_rows),
             "effective_fresh_tail_tokens": fresh_tail_tokens,
+            "effective_fresh_tail_uncounted_images": fresh_tail_uncounted_images,
             "pre_tail_message_count": max(0, message_total - len(fresh_tail_rows)),
             "fresh_tail": {
                 "returned": len(fresh_tail_items),
@@ -1672,6 +1740,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "total_nodes": total_dag_nodes,
             "total_tokens": total_dag_tokens,
             "total_source_tokens": total_dag_source_tokens,
+            "total_source_uncounted_images": total_dag_source_uncounted_images,
             "depths": {f"d{depth}": info for depth, info in sorted(depth_stats.items())},
             "latest_nodes": latest_nodes,
         },
@@ -1697,6 +1766,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     # Store stats
     store_messages = engine._store.get_session_count(session_id)
     store_tokens = engine._store.get_session_token_total(session_id)
+    store_uncounted_images = engine._store.get_session_uncounted_images(session_id)
 
     # DAG stats by depth
     depths = engine._dag.get_session_depth_stats(session_id)
@@ -1742,6 +1812,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "store": {
             "messages": store_messages,
             "estimated_tokens": store_tokens,
+            "estimated_uncounted_images": store_uncounted_images,
         },
         "dag": {
             "total_nodes": total_dag_nodes,

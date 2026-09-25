@@ -99,9 +99,16 @@ def _close_helpers(helpers: tuple, label: str, reason_box: list, backup: Optiona
 
 
 # The keys under which the tools show the plugin's own estimate (the views' token
-# columns, derived from records.est_tokens and derivations.est_tokens). The host's own
-# counts (last_prompt_tokens and the like) are not estimates and are not labelled.
-_ESTIMATE_KEYS = frozenset({"token_count", "source_token_count", "est_tokens", "tokens"})
+# columns, derived from records.est_tokens and derivations.est_tokens, and their sums).
+# The host's own counts (last_prompt_tokens and the like) are not estimates and are not
+# labelled. Beside every such count that can hold images stands the number of images
+# its estimate left uncounted (records.est_uncounted_images and its sums, #35).
+_ESTIMATE_KEYS = frozenset({
+    "token_count", "source_token_count", "est_tokens", "tokens", "source_tokens", "token_estimate",
+    "estimated_tokens", "effective_fresh_tail_tokens", "total_tokens", "total_source_tokens",
+    "total_summary_tokens",
+})
+_UNCOUNTED_NOTE = "; beside each count that can hold images, the images it left uncounted (*uncounted_images)"
 
 
 def _has_token_count(value: Any) -> bool:
@@ -120,7 +127,7 @@ def _label_token_counts(result: str) -> str:
     except (TypeError, ValueError):
         return result
     if isinstance(payload, dict) and _has_token_count(payload) and "token_counts" not in payload:
-        payload = {"token_counts": ESTIMATE_LABEL, **payload}
+        payload = {"token_counts": ESTIMATE_LABEL + _UNCOUNTED_NOTE, **payload}
         return json.dumps(payload, ensure_ascii=False)
     return result
 

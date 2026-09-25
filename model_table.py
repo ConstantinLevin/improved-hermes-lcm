@@ -15,11 +15,12 @@ Columns, each ``None`` where not established:
 - ``context_window``: the model's whole window in provider tokens, the bound on what one
   summariser call can read (the tiny-chunk rule on #52; #34 D4);
 - ``image_rule``: how the provider counts one image, from its documentation (#35,
-  #21): ``AnthropicImageRule`` (28-px tiles after scaling to the tier's edge and token
-  limits, plus a measured constant) or ``OpenAIImageRule`` (32-px patches after the
-  model's edge limit and patch budget for the default ``detail``, the host sends none,
-  times the model's multiplier). Where no rule is documented an image is not counted,
-  and the estimate says how many it left uncounted.
+  #21): ``AnthropicImageRule`` (the tier's edge and token limits, the documented resize,
+  28-px visual tokens, plus a measured constant; Anthropic has no ``detail``) or
+  ``OpenAIImageRule`` (per ``detail`` level a pixel limit and possibly a resizing patch
+  budget, the level ``auto`` stands for, and the model's multiplier; the algorithm is in
+  ``tokens``). Where no rule is documented an image is not counted, and the estimate
+  says how many it left uncounted.
 
 #21 adds the session window's bounds to this table. Each row says where its values
 come from.
@@ -39,10 +40,28 @@ class AnthropicImageRule:
 
 
 @dataclass(frozen=True)
+class OpenAISizing:
+    """One ``detail`` level's sizing: the pixel limit on either side, and the resizing
+    patch budget where the level has one (``None``: no resize to a budget)."""
+    max_edge_px: int
+    patch_budget: Optional[int]
+
+
+@dataclass(frozen=True)
 class OpenAIImageRule:
-    max_edge_px: Optional[int]
-    patch_budget: int
+    """The documented sizing per ``detail`` level (OpenAI, "Images and vision", model
+    sizing behavior, 2026-09-25), the level ``auto`` behaves as, and the multiplier."""
+    sizing: tuple[tuple[str, OpenAISizing], ...]
+    auto_as: str
     multiplier: float
+
+    def for_detail(self, detail: str) -> Optional[OpenAISizing]:
+        """The sizing of a part's ``detail``; ``auto`` or none is the model's default.
+        A level the model does not support has no sizing (the image is uncounted)."""
+        level = (detail or "auto").strip().lower()
+        if level == "auto":
+            level = self.auto_as
+        return dict(self.sizing).get(level)
 
 
 ImageRule = Union[AnthropicImageRule, OpenAIImageRule]
@@ -75,16 +94,24 @@ ROWS: tuple[ModelFacts, ...] = (
     ),
     ModelFacts(
         "openai", "gpt-6-astra", reads_images=True, output_cap=128_000, context_window=1_050_000,
-        source="images: OpenAI docs 2026-09-24, default detail original (edge up to 65,535 px, at most "
-               "30,000 patches, x1.2), measured = rule (#9, #35); output and window: third-party metadata "
+        source="images: OpenAI docs 2026-09-25 (low: within 512 px; high: 65,535 px and a 2,500-patch "
+               "budget; original: 65,535 px, no budget, rejected above 30,000 patches; auto as original; "
+               "x1.2), measured = rule at original (#9, #35); output and window: third-party metadata "
                "caches, not the provider's own (#31)",
-        image_rule=OpenAIImageRule(max_edge_px=None, patch_budget=30_000, multiplier=1.2),
+        image_rule=OpenAIImageRule(
+            sizing=(("low", OpenAISizing(512, None)), ("high", OpenAISizing(65_535, 2500)),
+                    ("original", OpenAISizing(65_535, None))),
+            auto_as="original", multiplier=1.2),
     ),
     ModelFacts(
         "openai", "gpt-5.4-mini", reads_images=True, output_cap=None, context_window=None,
-        source="images: OpenAI docs 2026-09-24, default detail high (2,048 px, 2,500 patches, x1.2), "
-               "measured = rule (#9, #35)",
-        image_rule=OpenAIImageRule(max_edge_px=2048, patch_budget=2500, multiplier=1.2),
+        source="images: OpenAI docs 2026-09-25 (low: 2,048 px and a 6,144-patch budget; high: 2,048 px "
+               "and 2,500; original: 6,000 px and 10,000; auto as high; x1.2), measured = rule at high "
+               "(#9, #35)",
+        image_rule=OpenAIImageRule(
+            sizing=(("low", OpenAISizing(2048, 6144)), ("high", OpenAISizing(2048, 2500)),
+                    ("original", OpenAISizing(6000, 10_000))),
+            auto_as="high", multiplier=1.2),
     ),
     ModelFacts(
         "openai", "gpt-5-nano", reads_images=True, output_cap=None, context_window=None,
