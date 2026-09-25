@@ -50,7 +50,7 @@ from .plugin_sessions import PluginSessions
 from .record_store import RecordStore
 from .record_write import RecordWriteMixin
 from .store import MessageStore
-from .tokens import count_messages_tokens
+from .tokens import ESTIMATE_LABEL, Estimator, count_messages_tokens
 from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,33 @@ def _close_helpers(helpers: tuple, label: str, reason_box: list, backup: Optiona
             logger.warning("LCM could not close the %s of %s (%s)", type(helper).__name__, label, reason,
                            exc_info=True)
     logger.info("LCM closed the store connections of %s: %s", label, reason)
+
+
+# The keys under which the tools show the plugin's own estimate (the views' token
+# columns, derived from records.est_tokens and derivations.est_tokens). The host's own
+# counts (last_prompt_tokens and the like) are not estimates and are not labelled.
+_ESTIMATE_KEYS = frozenset({"token_count", "source_token_count", "est_tokens", "tokens"})
+
+
+def _has_token_count(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(k in _ESTIMATE_KEYS or _has_token_count(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_has_token_count(v) for v in value)
+    return False
+
+
+def _label_token_counts(result: str) -> str:
+    """A tool result that shows the plugin's token counts says what they are: an
+    estimate (#21). The label is added at the top of the result object."""
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if isinstance(payload, dict) and _has_token_count(payload) and "token_counts" not in payload:
+        payload = {"token_counts": ESTIMATE_LABEL, **payload}
+        return json.dumps(payload, ensure_ascii=False)
+    return result
 
 
 class ReviewForkDetachRefused(RuntimeError):
@@ -600,6 +627,17 @@ class LCMEngine(
         with _ACTIVE_ENGINE_REGISTRY_LOCK:
             _remove_registry_entries_for_engine(self)
 
+    def _estimator(self) -> Estimator:
+        """The estimate for this session's context (#21): images by the session model's
+        rule, ``reasoning_content`` where the session's provider receives it (the host's
+        ``needs_reasoning_echo``)."""
+        try:
+            from agent.message_sanitization import needs_reasoning_echo  # type: ignore
+            echo = bool(needs_reasoning_echo(self.provider, self.model, self.base_url))
+        except Exception:
+            echo = False
+        return Estimator(image_model=self.model, reasoning_sent=echo)
+
     def _fresh_tail_boundary(self, messages: List[Dict[str, Any]]) -> FreshTailBoundary:
         # The newest message is always in the tail (#31's floor): no setting makes
         # the tail empty, so the return always ends with the host's own newest dict.
@@ -607,6 +645,7 @@ class LCMEngine(
             messages,
             fresh_tail_count=max(1, int(self._config.fresh_tail_count or 0)),
             fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
+            estimator=self._estimator(),
         )
 
     def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
@@ -866,7 +905,7 @@ class LCMEngine(
         }
         handler = handlers.get(name)
         if handler:
-            return handler(args, engine=self)
+            return _label_token_counts(handler(args, engine=self))
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
 
     def _database_path_source(self) -> str:
@@ -998,7 +1037,7 @@ class LCMEngine(
         if observed_tokens is not None and observed_tokens > 0:
             candidates.append(observed_tokens)
         if messages is not None:
-            candidates.append(count_messages_tokens(messages))
+            candidates.append(count_messages_tokens(messages, self._estimator()))
         if not candidates:
             return None
         return max(candidates)
@@ -1014,7 +1053,7 @@ class LCMEngine(
         if messages is None or observed_tokens is None or observed_tokens <= 0:
             return assembly_cap
 
-        message_tokens = count_messages_tokens(messages)
+        message_tokens = count_messages_tokens(messages, self._estimator())
         overhead_tokens = max(0, observed_tokens - message_tokens)
         return max(1, assembly_cap - overhead_tokens)
 

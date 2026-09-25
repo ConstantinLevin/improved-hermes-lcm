@@ -56,7 +56,7 @@ from .summariser_input import wire_facts
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .record_write import _ATTEMPT, AttemptCancelled
-from .tokens import count_message_tokens, count_messages_tokens
+from .tokens import Estimator, count_message_tokens, count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +87,17 @@ class CompactionMixin:
         compaction when the prompt is over the threshold and the material outside the
         tail reaches a chunk. Nothing else is written here."""
         self._bind_from_list(messages)
-        rough = count_messages_tokens(messages)
+        # The plugin's estimate (#21), compared with a threshold in provider tokens: on
+        # Claude it reads about 1.5 times lower (#31), so this gate fires later than the
+        # host's own pressure would; the conversion is PR-5's (R9).
+        rough = count_messages_tokens(messages, self._estimator())
         if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
             return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             mechanism = self._mechanism_positions(messages)
             tail_start = self._tail_start(messages, mechanism)
             material_tokens = count_messages_tokens(
-                [messages[index] for index in range(tail_start) if index not in mechanism]
+                [messages[index] for index in range(tail_start) if index not in mechanism], self._estimator()
             )
             if material_tokens >= self._config.leaf_chunk_tokens:
                 return self._mark_preflight_compression_requested()
@@ -256,7 +259,9 @@ class CompactionMixin:
         (#8, ``summariser_input``). The budget is a target in the prompt text, never an output limit. A wait
         between retries stops at once when the attempt is cancelled or superseded.
         """
-        source_tokens = count_messages_tokens(chunk_messages)
+        # What the summary replaces in the session's context, by the session's estimate
+        # (R6): the acceptance compares the reply with this, by the same estimate.
+        source_tokens = count_messages_tokens(chunk_messages, self._estimator())
         budget = min(max(2000, int(source_tokens * 0.20)), 12000)
         attempt = _ATTEMPT.get()
 
@@ -310,7 +315,8 @@ class CompactionMixin:
         return groups
 
     @classmethod
-    def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int) -> List[List[int]]:
+    def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int,
+                    estimator: Optional[Estimator] = None) -> List[List[int]]:
         """The material cut in list order into chunks of at most ``limit`` tokens, and
         only between groups: a tool call is never separated from its results. A group
         larger than the limit is a chunk of its own (#31: a chunk flexes by one group).
@@ -329,7 +335,7 @@ class CompactionMixin:
         current: List[int] = []
         used = 0
         for group in cls._groups(messages, material):
-            tokens = sum(count_message_tokens(messages[index]) for index in group)
+            tokens = sum(count_message_tokens(messages[index], estimator) for index in group)
             if current and used + tokens > limit:
                 chunks.append(current)
                 sizes.append(used)
@@ -413,7 +419,8 @@ class CompactionMixin:
         # 2. The tail and the material.
         tail_start = self._tail_start(messages, mechanism)
         material = [index for index in range(tail_start) if index not in mechanism]
-        material_tokens = count_messages_tokens([messages[index] for index in material])
+        estimator = self._estimator()
+        material_tokens = count_messages_tokens([messages[index] for index in material], estimator)
         if not material:
             if force_overflow:
                 self._publish("_last_overflow_recovery_failed", True)
@@ -427,21 +434,23 @@ class CompactionMixin:
             return self._abort(messages, why_not)
 
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk.
-        chunks = self._cut_chunks(messages, material, max(1, int(self._config.leaf_chunk_tokens)))
+        chunks = self._cut_chunks(messages, material, max(1, int(self._config.leaf_chunk_tokens)), estimator)
         # A chunk the summariser cannot read in one call would fail on every attempt; it
         # is never cut (the tiny-chunk rule on #52). Only where the model table knows
-        # the window; counted by the plugin's own counter, an estimate.
+        # the window; counted by the plugin's estimate, its images by the summariser's rule.
         model_facts = lookup_model(settings.route.model)
         if model_facts is not None and model_facts.context_window:
             room = model_facts.context_window - (model_facts.output_cap or 0)
+            summariser_estimate = Estimator(image_model=settings.route.model)
             for number, chunk in enumerate(chunks, start=1):
-                tokens = count_messages_tokens([messages[index] for index in chunk])
-                if tokens > room:
+                estimate = summariser_estimate.messages([messages[index] for index in chunk])
+                if estimate.tokens > room:
                     return self._abort(
                         messages,
-                        f"chunk {number} of {len(chunks)} holds about {tokens} tokens (the plugin's estimate), "
-                        f"more than the summariser {settings.route.describe()} can read in one call "
-                        f"({model_facts.context_window} window less {model_facts.output_cap or 0} output)",
+                        f"chunk {number} of {len(chunks)} holds about {estimate.tokens} tokens "
+                        f"({estimate.label()}), more than the summariser {settings.route.describe()} can read "
+                        f"in one call ({model_facts.context_window} window less {model_facts.output_cap or 0} "
+                        f"output)",
                     )
         try:
             chunk_handles = self._write_compaction(attempt, entries, chunks, force=force)
@@ -531,16 +540,18 @@ class CompactionMixin:
         self._publish("_last_compression_noop_reason", "")
         self._publish("_last_compress_aborted", False)
         self._publish("_last_summary_error", None)
-        over_cap = recovery_cap is not None and count_messages_tokens(result) > recovery_cap
+        before, after = estimator.messages(messages), estimator.messages(result)
+        over_cap = recovery_cap is not None and after.tokens > recovery_cap
         self._publish("_last_overflow_recovery_failed", over_cap)
         if over_cap:
             logger.warning(
-                "LCM overflow recovery left the context above the cap (%d > %d); nothing is cut to fit",
-                count_messages_tokens(result), recovery_cap,
+                "LCM overflow recovery left the context above the cap (%d > %d tokens, %s); nothing is cut to fit",
+                after.tokens, recovery_cap, after.label(),
             )
         logger.info(
-            "LCM compaction #%d: %d entries -> %d (%d chunk%s, %d summaries in the cover, %d -> %d tokens, %.1fms)",
+            "LCM compaction #%d: %d entries -> %d (%d chunk%s, %d summaries in the cover, %d -> %d tokens, "
+            "%s -> %s, %.1fms)",
             number, len(messages), len(result), len(chunks), "" if len(chunks) == 1 else "s", len(cover),
-            count_messages_tokens(messages), count_messages_tokens(result), duration_ms,
+            before.tokens, after.tokens, before.label(), after.label(), duration_ms,
         )
         return result

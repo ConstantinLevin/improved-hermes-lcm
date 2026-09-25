@@ -34,7 +34,7 @@ from typing import Any, Iterable, Optional, Sequence
 from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .message_content import base64_like_strings, describe_image_part, image_parts, index_text
-from .tokens import count_message_tokens
+from .tokens import Estimator, count_message_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -645,6 +645,7 @@ class RecordStore:
         attempt_generation: Optional[int],
         entries: Sequence[InputEntry],
         chunks: Sequence[Sequence[int]] = (),
+        estimator: Optional[Estimator] = None,
     ) -> tuple[int, dict[int, str], list[str]]:
         """Transaction 1: the compaction, its inputs, the new records, their tool calls
         and the chunks.
@@ -691,7 +692,7 @@ class RecordStore:
                             message.get("role"),
                             message.get("tool_call_id"),
                             index_text(message.get("content")),
-                            count_message_tokens(message),
+                            count_message_tokens(message, estimator),
                         ),
                     )
                     records[entry.position] = handle

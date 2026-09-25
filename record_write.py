@@ -207,6 +207,7 @@ class RecordWriteMixin:
             attempt_generation=attempt.generation if isinstance(attempt.generation, int) else None,
             entries=entries,
             chunks=chunks,
+            estimator=self._estimator(),
         )
         attempt.compaction = compaction
         attempt.records = records
