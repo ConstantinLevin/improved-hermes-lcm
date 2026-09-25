@@ -10,22 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
-from .externalize import (
-    _inspect_top_level_json_string_fields_before_content as _externalized_top_level_fields_before_content,
-    get_large_output_storage_dir,
-    load_externalized_payload,
-    read_externalized_payload_metadata_prefix,
-)
 from .diagnostics import doctor_guidance_for_checks
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
     check_external_content_fts_integrity,
     inspect_lcm_schema_health,
-)
-from .ingest_protection import (
-    _QUARANTINED_ASSISTANT_KIND,
-    extract_ingest_externalized_refs,
-    scan_ingest_side_file_integrity,
 )
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
@@ -91,22 +80,6 @@ def _get_session_node(engine: "LCMEngine", node_id: int):
     if node is None or node.session_id != engine.current_session_id:
         return None
     return node
-
-
-def _get_externalized_payload(
-    engine: "LCMEngine",
-    ref: str,
-    *,
-    allowed_session_ids: set[str] | None = None,
-) -> dict[str, Any] | None:
-    payload = load_externalized_payload(ref, config=engine._config, hermes_home=engine._hermes_home)
-    if payload is None:
-        return None
-    payload_session_id = payload.get("session_id") or ""
-    allowed = allowed_session_ids or {engine.current_session_id}
-    if payload_session_id and payload_session_id not in allowed:
-        return None
-    return payload
 
 
 def _truncate_text_to_token_budget(text: str, max_tokens: int) -> tuple[str, bool]:
@@ -196,8 +169,6 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
 _LCM_GREP_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
-_LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
-_LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
 _LCM_INSPECT_MAX_RESPONSE_CHARS = 20_000
 _OPERATOR_TEXT_FIELD_MAX_CHARS = 1_000
 
@@ -259,7 +230,6 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         "messages",
         "compaction",
         "dag",
-        "externalized_refs",
         "filters",
         "limit_clamped_from",
     ]
@@ -367,29 +337,6 @@ def _content_offset_for_query_match(content: str, query: str | None) -> int:
     return 0
 
 
-def _full_content_slice(content: str, content_offset: int = 0) -> dict[str, Any]:
-    content = content or ""
-    content_offset = min(max(0, content_offset), len(content))
-    sliced = content[content_offset:]
-    return {
-        "content": sliced,
-        "content_chars": len(content),
-        "content_offset": content_offset,
-        "content_returned_chars": len(sliced),
-        "content_truncated": False,
-        "next_content_offset": 0,
-        "has_more": False,
-    }
-
-
-def _is_compact_externalized_marker(content: str, ref: str | None) -> bool:
-    if not ref or not content:
-        return False
-    if len(content) > 512:
-        return False
-    return "[Externalized LCM ingest payload:" in content
-
-
 def _pagination_payload(
     *,
     total_sources: int,
@@ -428,7 +375,6 @@ def _expand_message_sources(
     source_offset: int = 0,
     source_limit: int | None = None,
     content_offset: int = 0,
-    hydrate_externalized_content: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -463,27 +409,9 @@ def _expand_message_sources(
             next_content_offset = 0
             has_more = next_source_offset < total_sources
             continue
-        transcript_content = stored.get("content", "")
-        content = transcript_content
-        content_source = "message"
-        ingest_refs = extract_ingest_externalized_refs(transcript_content)
-        ref = ingest_refs[0] if ingest_refs else None
-        if hydrate_externalized_content and ref:
-            # The query model gets quarantined assistant output from its side
-            # file; base64 ingest payloads stay as their placeholder.
-            ref_payload = _get_externalized_payload(
-                engine,
-                ref,
-                allowed_session_ids={engine.current_session_id, stored.get("session_id", "")},
-            )
-            if ref_payload is not None and ref_payload.get("kind") == _QUARANTINED_ASSISTANT_KIND:
-                content = ref_payload.get("content", "")
-                content_source = "externalized_payload"
+        content = stored.get("content", "")
         effective_content_offset = content_offset if source_index == source_offset else 0
-        if not hydrate_externalized_content and _is_compact_externalized_marker(content, ref):
-            sliced = _full_content_slice(content, effective_content_offset)
-        else:
-            sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset)
+        sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset)
         expanded = {
             "store_id": stored["store_id"],
             "source_index": source_index,
@@ -497,10 +425,7 @@ def _expand_message_sources(
             "content_returned_chars": sliced["content_returned_chars"],
             "content_truncated": sliced["content_truncated"],
             "next_content_offset": sliced["next_content_offset"],
-            "content_source": content_source,
         }
-        if content_source == "externalized_payload":
-            expanded["transcript_content"] = transcript_content
         messages.append(expanded)
         budget_used += count_tokens(sliced["content"])
         if sliced["has_more"]:
@@ -618,7 +543,6 @@ def _collect_descendant_evidence_blocks(
     node,
     max_tokens: int,
     *,
-    hydrate_externalized_content: bool = False,
     visited_node_ids: set[int] | None = None,
     source_path: list[dict[str, int]] | None = None,
     remaining_node_visits: list[int] | None = None,
@@ -667,7 +591,6 @@ def _collect_descendant_evidence_blocks(
                 engine,
                 child,
                 max_tokens=remaining_tokens,
-                hydrate_externalized_content=hydrate_externalized_content,
             )
             if messages or pagination.get("has_more"):
                 block = {
@@ -708,8 +631,6 @@ def _collect_context_blocks_for_node(
     engine: "LCMEngine",
     node,
     max_tokens: int,
-    *,
-    hydrate_externalized_content: bool = False,
 ) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -732,7 +653,6 @@ def _collect_context_blocks_for_node(
             engine,
             node,
             max_tokens=remaining_tokens,
-            hydrate_externalized_content=hydrate_externalized_content,
         )
         if messages or pagination.get("has_more"):
             block = {
@@ -761,7 +681,6 @@ def _collect_context_blocks_for_node(
                     engine,
                     node,
                     max_tokens=descendant_tokens,
-                    hydrate_externalized_content=hydrate_externalized_content,
                 )
             )
 
@@ -1119,33 +1038,28 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
 
 def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
-    """Expand a summary node, externalized payload, or raw message to its content.
+    """Expand a summary node or a stored message to its content.
 
     Mode selection (exactly one is required):
-    - ``externalized_ref``: open a stored externalized payload by ref filename (current session only)
-    - ``store_id``: fetch a single raw message by store_id
-    - ``node_id``: expand a summary node to its source content (current session only)
+    - ``store_id``: fetch a single stored message by store_id, as stored
+    - ``node_id``: expand a summary node to its source messages (current session only)
 
-    ``store_id`` mode has no session check. ``node_id`` stays current-session
-    scoped, but carried-over current-session nodes may reference raw source rows
-    that still belong to the previous session.
+    ``store_id`` mode has no session check.
     """
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    if "include_exact_ref" in args:
+    removed = [name for name in ("include_exact_ref", "externalized_ref") if name in args]
+    if removed:
         return json.dumps({
-            "error": "lcm_expand no longer accepts: include_exact_ref.",
+            "error": "lcm_expand no longer accepts: " + ", ".join(removed) + ".",
         })
 
-    externalized_ref = str(args.get("externalized_ref") or "").strip()
     raw_store_id_arg = args.get("store_id")
     raw_node_id_arg = args.get("node_id")
 
     modes_provided: list[str] = []
-    if externalized_ref:
-        modes_provided.append("externalized_ref")
     if raw_store_id_arg is not None:
         modes_provided.append("store_id")
     if raw_node_id_arg is not None:
@@ -1154,13 +1068,13 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     if len(modes_provided) > 1:
         return json.dumps({
             "error": (
-                "Provide only one of node_id, externalized_ref, store_id "
+                "Provide only one of node_id, store_id "
                 f"(got {', '.join(modes_provided)})"
             ),
         })
     if not modes_provided:
         return json.dumps({
-            "error": "node_id, externalized_ref, or store_id is required",
+            "error": "node_id or store_id is required",
         })
 
     max_tokens = _parse_positive_int(args.get("max_tokens", 4000), 4000)
@@ -1168,32 +1082,6 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     source_limit_arg = args.get("source_limit")
     source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
     content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
-
-    if externalized_ref:
-        payload = _get_externalized_payload(engine, externalized_ref)
-        if payload is None:
-            return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
-        content = payload.get("content", "")
-        sliced = _slice_content_for_response(content, max_tokens, content_offset)
-        return json.dumps(
-            {
-                "externalized_ref": externalized_ref,
-                "source_type": "externalized_payload",
-                "kind": payload.get("kind", "tool_result"),
-                "tool_call_id": payload.get("tool_call_id", ""),
-                "role": payload.get("role", ""),
-                "session_id": payload.get("session_id", ""),
-                "field_path": payload.get("field_path", ""),
-                "content_chars": payload.get("content_chars", len(content)),
-                "content_bytes": payload.get("content_bytes", 0),
-                "content": sliced["content"],
-                "content_offset": sliced["content_offset"],
-                "content_returned_chars": sliced["content_returned_chars"],
-                "content_truncated": sliced["content_truncated"],
-                "next_content_offset": sliced["next_content_offset"],
-                "has_more": sliced["has_more"],
-            }
-        )
 
     if raw_store_id_arg is not None:
         try:
@@ -1229,44 +1117,6 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             # A summary row the host rewrote: it stands beside the chain and revises
             # this summary, which the context shows re-emitted from its derivation.
             result["revises_node_id"] = stored["revises_node_id"]
-        # Surface externalized-payload metadata when the row references one. Content
-        # is not hydrated by default, mirroring the existing _expand_message_sources
-        # default. Externalized lookup remains session-scoped (per the existing
-        # _get_externalized_payload contract); cross-session rows surface only the
-        # ref string, with a hint pointing at the same-session expansion path.
-        ref_values = [transcript_content]
-        if stored.get("tool_calls"):
-            try:
-                ref_values.append(json.dumps(stored.get("tool_calls"), ensure_ascii=False, sort_keys=True))
-            except (TypeError, ValueError):
-                ref_values.append(str(stored.get("tool_calls")))
-        refs: list[str] = []
-        for value in ref_values:
-            if not isinstance(value, str):
-                continue
-            for found_ref in extract_ingest_externalized_refs(value):
-                if found_ref not in refs:
-                    refs.append(found_ref)
-        if refs:
-            result["externalized_refs"] = refs
-            result["externalized_ref"] = refs[0]
-            if bool(engine_session_id) and stored_session_id == engine_session_id:
-                payload_summaries = []
-                for ref in refs:
-                    payload = _get_externalized_payload(engine, ref)
-                    if payload is None:
-                        continue
-                    payload_summary = dict(payload)
-                    payload_summary.pop("content", None)
-                    payload_summaries.append(payload_summary)
-                if payload_summaries:
-                    result["externalized_payloads"] = payload_summaries
-                    result["externalized"] = payload_summaries[0]
-            else:
-                result["externalized_note"] = (
-                    "Externalized payload metadata is session-scoped; "
-                    "cross-session ref is surfaced for traceability only and cannot be expanded in this version."
-                )
         return json.dumps(result)
 
     node_id = raw_node_id_arg
@@ -1387,7 +1237,6 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             engine,
             node,
             max_tokens=remaining_context_tokens,
-            hydrate_externalized_content=True,
         )
         context_blocks.extend(node_blocks)
         context_budget_used += _context_content_token_count(node_blocks)
@@ -1646,25 +1495,6 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
     }
 
 
-def _inspect_externalized_refs_from_value(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        sources = [value]
-    else:
-        try:
-            sources = [json.dumps(value, ensure_ascii=False)]
-        except (TypeError, ValueError):
-            sources = [str(value)]
-
-    refs: list[str] = []
-    for source in sources:
-        for ref in extract_ingest_externalized_refs(source):
-            if ref not in refs:
-                refs.append(ref)
-    return refs
-
-
 def _inspect_message_metadata(row: dict[str, Any]) -> dict[str, Any]:
     """Return row metadata only; never include raw message content."""
     content = row.get("content") or ""
@@ -1682,14 +1512,6 @@ def _inspect_message_metadata(row: dict[str, Any]) -> dict[str, Any]:
         item["tool_call_id"] = row.get("tool_call_id")
     if row.get("tool_name"):
         item["tool_name"] = row.get("tool_name")
-
-    refs: list[str] = []
-    for value in (row.get("content"), row.get("tool_calls")):
-        for ref in _inspect_externalized_refs_from_value(value):
-            if ref not in refs:
-                refs.append(ref)
-    if refs:
-        item["externalized_refs"] = refs
     return item
 
 
@@ -1708,132 +1530,6 @@ def _inspect_last_compacted_store_id(engine: "LCMEngine", session_id: str) -> in
         (session_id, session_id),
     ).fetchone()
     return int(row[0]) if row else None
-
-
-def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
-    return _externalized_top_level_fields_before_content(text)
-
-
-def _read_externalized_payload_metadata_prefix(
-    path: Path,
-    *,
-    max_read_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
-) -> tuple[str, bool, bool]:
-    """Read bounded JSON metadata before the externalized payload body.
-
-    Returns ``(prefix_text, content_string_seen, prefix_truncated)``. The content
-    string body is intentionally not consumed; ``lcm_inspect`` reports bounded
-    metadata only and leaves full JSON/body validation to explicit expansion.
-    """
-    return read_externalized_payload_metadata_prefix(
-        path,
-        max_read_bytes=max_read_bytes,
-    )
-
-
-def _inspect_externalized_payload_metadata(
-    engine: "LCMEngine",
-    ref: str,
-    session_id: str,
-    *,
-    max_read_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
-) -> dict[str, Any]:
-    if not ref or Path(ref).name != ref:
-        return {"readable": False, "error": "invalid_ref"}
-    try:
-        storage_dir = get_large_output_storage_dir(
-            engine._config,
-            hermes_home=engine._hermes_home,
-            create=False,
-        )
-        path = storage_dir / ref
-        if not path.exists():
-            return {"readable": False, "error": "missing"}
-        if not path.is_file():
-            return {"readable": False, "error": "not_a_file"}
-        metadata_prefix_text, content_key_seen, prefix_truncated = _read_externalized_payload_metadata_prefix(
-            path,
-            max_read_bytes=max_read_bytes,
-        )
-    except FileNotFoundError:
-        return {"readable": False, "error": "missing"}
-    except (OSError, ValueError) as exc:
-        return {"readable": False, "error": str(exc)}
-
-    metadata_fields, _content_key_seen = _inspect_top_level_json_string_fields_before_content(metadata_prefix_text)
-    payload_session_id = metadata_fields.get("session_id", "")
-    if payload_session_id and payload_session_id != session_id:
-        return {"readable": False, "error": "session_mismatch"}
-    if not payload_session_id:
-        return {"readable": False, "error": "session_metadata_unavailable"}
-    if not content_key_seen:
-        error = "metadata_prefix_truncated" if prefix_truncated else "invalid_payload"
-        return {"readable": False, "error": error}
-
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return {"readable": False, "error": "missing"}
-    except OSError as exc:
-        return {"readable": False, "error": str(exc)}
-
-    metadata: dict[str, Any] = {
-        "readable": True,
-        "file_size_bytes": stat.st_size,
-        "modified_at": stat.st_mtime,
-        "payload_validation": "metadata_prefix",
-    }
-    if payload_session_id:
-        metadata["payload_session_id"] = payload_session_id
-    return metadata
-
-
-def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int) -> dict[str, Any]:
-    message_total = engine._store.get_session_count(session_id)
-    rows = engine._store.load_session_page(session_id, limit=_LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT)
-    scan_truncated = message_total > len(rows)
-    items: list[dict[str, Any]] = []
-    total_known = 0
-    seen: set[tuple[int, str]] = set()
-    for row in rows:
-        refs: list[str] = []
-        for value in (row.get("content"), row.get("tool_calls")):
-            for ref in _inspect_externalized_refs_from_value(value):
-                if ref not in refs:
-                    refs.append(ref)
-        for ref in refs:
-            key = (int(row.get("store_id") or 0), ref)
-            if key in seen:
-                continue
-            seen.add(key)
-            total_known += 1
-            if len(items) >= limit:
-                continue
-            metadata = _inspect_externalized_payload_metadata(engine, ref, session_id)
-            item: dict[str, Any] = {
-                "externalized_ref": ref,
-                "store_id": row.get("store_id"),
-                "session_id": row.get("session_id") or "",
-                "source": row.get("source") or "",
-                "conversation_id": row.get("conversation_id") or "",
-                "role": row.get("role") or "unknown",
-                "timestamp": row.get("timestamp", 0),
-                "readable": metadata.get("readable") is True,
-            }
-            if row.get("tool_call_id"):
-                item["tool_call_id"] = row.get("tool_call_id")
-            item.update(metadata)
-            items.append(item)
-
-    return {
-        "total_known": total_known,
-        "total_known_exact": not scan_truncated,
-        "scanned_messages": len(rows),
-        "scan_truncated": scan_truncated,
-        "returned": len(items),
-        "has_more": total_known > len(items) or scan_truncated,
-        "items": items,
-    }
 
 
 def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
@@ -1970,7 +1666,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "depths": {f"d{depth}": info for depth, info in sorted(depth_stats.items())},
             "latest_nodes": latest_nodes,
         },
-        "externalized_refs": _inspect_externalized_refs(engine, session_id, limit),
     }
     if requested_limit > _LCM_INSPECT_HARD_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
@@ -2157,27 +1852,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "sqlite_storage",
-            "status": "fail",
-            "detail": str(e),
-        })
-
-    # Ingest side files (base64 payloads, quarantined assistant output): SQLite
-    # integrity cannot see a missing or unreferenced file.
-    try:
-        side_file_integrity = scan_ingest_side_file_integrity(
-            engine._store.connection,
-            engine._config,
-            hermes_home=engine._hermes_home,
-        )
-        missing_side_files = int(side_file_integrity.get("externalized_payload_refs_missing", 0) or 0)
-        checks.append({
-            "check": "payload_storage",
-            "status": "warn" if missing_side_files else "pass",
-            "detail": side_file_integrity,
-        })
-    except Exception as e:
-        checks.append({
-            "check": "payload_storage",
             "status": "fail",
             "detail": str(e),
         })

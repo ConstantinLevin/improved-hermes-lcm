@@ -44,13 +44,6 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
             rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
     elif name == "sqlite_storage":
         command = "inspect journal/quick_check output and database/WAL size; restore from backup if SQLite reports corruption"
-    elif name == "payload_storage":
-        command = "inspect the missing ingest side-file refs; restore missing side files from backup before deleting or rewriting anything"
-        if status == "warn":
-            warning_only = True
-            rationale = "the rows still hold their placeholders; the side files hold the original payloads"
-        else:
-            rationale = "payload diagnostic failures mean doctor could not read side-file state reliably"
     elif name == "orphaned_dag_nodes":
         command = "inspect affected DAG/source IDs; do not auto-delete summaries without confirming recall impact"
         if status == "warn":

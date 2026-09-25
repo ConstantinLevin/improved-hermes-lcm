@@ -7,7 +7,7 @@ Use read-only product tools before changing configuration or running an apply pa
 1. `hermes plugins`: confirm `hermes-lcm` is enabled and the selected context engine is `lcm`.
 2. Send one normal message if the session has not been bound since restart.
 3. `lcm_status`: inspect runtime identity, database path, context pressure, summary/store counts, and filters.
-4. `lcm_inspect`: inspect current-session lineage, the stored fresh tail, externalized-ref readability, and skip/no-op reasons without retrieving content.
+4. `lcm_inspect`: inspect current-session lineage, the stored fresh tail, and skip/no-op reasons without retrieving content.
 5. `lcm_doctor`: run database, FTS, configuration, and context-pressure diagnostics.
 
 If optional slash commands are enabled, `/lcm status` and `/lcm doctor` expose the corresponding operator views.

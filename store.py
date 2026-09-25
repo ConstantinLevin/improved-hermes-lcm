@@ -307,61 +307,6 @@ class MessageStore:
         ).fetchall()
         return {row[0]: self._row_to_dict(row) for row in rows}
 
-
-
-    def _session_load_where(
-        self,
-        session_id: str,
-        *,
-        roles: list[str] | None = None,
-        time_from: float | None = None,
-        time_to: float | None = None,
-    ) -> tuple[list[str], list[Any]]:
-        where = ["session_id = ?"]
-        args: list[Any] = [session_id]
-        if roles:
-            placeholders = ",".join("?" for _ in roles)
-            where.append(f"role IN ({placeholders})")
-            args.extend(roles)
-        if time_from is not None:
-            where.append("timestamp >= ?")
-            args.append(time_from)
-        if time_to is not None:
-            where.append("timestamp <= ?")
-            args.append(time_to)
-        return where, args
-
-
-    def load_session_page(
-        self,
-        session_id: str,
-        *,
-        after_seq: int = 0,
-        limit: int = 100,
-        roles: list[str] | None = None,
-        time_from: float | None = None,
-        time_to: float | None = None,
-    ) -> List[Dict[str, Any]]:
-        """Load one page of a session's stored messages in transcript order.
-
-        ``after_seq`` is exclusive: pass the last row's ``seq`` to continue.
-        """
-        where, args = self._session_load_where(
-            session_id,
-            roles=roles,
-            time_from=time_from,
-            time_to=time_to,
-        )
-        where.append("seq > ?")
-        args.extend([after_seq, limit])
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE {' AND '.join(where)}
-               ORDER BY seq LIMIT ?""",
-            args,
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
-
     def get_returned_tail(self, session_id: str) -> List[Dict[str, Any]]:
         """The fresh tail as it was returned: the record entries of the session's
         latest effective return, in their return positions."""

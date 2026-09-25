@@ -15,7 +15,6 @@ from .db_bootstrap import (
 )
 from .diagnostics import doctor_guidance_for_checks
 from .dag import build_nodes_fts_spec
-from .ingest_protection import scan_ingest_side_file_integrity
 from .presets import (
     explicit_operator_overrides,
     get_preset,
@@ -371,25 +370,6 @@ def _doctor_text(engine) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         quick_check = f"error: {exc}"
         issues.append("sqlite_quick_check")
-    payload_storage_error = ""
-    try:
-        side_file_integrity = scan_ingest_side_file_integrity(
-            store_conn,
-            engine._config,
-            hermes_home=engine._hermes_home,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        payload_storage_error = str(exc)
-        side_file_integrity = {
-            "externalized_payload_refs_total": 0,
-            "externalized_payload_refs_existing": 0,
-            "externalized_payload_refs_missing": 0,
-            "externalized_payload_files_unreferenced": 0,
-            "missing_externalized_payload_refs": [],
-            "unreferenced_externalized_payload_files": [],
-        }
-        issues.append("payload_storage")
-    missing_side_files = int(side_file_integrity.get("externalized_payload_refs_missing", 0) or 0)
 
     observations: list[str] = []
 
@@ -407,18 +387,6 @@ def _doctor_text(engine) -> str:
         )
     else:
         observations.append("schema_core_tables: ok")
-
-    if missing_side_files:
-        issues.append("payload_storage")
-        observations.append(
-            f"payload_storage: {missing_side_files} ingest side-file ref(s) point to missing JSON files"
-        )
-        recommended_actions.append(
-            "inspect missing ingest side-file refs and restore from backups if needed"
-        )
-    if payload_storage_error:
-        observations.append(f"payload_storage_error: {payload_storage_error}")
-        recommended_actions.append("inspect payload storage diagnostics")
 
     try:
         source_stats = engine._store.get_source_stats()
@@ -463,15 +431,6 @@ def _doctor_text(engine) -> str:
             "status": "warn" if node_fts == "unchecked" else "fail",
             "detail": node_fts_integrity,
         })
-    if payload_storage_error or missing_side_files:
-        detail = dict(side_file_integrity)
-        if payload_storage_error:
-            detail["error"] = payload_storage_error
-        triage_checks.append({
-            "check": "payload_storage",
-            "status": "fail" if payload_storage_error else "warn",
-            "detail": detail,
-        })
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
     triage_guidance = doctor_guidance_for_checks(triage_checks)
@@ -507,12 +466,6 @@ def _doctor_text(engine) -> str:
         f"messages_fts_rows: {store_fts_count}",
         f"nodes_fts: {node_fts}",
         f"nodes_fts_rows: {node_fts_count}",
-        f"externalized_payload_refs_total: {side_file_integrity['externalized_payload_refs_total']}",
-        f"externalized_payload_refs_existing: {side_file_integrity['externalized_payload_refs_existing']}",
-        f"externalized_payload_refs_missing: {side_file_integrity['externalized_payload_refs_missing']}",
-        f"externalized_payload_files_unreferenced: {side_file_integrity['externalized_payload_files_unreferenced']}",
-        f"missing_externalized_payload_refs: {side_file_integrity['missing_externalized_payload_refs']}",
-        f"unreferenced_externalized_payload_files: {side_file_integrity['unreferenced_externalized_payload_files']}",
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")

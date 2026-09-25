@@ -38,8 +38,7 @@ Recommended current-session escalation:
 Use as low-level drill-down after a known handle:
 
 - `node_id` expands a current-session summary with source pagination;
-- `store_id` recovers one raw message;
-- `externalized_ref` opens a current-session payload with content pagination.
+- `store_id` recovers one stored message as the host handed it over, with content pagination.
 
 Do not use it as broad first-step discovery.
 
