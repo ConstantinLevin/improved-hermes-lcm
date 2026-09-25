@@ -1,8 +1,9 @@
 """Process-wide registry of active LCM runtime clones by session/lane.
 
 Isolated from ``engine.py`` (WS5 seam): LCM clones register their own
-session/conversation binding so post-turn ingest can follow the active clone
-instead of the process-wide plugin singleton. The lock and the two weak
+session/conversation binding so the ``pre_llm_call`` recall-policy hook and the
+``/lcm`` command find the active clone instead of the process-wide plugin
+singleton. The lock and the two weak
 registries live here alongside the pure resolver/matcher helpers that read
 them. ``engine.py`` imports the shared lock, the two registries, the removal
 helper, and the public ``resolve_active_lcm_engine`` entry point; the binding
@@ -21,11 +22,7 @@ _ACTIVE_ENGINES_BY_CONVERSATION_ID = weakref.WeakValueDictionary()
 
 
 def _is_usable_lcm_engine(engine: Any) -> bool:
-    return bool(
-        engine is not None
-        and getattr(engine, "name", None) == "lcm"
-        and hasattr(engine, "ingest")
-    )
+    return bool(engine is not None and getattr(engine, "name", None) == "lcm")
 
 
 def _engine_matches_session_binding(engine: Any, session_id: str) -> bool:
@@ -66,11 +63,9 @@ def resolve_active_lcm_engine(
 ) -> Any:
     """Return the LCM runtime clone most recently bound to a session/lane.
 
-    Newer Hermes Agent hosts pass the active per-agent context engine directly
-    to ``post_llm_call`` hooks. Older hosts may only pass session/lane ids. LCM
-    clones register their own session binding when ``on_session_start`` runs so
-    post-turn ingest can still follow the active clone instead of rebinding the
-    process-wide plugin singleton.
+    Hooks and plugin commands receive only session/lane ids. LCM clones register
+    their own session binding when ``on_session_start`` runs, so a hook or a
+    command reaches the active clone instead of the process-wide plugin singleton.
     """
     session_id = str(session_id or "")
     conversation_id = str(conversation_id or "")

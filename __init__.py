@@ -42,7 +42,8 @@ def _host_forwards_registered_tool_messages(ctx) -> bool:
     plugin tools, but not the active conversation messages list. Registering
     duplicate lcm_* tool names on that host makes the model call the registry
     handler instead of the native context-engine dispatch branch, so LCM loses
-    current-turn ingest before lcm_grep/lcm_expand style recovery.
+    the live list it settles before a tool answers (a summary a compaction
+    inside the turn returned could not be expanded at once).
 
     Keep plugin-side tool registration opt-in until a host explicitly
     advertises that registered context-engine handlers receive messages.
@@ -206,7 +207,7 @@ def register(ctx):
     # Older/current Hermes hosts already expose lcm_* correctly through the
     # native context-engine schema/dispatch path (Path B). Registering duplicate
     # names through the plugin registry (Path A) on message-blind hosts would
-    # shadow Path B and lose current-turn ingest, so the Path B fallback is the
+    # shadow Path B and lose the live list a tool call settles, so the Path B fallback is the
     # expected healthy behavior there.
     _TOOLS = [
         ("lcm_grep", LCM_GREP, "🔍"),
