@@ -43,6 +43,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from . import turn_signals
 from .record_store import RET_KEY, InputEntry, parse_ret_key
 from .tokens import count_tokens
 
@@ -625,5 +626,12 @@ class RecordWriteMixin:
         self._settle_from_list(messages)
 
     def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None, **kwargs: Any) -> None:
-        """The first list after a commit settles and binds what the confirmation could not."""
+        """The turn ended (the hook state, #32 §1), and the first list after a commit
+        settles and binds what the confirmation could not.
+
+        The review fork's copy never touches the hook state (C1): its agent reuses its
+        parent's session id with turns of its own. Only the end of the turn
+        ``pre_llm_call`` opened for the session ends it (``turn_signals``)."""
+        if not getattr(self, "_review_fork", False):
+            turn_signals.turn_ended(self._session_id, kwargs.get("turn_id"))
         self._bind_from_list(messages)

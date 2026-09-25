@@ -51,6 +51,7 @@ import logging
 import math
 import queue
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from .escalation import (
@@ -100,6 +101,57 @@ _WAIT_SLICE_S = 0.25
 _SMALLEST_STANDALONE_RUN = 0.25
 
 
+try:  # the host's own test for its ephemeral recovery scaffolding (the nudge flags)
+    from agent.session_persistence import _is_ephemeral_scaffolding as _host_scaffolding  # type: ignore
+except Exception:  # pragma: no cover - older or absent host; its flags at 7b761da
+    _SCAFFOLDING_FLAGS = ("_empty_recovery_synthetic", "_empty_terminal_sentinel", "_thinking_prefill",
+                          "_verification_stop_synthetic", "_pre_verify_synthetic", "_kanban_stop_synthetic",
+                          "_dropped_toolcall_nudge")
+
+    def _host_scaffolding(message: Any) -> bool:
+        return isinstance(message, dict) and any(message.get(flag) for flag in _SCAFFOLDING_FLAGS)
+
+
+@dataclass(frozen=True)
+class Occasion:
+    """What an occasion is by the hooks and the list (#32 D1): ``kind`` one of
+    manual, between, no_work, running, gap; ``raised`` whether τ′ applies; ``gap``
+    whether the tail's floor reaches back to the newest tool group."""
+
+    kind: str
+    raised: bool
+    gap: bool
+    why: str
+
+
+def _is_steer(message: Any) -> bool:
+    return isinstance(message, dict) and message.get("role") == "user" and message.get("display_kind") == "steer"
+
+
+def _is_next_user_message(message: Any) -> bool:
+    """The row a turn start ends with: a user row not yet persisted (no ``_row_id``),
+    neither a steer row nor the host's flagged scaffolding (#32 §1)."""
+    return (isinstance(message, dict) and message.get("role") == "user" and "_row_id" not in message
+            and not _is_steer(message) and not _host_scaffolding(message))
+
+
+def _ends_with_tool_results(messages: List[Dict[str, Any]]) -> bool:
+    """The list ends with tool results, or with steer rows after them (#32 §1)."""
+    at = len(messages) - 1
+    while at >= 0 and _is_steer(messages[at]):
+        at -= 1
+    return at >= 0 and isinstance(messages[at], dict) and messages[at].get("role") == "tool"
+
+
+def _newest_tool_group_start(messages: List[Dict[str, Any]]) -> Optional[int]:
+    """Where the newest tool group begins: the assistant row that opened the newest tool
+    result, or that result where no opening row is found; None without tool rows."""
+    for at in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[at], dict) and messages[at].get("role") == "tool":
+            return _assistant_group_start(messages, at)
+    return None
+
+
 def _fewest_chunks(sizes: List[int], limit: int) -> int:
     """The fewest chunks of at most ``limit`` that cover ``sizes`` in order, every
     size at most ``limit``: filling each chunk as far as it goes is optimal."""
@@ -146,42 +198,92 @@ def _split_run(sizes: List[int], limit: int) -> List[int]:
 
 class CompactionMixin:
     def should_compress(self, prompt_tokens: int = None) -> bool:
+        """The host's count against τ, or τ′ while a turn runs (#32 D1, D2). No side
+        effects: the host asks several times per occasion.
+
+        The host hands one integer and no list, so "a turn runs" is read from the hooks
+        alone: ``pre_llm_call`` opened a turn for this session, and the last of its
+        events was a tool that ran (``post_tool_call``), so the list ends with tool
+        results (#32 §3). After a response of the turn (``post_api_request``), as at the
+        gate after a host nudge, or before any tool round, τ applies. ``compress()``
+        classifies again with the list."""
+        if self._geometry is None:
+            return False  # R11: nothing is compacted; the error was recorded where W was set
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
             return True
-        if self.threshold_tokens <= 0:
-            return False
-        return tokens >= self.threshold_tokens
+        return tokens >= self._tau(raised=self._turn_state().running())
+
+    def _provider_estimate(self, estimate: int) -> tuple[int, str]:
+        """An estimate turned into provider tokens where the plugin must decide from its
+        own count, as for c (#31's p50), with its label."""
+        ratio = self._config.estimate_ratio
+        return int(estimate * ratio), (f"{estimate} by the plugin's estimate (characters / 4) × {ratio}, #31's "
+                                       f"p50 of the provider's count over it, = {int(estimate * ratio)} provider tokens")
 
     def should_compress_preflight(self, messages):
-        """Before a request: settle and bind what the list shows, then ask for a
-        compaction when the prompt is over the threshold and the material outside the
-        tail holds a run that stands alone (c/4). Nothing else is written here."""
+        """Before a request, at turn start (the host asks it only there, after
+        ``should_compress`` declined): settle and bind what the list shows, then ask
+        for a compaction when the prompt reaches the occasion's threshold and the
+        material outside the tail holds a run that stands alone (c/4). No count of the
+        host's exists here, so the plugin's estimate decides, converted into provider
+        tokens by #31's ratio and labelled. Nothing else is written."""
         self._bind_from_list(messages)
-        # The plugin's estimate (#21), compared with a threshold in provider tokens: on
-        # Claude it reads about 1.5 times lower (#31), so this gate fires later than the
-        # host's own pressure would; the threshold and its comparison are #11/#32's.
+        if self._geometry is None:
+            return False
         rough = count_messages_tokens(messages, self._estimator())
         if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
             return self._mark_preflight_compression_requested()
-        if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+        occasion = self._classify_occasion(messages, force=False)
+        threshold = self._tau(raised=occasion.raised)
+        provider_rough, rough_label = self._provider_estimate(rough)
+        if provider_rough >= threshold:
             mechanism = self._mechanism_positions(messages)
-            tail_start = self._tail_start(messages, mechanism)
+            tail_start = self._tail_start(messages, mechanism, occasion)
             material = self._estimator().messages(
                 [messages[index] for index in range(tail_start) if index not in mechanism]
             )
             smallest = self._smallest_run()
             if material.tokens >= smallest:
                 return self._mark_preflight_compression_requested()
-            # Here no count of the host's exists yet, so the estimate decides, and says
-            # so. The host's count after the request decides again (``compress``).
             reason = (f"the material outside the fresh tail is below the smallest run that stands alone, c/4, "
                       f"by the plugin's estimate ({material.tokens} < {smallest} tokens, {material.label()}; "
                       f"{self._chunk_label()})")
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = reason
             logger.info("LCM preflight compression no-op: %s", reason)
+        else:
+            logger.debug("LCM preflight: %s is below %s %d (%s)", rough_label,
+                         "τ′" if occasion.raised else "τ", threshold, occasion.why)
         return False
+
+    def _classify_occasion(self, messages: List[Dict[str, Any]], *, force: bool) -> Occasion:
+        """The occasion by the hooks and the list's structure, where both agree (#32
+        D1): between turns, a turn with no work in progress, a running turn (τ′), or a
+        gap. At a gap the plugin does not guess: τ applies, nothing is re-inserted,
+        and the tail's floor reaches back to the newest tool group. Rows are read by
+        structure and host fields only, never by text."""
+        if force:
+            return Occasion("manual", False, False, "the host's /compress (force): between turns, τ (R15)")
+        state = self._turn_state()
+        last = messages[-1] if messages and isinstance(messages[-1], dict) else None
+        if not state.in_turn:
+            if _is_next_user_message(last):
+                return Occasion("between", False, False, "between turns: the list ends with the next user message")
+            return Occasion("gap", False, True, "a gap: the hooks say between turns, but the list does not end "
+                                                "with the next user message (the gateway's hygiene path, or "
+                                                "another host occasion)")
+        opening = state.opening_row_id()
+        if opening is not None and last is not None and last.get("_row_id") == opening:
+            return Occasion("no_work", False, False, "in a turn with no work in progress: the list ends with the "
+                                                     "turn's opening row")
+        if _ends_with_tool_results(messages):
+            return Occasion("running", True, False, "in a running turn: the list ends with tool results")
+        if _is_next_user_message(last):
+            return Occasion("gap", False, True, "a gap: a turn start while the hooks still say a turn runs (an "
+                                                "exit that skipped on_turn_complete)")
+        return Occasion("gap", False, True, "a gap: in a turn, the list ends with neither tool results nor the "
+                                            "turn's opening row (a host nudge, or another row the host inserts)")
 
     def _mechanism_positions(self, messages: List[Dict[str, Any]]) -> set:
         """The entries of a list that are the mechanism's layer, by identity: the host's
@@ -209,10 +311,16 @@ class CompactionMixin:
                 positions.add(index)
         return positions
 
-    def _tail_start(self, messages: List[Dict[str, Any]], mechanism: set) -> int:
-        """Where the fresh tail begins: the configured boundary, never before the last
-        entry of the mechanism's layer, which the cover re-emits."""
+    def _tail_start(self, messages: List[Dict[str, Any]], mechanism: set,
+                    occasion: Optional[Occasion] = None) -> int:
+        """Where the fresh tail begins: the configured boundary, reaching back to the
+        newest tool group at a gap (#32 D1), never before the last entry of the
+        mechanism's layer, which the cover re-emits."""
         boundary = self._fresh_tail_start(messages)
+        if occasion is not None and occasion.gap:
+            group = _newest_tool_group_start(messages)
+            if group is not None:
+                boundary = min(boundary, group)
         return max(boundary, max(mechanism) + 1 if mechanism else 0)
 
     def _chunk_limit(self) -> int:
@@ -241,11 +349,16 @@ class CompactionMixin:
                 f"/ {config.estimate_ratio}, #31's p50 of the provider's count over characters / 4")
 
     @staticmethod
-    def _tail_floor(messages: List[Dict[str, Any]], mechanism: set) -> int:
+    def _tail_floor(messages: List[Dict[str, Any]], mechanism: set, occasion: Optional[Occasion] = None) -> int:
         """The least the tail keeps under the host's pressure: the newest message, or,
         where the list ends inside a tool group, that group from the assistant that
-        opened it; never before the last entry of the mechanism's layer."""
+        opened it; at a gap, the newest tool group and everything after it (#32 D1);
+        never before the last entry of the mechanism's layer."""
         start = _assistant_group_start(messages, len(messages) - 1)
+        if occasion is not None and occasion.gap:
+            group = _newest_tool_group_start(messages)
+            if group is not None:
+                start = min(start, group)
         return max(start, max(mechanism) + 1 if mechanism else 0)
 
     def _unchanged_return(self, messages: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
@@ -259,6 +372,7 @@ class CompactionMixin:
         self._publish("_last_compression_noop_reason", reason)
         self._publish("_last_compress_aborted", False)
         self._publish("_last_summary_error", None)
+        self._publish("_last_compression_made_progress", False)
         logger.info("LCM compression no-op: %s", reason)
         return messages
 
@@ -269,6 +383,7 @@ class CompactionMixin:
         self._publish("_last_compression_noop_reason", cause)
         self._publish("_last_compress_aborted", True)
         self._publish("_last_summary_error", cause)
+        self._publish("_last_compression_made_progress", False)
         logger.warning("LCM compaction aborted: %s", cause)
         return messages
 
@@ -317,7 +432,8 @@ class CompactionMixin:
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
-                 force: bool = False) -> List[Dict[str, Any]]:
+                 force: bool = False,
+                 bypass_cooldown: bool = False) -> List[Dict[str, Any]]:
         """Run one compaction attempt.
 
         The host's cancellation check and the attempt's generation are captured here,
@@ -325,10 +441,20 @@ class CompactionMixin:
         its input at once and sets nothing. Engine attributes are set only when the
         attempt returns and is the host's current working attempt; a terminal status
         is left on every failure under the same rule.
+
+        ``bypass_cooldown``: the host hands a keyword on only to an engine whose
+        signature names it (``_supported_compression_kwargs``,
+        agent/conversation_compression.py 1771-1792 at 7b761da). It passes this one
+        when the provider rejected a request as too long (agent/turn_overflow.py
+        162-165, with the request's size as ``current_tokens``) and on its stall retry
+        of an occasion already under way (agent/compression_facade.py 282). The
+        provider's refusal is the real count: it compacts whatever τ says (#56).
         """
         attempt = self._begin_attempt()
         if attempt.cancelled():
             return messages
+        # The host's native compaction switch, read where the host reads it (#32 D2).
+        self._check_host_native_compaction()
         token = _ATTEMPT.set(attempt)
         try:
             result = self._compress_impl(
@@ -336,6 +462,7 @@ class CompactionMixin:
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
+                provider_rejected=bool(bypass_cooldown),
             )
         except AttemptCancelled:
             return messages
@@ -533,7 +660,8 @@ class CompactionMixin:
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
                        focus_topic: Optional[str] = None,
-                       force: bool = False) -> List[Dict[str, Any]]:
+                       force: bool = False,
+                       provider_rejected: bool = False) -> List[Dict[str, Any]]:
         attempt = _ATTEMPT.get()
         if self._closed_reason is not None:
             return self._abort(
@@ -559,6 +687,34 @@ class CompactionMixin:
                 "this engine copy is bound to no session of the plugin, and it compacts only for its own",
             )
         attempt.messages = messages
+        if self._geometry is None:
+            # R11: outside #21's bounds nothing is compacted (recorded where W was set).
+            return self._abort(messages, f"LCM compacts nothing: {self._geometry_error}")
+
+        # 0. The occasion (#32 D1) and the threshold. Compaction runs at τ and only
+        # there (#11), unless forced (the host's /compress, R15) or on overflow
+        # recovery. The count is the host's: its real count at most call sites, its own
+        # rough estimate at some (turn_recovery.py:1839). Where the host hands none, the
+        # plugin's estimate is converted into provider tokens by #31's ratio, labelled.
+        occasion = self._classify_occasion(messages, force=force)
+        tau = self._tau(raised=False)
+        if current_tokens is not None:
+            count, count_label = int(current_tokens), f"the host's count {int(current_tokens)}"
+        else:
+            count, count_label = self._provider_estimate(count_messages_tokens(messages, self._estimator()))
+        if not (force or force_overflow or provider_rejected) and count < tau:
+            return self._unchanged_return(
+                messages, f"below the threshold: {count_label} < τ {tau} ({occasion.why}; {self._geometry.label()})")
+        if force:
+            why_now = "the compaction was forced"
+        elif force_overflow:
+            why_now = "the context overflowed"
+        elif count < tau:
+            why_now = (f"the host required it after the provider rejected the request or a stalled attempt "
+                       f"({count_label}, below τ {tau})")
+        else:
+            why_now = f"{count_label} is at or above τ {tau}"
+        logger.info("LCM compacts: %s; %s", why_now, occasion.why)
 
         # 1. Identity (#29 W3). A list that cannot be classified is not compacted.
         self._settle_from_list(messages)
@@ -568,49 +724,30 @@ class CompactionMixin:
         mechanism = {entry.position for entry in entries if entry.klass == "system"}
         mechanism |= attempt.summary_inputs
 
-        # 2. The tail and the material.
-        tail_start = self._tail_start(messages, mechanism)
+        # 2. The tail and the material. At a gap the tail reaches back to the newest
+        # tool group (#32 D1). At the threshold everything outside the tail is chunked,
+        # with no minimum (#11, #12): where the tail leaves no material it yields down to
+        # its floor, and the estimate vetoes nothing the host's count requires (#56).
+        tail_start = self._tail_start(messages, mechanism, occasion)
         material = [index for index in range(tail_start) if index not in mechanism]
         estimator = self._estimator()
-        # The host's count decides pressure; the plugin's estimate reads lower than the
-        # provider's count (#31) and never vetoes a compaction that count requires.
-        # ``current_tokens`` is what the host hands its compaction: its real count at
-        # most call sites, its own rough estimate at some (turn_recovery.py:1839); either
-        # way the host's, not the plugin's.
-        host_pressure = (
-            current_tokens is not None and self.threshold_tokens > 0 and current_tokens >= self.threshold_tokens
-        )
-        pressure = bool(force or force_overflow or host_pressure)
-        if not material and pressure:
-            floor = self._tail_floor(messages, mechanism)
+        if not material:
+            floor = self._tail_floor(messages, mechanism, occasion)
             if floor > tail_start:
-                logger.info("LCM fresh tail yields to its floor under the host's pressure: %d entries -> %d",
+                logger.info("LCM fresh tail yields to its floor: %d entries -> %d",
                             len(messages) - tail_start, len(messages) - floor)
                 tail_start = floor
                 material = [index for index in range(tail_start) if index not in mechanism]
         if not material:
-            if force_overflow:
+            if force_overflow or provider_rejected:
                 self._publish("_last_overflow_recovery_failed", True)
-            if pressure:
-                why = (f"the host's count {current_tokens} is at or above the threshold {self.threshold_tokens}"
-                       if host_pressure else "the compaction was forced" if force
-                       else "the context overflowed")
-                return self._abort(
-                    messages,
-                    f"{why}, and nothing is left to compact: outside the newest "
-                    f"{'tool group' if len(messages) - tail_start > 1 else 'message'} "
-                    f"stands only the mechanism's layer (the system row and the summaries)",
-                )
-            return self._unchanged_return(messages, "no material outside the fresh tail")
-        material_estimate = estimator.messages([messages[index] for index in material])
-        smallest = self._smallest_run()
-        if material_estimate.tokens < smallest and not pressure:
-            return self._unchanged_return(
+            return self._abort(
                 messages,
-                f"without the host's pressure, the material outside the fresh tail is below the smallest run "
-                f"that stands alone, c/4, by the plugin's estimate ({material_estimate.tokens} < {smallest} "
-                f"tokens, {material_estimate.label()}; {self._chunk_label()})",
+                f"{why_now}, and nothing is left to compact: outside the newest "
+                f"{'tool group' if len(messages) - tail_start > 1 else 'message'} "
+                f"stands only the mechanism's layer (the system row and the summaries)",
             )
+        material_estimate = estimator.messages([messages[index] for index in material])
 
         # The summariser, as far as anything can be written: its route and effort (#9).
         settings, why_not = self._summariser_settings()
@@ -764,6 +901,9 @@ class CompactionMixin:
         self._publish("_last_compression_noop_reason", "")
         self._publish("_last_compress_aborted", False)
         self._publish("_last_summary_error", None)
+        # The host sets its re-arm flag from this after the commit, and re-arms its
+        # per-turn count when the next prompt is below threshold_tokens (#32 §9).
+        self._publish("_last_compression_made_progress", True)
         before, after = estimator.messages(messages), estimator.messages(result)
         over_cap = recovery_cap is not None and after.tokens > recovery_cap
         self._publish("_last_overflow_recovery_failed", over_cap)

@@ -33,7 +33,7 @@ It refuses conflicting paths rather than overwriting an existing install.
 
 Start with:
 
-- `LCM_CONTEXT_THRESHOLD`: when normal context pressure triggers compaction;
+- compaction runs at a threshold derived from the model's context window, τ = min(W − 123k, 0.85·W) − 54.5k, raised by the 54.5k margin while a turn runs; `lcm_status` shows τ, τ′ and the target G. The weights are `LCM_ROUND_GROWTH_TOKENS`, `LCM_HYGIENE_SHARE`, `LCM_TURN_MARGIN_TOKENS` and `LCM_TARGET_SHARE`; the host's own compression threshold is not read;
 - `LCM_FRESH_TAIL_COUNT`: newest messages kept raw;
 - `LCM_CHUNK_TOKENS`: the chunk size in provider tokens (default 50,000); the material outside the fresh tail is split equally into chunks of at most this size, cut by the plugin's estimate as this size divided by `LCM_ESTIMATE_RATIO` (default 1.51);
 - `LCM_DATABASE_PATH`: profile-local SQLite path when the default is unsuitable;

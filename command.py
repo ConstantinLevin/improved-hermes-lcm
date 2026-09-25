@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import os
 import sqlite3
 from typing import Any
 
@@ -15,17 +14,6 @@ from .db_bootstrap import (
 )
 from .diagnostics import doctor_guidance_for_checks
 from .dag import build_nodes_fts_spec
-from .presets import (
-    explicit_operator_overrides,
-    get_preset,
-    invalid_operator_overrides,
-    preset_confidence_reasons,
-    preset_env_diff,
-    preset_match_confidence,
-    shipped_presets,
-    suggest_preset_for_engine,
-    unsupported_runtime_fields_text,
-)
 from .store import build_message_fts_spec
 
 
@@ -57,9 +45,6 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
         "- /lcm doctor repair apply: rebuild the message and summary FTS indexes from the stored records",
-        "- /lcm preset show [name]: inspect shipped preset metadata and benchmark provenance",
-        "- /lcm preset suggest: preview the best shipped preset for the current engine state",
-        "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
         "- /lcm help: show this help",
     ])
     return "\n".join(lines)
@@ -81,7 +66,6 @@ def _status_text(engine) -> str:
         "effective_unknown_messages": int(source_stats.get("effective_unknown_messages", 0) or 0),
         **({"error": source_stats.get("error")} if source_stats.get("error") else {}),
     }
-    config_sources = status.get("config_sources") or {}
     config_source_warnings = status.get("config_source_warnings") or []
     ignored_config_yaml_lcm_keys = status.get("ignored_config_yaml_lcm_keys") or []
 
@@ -119,15 +103,14 @@ def _status_text(engine) -> str:
         f"total_compactions_scope: {status.get('total_compactions_scope', 'current_conversation')}",
         f"last_compression_status: {status.get('last_compression_status', 'idle')}",
         f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
+        f"native_compaction_refused: {status.get('native_compaction_refused') or '(not configured)'}",
         f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",
         f"raw_context_length: {status.get('raw_context_length', 0) if session_bound else '(uninitialized)'}",
         f"effective_context_length_cap: {status.get('effective_context_length_cap') or '(none)'}",
         f"effective_context_length_reason: {status.get('effective_context_length_reason') or '(none)'}",
         f"context_length_source: {context_length_source}",
-        f"configured_context_threshold: {status.get('configured_context_threshold', engine._config.context_threshold)}",
-        f"context_threshold: {status.get('context_threshold', engine._config.context_threshold)}",
-        f"context_threshold_source: {status.get('context_threshold_source', config_sources.get('context_threshold', 'manual_or_default'))}",
-        f"context_threshold_autoraised: {status.get('context_threshold_autoraised') or '(none)'}",
+        f"geometry: {status.get('geometry') or '(none)'}",
+        f"turn: {status.get('turn') or '(none)'}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
         f"last_input_tokens: {status.get('last_input_tokens', 0)}",
@@ -527,154 +510,6 @@ def _doctor_text(engine) -> str:
     return "\n".join(lines)
 
 
-def _unknown_preset_text(name: str) -> str:
-    available = ", ".join(preset.name for preset in shipped_presets()) or "(none)"
-    return "\n".join([
-        "LCM preset",
-        "status: error",
-        f"error: unknown preset {name}",
-        f"available_presets: {available}",
-    ])
-
-
-def _preset_show_text(tokens: list[str], engine) -> str:
-    if len(tokens) > 1:
-        return _help_text("`/lcm preset show` accepts at most one preset name.")
-    preset = get_preset(tokens[0] if tokens else None)
-    if preset is None:
-        return _unknown_preset_text(tokens[0])
-    provenance = dict(preset.provenance)
-    metric_summary = dict(provenance.get("metric_summary") or {})
-    fixture_suite = ", ".join(str(item) for item in provenance.get("fixture_suite") or []) or "(unknown)"
-    applies_to = ", ".join(preset.applies_to) if preset.applies_to else "(unspecified)"
-    lines = [
-        "LCM preset show",
-        f"preset: {preset.name}",
-        f"family: {preset.family}",
-        f"description: {preset.description}",
-        f"policy_version: {preset.policy_version}",
-        f"policy_path: {preset.policy_path}",
-        f"benchmark_version: {provenance.get('benchmark_version', '(unknown)')}",
-        f"fixture_suite: {fixture_suite}",
-        f"score: {metric_summary.get('score', '(unknown)')}",
-        f"baseline_score: {metric_summary.get('baseline_score', '(unknown)')}",
-        f"retrieval_canary_recall: {metric_summary.get('retrieval_canary_recall', '(unknown)')}",
-        f"applies_to: {applies_to}",
-        "runtime_env:",
-    ]
-    for item in preset_env_diff(preset, engine._config):
-        lines.append(f"- {item}")
-    lines.extend([
-        f"unsupported_runtime_fields: {unsupported_runtime_fields_text(preset)}",
-        "operator_config_precedence: explicit preset-managed LCM_* overrides win",
-        "runtime_mutation: no",
-        f"notes: {preset.notes}",
-    ])
-    return "\n".join(lines)
-
-
-def _preset_suggest_text(engine) -> str:
-    preset, reason = suggest_preset_for_engine(engine)
-    lines = ["LCM preset suggest"]
-    if preset is None:
-        lines.extend([
-            "suggested_preset: (none)",
-            f"reason: {reason}",
-            "note: run deterministic benchmarks before promoting a runtime preset",
-            "note: suggestion only; no live config was changed",
-        ])
-        return "\n".join(lines)
-
-    explicit = explicit_operator_overrides()
-    invalid = invalid_operator_overrides()
-    invalid_text = ", ".join(
-        f"{env_var}={os.environ.get(env_var, '')}" for env_var in sorted(invalid.values())
-    ) if invalid else "(none)"
-    lines.extend([
-        f"suggested_preset: {preset.name}",
-        f"reason: {reason}",
-        f"match_confidence: {preset_match_confidence(engine, preset)}",
-        f"policy_version: {preset.policy_version}",
-        f"benchmark_version: {preset.provenance.get('benchmark_version', '(unknown)')}",
-        "explicit_overrides: " + (", ".join(sorted(explicit.values())) if explicit else "(none)"),
-        f"invalid_overrides: {invalid_text}",
-        "confidence_reasons:",
-    ])
-    for item in preset_confidence_reasons(engine, preset, reason):
-        lines.append(f"- {item}")
-    lines.extend([
-        "preview:",
-    ])
-    for item in preset_env_diff(
-        preset,
-        engine._config,
-        runtime_context_threshold=getattr(engine, "context_threshold", None),
-        runtime_context_threshold_source=getattr(engine, "_context_threshold_source", ""),
-    ):
-        lines.append(f"- {item}")
-    lines.extend([
-        f"unsupported_runtime_fields: {unsupported_runtime_fields_text(preset)}",
-        "note: suggestion only; no live config was changed",
-    ])
-    return "\n".join(lines)
-
-
-def _preset_apply_text(tokens: list[str], engine) -> str:
-    if not tokens:
-        return _help_text("`/lcm preset apply` requires a preset name and `--dry-run`.")
-    dry_run = "--dry-run" in tokens
-    selected = [token for token in tokens if token != "--dry-run"]
-    if len(selected) != 1:
-        return _help_text("`/lcm preset apply` accepts exactly one preset name and optional `--dry-run`.")
-    preset_name = selected[0]
-    preset = get_preset(preset_name)
-    if preset is None:
-        return _unknown_preset_text(preset_name)
-    if not dry_run:
-        return "\n".join([
-            "LCM preset apply",
-            "status: denied",
-            "error: preset apply is preview-only for now; pass --dry-run",
-            "note: no live config was changed",
-        ])
-
-    lines = [
-        "LCM preset apply",
-        "status: dry-run",
-        f"preset: {preset.name}",
-        "would_set:",
-    ]
-    for item in preset_env_diff(
-        preset,
-        engine._config,
-        runtime_context_threshold=getattr(engine, "context_threshold", None),
-        runtime_context_threshold_source=getattr(engine, "_context_threshold_source", ""),
-    ):
-        lines.append(f"- {item}")
-    lines.extend([
-        f"unsupported_runtime_fields: {unsupported_runtime_fields_text(preset)}",
-        "operator_config_precedence: explicit preset-managed LCM_* overrides win",
-        "note: no live config was changed",
-    ])
-    return "\n".join(lines)
-
-
-def _preset_text(tokens: list[str], engine) -> str:
-    if not tokens:
-        return _help_text("`/lcm preset` requires `show`, `suggest`, or `apply`.")
-    subcommand = tokens[0].lower()
-    rest = tokens[1:]
-    if subcommand == "show":
-        return _preset_show_text(rest, engine)
-    if subcommand == "suggest":
-        if rest:
-            return _help_text("`/lcm preset suggest` does not accept extra arguments.")
-        return _preset_suggest_text(engine)
-    if subcommand == "apply":
-        return _preset_apply_text(rest, engine)
-    return _help_text("`/lcm preset` supports `show`, `suggest`, and `apply`.")
-
-
 def handle_lcm_command(raw_args: str | None, engine) -> str:
     tokens = [part.strip() for part in (raw_args or "").strip().split() if part.strip()]
     if not tokens:
@@ -696,9 +531,6 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
             return _doctor_repair_apply_text(engine)
         return _help_text("`/lcm doctor` currently supports `repair` and `repair apply` as extra subcommands.")
-
-    if head == "preset":
-        return _preset_text(rest, engine)
 
     if head == "help":
         return _help_text()
