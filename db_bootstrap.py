@@ -32,9 +32,17 @@ logger = logging.getLogger(__name__)
 # doctor's invariant check reads by (chunks by session, rejections by compaction),
 # so that a store without them is never opened. Format 6 stores beside a record's
 # estimate how many of its images the estimate left uncounted
-# (``records.est_uncounted_images``, #21, #35), and the views show it; a format-5
-# store is refused and begun again (#29 W8: a change of format wipes the store).
-STORE_FORMAT = "ihl-store/6"
+# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 10
+# records each failure of a chunk's call with its kind (``chunk_failures``,
+# insert-only), for the chunk that keeps failing (#7); a retry keeps every recorded
+# chunk of an unsettled attempt, so nothing about dispatch is stored (#33 D14 as
+# revised); and it indexes ``compaction_inputs`` by (compaction, record), which the
+# frozen cut reads inside the planning transaction. Formats 7 to 9 were written only
+# by unmerged commits of #61 (7 and 8 with a ``chunk_dispatches`` table, 9 without
+# that index); opening runs no DDL, so each layout has its own name and is refused.
+# A store of an earlier format is refused and begun again (#29 W8: a change of format
+# wipes the store).
+STORE_FORMAT = "ihl-store/10"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -253,6 +261,7 @@ INSERT_ONLY_TABLES = (
     "compaction_inputs",
     "chunks",
     "chunk_members",
+    "chunk_failures",
     "derivations",
     "derivation_sources",
     "compaction_returns",
@@ -352,6 +361,9 @@ CREATE TABLE compaction_inputs (
 );
 CREATE INDEX idx_compaction_inputs_row ON compaction_inputs(host_row_id);
 CREATE INDEX idx_compaction_inputs_record ON compaction_inputs(record);
+-- A member's host id as its attempt's list carried it, looked up per (compaction,
+-- record) by the frozen cut inside the planning transaction (#33 D14).
+CREATE INDEX idx_compaction_inputs_member ON compaction_inputs(compaction, record, position);
 
 CREATE TABLE chunks (
     handle TEXT PRIMARY KEY,
@@ -367,6 +379,18 @@ CREATE TABLE chunk_members (
     PRIMARY KEY (chunk, ordinal),
     UNIQUE (chunk, record)
 );
+CREATE INDEX idx_chunk_members_record ON chunk_members(record, ordinal);
+
+-- A chunk's call failed, with the failure's kind (#7; ruling on #61, 2): the chunk's
+-- own failures (reply, request) in three consecutive attempts of the same members
+-- make the chunk that keeps failing; route, endpoint and other failures do not count.
+CREATE TABLE chunk_failures (
+    chunk TEXT NOT NULL REFERENCES chunks(handle),
+    at REAL NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('reply', 'request', 'route', 'endpoint', 'other')),
+    error TEXT NOT NULL
+);
+CREATE INDEX idx_chunk_failures_chunk ON chunk_failures(chunk);
 
 CREATE TABLE derivations (
     derivation_id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -36,6 +36,7 @@ An engine copy writes only for its own plugin session.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -115,6 +116,24 @@ class CompressAttempt:
     # Set when compress() has returned: the attempt then wants no further summariser
     # call; a call already in flight runs to its end and its summary is written (#33 D13).
     over: bool = False
+    # The planning transaction while it is open (``RecordStore.planning``): from the
+    # identity step to the write of the cut (#33 D14 as revised). ``end_planning``
+    # commits it, or rolls it back when the attempt ends with an exception.
+    planning: Optional[contextlib.ExitStack] = None
+    planning_began: float = 0.0
+
+    def end_planning(self, exc: Optional[BaseException] = None) -> Optional[float]:
+        """Close the planning transaction if it is open: commit, or roll back with
+        ``exc``. Returns how long it held the store's write lock, in milliseconds."""
+        stack, self.planning = self.planning, None
+        if stack is None:
+            return None
+        held = (time.perf_counter() - self.planning_began) * 1000.0
+        if exc is None:
+            stack.close()
+        else:
+            stack.__exit__(type(exc), exc, exc.__traceback__)
+        return held
 
     def cancelled(self) -> bool:
         if not callable(self.check):
@@ -194,6 +213,17 @@ class RecordWriteMixin:
             detail=detail,
         )
 
+    def _begin_planning(self, attempt: CompressAttempt) -> None:
+        """Open the planning transaction (``RecordStore.planning``: ``BEGIN IMMEDIATE``)
+        and ask the attempt's captured check at once, inside it (#33 D14 as revised). A
+        planner in another process waits here for an earlier attempt's commit, and so
+        reads its chunks; an attempt cancelled or superseded before this point writes no
+        cut. The transaction stays open until the cut is written (``end_planning``)."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(self._records.planning())
+        attempt.planning, attempt.planning_began = stack, time.perf_counter()
+        self._require_live_write()
+
     def _write_compaction(
         self,
         attempt: CompressAttempt,
@@ -203,7 +233,8 @@ class RecordWriteMixin:
         force: bool,
     ) -> List[str]:
         """Transaction 1: the compaction, its inputs, the new records, their tool calls
-        and every chunk. Returns the chunk handles; raises when the write fails."""
+        and every chunk, inside the planning transaction when one is open. Returns the
+        chunk handles; raises when the write fails."""
         compaction, records, chunk_handles = self._records.begin_compaction(
             session=attempt.session,
             kind="full" if force else "threshold",
@@ -361,10 +392,18 @@ class RecordWriteMixin:
         def known_row(index: int, row_id: Optional[int], message: Dict[str, Any], base: str,
                       merged: List[str]) -> None:
             """A row the store already holds as ``base``: referenced when unchanged,
-            else revised. A record beside the chain keeps its revisions beside it."""
+            else revised. A record beside the chain keeps its revisions beside it.
+
+            Where ``base`` is the record an unconfirmed attempt wrote for this very row
+            (its ``_row_id`` in ``reusable``, #33 D14), that record already holds what
+            the row absorbed then: the row is a new revision only if it was rewritten
+            since. Otherwise a merged row would be recorded anew at every retry, and a
+            frozen chunk holding it would never be found again."""
             nonlocal chain
             beside_chain = side.get(base, False) and all(side.get(r, False) for r in merged)
-            if merged or (base in facts and rewritten(message, facts[base][1])):
+            changed = base in facts and rewritten(message, facts[base][1])
+            from_retry = row_id is not None and reusable.get(row_id) == base
+            if changed or (merged and not from_retry):
                 originals = [base] + [r for r in merged if r != base]
                 pred = (chain if chain is not None else fallback) if beside_chain \
                     else predecessor_of(earliest(originals))
@@ -402,10 +441,13 @@ class RecordWriteMixin:
                 continue
             if index == 0 and message.get("role") == "system":
                 entries.append(InputEntry(index, row_id, "system"))
+            elif row_id is not None and row_id in reusable:
+                # A row an unconfirmed attempt already recorded, a bound host insertion
+                # included: the same record while unchanged (#33 D14; Codex review of
+                # 3da00d9), before it is taken for a new host insertion.
+                known_row(index, row_id, message, reusable[row_id], merged)
             elif row_id is not None and row_id in insertions:
                 entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
-            elif row_id is not None and row_id in reusable:
-                known_row(index, row_id, message, reusable[row_id], merged)
             elif index < last_bound_index:
                 entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
             elif merged:
@@ -522,7 +564,10 @@ class RecordWriteMixin:
         return pairs
 
     def _bind(self, attempt: CompressAttempt, returns, insertions=()) -> None:
-        written = self._records.bind(attempt.compaction, returns, insertions)
+        self._bind_applied(attempt, self._records.bind(attempt.compaction, returns, insertions))
+
+    def _bind_applied(self, attempt: CompressAttempt, written) -> None:
+        """What a committed binding changes in memory."""
         attempt.bound_positions.update(written)
         if set(attempt.objects) <= attempt.bound_positions:
             self._returned_attempts.pop(attempt.compaction, None)
@@ -569,7 +614,13 @@ class RecordWriteMixin:
 
     def _settle_from_list(self, messages: Optional[List[Dict[str, Any]]]) -> None:
         """Read the keys of a list the host hands over: attribute a waiting
-        confirmation, find a return adopted without one, and bind stamped entries."""
+        confirmation, find a return adopted without one, and bind stamped entries.
+
+        All of it is one transaction of its own, each compaction a savepoint in it; what
+        it changes in memory (the waiting confirmation cleared, the bound positions, an
+        attempt no longer waited for) is applied only after that transaction committed,
+        so that memory never runs ahead of the store (pre-review of 78c2cbf). A failure
+        is logged and recorded as an event; nothing is changed in memory for it."""
         if not messages or not self._plugin_session or not self._returned_attempts:
             return
         keyed: set[int] = set()
@@ -578,36 +629,61 @@ class RecordWriteMixin:
                 key = parse_ret_key(message.get(RET_KEY))
                 if key is not None and key[0] in self._returned_attempts:
                     keyed.add(key[0])
-        for compaction in sorted(keyed):
-            attempt = self._returned_attempts.get(compaction)
-            if attempt is None or attempt.session != self._plugin_session:
-                continue
-            try:
-                store = self._records
-                if not store.is_settled(compaction):
-                    effective = store.effective_compaction(self._plugin_session)
-                    if effective is not None and compaction <= effective:
+        if not keyed:
+            return
+        store = self._records
+        applied: list = []   # in-memory changes, made once the transaction committed
+        # The waiting confirmation as this pass sees it: used by one compaction at most.
+        pending = getattr(self, "_pending_confirmation", None)
+        try:
+            with store.transaction():
+                for compaction in sorted(keyed):
+                    attempt = self._returned_attempts.get(compaction)
+                    if attempt is None or attempt.session != self._plugin_session:
                         continue
-                    pending = getattr(self, "_pending_confirmation", None)
-                    if pending is not None:
-                        store.confirm(compaction, host_session_before=pending.old_session_id,
-                                      host_session_after=pending.session_id, at=pending.at)
-                        self._pending_confirmation = None
-                    elif any(
-                        parse_ret_key(m.get(RET_KEY)) == (compaction, position)
-                        for m in messages if isinstance(m, dict)
-                        for position in attempt.summary_positions
-                    ):
-                        store.adopt(compaction, evidence="its returned summary entry stands in the next list")
-                    else:
+                    changes: list = []
+                    try:
+                        with store.transaction():   # a savepoint: this compaction, whole or not at all
+                            settled = store.is_settled(compaction)
+                            if not settled:
+                                effective = store.effective_compaction(self._plugin_session)
+                                if effective is not None and compaction <= effective:
+                                    pass
+                                elif pending is not None:
+                                    store.confirm(compaction, host_session_before=pending.old_session_id,
+                                                  host_session_after=pending.session_id, at=pending.at)
+                                    changes.append(("pending_cleared", pending))
+                                    settled = True
+                                elif any(
+                                    parse_ret_key(m.get(RET_KEY)) == (compaction, position)
+                                    for m in messages if isinstance(m, dict)
+                                    for position in attempt.summary_positions
+                                ):
+                                    store.adopt(compaction, evidence="its returned summary entry stands in the "
+                                                                     "next list")
+                                    settled = True
+                            if settled and store.effective_compaction(self._plugin_session) == compaction:
+                                written = store.bind(attempt.compaction,
+                                                     self._returns_to_bind(attempt, messages, own_objects_only=False),
+                                                     ())
+                                changes.append(("bound", (attempt, written)))
+                    except Exception as exc:
+                        logger.warning("LCM could not settle a returned compaction", exc_info=True)
+                        self._records.event("settle_write_failed", session=self._plugin_session,
+                                            compaction=compaction, detail=repr(exc))
                         continue
-                if store.effective_compaction(self._plugin_session) != compaction:
-                    continue
-                self._bind(attempt, self._returns_to_bind(attempt, messages, own_objects_only=False))
-            except Exception as exc:
-                logger.warning("LCM could not settle a returned compaction", exc_info=True)
-                self._records.event("settle_write_failed", session=self._plugin_session, compaction=compaction,
-                                    detail=repr(exc))
+                    if any(what == "pending_cleared" for what, _value in changes):
+                        pending = None
+                    applied.extend(changes)
+        except Exception as exc:
+            logger.warning("LCM could not commit the settling of returned compactions", exc_info=True)
+            self._records.event("settle_write_failed", session=self._plugin_session, detail=repr(exc))
+            return
+        for what, value in applied:
+            if what == "pending_cleared" and getattr(self, "_pending_confirmation", None) is value:
+                self._pending_confirmation = None
+            elif what == "bound":
+                self._bind_applied(*value)
 
     def record_rejected_compaction(self, *args: Any, **kwargs: Any) -> None:
         """The host refused the result this copy last returned (for example a grown one)."""

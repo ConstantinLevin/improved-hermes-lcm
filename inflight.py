@@ -45,6 +45,13 @@ current. A call none of whose attempts wants it any more (each was cancelled or
 superseded) starts no further dispatch: not a first one waiting for the limiter, not a
 retry. These all rest on host internals (the thread-locals of
 ``agent.auxiliary_client``); ask A-33.1.
+
+**What reaches the attempts.** Each subscriber is told the call's failure with its kind
+(``escalation.FAILURE_KINDS``), so the attempt can tell the chunk's own failures from
+the endpoint's; the first subscriber a failure reaches records it, the others only
+read what it recorded, so a call several attempts joined is one trial of the chunk.
+Whether a call was ever sent is not recorded: a retry keeps every recorded chunk
+(#33 D14 as revised), and the registry only serves joining (D12).
 """
 
 from __future__ import annotations
@@ -115,12 +122,6 @@ class EndpointLimiter:
         self._cond = threading.Condition()
         self._active = 0
         self._held_until = 0.0
-        self.peak = 0
-
-    @property
-    def active(self) -> int:
-        with self._cond:
-            return self._active
 
     def acquire(self, limit: int, wanted: Callable[[], bool]) -> bool:
         """A slot, or False as soon as the call is no longer wanted."""
@@ -132,7 +133,6 @@ class EndpointLimiter:
                 now = time.monotonic()
                 if self._active < limit and now >= self._held_until:
                     self._active += 1
-                    self.peak = max(self.peak, self._active)
                     return True
                 wait = _POLL_S if now >= self._held_until else min(_POLL_S, self._held_until - now)
                 self._cond.wait(timeout=wait)
@@ -188,10 +188,16 @@ class ChunkSummary:
 
 @dataclass
 class Outcome:
-    """What one attempt got for its chunk: the derivation written for it, or why not."""
+    """What one attempt got for its chunk: the derivation written for it, or why not
+    (``failure``), and the cause the host is to show for it (``cause``), which names the
+    chunk and says whether the failure counts toward the chunk's own."""
 
     derivation: Optional[str] = None
     failure: Optional[str] = None
+    cause: Optional[str] = None
+    # Whether this subscriber wrote the call's failure into the store: only then is the
+    # call's failure recorded, and no later subscriber records it again.
+    recorded: bool = False
 
 
 class Subscriber:
@@ -201,18 +207,20 @@ class Subscriber:
     it is the host's current working attempt); ``hook`` and ``deadline`` are the host's
     progress hook and deadline read on its ``compress()`` thread; ``deliver`` writes the
     summary as a derivation of the attempt's own chunk, or records why there is none,
-    and returns the ``Outcome``. It runs on the thread that has the result."""
+    and returns the ``Outcome``. It runs on the thread that has the result. A call's
+    failure is recorded once (``record``): one call is one trial of the chunk, however
+    many attempts joined it. The subscriber asked to record it says whether the write
+    succeeded (``Outcome.recorded``); where it did not, the next subscriber is asked."""
 
     def __init__(self, *, wanted: Callable[[], bool], hook: Optional[Callable[[], Any]],
                  deadline: Optional[float],
-                 deliver: Callable[[Optional[ChunkSummary], Optional[str], bool], Outcome],
+                 deliver: Callable[[Optional[ChunkSummary], Optional[str], bool, Optional[str], bool], Outcome],
                  on_done: Optional[Callable[[], None]] = None) -> None:
         self._wanted = wanted
         self.hook = hook
         self.deadline = deadline
         self._deliver = deliver
         self._on_done = on_done
-        self.done = threading.Event()
         self.outcome: Optional[Outcome] = None
 
     def wanted(self) -> bool:
@@ -222,16 +230,18 @@ class Subscriber:
             logger.warning("LCM could not ask whether an attempt still wants its summary", exc_info=True)
             return False
 
-    def finish(self, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool = False) -> None:
-        """Deliver, then say so: the outcome is set before ``done`` and before
-        ``on_done`` is called, so whoever is told reads a complete outcome."""
+    def finish(self, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool = False,
+               kind: Optional[str] = None, record: bool = True) -> None:
+        """Deliver, then say so: the outcome is set before ``on_done`` is called, so
+        whoever is told reads a complete outcome. ``kind`` is a failure's kind
+        (``escalation.FAILURE_KINDS``); ``record`` whether this subscriber is to record
+        the call's failure (no earlier one has) or only read what was recorded."""
         try:
-            self.outcome = self._deliver(summary, failure, abandoned)
+            self.outcome = self._deliver(summary, failure, abandoned, kind, record)
         except BaseException as exc:  # a store closed meanwhile, or anything else: never swallowed silently
             logger.warning("LCM could not deliver a chunk's summary (%s: %s)", type(exc).__name__, exc)
             self.outcome = Outcome(failure=f"the summary could not be written ({type(exc).__name__}: {exc})")
         finally:
-            self.done.set()
             if self._on_done is not None:
                 try:
                     self._on_done()
@@ -246,6 +256,8 @@ class ChunkCall:
         self.key = key
         self.limiter = limiter
         self.limit = limit
+        # Whether a subscriber has written the call's failure into the store.
+        self._failure_recorded = False
         self._lock = threading.Lock()
         self._subscribers: list[Subscriber] = []
         self._delivered = 0
@@ -298,6 +310,16 @@ class ChunkCall:
         with self._lock:
             return self._deadline
 
+    def failure_recorded(self) -> bool:
+        """Whether a subscriber has written the call's failure into the store."""
+        with self._lock:
+            return self._failure_recorded
+
+    def mark_failure_recorded(self) -> None:
+        """The call's failure is in the store: later subscribers only read it."""
+        with self._lock:
+            self._failure_recorded = True
+
     def still_needed(self) -> bool:
         """Whether any attempt still wants the call. Where none does, the call leaves
         the registry and closes at once, in one step under the registry lock, before
@@ -349,12 +371,8 @@ _REGISTRY_LOCK = threading.Lock()
 _WORKER_NUMBERS = itertools.count(1)
 
 
-def in_flight(key: tuple) -> Optional[ChunkCall]:
-    with _REGISTRY_LOCK:
-        return _REGISTRY.get(key)
-
-
-def _close(call: ChunkCall, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool) -> None:
+def _close(call: ChunkCall, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool,
+           kind: Optional[str] = None) -> None:
     """Deliver to every subscriber, then close the call and leave the registry, in that
     order: a summary is in the store before a later attempt can miss the call. An
     abandoned call has already left the registry (``still_needed``)."""
@@ -367,23 +385,39 @@ def _close(call: ChunkCall, summary: Optional[ChunkSummary], failure: Optional[s
                     del _REGISTRY[call.key]
                 return
         for subscriber in pending:
-            subscriber.finish(summary, failure, abandoned)
+            # The right to record is used up only by a write that succeeded: where the
+            # store refused it, the next subscriber records the failure.
+            record = not call.failure_recorded()
+            subscriber.finish(summary, failure, abandoned, kind, record=record)
+            if record and subscriber.outcome is not None and subscriber.outcome.recorded:
+                call.mark_failure_recorded()
 
 
 def _worker(call: ChunkCall, run: Callable[[ChunkCall], ChunkSummary],
             describe: Callable[[BaseException], str]) -> None:
     summary: Optional[ChunkSummary] = None
     failure: Optional[str] = None
+    kind: Optional[str] = None
     abandoned = False
     with _scope(_host_interrupt_protection, active=True), _scope(_host_progress_hook, call.tick):
         try:
             summary = run(call)
-        except CallAbandoned:
-            abandoned = True
-            failure = "no attempt wants the summary any more (each was cancelled or superseded)"
-        except BaseException as exc:  # a SummaryFailure, or anything else: never swallowed
-            failure = describe(exc)
-    _close(call, summary, failure, abandoned)
+        except BaseException as exc:  # a SummaryFailure, an abandonment, or anything else: never swallowed
+            # An own failure observed before the call ended otherwise (level 1 rejected,
+            # then level 2 abandoned or raised) is the call's failure, recorded once
+            # (``escalation.summarize_chunk``; Codex review of 3da00d9).
+            observed = getattr(exc, "observed_failure", None)
+            if observed is not None:
+                failure = f"{describe(observed)}; then {type(exc).__name__}"
+                kind = getattr(observed, "kind", None) or "other"
+            elif isinstance(exc, CallAbandoned):
+                abandoned = True
+                failure = "no attempt wants the summary any more (each was cancelled or superseded)"
+            else:
+                failure = describe(exc)
+                # A SummaryFailure names its kind; anything else is of none the plugin knows.
+                kind = getattr(exc, "kind", None) or "other"
+    _close(call, summary, failure, abandoned, kind)
 
 
 def join_or_start(
@@ -429,7 +463,7 @@ def join_or_start(
                 return "started"
     if start_failure is not None:
         logger.warning("LCM %s", start_failure)
-        subscriber.finish(None, start_failure)
+        subscriber.finish(None, start_failure, kind="other")
         return "failed"
     subscriber.finish(reused, None)
     return "reused"

@@ -6,8 +6,10 @@ written in short transactions, none held open across a summariser call:
 
 1. the compaction, its inputs, a record for every input entry the store does not
    hold yet (the fresh tail included), their tool calls, and every chunk with its
-   members, all before the first summariser call;
-2. each summary, as a derivation of its chunk, when it arrives;
+   members, all before the first summariser call, in the planning transaction that
+   also holds every read the cut depends on (``planning``; #33 D14 as revised);
+2. each summary, as a derivation of its chunk, when it arrives; each failure of a
+   chunk's call with its kind, when it happens (#7);
 3. what the plugin returned.
 
 The host confirms a compaction with ``on_session_start(boundary_reason="compression")``
@@ -93,6 +95,22 @@ def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
         return None
 
 
+@dataclass(frozen=True)
+class FrozenChunk:
+    """A chunk of an unconfirmed attempt that a retry keeps (#33 D14): its members as
+    (record, the host's ``_row_id`` when it was cut), in order, and its state,
+    "summarised" (its summary is reused) or "cut" (retried as the same chunk)."""
+
+    chunk: str
+    compaction: int
+    members: tuple
+    state: str
+
+    @property
+    def records(self) -> list[str]:
+        return [record for record, _row_id in self.members]
+
+
 @dataclass
 class InputEntry:
     """One entry of the list the host handed to ``compress()``, classified (W3, W4)."""
@@ -120,6 +138,9 @@ class RecordStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._lock = threading.RLock()
+        # How deep the thread that holds ``_lock`` is inside ``_tx``: an inner ``_tx``
+        # joins the outer transaction (the planning transaction, ``planning``).
+        self._tx_depth = 0
         self._pending_events: list[tuple] = []
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(
             str(self.db_path),
@@ -145,17 +166,55 @@ class RecordStore:
         """One short write transaction. It never stays open: when the body or the
         COMMIT fails (in rollback-journal mode a COMMIT can fail on the busy timeout
         while a reader holds its shared lock), the transaction is rolled back before
-        the error is raised, so that no lock of the shadow ever blocks a live write."""
+        the error is raised, so that no lock of the shadow ever blocks a live write.
+        Inside an open transaction of this helper on the same thread it is a savepoint
+        of that transaction: a failed inner block is undone whole, and the outer one
+        commits or rolls back."""
         with self._lock:
+            if self._tx_depth:
+                conn = self._conn
+                name = f"lcm_inner_{self._tx_depth}"
+                conn.execute(f"SAVEPOINT {name}")
+                self._tx_depth += 1
+                try:
+                    yield conn
+                    conn.execute(f"RELEASE {name}")
+                except BaseException:
+                    try:
+                        conn.execute(f"ROLLBACK TO {name}")
+                        conn.execute(f"RELEASE {name}")
+                    except Exception:
+                        logger.error("LCM could not undo a failed step inside a transaction in %s", self.db_path,
+                                     exc_info=True)
+                    raise
+                finally:
+                    self._tx_depth -= 1
+                return
             conn = self._conn
             conn.execute("BEGIN IMMEDIATE")
+            self._tx_depth = 1
             try:
                 yield conn
                 conn.execute("COMMIT")
             except BaseException:
                 self._rollback(conn)
                 raise
+            finally:
+                self._tx_depth = 0
             self._flush_events()
+
+    def transaction(self):
+        """One write transaction, or a savepoint inside an open one (``_tx``)."""
+        return self._tx()
+
+    def planning(self):
+        """The planning transaction of a compaction (#33 D14, revised 2026-09-25): one
+        ``BEGIN IMMEDIATE`` around every store read the cut depends on and the write of
+        the cut, so that a planner in another process waits for an earlier attempt's
+        commit and sees its chunks. Every write inside it joins it. Nothing inside it
+        calls a model or does other I/O; it holds the write lock for as long as the
+        plan and the write take."""
+        return self._tx()
 
     def _rollback(self, conn: sqlite3.Connection) -> None:
         if not conn.in_transaction:
@@ -192,9 +251,10 @@ class RecordStore:
             self._flush_events()
 
     def _flush_events(self) -> None:
-        """Write the events not written yet, in their own short transaction."""
+        """Write the events not written yet, in their own short transaction; inside an
+        open transaction they wait for its end (``_tx`` flushes after its commit)."""
         with self._lock:
-            if not self._pending_events or self._conn is None:
+            if not self._pending_events or self._conn is None or self._tx_depth:
                 return
             conn = self._conn
             try:
@@ -259,39 +319,184 @@ class RecordStore:
         model: Optional[str],
         provider: Optional[str],
         effort: Optional[str],
+        any_route: bool = False,
     ) -> Optional[ChunkSummary]:
         """The latest summary already written of a chunk of this session with exactly
         these member records, in this order, by the same summariser route and effort, or
         None (#33 D12: a second attempt reuses a summary already written). Records are
-        matched by handle, never by content."""
+        matched by handle, never by content. With ``any_route`` the route and effort do
+        not matter: a summarised chunk the frozen cut keeps is never summarised again
+        (#33 D14, orchestrator ruling on #61)."""
         if not records:
             return None
-        wanted = [str(r) for r in records]
-        candidates = self._q(
-            "SELECT m.chunk FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
-            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ?",
-            (session, wanted[0]),
-        )
-        for (chunk,) in candidates:
+        for chunk, _compaction in self._chunks_with_members(session, records):
             if chunk == exclude_chunk:
                 continue
-            members = [str(r) for (r,) in self._q(
-                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
-            if members != wanted:
-                continue
+            route_clause = "" if any_route else "AND d.model IS ? AND d.provider IS ? AND d.effort IS ? "
+            args = (chunk,) if any_route else (chunk, model or None, provider or None, effort or None)
             rows = self._q(
                 "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort "
                 "FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
                 "WHERE s.chunk = ? AND s.ordinal = 0 AND d.kind = 'summary' "
-                "AND d.model IS ? AND d.provider IS ? AND d.effort IS ? "
-                "ORDER BY d.derivation_id DESC LIMIT 1",
-                (chunk, model or None, provider or None, effort or None),
+                + route_clause + "ORDER BY d.derivation_id DESC LIMIT 1",
+                args,
             )
             if rows:
                 text, level, budget, finish_reason, model_, provider_, effort_ = rows[0]
                 return ChunkSummary(text=str(text), level=level, budget=budget, finish_reason=finish_reason,
                                     model=model_, provider=provider_, effort=effort_)
         return None
+
+    def _chunks_with_members(self, session: str, records: Sequence[str]) -> list[tuple[str, int]]:
+        """(chunk, compaction) of every chunk of the session with exactly these member
+        records, in this order, newest compaction first. By handle, never by content."""
+        wanted = [str(r) for r in records]
+        if not wanted:
+            return []
+        found: list[tuple[str, int]] = []
+        for chunk, compaction in self._q(
+            "SELECT m.chunk, ch.compaction FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
+            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ? ORDER BY ch.compaction DESC, ch.rowid DESC",
+            (session, wanted[0]),
+        ):
+            members = [str(r) for (r,) in self._q(
+                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
+            if members == wanted:
+                found.append((str(chunk), int(compaction)))
+        return found
+
+    def _summarised(self, chunk: str) -> bool:
+        return bool(self._q(
+            "SELECT 1 FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
+            "WHERE s.chunk = ? AND d.kind = 'summary' LIMIT 1", (chunk,)))
+
+    def _failed_by_itself(self, chunk: str) -> bool:
+        """A failure of the chunk's own kind: its reply rejected, or its request
+        rejected by the provider (ruling on #61, 2)."""
+        return bool(self._q("SELECT 1 FROM chunk_failures WHERE chunk = ? AND kind IN ('reply', 'request') "
+                            "LIMIT 1", (chunk,)))
+
+    def chunk_state(self, session: str, records: Sequence[str]) -> str:
+        """The state of a set of members over every chunk of the session that held
+        exactly them (#33 D14, revised): "summarised" where one of them has a summary,
+        which a retry reuses, else "cut": a recorded chunk, retried as the same chunk
+        whether or not its call was ever sent. Only chunks that have a summary and the
+        same first member are compared member by member, so the cost does not grow with
+        the attempts that cut the same chunk."""
+        wanted = [str(r) for r in records]
+        if not wanted:
+            return "cut"
+        for (chunk,) in self._q(
+            "SELECT DISTINCT m.chunk FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
+            "JOIN derivation_sources s ON s.chunk = m.chunk JOIN derivations d ON d.handle = s.derivation "
+            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ? AND d.kind = 'summary'",
+            (session, wanted[0]),
+        ):
+            members = [str(r) for (r,) in self._q(
+                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
+            if members == wanted:
+                return "summarised"
+        return "cut"
+
+    def frozen_chunks(self, session: str, after: Optional[int]
+                      ) -> tuple[list[FrozenChunk], list[tuple[str, int, tuple[str, ...]]]]:
+        """The chunks a retry keeps (#33 D14 as revised 2026-09-25, #31): every chunk
+        recorded by the session's attempts after its effective compaction that the host
+        neither confirmed, adopted nor rejected, whether or not its call was ever sent.
+        A chunk is recorded with its members before any call of its attempt starts,
+        in the planning transaction (``planning``), and is frozen from then on. Read
+        inside the next attempt's planning transaction, so a planner in another
+        process waits for an earlier attempt's commit and sees its chunks.
+
+        The newest attempt's cut comes first, and a chunk that shares a record with
+        one already taken is left out: a safety net only, since the planning
+        transaction orders the attempts. Each member carries the ``_row_id`` its row
+        had in that attempt's list: ids hold until a commit (#29 W2 step 8), so the
+        retry recognises the chunk by identity.
+
+        A chunk with a member whose row came without a host identity (``_row_id``) can
+        never be found again by identity: the gateway's replayed history carries none,
+        and host scaffolding the host never persists has none on the CLI either (ruling
+        3 on #61; the ask to Hermes is A1). Such chunks are returned apart, as (chunk,
+        compaction, the member records without identity), and none is kept."""
+        compactions = [int(c) for (c,) in self._q(
+            "SELECT c.compaction_id FROM compactions c WHERE c.session = ? AND c.compaction_id > ? "
+            "AND NOT EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
+            "AND NOT EXISTS (SELECT 1 FROM adoptions a WHERE a.compaction = c.compaction_id) "
+            "AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.compaction = c.compaction_id) "
+            "ORDER BY c.compaction_id DESC",
+            (session, after or 0),
+        )]
+        taken: set = set()
+        frozen: list[FrozenChunk] = []
+        unidentified: list[tuple[str, int, tuple[str, ...]]] = []
+        # The records already taken, as a TEMP table of this connection, so that an
+        # older attempt's chunk that overlaps one is left out in SQL, at its first
+        # overlapping member, without reading its members (the cost of the read no
+        # longer grows with the members of every unsettled attempt). TEMP touches no
+        # other connection and takes no lock of the store; it is emptied again at once.
+        with self._lock:
+            conn = self._conn
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS lcm_taken (record TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM temp.lcm_taken")
+            try:
+                for compaction in compactions:
+                    for (chunk,) in conn.execute(
+                        "SELECT ch.handle FROM chunks ch WHERE ch.session = ? AND ch.compaction = ? "
+                        "AND NOT EXISTS (SELECT 1 FROM chunk_members m JOIN temp.lcm_taken t ON t.record = m.record "
+                        "WHERE m.chunk = ch.handle) ORDER BY ch.rowid",
+                        (session, compaction),
+                    ).fetchall():
+                        # A member's host id as that attempt's list carried it
+                        # (idx_compaction_inputs_member).
+                        members = tuple(
+                            (str(record), int(row_id) if row_id is not None else None)
+                            for record, row_id in conn.execute(
+                                "SELECT m.record, (SELECT i.host_row_id FROM compaction_inputs i WHERE "
+                                "i.compaction = ? AND i.record = m.record ORDER BY i.position LIMIT 1) "
+                                "FROM chunk_members m WHERE m.chunk = ? ORDER BY m.ordinal",
+                                (compaction, chunk),
+                            ).fetchall()
+                        )
+                        records = [record for record, _ in members]
+                        if not records or taken.intersection(records):
+                            continue
+                        taken.update(records)
+                        conn.executemany("INSERT OR IGNORE INTO temp.lcm_taken(record) VALUES (?)",
+                                         [(record,) for record in records])
+                        without = tuple(record for record, row_id in members if row_id is None)
+                        if without:
+                            unidentified.append((str(chunk), compaction, without))
+                            continue
+                        frozen.append(FrozenChunk(str(chunk), compaction, members,
+                                                  self.chunk_state(session, records)))
+            finally:
+                conn.execute("DELETE FROM temp.lcm_taken")
+        return frozen, unidentified
+
+    def failure_streak(self, session: str, records: Sequence[str]) -> int:
+        """In how many consecutive attempts, the newest first, a chunk of exactly these
+        members failed by its own fault (#7, #33; ruling on #61, 2): a summary ends the
+        streak; an attempt that reached no outcome for it (cancelled, abandoned), or
+        whose failure was the route's, the endpoint's or another's, neither counts nor
+        ends it."""
+        streak = 0
+        for chunk, _compaction in self._chunks_with_members(session, records):
+            if self._summarised(chunk):
+                break
+            if self._failed_by_itself(chunk):
+                streak += 1
+        return streak
+
+    def chunk_failed(self, chunk: str, error: str, *, kind: str, session: str, records: Sequence[str]) -> int:
+        """Record a failure of ``chunk`` with its kind, and return the streak of its
+        members, read inside the same transaction (ruling on #61, 4). The transaction
+        begins IMMEDIATE, so two threads or processes recording failures of the same
+        members read distinct streaks."""
+        with self._tx() as conn:
+            conn.execute("INSERT INTO chunk_failures(chunk, at, kind, error) VALUES (?, ?, ?, ?)",
+                         (chunk, time.time(), kind, str(error)))
+            return self.failure_streak(session, records)
 
     def is_settled(self, compaction: int) -> bool:
         """Confirmed, adopted or rejected: the host's handling of it is known."""

@@ -29,6 +29,18 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
 
+Each failure carries a kind (``FAILURE_KINDS``). Only a reply the checks rejected and a
+request the provider rejected (HTTP 400, 413, 422) are the chunk's own and count toward
+"keeps failing"; another model answering (D9), a rate limit, a deadline, a malformed
+response and every other failure of the endpoint do not (ruling on #61, 2). Where level 1
+failed by the chunk's own kind and level 2 by another, the failure is still the chunk's.
+
+An HTTP status is read the way the host reads it (``_host_status``): its error
+classifier's ``_extract_status_code`` first, then its auxiliary client's
+``_exc_http_status``, then, for botocore's ``ClientError`` (Bedrock), the status in its
+``response`` mapping, which the host's Bedrock adapter reads the same way; never an
+attribute guessed per provider.
+
 The budget is a target in the prompt text only. ``max_tokens`` is the summariser
 model's own output cap where the model table knows it (R5 b), and absent otherwise, so
 the plugin never cuts a summary at an output limit of its own; a reply stopped at the
@@ -237,17 +249,75 @@ def configured_route_problem(config: Any) -> Optional[str]:
     return None
 
 
+# What a failure says about its chunk (#33; ruling on #61, 2): ``reply``, a reply the
+# plugin's checks rejected (a well-formed reply; a malformed one is the endpoint's);
+# ``request``, the provider rejecting the request (HTTP 400,
+# 413, 422); ``route``, another model answered or the host resolved another route (D9);
+# ``endpoint``, a rate limit, a timeout, a connection error, no time left, any other
+# status; ``other``, an exception that is none of these. Only the first two are the
+# chunk's own and count toward "keeps failing".
+FAILURE_KINDS = ("reply", "request", "route", "endpoint", "other")
+OWN_FAILURE_KINDS = frozenset({"reply", "request"})
+_REQUEST_REJECTED_STATUS = frozenset({400, 413, 422})
+
+
 class SummaryFailure(Exception):
     """A chunk's summary could not be written. ``transient`` failures were retried
-    until the deadline allowed no more; the others were retried once at level 2."""
+    until the deadline allowed no more; the others were retried once at level 2.
+    ``kind`` is one of ``FAILURE_KINDS``."""
 
-    def __init__(self, reason: str, *, transient: bool, detail: str = "",
+    def __init__(self, reason: str, *, transient: bool, kind: str, detail: str = "",
                  retry_after: Optional[float] = None) -> None:
         self.reason = reason
         self.transient = transient
+        self.kind = kind if kind in FAILURE_KINDS else "other"
         self.detail = detail
         self.retry_after = retry_after
         super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+def _host_status(exc: BaseException) -> Optional[int]:
+    """The HTTP status of a failed call, read the way the host reads it (orchestrator
+    ruling on f881fd2): ``agent.error_classifier._extract_status_code`` (the exception's
+    ``status_code`` or ``status`` over its cause chain, else a numeric code in its body;
+    agent/error_classifier.py 1424 at Hermes 1b57acf94a), then the auxiliary client's
+    ``_exc_http_status`` (``status_code`` on the exception or on its ``response``,
+    agent/auxiliary_client.py 3305), the one the host's ladder uses on this path; then,
+    for botocore's ``ClientError`` (Bedrock), ``response["ResponseMetadata"]
+    ["HTTPStatusCode"]``: the host reads a ``ClientError`` by its ``response`` mapping
+    itself (``is_streaming_access_denied_error``, agent/bedrock_adapter.py 303-307 at
+    Hermes c6e0f2498e; the files above are unchanged there since 1b57acf94a), and
+    neither helper reads it (orchestrator ruling on 78c2cbf). Never an attribute guessed
+    per provider; where none finds one, None."""
+    for module_name, helper in (("agent.error_classifier", "_extract_status_code"),
+                                ("agent.auxiliary_client", "_exc_http_status")):
+        try:
+            module = __import__(module_name, fromlist=[helper])
+            status = getattr(module, helper)(exc)
+        except Exception:
+            continue
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    try:
+        from botocore.exceptions import ClientError  # type: ignore
+    except ImportError:
+        return None
+    if isinstance(exc, ClientError):
+        response = getattr(exc, "response", None) or {}
+        metadata = response.get("ResponseMetadata") if isinstance(response, dict) else None
+        status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
+def _failed_call_kind(exc: BaseException) -> str:
+    """A non-transient exception of the call, by its HTTP status as the host reads it
+    (``_host_status``), never by its message."""
+    status = _host_status(exc)
+    if isinstance(status, int):
+        return "request" if status in _REQUEST_REJECTED_STATUS else "endpoint"
+    return "other"
 
 
 def _retry_after_seconds(exc: BaseException) -> Optional[float]:
@@ -274,8 +344,9 @@ def _retry_after_seconds(exc: BaseException) -> Optional[float]:
 
 
 def _is_transient(exc: BaseException) -> bool:
-    """By the exception's class and status code, never by its message."""
-    status = getattr(exc, "status_code", None)
+    """By the exception's class and its HTTP status as the host reads it
+    (``_host_status``), never by its message."""
+    status = _host_status(exc)
     if isinstance(status, int):
         return status in _TRANSIENT_STATUS or status >= 500
     if isinstance(exc, (TimeoutError, ConnectionError)):
@@ -400,18 +471,18 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
     # plugin's: the host's label for a provider is not its normalised name (an explicit
     # "openai" route with a base URL is recorded as "custom", "x-ai" as "x-ai").
     if not route_info.routes:
-        raise SummaryFailure("reply on an unknown route", transient=False,
+        raise SummaryFailure("reply on an unknown route", transient=False, kind="route",
                              detail="the host recorded no route in route_info (#33 D9)")
     resolved, answered = route_info.routes[0], route_info.routes[-1]
     if resolved[1] not in _host_model_forms(route.model, resolved[0]):
         raise SummaryFailure(
-            "the host resolved the summariser's route to another model", transient=False,
+            "the host resolved the summariser's route to another model", transient=False, kind="route",
             detail=f"route_info names {resolved[0] or '?'}/{resolved[1] or '?'} for the summariser "
                    f"{route.describe()} (#33 D9)",
         )
     if answered != resolved:
         raise SummaryFailure(
-            "reply from another model", transient=False,
+            "reply from another model", transient=False, kind="route",
             detail=f"the host's route_info names {answered[0] or '?'}/{answered[1] or '?'} as the route that "
                    f"answered, the summariser is {route.describe()}, which the host resolved as "
                    f"{resolved[0]}/{resolved[1]} (#33 D9)",
@@ -420,15 +491,18 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         choice = response.choices[0]
         message = choice.message
     except Exception as exc:
-        raise SummaryFailure("malformed reply", transient=False,
+        # The endpoint's fault, not the chunk's (orchestrator ruling on a3f2505): the
+        # response has no shape to read. A well-formed reply with no summary in it is the
+        # chunk's ("reply carries no summary" below): the model answered and wrote nothing.
+        raise SummaryFailure("malformed reply", transient=False, kind="endpoint",
                              detail=f"no choices[0].message ({type(exc).__name__})") from None
     finish_reason = getattr(choice, "finish_reason", None)
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
-        raise SummaryFailure("reply carries no summary", transient=False,
+        raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
                              detail=f"content is {type(content).__name__}, finish_reason {finish_reason!r}")
     if finish_reason == "length":
-        raise SummaryFailure("reply cut at the output limit", transient=False,
+        raise SummaryFailure("reply cut at the output limit", transient=False, kind="reply",
                              detail="finish_reason 'length'")
     return content, str(finish_reason) if finish_reason is not None else ""
 
@@ -475,7 +549,7 @@ def _call_with_retries(
                     timeout = bound - time.monotonic()
                     if timeout <= 0:
                         raise SummaryFailure("summariser call not made, no time left before the host's deadline",
-                                             transient=True)
+                                             transient=True, kind="endpoint")
                 try:
                     content, finish_reason = _call_once(messages, settings, timeout)
                 except SummaryFailure:
@@ -495,7 +569,8 @@ def _call_with_retries(
             # What leaves here is its class and message, with every known secret removed.
             text = failure_text(exc, settings.secrets)
             if not _is_transient(exc):
-                raise SummaryFailure("summariser call failed", transient=False, detail=text) from None
+                raise SummaryFailure("summariser call failed", transient=False, kind=_failed_call_kind(exc),
+                                     detail=text) from None
             retry_after = _retry_after_seconds(exc)
             # The growing backoff always applies: a provider's Retry-After can only make
             # the wait longer, so a zero or expired one never makes a hot loop.
@@ -503,9 +578,10 @@ def _call_with_retries(
             deadline = path.deadline()
             if deadline is not None and time.monotonic() + delay >= deadline:
                 raise SummaryFailure("summariser call failed, no time left before the host's deadline",
-                                     transient=True, detail=text, retry_after=retry_after) from None
+                                     transient=True, kind="endpoint", detail=text,
+                                     retry_after=retry_after) from None
             if deadline is None and retries >= _NO_DEADLINE_RETRIES:
-                raise SummaryFailure("summariser call kept failing", transient=True,
+                raise SummaryFailure("summariser call kept failing", transient=True, kind="endpoint",
                                      detail=text, retry_after=retry_after) from None
             logger.warning("LCM summariser call failed transiently (%s); retrying in %.1fs", text, delay)
             path.wait(delay)
@@ -516,7 +592,7 @@ def _call_with_retries(
         # hold images the estimate could not count, and the numbers say so.
         reply_tokens = count_tokens(content)
         if reply_tokens >= source.tokens:
-            raise SummaryFailure("reply not shorter than its source", transient=False,
+            raise SummaryFailure("reply not shorter than its source", transient=False, kind="reply",
                                  detail=f"{reply_tokens} >= {source.tokens} tokens, {source.label()}")
         return content, finish_reason
 
@@ -560,23 +636,46 @@ def summarize_chunk(
         if first.transient:
             raise
         logger.warning("LCM level-1 summary failed (%s); trying level 2", first)
-        l2 = summariser_messages(
-            records,
-            instructions=_l2_instructions(int(token_budget * _L2_BUDGET_RATIO), focus_topic=focus_topic,
-                                          custom_instructions=custom_instructions),
-            request=request,
-            facts=facts,
-        )
         try:
+            l2 = summariser_messages(
+                records,
+                instructions=_l2_instructions(int(token_budget * _L2_BUDGET_RATIO), focus_topic=focus_topic,
+                                              custom_instructions=custom_instructions),
+                request=request,
+                facts=facts,
+            )
             content, finish_reason = _call_with_retries(
                 l2, source=source, settings=settings, path=path)
         except SummaryFailure as second:
+            # The chunk's own failure is not lost to what level 2 met (orchestrator ruling
+            # on a3f2505): where either level failed by the chunk's own kind, the combined
+            # failure is the chunk's, level 2's own kind first, else level 1's.
+            if second.kind in OWN_FAILURE_KINDS:
+                kind = second.kind
+            elif first.kind in OWN_FAILURE_KINDS:
+                kind = first.kind
+            else:
+                kind = second.kind
             raise SummaryFailure(
                 f"level 1: {first}; level 2: {second.reason}",
                 transient=second.transient,
+                kind=kind,
                 detail=second.detail,
                 retry_after=second.retry_after,
             ) from second
+        except BaseException as exc:
+            # Level 2 ended by something that is no summary failure: the call abandoned
+            # because no attempt wants it any more (``inflight.CallAbandoned``), or any
+            # other exception. An own failure observed at level 1 is still recorded
+            # (Codex review of 3da00d9): it rides the exception, and the worker delivers
+            # it as the call's one failure (``inflight._worker``).
+            if first.kind in OWN_FAILURE_KINDS and getattr(exc, "observed_failure", None) is None:
+                try:
+                    exc.observed_failure = first
+                except Exception:
+                    logger.warning("LCM could not carry the level-1 failure (%s) past %s", first,
+                                   type(exc).__name__)
+            raise
         return content, 2, finish_reason
 
 
