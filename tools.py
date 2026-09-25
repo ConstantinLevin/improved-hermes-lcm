@@ -2014,6 +2014,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "runtime_identity": engine.get_runtime_identity(),
         "store_identity": store_identity,
         "store_events_recent": store_events,
+        # The daily backup slot (#6): read with stat, never opened.
+        "backup": engine._backup.describe(),
         "checks": checks,
         "guidance": doctor_guidance_for_checks(checks),
     })

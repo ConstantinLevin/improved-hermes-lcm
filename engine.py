@@ -55,6 +55,7 @@ from .message_analysis import (
     _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
+from .backup import DailyBackup
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .plugin_sessions import PluginSessions
@@ -89,11 +90,17 @@ def _register_exit_mark() -> None:
         _EXIT_MARK_REGISTERED = True
 
 
-def _close_helpers(helpers: tuple, label: str, reason_box: list) -> None:
+def _close_helpers(helpers: tuple, label: str, reason_box: list, backup: Optional[DailyBackup] = None) -> None:
     """Close one engine's store helpers and say so. Run by ``LCMEngine.close`` with
     its reason, and otherwise by the engine's finalizer, when the engine is collected
-    or the process exits. It holds the helpers, never the engine."""
+    or the process exits. It holds the helpers, never the engine. A daily backup the
+    engine started is stopped first and waited for; the slot stays as it was."""
     reason = reason_box[0] or ("the process is exiting" if _PROCESS_EXITING else "its engine was collected")
+    if backup is not None:
+        try:
+            backup.stop()
+        except Exception:
+            logger.warning("LCM could not stop the daily backup of %s (%s)", label, reason, exc_info=True)
     for helper in helpers:
         try:
             helper.close(reason)
@@ -317,8 +324,11 @@ class LCMEngine(
             raise
         self._store, self._dag, self._sessions, self._records = helpers
         self._close_box: list = [None]
+        # The store's daily backup (#6); it holds the record helper, never the engine.
+        self._backup = DailyBackup(db_path, self._records)
         self._storage_finalizer = weakref.finalize(
             self, _close_helpers, tuple(helpers), f"engine {id(self):#x} on {db_path}", self._close_box,
+            self._backup,
         )
         _register_exit_mark()
 
@@ -747,6 +757,7 @@ class LCMEngine(
             self._apply_session_start_metadata(session_id, kwargs)
             self._conversation_id = requested_conversation_id or previous_conversation_id or session_id
             self._register_active_engine_binding()
+            self._start_daily_backup()
             return
 
         if previous_session_id and previous_session_id != session_id:
@@ -766,6 +777,12 @@ class LCMEngine(
             signal="on_session_start",
             platform=str(kwargs.get("platform") or "") or None,
         )
+        self._start_daily_backup()
+
+    def _start_daily_backup(self) -> None:
+        """Start the store's daily backup on its own thread when one is due (#6)."""
+        if self._closed_reason is None:
+            self._backup.start_if_due()
 
     def _name_plugin_session(self, host_session_id: str, *, signal: str, platform: str | None) -> None:
         """Bind this engine copy to the plugin session a host session id names.
@@ -1100,15 +1117,3 @@ class LCMEngine(
             # Take first line only
             return hint.split("\n")[0].strip()
         return ""
-
-    # -- Backup path -------------------------------------------------------
-
-    def backup_dir(self) -> Path:
-        """Return the directory where ``maintenance.backup_database`` writes."""
-        db_path = Path(self._store.db_path)
-        backup_root = (
-            Path(self._hermes_home).expanduser()
-            if getattr(self, "_hermes_home", "")
-            else db_path.parent
-        )
-        return backup_root / "backups" / "lcm"

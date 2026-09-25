@@ -8,19 +8,33 @@ Use read-only product tools before changing configuration or running an apply pa
 2. Send one normal message if the session has not been bound since restart.
 3. `lcm_status`: inspect runtime identity, database path, context pressure, summary/store counts, and filters.
 4. `lcm_inspect`: inspect current-session lineage, the stored fresh tail, and skip/no-op reasons without retrieving content.
-5. `lcm_doctor`: run database, FTS, configuration, and context-pressure diagnostics, check the record's invariant (every record on the branch is in the returned tail or under exactly one summary of the latest compaction), and list the store's identity and its recent events (what the plugin could not do).
+5. `lcm_doctor`: run database, FTS, configuration, and context-pressure diagnostics, check the record's invariant (every record on the branch is in the returned tail or under exactly one summary of the latest compaction), list the store's identity and its recent events (what the plugin could not do), and show the daily backup slot and its age.
 
 If optional slash commands are enabled, `/lcm status` and `/lcm doctor` expose the corresponding operator views.
 
 ## Safe mutation order
 
-For repair:
+For repair (the only one is rebuilding a full-text index, `/lcm doctor repair apply`, which rebuilds derived data from the insert-only record):
 
-1. run the read-only preview;
+1. run the read-only preview (`/lcm doctor repair`);
 2. inspect exact candidates and paths;
-3. create/confirm a backup;
-4. obtain user authorization for the specific apply operation;
-5. run one bounded apply and verify integrity afterward.
+3. obtain user authorization for the specific apply operation;
+4. run one bounded apply and verify integrity afterward.
+
+## The daily backup
+
+The plugin keeps one backup of each store: `<store directory>/backups/lcm/<store name>.daily.sqlite3`. It is taken automatically, at most once a day and only when the store changed since, through SQLite's backup API. Each copy is checked (`integrity_check`, the store's identity, the record's invariant) before it replaces the slot, so the slot is always the last copy that passed. A failed backup keeps the old slot and appears in the doctor's recent events as `backup_failed`. A slot that holds another store's backup is set aside as `<store name>.daily.<uuid>.sqlite3` and never overwritten. There is no backup command.
+
+## Restore
+
+A restore is the owner's, by hand, with every Hermes process on that home stopped:
+
+1. stop Hermes (gateway, CLI, dashboard) on this home;
+2. move the live store aside, for example to `lcm-record.db.before-restore`. Never delete it: it holds everything written since the backup;
+3. write the slot into place through SQLite: `sqlite3 backups/lcm/lcm-record.daily.sqlite3 ".backup lcm-record.db"` (run in the store's directory);
+4. start Hermes again.
+
+A session that was running continues from its host context, which holds summaries and rows the restored store does not have. So a running session aborts visibly at its next compaction after a restore ("Compression aborted: …", nothing changed in its context). Begin a new session with `/new`.
 
 ## Common states
 

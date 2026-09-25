@@ -26,7 +26,6 @@ from .presets import (
     suggest_preset_for_engine,
     unsupported_runtime_fields_text,
 )
-from .maintenance import backup_database
 from .store import build_message_fts_spec
 
 
@@ -57,8 +56,7 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm or /lcm status: show current LCM runtime/session status",
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
-        "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
-        "- /lcm backup: create a timestamped SQLite backup",
+        "- /lcm doctor repair apply: rebuild the message and summary FTS indexes from the stored records",
         "- /lcm preset show [name]: inspect shipped preset metadata and benchmark provenance",
         "- /lcm preset suggest: preview the best shipped preset for the current engine state",
         "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
@@ -231,21 +229,15 @@ def _doctor_repair_text(engine) -> str:
             lines.append(f"{label}_integrity_status: {item['integrity_status']}")
     lines.append("note: read-only scan only — no FTS tables were repaired")
     if scan["needs_repair"]:
-        lines.append("note: use `/lcm doctor repair apply` to create a backup and repair FTS indexes")
+        lines.append("note: use `/lcm doctor repair apply` to rebuild the FTS indexes from the stored records")
     return "\n".join(lines)
 
 
 def _doctor_repair_apply_text(engine) -> str:
-    backup = backup_database(engine)
-    if not backup["ok"]:
-        return "\n".join([
-            "LCM doctor repair apply",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"error: backup failed: {backup['error']}",
-            "note: repair apply aborted before any FTS tables were repaired",
-        ])
-
+    # The full-text indexes are derived from the record, which is insert-only, and are
+    # rebuilt from it; a repair cannot lose a record. The store's backup is the daily
+    # slot (#6), not a copy per command.
+    db_path = engine._store.db_path
     conn = engine._store.connection
     try:
         messages_result = repair_external_content_fts(conn, build_message_fts_spec())
@@ -254,27 +246,33 @@ def _doctor_repair_apply_text(engine) -> str:
         return "\n".join([
             "LCM doctor repair apply",
             "status: error",
-            f"database_path: {backup['db_path']}",
-            f"backup_path: {backup['backup_path']}",
-            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+            f"database_path: {db_path}",
             f"error: FTS repair failed: {exc}",
-            "note: backup was created before repair apply",
         ])
 
     return "\n".join([
         "LCM doctor repair apply",
         "status: ok",
-        f"database_path: {backup['db_path']}",
-        f"backup_path: {backup['backup_path']}",
-        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+        f"database_path: {db_path}",
         f"messages_fts_rebuilt: {_fmt_bool(messages_result['rebuilt'])}",
         f"messages_fts_triggers_recreated: {_fmt_bool(messages_result['triggers_recreated'])}",
         f"messages_fts_degraded: {_fmt_bool(messages_result['degraded'])}",
         f"nodes_fts_rebuilt: {_fmt_bool(nodes_result['rebuilt'])}",
         f"nodes_fts_triggers_recreated: {_fmt_bool(nodes_result['triggers_recreated'])}",
         f"nodes_fts_degraded: {_fmt_bool(nodes_result['degraded'])}",
-        "note: backup created before repair apply",
+        "note: the indexes are rebuilt from the stored records",
     ])
+
+
+def _backup_lines(engine) -> list[str]:
+    """The daily backup slot (#6), as the doctor shows it."""
+    backup = engine._backup.describe()
+    if not backup["taken"]:
+        return [f"backup_slot: {backup['slot']}", "backup_taken: none yet"]
+    return [
+        f"backup_slot: {backup['slot']}",
+        f"backup_taken: {backup['age_hours']} h ago ({_fmt_size(int(backup['size_bytes']))})",
+    ]
 
 
 def _doctor_text(engine) -> str:
@@ -500,6 +498,7 @@ def _doctor_text(engine) -> str:
         + ("error" if invariant_error else "fail" if invariant_failing else "pass")
         + f" ({len(invariant_reports)} session(s) checked)",
         f"store_events_recent: {len(store_events)}",
+        *_backup_lines(engine),
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")
@@ -526,26 +525,6 @@ def _doctor_text(engine) -> str:
     else:
         lines.append("- none")
     return "\n".join(lines)
-
-
-def _backup_text(engine) -> str:
-    backup = backup_database(engine)
-    if not backup["ok"]:
-        return "\n".join([
-            "LCM backup",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"error: {backup['error']}",
-        ])
-
-    return "\n".join([
-        "LCM backup",
-        "status: ok",
-        f"database_path: {backup['db_path']}",
-        f"backup_path: {backup['backup_path']}",
-        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-        "note: backup created before any future cleanup/apply workflow",
-    ])
 
 
 def _unknown_preset_text(name: str) -> str:
@@ -717,11 +696,6 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
             return _doctor_repair_apply_text(engine)
         return _help_text("`/lcm doctor` currently supports `repair` and `repair apply` as extra subcommands.")
-
-    if head == "backup":
-        if rest:
-            return _help_text("`/lcm backup` does not accept extra arguments.")
-        return _backup_text(engine)
 
     if head == "preset":
         return _preset_text(rest, engine)
