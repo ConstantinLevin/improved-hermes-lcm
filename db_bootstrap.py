@@ -28,8 +28,10 @@ logger = logging.getLogger(__name__)
 
 # The layout this build writes. A store with any other format is refused. Format 4
 # makes the record the only store: the old path's tables are gone, and what the
-# tools read are views over the record (#29, #1).
-STORE_FORMAT = "ihl-store/4"
+# tools read are views over the record (#29, #1). Format 5 adds the indexes the
+# doctor's invariant check reads by (chunks by session, rejections by compaction),
+# so that a store without them is never opened.
+STORE_FORMAT = "ihl-store/5"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -240,6 +242,7 @@ CREATE TABLE chunks (
     session TEXT NOT NULL REFERENCES sessions(handle),
     compaction INTEGER NOT NULL REFERENCES compactions(compaction_id)
 );
+CREATE INDEX idx_chunks_session ON chunks(session, compaction);
 
 CREATE TABLE chunk_members (
     chunk TEXT NOT NULL REFERENCES chunks(handle),
@@ -319,6 +322,7 @@ CREATE TABLE rejections (
     how TEXT NOT NULL,
     at REAL NOT NULL
 );
+CREATE INDEX idx_rejections_compaction ON rejections(compaction);
 
 CREATE TABLE adoptions (
     compaction INTEGER NOT NULL UNIQUE REFERENCES compactions(compaction_id),

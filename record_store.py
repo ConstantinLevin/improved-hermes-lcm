@@ -386,40 +386,68 @@ class RecordStore:
           effective compaction's input list held stands in its place, and the walk
           goes on from the revision's predecessor.
         - No two chunks the return reaches share a record.
+        - Every chunk a summary entry reaches is on this session's active branch: a
+          chunk of the session, written by one of its effective compactions, whose
+          members are on the branch or stand beside it (a host insertion or a
+          revision chained off a branch record).
         - The summary entries form a cover (#34 D5): complete (every chunk an
           effective compaction of the session wrote is covered: nothing of a return
           can leave a later one, and the host offers no revert past a compaction),
           disjoint (by exactly one summary entry), contiguous (each entry covers a
           contiguous run of chunks, and the entries stand in the order of their runs'
-          first chunks). Chunks stand in transcript order: by compaction, and within
-          a compaction by the list position of their first member, as the host's list
-          held it. Every summary entry reaches at least one chunk.
+          first chunks). The order is the active branch's own: a chunk stands where
+          its first member stands on the branch. A chunk of records beside the chain
+          only (host insertions) has no place on the branch and takes no part in the
+          order. Every summary entry reaches at least one chunk.
+
+        The whole check reads one snapshot: it runs inside one read transaction, so
+        a compaction committing meanwhile is not half seen. In rollback-journal mode
+        that transaction holds a shared lock, and a writer's commit waits for it
+        (within its busy timeout) until the check ends. Every read is scoped to the
+        session by an index, so the check stays short on a large store.
 
         Returns one report per session: the compaction checked, counts, and the
         problems found (at most ``max_problems`` listed, all counted).
         """
-        reports: list[dict[str, Any]] = []
-        for session, compaction in self._q(
-            "SELECT session, MAX(compaction_id) FROM effective_compactions GROUP BY session ORDER BY session"
-        ):
-            reports.append(self._check_session(str(session), int(compaction), max_problems))
+        with self._lock:
+            conn = self._conn
+            conn.execute("BEGIN")
+            try:
+                reports = [
+                    self._check_session(str(session), int(compaction), max_problems)
+                    for session, compaction in self._q(
+                        "SELECT session, MAX(compaction_id) FROM effective_compactions "
+                        "GROUP BY session ORDER BY session"
+                    )
+                ]
+            except BaseException:
+                self._rollback(conn)
+                raise
+            conn.execute("COMMIT")
         return reports
 
-    def _chunks_of(self, derivation: str, seen: Optional[set] = None) -> list[str]:
-        seen = set() if seen is None else seen
-        if derivation in seen or len(seen) > 4096:
-            return []
-        seen.add(derivation)
+    def _chunks_of(self, derivation: str) -> list[str]:
+        """The chunks a derivation covers: its sources when they are chunks, and the
+        chunks of its sources, recursively, when they are derivations. The visited
+        set makes the walk finite; there is no depth limit."""
         chunks: list[str] = []
-        for chunk, source in self._q(
-            "SELECT chunk, source_derivation FROM derivation_sources WHERE derivation = ? ORDER BY ordinal",
-            (derivation,),
-        ):
-            if chunk:
-                chunks.append(str(chunk))
-            elif source:
-                chunks.extend(self._chunks_of(str(source), seen))
-        return chunks
+        seen: set[str] = set()
+        stack = [derivation]
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            sources = self._q(
+                "SELECT chunk, source_derivation FROM derivation_sources WHERE derivation = ? ORDER BY ordinal",
+                (current,),
+            )
+            for chunk, source in reversed(sources):
+                if chunk:
+                    chunks.append(str(chunk))
+                elif source:
+                    stack.append(str(source))
+        return list(dict.fromkeys(chunks))
 
     def _check_session(self, session: str, compaction: int, max_problems: int) -> dict[str, Any]:
         problems: list[str] = []
@@ -438,53 +466,46 @@ class RecordStore:
         record_entries = [str(r) for _p, kind, r, _d in returns if kind == "record" and r]
         summary_entries = [(int(p), str(d)) for p, kind, _r, d in returns if kind == "summary" and d]
 
-        # The chunks each summary entry reaches, and the members of every chunk.
+        effective = {int(k) for (k,) in self._q(
+            "SELECT compaction_id FROM effective_compactions WHERE session = ?", (session,))}
+
+        # The chunks each summary entry reaches, and where each chunk belongs.
         covered_by: dict[str, list[int]] = {}
         entry_chunks: dict[int, list[str]] = {}
         for position, derivation in summary_entries:
-            chunks = list(dict.fromkeys(self._chunks_of(derivation)))
+            chunks = self._chunks_of(derivation)
             entry_chunks[position] = chunks
             if not chunks:
                 problem(f"summary entry {position} reaches no chunk")
             for chunk in chunks:
                 covered_by.setdefault(chunk, []).append(position)
+        chunk_home = {
+            chunk: rows[0] if rows else None
+            for chunk in covered_by
+            for rows in [self._q("SELECT session, compaction FROM chunks WHERE handle = ?", (chunk,))]
+        }
         effective_chunks = [(str(c), int(k)) for c, k in self._q(
-            "SELECT ch.handle, ch.compaction FROM chunks ch "
-            "JOIN effective_compactions e ON e.compaction_id = ch.compaction "
-            "WHERE ch.session = ? ORDER BY ch.compaction, ch.rowid",
-            (session,),
-        )]
+            "SELECT handle, compaction FROM chunks WHERE session = ? ORDER BY compaction, rowid", (session,))
+            if int(k) in effective]
         members: dict[str, list[str]] = {}
         for chunk, record in self._q(
-            "SELECT m.chunk, m.record FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
+            "SELECT m.chunk, m.record FROM chunks ch JOIN chunk_members m ON m.chunk = ch.handle "
             "WHERE ch.session = ? ORDER BY m.chunk, m.ordinal",
             (session,),
         ):
             members.setdefault(str(chunk), []).append(str(record))
-        # Transcript order of a chunk: its compaction, then the list position of its
-        # first member in that compaction's input.
-        chunk_order = {str(chunk): (int(k), float("inf") if first is None else int(first))
-                       for chunk, k, first in self._q(
-            "SELECT m.chunk, ch.compaction, MIN(i.position) FROM chunk_members m "
-            "JOIN chunks ch ON ch.handle = m.chunk "
-            "LEFT JOIN compaction_inputs i ON i.compaction = ch.compaction AND i.record = m.record "
-            "WHERE ch.session = ? GROUP BY m.chunk",
-            (session,),
-        )}
 
         # A revised record is read through the revision an effective compaction's
         # input held (the latest such), transitively.
         revised: dict[str, tuple[int, str]] = {}
         for source, revision, at in self._q(
-            "SELECT s.source_record, s.revision, MAX(i.compaction) FROM revision_sources s "
-            "JOIN records r ON r.handle = s.revision "
-            "JOIN compaction_inputs i ON i.record = s.revision "
-            "JOIN effective_compactions e ON e.compaction_id = i.compaction "
-            "WHERE r.session = ? AND s.source_record IS NOT NULL "
-            "GROUP BY s.source_record, s.revision",
+            "SELECT s.source_record, s.revision, i.compaction FROM records r "
+            "JOIN revision_sources s ON s.revision = r.handle "
+            "JOIN compaction_inputs i ON i.record = r.handle "
+            "WHERE r.session = ? AND r.kind = 'revision' AND s.source_record IS NOT NULL",
             (session,),
         ):
-            if str(source) not in revised or int(at) > revised[str(source)][0]:
+            if int(at) in effective and (str(source) not in revised or int(at) > revised[str(source)][0]):
                 revised[str(source)] = (int(at), str(revision))
 
         def resolve(record: str) -> str:
@@ -495,8 +516,13 @@ class RecordStore:
             return record
 
         # The branch: from the head back along the predecessors.
-        predecessor = {str(h): (str(p) if p else None) for h, p in self._q(
-            "SELECT handle, predecessor FROM records WHERE session = ?", (session,))}
+        predecessor: dict[str, Optional[str]] = {}
+        kind_of: dict[str, str] = {}
+        for handle, previous_handle, kind in self._q(
+            "SELECT handle, predecessor, kind FROM records WHERE session = ?", (session,)
+        ):
+            predecessor[str(handle)] = str(previous_handle) if previous_handle else None
+            kind_of[str(handle)] = str(kind)
         branch: list[str] = []
         if not record_entries:
             problem("the return has no record entry, so the branch has no head")
@@ -512,6 +538,32 @@ class RecordStore:
                 previous = predecessor.get(cursor)
                 cursor = resolve(previous) if previous else None
             branch.reverse()
+        on_branch = {record: index for index, record in enumerate(branch)}
+
+        def beside(record: str) -> bool:
+            """A host insertion or a revision chained off a branch record, not on it."""
+            if record in on_branch or kind_of.get(record, "transcript") == "transcript":
+                return False
+            previous = predecessor.get(record)
+            return previous is not None and resolve(previous) in on_branch
+
+        # Every chunk a summary entry reaches is on this session's active branch.
+        for position, _derivation in summary_entries:
+            for chunk in entry_chunks.get(position, []):
+                home = chunk_home.get(chunk)
+                if home is None:
+                    problem(f"summary entry {position} reaches chunk {chunk}, which the store does not hold")
+                elif str(home[0]) != session:
+                    problem(f"summary entry {position} reaches chunk {chunk} of session {home[0]}, "
+                            f"not of this session's active branch")
+                elif int(home[1]) not in effective:
+                    problem(f"summary entry {position} reaches chunk {chunk} of compaction {home[1]}, "
+                            f"which is not effective, so not on the active branch")
+                else:
+                    off = [r for r in members.get(chunk, []) if r not in on_branch and not beside(r)]
+                    if off:
+                        problem(f"summary entry {position} reaches chunk {chunk}, whose record {off[0]} "
+                                f"is not on the active branch")
 
         # Every record on the branch: a record entry, or under a reached chunk; not both.
         in_tail = set(record_entries)
@@ -536,7 +588,15 @@ class RecordStore:
             if len(positions) > 1:
                 problem(f"chunk {chunk} is covered by {len(positions)} summary entries: {positions}")
 
-        order = sorted(covered_by, key=lambda c: chunk_order.get(c, (float("inf"), float("inf"))))
+        # Contiguity in the active branch's own order: a chunk stands where its first
+        # member on the branch stands. Chunks with no member on the branch (host
+        # insertions only, beside the chain) have no place in it.
+        place = {
+            chunk: min(on_branch[r] for r in members.get(chunk, []) if r in on_branch)
+            for chunk in covered_by
+            if any(r in on_branch for r in members.get(chunk, []))
+        }
+        order = sorted(place, key=lambda c: place[c])
         rank = {chunk: index for index, chunk in enumerate(order)}
         previous_first = -1
         for position, _derivation in summary_entries:
