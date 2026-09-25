@@ -213,6 +213,26 @@ def register(ctx):
         register_hook("on_session_reset", _on_session_reset)
         register_hook("subagent_start", _on_subagent_start)
 
+        # The per-turn signals, per host session id, process-wide (#32 §1, D1):
+        # a turn begins, a tool of it ran, a response of it arrived. The turn's end
+        # is the engine's on_turn_complete. Each observes and returns nothing.
+        from . import turn_signals
+
+        def _on_pre_llm_call_turn(**payload):
+            turn_signals.turn_began(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""),
+                                    payload.get("conversation_history"))
+            return None
+
+        def _on_post_tool_call(**payload):
+            turn_signals.tool_ran(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""))
+
+        def _on_post_api_request(**payload):
+            turn_signals.response_arrived(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""))
+
+        register_hook("pre_llm_call", _on_pre_llm_call_turn)
+        register_hook("post_tool_call", _on_post_tool_call)
+        register_hook("post_api_request", _on_post_api_request)
+
     # Register tools via the plugin registry only on hosts that preserve the
     # active messages=... contract for registered context-engine tools.
     # Older/current Hermes hosts already expose lcm_* correctly through the

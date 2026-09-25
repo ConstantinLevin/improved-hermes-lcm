@@ -14,11 +14,10 @@ from typing import Any, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
 
-from .codex_routing import (
-    _codex_oauth_context_cap,
-    _is_codex_gpt55_route,
-)
+from . import turn_signals
+from .codex_routing import _codex_oauth_context_cap
 from .config import LCMConfig
+from .geometry import Geometry, geometry
 from .dag import SummaryDAG
 from .db_bootstrap import STORE_FILENAME, StoreClosedError, StoreRefusedError
 from .engine_registry import (
@@ -56,7 +55,6 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 
-_CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "plugin_session"
 
 # Set by an exit handler registered right after the first finalizer (which registers
@@ -202,15 +200,16 @@ class LCMEngine(
         self.effective_context_length_reason = ""
         self._context_length_source = ""
         self._update_model_pending_session_start = False
-        self.threshold_tokens = 0
-        self.context_threshold = self._config.context_threshold
-        self.threshold_percent = self.context_threshold
-        self._context_threshold_source = (
-            self._config.config_sources.get("context_threshold", "manual_or_default")
-            if getattr(self._config, "config_sources", None)
-            else "manual_or_default"
-        )
-        self._context_threshold_autoraised: dict[str, float] | None = None
+        # τ, τ′ and G from the window (``geometry``), or why there are none (R11).
+        self._geometry: Optional[Geometry] = None
+        self._geometry_error = "the window is not known: the host has named no context length"
+        # Set when the host detaches this copy as its review fork (bind_session_state
+        # with an empty id): the fork's turn end never touches the hook state (C1).
+        self._review_fork = False
+        # What the host reads after a compaction and around its per-turn count (#32 §9).
+        self._last_compression_made_progress = False
+        self.awaiting_real_usage_after_compression = False
+        self._verify_compaction_cleared_threshold = False
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -221,9 +220,6 @@ class LCMEngine(
         self.last_reasoning_tokens = 0
         self.cache_metrics_available = False
         self.compression_count = 0
-        # run_agent.py reads these for preflight checks
-        self.protect_first_n = 3
-        self.protect_last_n = self._config.fresh_tail_count
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
@@ -420,37 +416,6 @@ class LCMEngine(
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 
-    def _runtime_context_threshold(
-        self,
-        *,
-        model: str | None = None,
-        provider: str | None = None,
-    ) -> tuple[float, str, dict[str, float] | None]:
-        configured = float(self._config.context_threshold)
-        source = (
-            self._config.config_sources.get("context_threshold", "manual_or_default")
-            if getattr(self._config, "config_sources", None)
-            else "manual_or_default"
-        )
-        explicit_lcm_override = source in {
-            "env:LCM_CONTEXT_THRESHOLD",
-            "config_yaml:lcm.context_threshold",
-        }
-        route_model = self.model if model is None else model
-        route_provider = self.provider if provider is None else provider
-        if (
-            _is_codex_gpt55_route(route_model, route_provider)
-            and self._config.codex_gpt55_autoraise_enabled
-            and not explicit_lcm_override
-            and configured < _CODEX_GPT55_COMPACTION_THRESHOLD
-        ):
-            return (
-                _CODEX_GPT55_COMPACTION_THRESHOLD,
-                "codex_gpt55_autoraise",
-                {"from": configured, "to": _CODEX_GPT55_COMPACTION_THRESHOLD},
-            )
-        return configured, source, None
-
     def _effective_context_length(
         self,
         raw_context_length: int,
@@ -469,21 +434,82 @@ class LCMEngine(
             )
         return raw_context_length, None, ""
 
-    def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
-        """Return the host-visible preflight trigger token count.
+    # -- The published threshold and the host's compaction parameters (#32 D2, R16) --
 
-        Hermes core uses ``threshold_tokens`` as a cheap gate before it pays for
-        the full request estimate that includes system prompt and tool schemas.
-        LCM can enforce a stricter active-context assembly cap than the normal
-        context-threshold value, so expose the stricter cap here; otherwise a
-        tool/schema-heavy request can skip host preflight entirely.
-        """
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is not None and assembly_cap > 0:
-            if context_threshold_tokens > 0:
-                return min(context_threshold_tokens, assembly_cap)
-            return assembly_cap
-        return context_threshold_tokens
+    def _refuse_host_write(self, name: str, value: Any) -> None:
+        """The host wrote one of the values the plugin publishes: refused, recorded."""
+        logger.warning("LCM refuses the host's write of %s = %r: the plugin publishes it (#32 D2, R16)",
+                       name, value)
+        try:
+            self._records.event("host_write_refused", session=self._plugin_session or None,
+                                detail={"attribute": name, "value": repr(value)})
+        except Exception:
+            logger.debug("LCM could not record the refused write", exc_info=True)
+
+    def _tau(self, *, raised: bool) -> int:
+        """τ, or τ′ when ``raised``: 0 where no geometry is defined (R11). An assembly
+        cap, where configured, lowers it (left for #14, R19)."""
+        if self._geometry is None:
+            return 0
+        value = self._geometry.tau_raised if raised else self._geometry.tau
+        cap = self._effective_assembly_token_cap()
+        return min(value, cap) if cap is not None and cap > 0 else value
+
+    def _turn_state(self) -> "turn_signals.TurnState":
+        return turn_signals.state(self._session_id)
+
+    def _turn_label(self) -> str:
+        state = self._turn_state()
+        if not state.in_turn:
+            return "between turns, by the hooks"
+        after = {"tool_result": "after a tool round", "api_response": "after a response"}.get(state.last_event,
+                                                                                             "before any tool round")
+        return f"in turn {state.turn_id or '?'}, {after}, by the hooks"
+
+    @property
+    def threshold_tokens(self) -> int:
+        """τ′ while the hook state says a turn runs for this copy's session, else τ
+        (#32 D2). The host reads it at the turn-start skip, the re-arm after a
+        compaction and the idle floor; ``should_compress`` applies τ or τ′ itself."""
+        return self._tau(raised=self._turn_state().in_turn)
+
+    @threshold_tokens.setter
+    def threshold_tokens(self, value: Any) -> None:
+        # The host writes it only for its own auxiliary model's window
+        # (agent/conversation_compression.py), which is not the plugin's trigger (R16).
+        self._refuse_host_write("threshold_tokens", value)
+
+    @property
+    def protect_first_n(self) -> int:
+        """0: the host's turn-start skip never decides for the plugin (#32 D2)."""
+        return 0
+
+    @protect_first_n.setter
+    def protect_first_n(self, value: Any) -> None:
+        self._refuse_host_write("protect_first_n", value)
+
+    @property
+    def protect_last_n(self) -> int:
+        """0: the host's turn-start skip never decides for the plugin (#32 D2)."""
+        return 0
+
+    @protect_last_n.setter
+    def protect_last_n(self, value: Any) -> None:
+        self._refuse_host_write("protect_last_n", value)
+
+    def _apply_geometry(self) -> None:
+        """τ, τ′ and G from the window, where #21's bounds allow; else the error is
+        kept, logged and recorded once per window (R11)."""
+        found, why = geometry(int(self.context_length or 0), self._config)
+        previous = (self._geometry, self._geometry_error)
+        self._geometry, self._geometry_error = found, why
+        if found is None and self.context_length and previous[1] != why:
+            logger.warning("LCM compacts nothing: %s", why)
+            try:
+                self._records.event("geometry_undefined", session=self._plugin_session or None,
+                                    detail={"window": int(self.context_length), "why": why})
+            except Exception:
+                logger.debug("LCM could not record the undefined geometry", exc_info=True)
 
     def _set_context_length(
         self,
@@ -509,11 +535,7 @@ class LCMEngine(
             self.effective_context_length_cap = None
             self.effective_context_length_reason = ""
             self._context_length_source = source
-            self.threshold_tokens = 0
-            self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-                self._runtime_context_threshold(model=model, provider=provider)
-            )
-            self.threshold_percent = self.context_threshold
+            self._apply_geometry()
             return True
         self.raw_context_length = parsed_context_length
         effective_context_length, cap, reason = self._effective_context_length(
@@ -525,16 +547,7 @@ class LCMEngine(
         self.effective_context_length_cap = cap
         self.effective_context_length_reason = reason
         self._context_length_source = source
-        self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-            self._runtime_context_threshold(model=model, provider=provider)
-        )
-        self.threshold_percent = self.context_threshold
-        context_threshold_tokens = int(
-            effective_context_length * self.context_threshold
-        )
-        self.threshold_tokens = self._effective_threshold_tokens(
-            context_threshold_tokens
-        )
+        self._apply_geometry()
         return True
 
     def _session_metadata_matches_active_runtime(
@@ -596,6 +609,13 @@ class LCMEngine(
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
+        if self.last_prompt_tokens > 0:
+            # A real prompt count arrived after a compaction: the host's latch and its
+            # re-arm flag are cleared, as its own compressor does (#32 §9). The host has
+            # captured the re-arm flag before this call and re-arms its per-turn count
+            # when this prompt is below threshold_tokens.
+            self.awaiting_real_usage_after_compression = False
+            self._verify_compaction_cleared_threshold = False
 
         cache_keys = {"cache_read_tokens", "cache_write_tokens"}
         self.cache_metrics_available = any(key in usage for key in cache_keys)
@@ -782,6 +802,10 @@ class LCMEngine(
         if boundary_reason == "compression":
             # The host committed a compaction: the record line (#20, #29 W2 step 7).
             self._record_confirmation(old_session_id, session_id)
+            # A compaction inside a turn does not end the turn; a renamed host session
+            # carries its hook state (#32).
+            if not self._review_fork:
+                turn_signals.carry(old_session_id, session_id)
         previous_session_id = self._session_id
         previous_conversation_id = self._conversation_id
         requested_conversation_id = str(kwargs.get("conversation_id") or "")
@@ -848,6 +872,9 @@ class LCMEngine(
         if session_id:
             self._name_plugin_session(session_id, signal="bind_session_state", platform=None)
             return
+        # This copy is the review fork's: its turn end never touches the hook state of
+        # the session whose id its agent reuses (C1).
+        self._review_fork = True
         if self._plugin_session:
             self._sessions.add_fact(
                 self._plugin_session,
@@ -972,10 +999,11 @@ class LCMEngine(
             "model": self.model,
             "provider": self.provider,
             "context_length_source": self._context_length_source,
-            "configured_context_threshold": self._config.context_threshold,
-            "context_threshold": self.context_threshold,
-            "context_threshold_source": self._context_threshold_source,
-            "context_threshold_autoraised": self._context_threshold_autoraised,
+            "geometry": self._geometry.label() if self._geometry is not None else self._geometry_error,
+            "tau": self._geometry.tau if self._geometry is not None else None,
+            "tau_raised": self._geometry.tau_raised if self._geometry is not None else None,
+            "target": self._geometry.target if self._geometry is not None else None,
+            "turn": self._turn_label(),
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),

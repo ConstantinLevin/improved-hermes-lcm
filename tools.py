@@ -19,7 +19,6 @@ from .db_bootstrap import (
 from .message_content import content_parts, is_image_part
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
-from .presets import preset_status_payload
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .store import build_message_fts_spec
 
@@ -1796,10 +1795,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "effective_context_length_cap": full_status.get("effective_context_length_cap"),
         "effective_context_length_reason": full_status.get("effective_context_length_reason", ""),
         "context_length_source": full_status.get("context_length_source", ""),
-        "configured_context_threshold": full_status.get("configured_context_threshold", engine._config.context_threshold),
-        "context_threshold": full_status.get("context_threshold", engine._config.context_threshold),
-        "context_threshold_source": full_status.get("context_threshold_source", ""),
-        "context_threshold_autoraised": full_status.get("context_threshold_autoraised"),
+        "geometry": full_status.get("geometry"),
+        "tau": full_status.get("tau"),
+        "tau_raised": full_status.get("tau_raised"),
+        "target": full_status.get("target"),
+        "turn": full_status.get("turn"),
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
         "last_input_tokens": engine.last_input_tokens,
@@ -1828,7 +1828,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "chunk_tokens": engine._config.chunk_tokens,
             "estimate_ratio": engine._config.estimate_ratio,
             "chunk": engine._chunk_label(),
-            "context_threshold": engine._config.context_threshold,
             "summary_model": (
                 f"{engine._config.summary_provider}/{engine._config.summary_model}"
                 if engine._config.summary_model else f"(the session's model: {engine.provider}/{engine.model})"
@@ -1842,7 +1841,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "config_source_warnings": config_source_warnings,
         "ignored_config_yaml_lcm_keys": ignored_config_yaml_lcm_keys,
         "source_lineage": source_lineage,
-        "preset_suggestion": preset_status_payload(engine),
         "runtime_identity": runtime_identity,
     })
 
@@ -2012,11 +2010,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     c = engine._config
     if c.fresh_tail_count < 2:
         config_warnings.append("fresh_tail_count < 2 may cause aggressive compaction")
-    runtime_context_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
-    if runtime_context_threshold > 0.95:
-        config_warnings.append("runtime context_threshold > 0.95 leaves very little headroom")
-    if runtime_context_threshold < 0.3:
-        config_warnings.append("runtime context_threshold < 0.3 triggers compaction very early")
+    if engine.context_length and engine._geometry is None:
+        config_warnings.append(f"no compaction: {engine._geometry_error}")
     for warning in getattr(c, "config_source_warnings", []) or []:
         config_warnings.append(warning)
     for key in getattr(c, "ignored_config_yaml_lcm_keys", []) or []:
@@ -2067,14 +2062,13 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         })
 
     # 7. Context pressure
-    if engine.context_length > 0:
-        usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
-        runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
-        threshold_pct = round(runtime_threshold * 100, 1)
+    if engine.context_length > 0 and engine._geometry is not None:
+        tau = engine._geometry.tau
         checks.append({
             "check": "context_pressure",
-            "status": "pass" if usage_pct < threshold_pct else "warn",
-            "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
+            "status": "pass" if engine.last_prompt_tokens < tau else "warn",
+            "detail": f"the last prompt was {engine.last_prompt_tokens} provider tokens; compaction runs at "
+                      f"τ {tau} ({engine._geometry.label()})",
         })
 
     overall = "healthy"

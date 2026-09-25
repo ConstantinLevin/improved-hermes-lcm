@@ -77,21 +77,6 @@ def _parse_float_env_with_source(
         return default, default_source, f"invalid env {key}={raw!r} ignored"
 
 
-def _config_bool_disabled(value) -> bool:
-    if isinstance(value, bool):
-        return value is False
-    if isinstance(value, (int, float)):
-        return value == 0
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"0", "false", "no", "off"}:
-            return True
-        try:
-            return float(normalized) == 0
-        except ValueError:
-            return False
-    return False
-
 
 def _hermes_config_path() -> Path:
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
@@ -143,7 +128,9 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+# The plugin reads no key of the host's config.yaml ``lcm:`` section: its values come
+# from its own configuration (#22). Every key found there is listed as ignored.
+_SUPPORTED_LCM_CONFIG_YAML_KEYS: frozenset = frozenset()
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -156,27 +143,6 @@ def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str
         for key in lcm_section
         if str(key) not in _SUPPORTED_LCM_CONFIG_YAML_KEYS
     )
-
-
-def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
-    cfg = _load_hermes_config_yaml()
-    try:
-        lcm_section = cfg.get("lcm") or {}
-        if isinstance(lcm_section, dict):
-            lcm_val = lcm_section.get("context_threshold")
-            if lcm_val is not None:
-                return float(lcm_val), "config_yaml:lcm.context_threshold"
-        compression = cfg.get("compression") or {}
-        if not isinstance(compression, dict):
-            return default, "default"
-        if _config_bool_disabled(compression.get("enabled")):
-            return default, "default"
-        comp_val = compression.get("threshold")
-        if comp_val is not None:
-            return float(comp_val), "config_yaml:compression.threshold"
-    except Exception:
-        return default, "default"
-    return default, "default"
 
 
 def _parse_calls_per_endpoint(raw: str) -> tuple[dict[str, int], str | None]:
@@ -203,20 +169,6 @@ def _parse_calls_per_endpoint(raw: str) -> tuple[dict[str, int], str | None]:
     return parsed, warning
 
 
-def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]:
-    cfg = _load_hermes_config_yaml()
-    try:
-        compression = cfg.get("compression") or {}
-        if not isinstance(compression, dict):
-            return default, "default"
-        value = compression.get("codex_gpt55_autoraise")
-        if value is None:
-            return default, "default"
-        return (not _config_bool_disabled(value)), "config_yaml:compression.codex_gpt55_autoraise"
-    except Exception:
-        return default, "default"
-
-
 @dataclass(frozen=True)
 class _EnvFieldSpec:
     """One scalar ``LCM_*`` environment override: which config field it sets,
@@ -228,15 +180,18 @@ class _EnvFieldSpec:
 
 
 # Single source of truth for the scalar LCM_* env overrides. ``from_env`` applies
-# the non-source-tracked entries uniformly, and ``presets`` derives its
-# preset-field lookups from the same list so the field/env/type mapping is not
-# duplicated. Order mirrors the historical ``from_env`` order for readability.
+# the non-source-tracked entries uniformly.
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("chunk_tokens", "LCM_CHUNK_TOKENS", int),
     _EnvFieldSpec("estimate_ratio", "LCM_ESTIMATE_RATIO", float),
-    _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
+    _EnvFieldSpec("round_growth_tokens", "LCM_ROUND_GROWTH_TOKENS", int),
+    _EnvFieldSpec("hygiene_share", "LCM_HYGIENE_SHARE", float),
+    _EnvFieldSpec("turn_margin_tokens", "LCM_TURN_MARGIN_TOKENS", int),
+    _EnvFieldSpec("target_share", "LCM_TARGET_SHARE", float),
+    _EnvFieldSpec("window_min_tokens", "LCM_WINDOW_MIN_TOKENS", int),
+    _EnvFieldSpec("window_max_tokens", "LCM_WINDOW_MAX_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
@@ -267,8 +222,30 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fresh_tail_max_tokens",
     "chunk_tokens",
     "estimate_ratio",
-    "context_threshold",
+    "round_growth_tokens",
+    "hygiene_share",
+    "turn_margin_tokens",
+    "target_share",
+    "window_min_tokens",
+    "window_max_tokens",
 })
+
+# The geometry's weights (#31, Decided; R14): field, env var, parse type, default, and
+# the source recorded while the default stands.
+_GEOMETRY_WEIGHTS = (
+    ("round_growth_tokens", "LCM_ROUND_GROWTH_TOKENS", int, 123_000,
+     "default: #31 Decided, the most one tool round adds (50k by the estimate x 1.95, plus 25k output)"),
+    ("hygiene_share", "LCM_HYGIENE_SHARE", float, 0.85,
+     "default: #31 Decided, the gateway's hygiene path at 0.85 of the window"),
+    ("turn_margin_tokens", "LCM_TURN_MARGIN_TOKENS", int, 54_500,
+     "default: #31 Decided, the count-p95 of the growth inside a human-begun turn"),
+    ("target_share", "LCM_TARGET_SHARE", float, 0.3,
+     "default: #31 Decided, G = min(0.3 x W, tau)"),
+    ("window_min_tokens", "LCM_WINDOW_MIN_TOKENS", int, 256_000,
+     "default: #21's lower bound on the window (R11)"),
+    ("window_max_tokens", "LCM_WINDOW_MAX_TOKENS", int, 2_000_000,
+     "default: #21's upper bound on the window (R11)"),
+)
 
 
 @dataclass
@@ -288,13 +265,17 @@ class LCMConfig:
     # results, p50 (p95 1.95, p99 2.37, n = 201). c in the estimate: 50,000 / 1.51.
     estimate_ratio: float = 1.51
 
-    # -- Compaction thresholds ---
-    # Fraction of context window that triggers compaction (0.0–1.0)
-    context_threshold: float = 0.35
-    # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
-    # when LCM is inheriting the host compression threshold. Explicit LCM
-    # threshold overrides remain authoritative.
-    codex_gpt55_autoraise_enabled: bool = True
+    # -- The trigger's geometry (#31, Decided; #11, #32; ``geometry``) ---
+    # tau' = min(W - round_growth_tokens, hygiene_share x W), tau = tau' - turn_margin_tokens,
+    # G = min(target_share x W, tau); all provider tokens. Defined for a window within
+    # [window_min_tokens, window_max_tokens] only (R11). Nothing of the host's own
+    # threshold setting is read.
+    round_growth_tokens: int = 123_000
+    hygiene_share: float = 0.85
+    turn_margin_tokens: int = 54_500
+    target_share: float = 0.3
+    window_min_tokens: int = 256_000
+    window_max_tokens: int = 2_000_000
 
     # -- Assembly guardrails ---
     # Hard cap for the assembled active context (0 = disabled)
@@ -386,17 +367,14 @@ class LCMConfig:
                 f"LCM_ESTIMATE_RATIO={c.estimate_ratio} is not positive; the default applies", 1.51,
                 "default: #31 measured, p50 of the provider's count over characters / 4 on Claude")
         _record("estimate_ratio", source, warning)
-        context_default, context_source = _hermes_compression_threshold_with_source(c.context_threshold)
-        c.context_threshold, source, warning = _parse_float_env_with_source(
-            "LCM_CONTEXT_THRESHOLD",
-            context_default,
-            default_source=context_source,
-        )
-        _record("context_threshold", source, warning)
-        c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
-            c.codex_gpt55_autoraise_enabled
-        )
-        _record("codex_gpt55_autoraise_enabled", source)
+        for name, env_key, py_type, default, default_source in _GEOMETRY_WEIGHTS:
+            parse = _parse_int_env_with_source if py_type is int else _parse_float_env_with_source
+            value, source, warning = parse(env_key, default, default_source=default_source)
+            if not value > 0:
+                warning = f"{env_key}={value} is not positive; the default applies"
+                value, source = default, default_source
+            setattr(c, name, value)
+            _record(name, source, warning)
         c.summary_calls_per_endpoint, warning = _parse_calls_per_endpoint(
             os.environ.get("LCM_SUMMARY_CALLS_PER_ENDPOINT", "")
         )
