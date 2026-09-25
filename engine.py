@@ -41,7 +41,6 @@ from .schemas import (
     LCM_INSPECT,
     LCM_STATUS,
 )
-from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .backup import DailyBackup
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
@@ -664,6 +663,7 @@ class LCMEngine(
             # when this prompt is below threshold_tokens.
             self.awaiting_real_usage_after_compression = False
             self._verify_compaction_cleared_threshold = False
+            self._measure_fixed_prefix()
 
         cache_keys = {"cache_read_tokens", "cache_write_tokens"}
         self.cache_metrics_available = any(key in usage for key in cache_keys)
@@ -713,18 +713,34 @@ class LCMEngine(
             echo = False
         return Estimator(image_model=self.model, reasoning_sent=echo)
 
-    def _fresh_tail_boundary(self, messages: List[Dict[str, Any]]) -> FreshTailBoundary:
-        # The newest message is always in the tail (#31's floor): no setting makes
-        # the tail empty, so the return always ends with the host's own newest dict.
-        return resolve_fresh_tail_boundary(
-            messages,
-            fresh_tail_count=max(1, int(self._config.fresh_tail_count or 0)),
-            fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
-            estimator=self._estimator(),
-        )
-
-    def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
-        return self._fresh_tail_boundary(messages).start
+    def _measure_fixed_prefix(self) -> None:
+        """R10: F, the fixed prefix (the system prompt, tool schemas and whatever else
+        the request carries beside the list), measured once per plugin session at its
+        first response: the provider's prompt count less the list that request sent
+        (``pre_api_request``), the list's estimate converted by #31's ratio. Recorded as
+        the session fact ``fixed_prefix``; until then F is the 32k hypothesis."""
+        if not self._plugin_session or self.last_prompt_tokens <= 0 or self._review_fork:
+            return
+        if turn_signals.prefix_known(self._session_id):
+            return
+        sent = turn_signals.request_list(self._session_id)
+        if sent is None:
+            return
+        try:
+            if self._sessions.latest_fact(self._plugin_session, "fixed_prefix") is not None:
+                turn_signals.mark_prefix_known(self._session_id)
+                return
+            estimate = self._estimator().messages([m for m in sent if isinstance(m, dict)]).tokens
+            ratio = float(self._config.estimate_ratio)
+            fixed = int(self.last_prompt_tokens - estimate * ratio)
+            self._sessions.add_fact(self._plugin_session, "fixed_prefix", str(max(0, fixed)),
+                                    signal="first_response", host_session_id=self._session_id or None)
+            turn_signals.mark_prefix_known(self._session_id)
+            logger.info("LCM measured F %d provider tokens: the prompt's %d less %d by the estimate × %s (%d "
+                        "entries sent)%s", max(0, fixed), self.last_prompt_tokens, estimate, ratio, len(sent),
+                        "; the difference was negative and is recorded as 0" if fixed < 0 else "")
+        except Exception:
+            logger.warning("LCM could not measure the fixed prefix", exc_info=True)
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id

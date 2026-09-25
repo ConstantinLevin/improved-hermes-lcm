@@ -212,8 +212,6 @@ class _EnvFieldSpec:
 # Single source of truth for the scalar LCM_* env overrides. ``from_env`` applies
 # the non-source-tracked entries uniformly.
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
-    _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
-    _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("chunk_tokens", "LCM_CHUNK_TOKENS", int),
     _EnvFieldSpec("estimate_ratio", "LCM_ESTIMATE_RATIO", float),
     _EnvFieldSpec("round_growth_tokens", "LCM_ROUND_GROWTH_TOKENS", int),
@@ -222,6 +220,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("target_share", "LCM_TARGET_SHARE", float),
     _EnvFieldSpec("window_min_tokens", "LCM_WINDOW_MIN_TOKENS", int),
     _EnvFieldSpec("window_max_tokens", "LCM_WINDOW_MAX_TOKENS", int),
+    _EnvFieldSpec("fixed_prefix_hypothesis_tokens", "LCM_FIXED_PREFIX_HYPOTHESIS_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
@@ -248,8 +247,6 @@ _PARSER_BY_TYPE = {
 # Fields whose env reading needs provenance tracking or a computed default;
 # ``from_env`` handles these explicitly, so the uniform loop skips them.
 _SOURCE_TRACKED_ENV_FIELDS = frozenset({
-    "fresh_tail_count",
-    "fresh_tail_max_tokens",
     "chunk_tokens",
     "estimate_ratio",
     "round_growth_tokens",
@@ -258,6 +255,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "target_share",
     "window_min_tokens",
     "window_max_tokens",
+    "fixed_prefix_hypothesis_tokens",
 })
 
 # The geometry's weights (#31, Decided; R14): field, env var, parse type, default, and
@@ -275,17 +273,14 @@ _GEOMETRY_WEIGHTS = (
      "default: #21's lower bound on the window (R11)"),
     ("window_max_tokens", "LCM_WINDOW_MAX_TOKENS", int, 2_000_000,
      "default: #21's upper bound on the window (R11)"),
+    ("fixed_prefix_hypothesis_tokens", "LCM_FIXED_PREFIX_HYPOTHESIS_TOKENS", int, 32_000,
+     "default: a hypothesis (R10), F until the session's first response measures it"),
 )
 
 
 @dataclass
 class LCMConfig:
     """All tunables for the LCM engine."""
-
-    # -- Fresh tail: recent messages never compacted ---
-    fresh_tail_count: int = 32
-    # Optional token cap for the protected suffix (0 = disabled)
-    fresh_tail_max_tokens: int = 0
 
     # -- The chunk (#31, Decided; #12) ---
     # c in provider tokens: bound by the summariser only, not scaled with the window.
@@ -306,6 +301,10 @@ class LCMConfig:
     target_share: float = 0.3
     window_min_tokens: int = 256_000
     window_max_tokens: int = 2_000_000
+    # -- The tail (#13, #31): t = G - F - S - R_in, no message count ---
+    # F, the fixed prefix, is measured per plugin session at its first response (a
+    # session fact); until then this hypothesis stands in for it (R10).
+    fixed_prefix_hypothesis_tokens: int = 32_000
 
     # -- Assembly guardrails ---
     # Hard cap for the assembled active context (0 = disabled)
@@ -378,15 +377,6 @@ class LCMConfig:
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
-        c.fresh_tail_count, source, warning = _parse_int_env_with_source(
-            "LCM_FRESH_TAIL_COUNT", c.fresh_tail_count
-        )
-        _record("fresh_tail_count", source, warning)
-        c.fresh_tail_max_tokens, source, warning = _parse_int_env_with_source(
-            "LCM_FRESH_TAIL_MAX_TOKENS", c.fresh_tail_max_tokens
-        )
-        c.fresh_tail_max_tokens = max(0, c.fresh_tail_max_tokens)
-        _record("fresh_tail_max_tokens", source, warning)
         c.chunk_tokens, source, warning = _parse_int_env_with_source(
             "LCM_CHUNK_TOKENS", c.chunk_tokens, default_source="default: #31 Decided, c = 50k provider tokens"
         )

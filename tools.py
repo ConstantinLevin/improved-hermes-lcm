@@ -1645,7 +1645,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     first_store_id = store_totals_row[2] if store_totals_row else None
     last_store_id = store_totals_row[3] if store_totals_row else None
     estimated_uncounted_images = int(store_totals_row[4] or 0) if store_totals_row else 0
-    fresh_tail_count = max(0, int(engine._config.fresh_tail_count or 0))
     # The fresh tail as the latest effective compaction returned it, in its positions.
     fresh_tail_rows = engine._store.get_returned_tail(session_id)
     fresh_tail_tokens = sum(int(row.get("token_estimate") or 0) for row in fresh_tail_rows)
@@ -1712,8 +1711,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "estimated_uncounted_images": estimated_uncounted_images,
             "first_store_id": first_store_id,
             "last_store_id": last_store_id,
-            "fresh_tail_count": fresh_tail_count,
-            "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
             "effective_fresh_tail_count": len(fresh_tail_rows),
             "effective_fresh_tail_tokens": fresh_tail_tokens,
             "effective_fresh_tail_uncounted_images": fresh_tail_uncounted_images,
@@ -1824,8 +1821,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             },
         },
         "config": {
-            "fresh_tail_count": engine._config.fresh_tail_count,
-            "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
+            "fixed_prefix": engine._fixed_prefix()[1],
             "chunk_tokens": engine._config.chunk_tokens,
             "estimate_ratio": engine._config.estimate_ratio,
             "chunk": engine._chunk_label(),
@@ -2009,8 +2005,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 4. Configuration validation
     config_warnings = []
     c = engine._config
-    if c.fresh_tail_count < 2:
-        config_warnings.append("fresh_tail_count < 2 may cause aggressive compaction")
     if engine.context_length and engine._geometry is None:
         config_warnings.append(f"no compaction: {engine._geometry_error}")
     if engine._native_compaction_refusal:

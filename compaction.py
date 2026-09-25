@@ -7,16 +7,17 @@ In order:
    only: the host's ``_row_id`` and the plugin's in-memory key, never by content.
    Where it cannot be, the compaction is aborted: nothing is written, the host keeps
    its list and shows the cause.
-2. The tail is the host's list from ``resolve_fresh_tail_boundary`` on, and never
+2. The tail takes what the target leaves, t = G − F − S − R_in (#13, #31), sized in
+   the plugin's estimate with #31's conversion (``_tail_plan``), in whole groups: a
+   tool call is never separated from its result, and the forward check aborts where
+   a call at the boundary has no result. Its floor is D1's (the newest message, or
+   the newest tool group); its ceiling leaves the oldest group outside; it never
    reaches back into the summaries the plugin returned. The material is every entry
    before the tail that is not the mechanism's layer (the host's system row, a
    summary the plugin returned, also as the host rewrote it: a summary revision holds
-   a summary and is never chunked). The host's count decides pressure: when the host
-   calls with its count at or above the threshold, or forces, or recovers from an
-   overflow, the plugin's estimate vetoes nothing. No minimum material applies, and
-   where the tail leaves no material it yields down to its floor, the newest message
-   or the newest tool group inside a turn; only when the floor alone is left is
-   there nothing to compact, and that is shown as an abort.
+   a summary and is never chunked). Compaction runs at τ, forced, or on a provider's
+   rejection; no minimum material applies. Where the floor alone is left, the
+   compaction aborts visibly: the chain and the newest turn fill the context.
 3. The material is cut into chunks of the size c (#31, #12), in list order and only
    between groups: a tool call and its results stay in one chunk. A group larger than
    c is a chunk of its own; between such groups, each run of material B is split
@@ -70,7 +71,7 @@ from .model_table import lookup as lookup_model
 from .summariser_input import wire_facts
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
-from .fresh_tail import _assistant_group_start
+from .fresh_tail import ToolPairingError, _assistant_group_start
 from .inflight import (
     DEFAULT_CALLS_PER_ENDPOINT,
     ChunkCall,
@@ -99,6 +100,10 @@ _WAIT_SLICE_S = 0.25
 # #22's table (#31, Decided; orchestrator ruling on #52). A smaller run next to an
 # oversized group, or at the end of the material, joins that group's chunk.
 _SMALLEST_STANDALONE_RUN = 0.25
+
+# The share of its source a summary's budget asks for (today's prompt, until #10):
+# min(max(2000, 0.20 × source), 12000). ρ in the tail's sizing (R9).
+_SUMMARY_BUDGET_SHARE = 0.20
 
 
 try:  # the host's own test for its ephemeral recovery scaffolding (the nudge flags)
@@ -141,6 +146,24 @@ def _ends_with_tool_results(messages: List[Dict[str, Any]]) -> bool:
     while at >= 0 and _is_steer(messages[at]):
         at -= 1
     return at >= 0 and isinstance(messages[at], dict) and messages[at].get("role") == "tool"
+
+
+def _unanswered_calls_at(messages: List[Dict[str, Any]], boundary: int) -> Optional[tuple]:
+    """(position, call ids) of an assistant row at the boundary, the last row before it
+    or the first row after it, whose tool calls have no result anywhere in the list;
+    None where there is none."""
+    answered = {str(m.get("tool_call_id") or "").strip()
+                for m in messages if isinstance(m, dict) and m.get("role") == "tool"}
+    for position in (boundary - 1, boundary):
+        if position < 0 or position >= len(messages) or not isinstance(messages[position], dict):
+            continue
+        message = messages[position]
+        if message.get("role") != "assistant":
+            continue
+        missing = sorted({_tool_call_id(call) for call in (message.get("tool_calls") or [])} - {""} - answered)
+        if missing:
+            return position, missing
+    return None
 
 
 def _newest_tool_group_start(messages: List[Dict[str, Any]]) -> Optional[int]:
@@ -239,7 +262,11 @@ class CompactionMixin:
         provider_rough, rough_label = self._provider_estimate(rough)
         if provider_rough >= threshold:
             mechanism = self._mechanism_positions(messages)
-            tail_start = self._tail_start(messages, mechanism, occasion)
+            try:
+                tail_start = self._tail_start(messages, mechanism, occasion)
+            except ToolPairingError:
+                # compress() records the error and shows it; the preflight asks for it.
+                return self._mark_preflight_compression_requested()
             material = self._estimator().messages(
                 [messages[index] for index in range(tail_start) if index not in mechanism]
             )
@@ -311,18 +338,6 @@ class CompactionMixin:
                 positions.add(index)
         return positions
 
-    def _tail_start(self, messages: List[Dict[str, Any]], mechanism: set,
-                    occasion: Optional[Occasion] = None) -> int:
-        """Where the fresh tail begins: the configured boundary, reaching back to the
-        newest tool group at a gap (#32 D1), never before the last entry of the
-        mechanism's layer, which the cover re-emits."""
-        boundary = self._fresh_tail_start(messages)
-        if occasion is not None and occasion.gap:
-            group = _newest_tool_group_start(messages)
-            if group is not None:
-                boundary = min(boundary, group)
-        return max(boundary, max(mechanism) + 1 if mechanism else 0)
-
     def _chunk_limit(self) -> int:
         """c in the unit the plugin cuts in, its estimate (characters / 4, #21).
 
@@ -350,16 +365,94 @@ class CompactionMixin:
 
     @staticmethod
     def _tail_floor(messages: List[Dict[str, Any]], mechanism: set, occasion: Optional[Occasion] = None) -> int:
-        """The least the tail keeps under the host's pressure: the newest message, or,
-        where the list ends inside a tool group, that group from the assistant that
-        opened it; at a gap, the newest tool group and everything after it (#32 D1);
-        never before the last entry of the mechanism's layer."""
-        start = _assistant_group_start(messages, len(messages) - 1)
+        """The least the tail keeps (#31, #32 D1): the newest message; where the list
+        ends inside a tool group, or with steer rows after one, that group from the
+        assistant that opened it; at a gap, the newest tool group and everything after
+        it; never before the last entry of the mechanism's layer."""
+        at = len(messages) - 1
+        while at > 0 and _is_steer(messages[at]):
+            at -= 1
+        start = _assistant_group_start(messages, at) if not _is_steer(messages[at]) else len(messages) - 1
+        start = min(start, len(messages) - 1)
         if occasion is not None and occasion.gap:
             group = _newest_tool_group_start(messages)
             if group is not None:
                 start = min(start, group)
         return max(start, max(mechanism) + 1 if mechanism else 0)
+
+    def _fixed_prefix(self) -> tuple[int, str]:
+        """F, the fixed prefix in provider tokens (R10): measured once per plugin session
+        at its first response and recorded as the session fact ``fixed_prefix``; until
+        then the configured hypothesis (32k), labelled."""
+        value = None
+        if self._plugin_session:
+            try:
+                value = self._sessions.latest_fact(self._plugin_session, "fixed_prefix")
+            except Exception:
+                value = None
+        if value is not None:
+            try:
+                return max(0, int(value)), f"F {max(0, int(value))} (measured at the session's first response)"
+            except ValueError:
+                pass
+        hypothesis = int(self._config.fixed_prefix_hypothesis_tokens)
+        return hypothesis, f"F {hypothesis} (a hypothesis until the first response measures it, R10)"
+
+    def _tail_plan(self, messages: List[Dict[str, Any]], mechanism: set,
+                   occasion: Optional[Occasion] = None) -> tuple[int, str]:
+        """Where the tail begins, and how it was sized (#13, #31).
+
+        The tail takes what the target leaves: after the compaction the context is
+        F + S + (the new summaries) + t + R_in, and it should come to G. In the plugin's
+        estimate, with k the provider's count over it (#31's p50, ``estimate_ratio``)
+        and ρ the share the summariser's prompt asks for (budget over source):
+
+            F + k·S + ρ·k·(X − t) + k·t + R_in = G
+            t = (G − F − k·S − R_in − ρ·k·X) / (k·(1 − ρ))
+
+        X is every entry that is not the mechanism's layer, S the summaries the list
+        already holds, F per R10, R_in 0 until #14 re-inserts the instruction. The walk
+        goes back from the newest group, whole groups only, while the sum stays within
+        t. Its floor is D1's; its ceiling leaves the oldest group of the material
+        outside, so that something is chunked. The floor wins over the ceiling. The
+        room for #34: condensation shrinks S before this is sized, and T_def is its
+        guarantee on t; neither is built here."""
+        first = max(mechanism) + 1 if mechanism else 0
+        floor = self._tail_floor(messages, mechanism, occasion)
+        if self._geometry is None:
+            return floor, "no geometry: the floor only"
+        estimator = self._estimator()
+        sizes = [estimator.message(message).tokens if isinstance(message, dict) else 0 for message in messages]
+        system = {0} if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system" else set()
+        summaries = sum(sizes[i] for i in mechanism if i not in system)
+        outside = [i for i in range(len(messages)) if i not in mechanism]
+        total = sum(sizes[i] for i in outside)
+        k, rho = float(self._config.estimate_ratio), _SUMMARY_BUDGET_SHARE
+        fixed, fixed_label = self._fixed_prefix()
+        reinserted = 0  # R_in, until #14
+        target = self._geometry.target
+        t = (target - fixed - k * summaries - reinserted - rho * k * total) / (k * (1 - rho))
+        start = floor
+        used = sum(sizes[floor:])
+        candidates = [i for i in range(first, floor)]
+        for group in reversed(self._groups(messages, candidates)):
+            weight = sum(sizes[i] for i in group)
+            if used + weight > t:
+                break
+            start, used = group[0], used + weight
+        groups = self._groups(messages, outside)
+        ceiling = groups[1][0] if len(groups) >= 2 else len(messages)
+        if start < ceiling:
+            start = min(ceiling, floor)
+            used = sum(sizes[start:])
+        label =(f"t {max(0, int(t))} by the estimate ({max(0, int(t * k))} provider tokens): G {target} − "
+                 f"{fixed_label} − {k}·S {summaries} − R_in {reinserted} − {rho}·{k}·X {total}, over {k}·(1 − {rho}); "
+                 f"the tail holds {used} by the estimate from position {start}")
+        return start, label
+
+    def _tail_start(self, messages: List[Dict[str, Any]], mechanism: set,
+                    occasion: Optional[Occasion] = None) -> int:
+        return self._tail_plan(messages, mechanism, occasion)[0]
 
     def _unchanged_return(self, messages: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
         """No compaction: the host's own list, the same object with the same dicts.
@@ -499,7 +592,7 @@ class CompactionMixin:
         # What the summary replaces in the session's context, by the session's estimate
         # (R6): the acceptance compares the reply with this, by the same estimate.
         source = self._estimator().messages(chunk_messages)
-        budget = min(max(2000, int(source.tokens * 0.20)), 12000)
+        budget = min(max(2000, int(source.tokens * _SUMMARY_BUDGET_SHARE)), 12000)
         facts = lookup_model(settings.route.model)
         route = settings.route
         records = list(zip(record_handles, chunk_messages))
@@ -575,18 +668,31 @@ class CompactionMixin:
         """The material in list order as groups a cut may not enter: an assistant row
         that carries tool calls, with every result of those calls in the material and
         whatever stands between them; every other entry alone. Calls and results are
-        matched by their ``tool_call_id``, the host's identity for the pair."""
+        matched by their ``tool_call_id``, the host's identity for the pair. The span
+        closes over every assistant inside it: where a second assistant's calls are
+        answered after the first one's results, its results join the group too."""
+
+        def calls(index: int) -> set:
+            message = messages[material[index]]
+            if message.get("role") != "assistant":
+                return set()
+            return {_tool_call_id(call) for call in (message.get("tool_calls") or [])} - {""}
+
         groups: List[List[int]] = []
         at = 0
         while at < len(material):
-            message = messages[material[at]]
-            call_ids = {_tool_call_id(call) for call in (message.get("tool_calls") or [])} - {""}
             end = at
-            if message.get("role") == "assistant" and call_ids:
-                for later in range(at + 1, len(material)):
+            call_ids = calls(at)
+            while call_ids:
+                last = end
+                for later in range(end + 1, len(material)):
                     other = messages[material[later]]
                     if other.get("role") == "tool" and str(other.get("tool_call_id") or "").strip() in call_ids:
-                        end = later
+                        last = later
+                widened = set().union(*(calls(k) for k in range(at, last + 1)))
+                if last == end and widened <= call_ids:
+                    break
+                end, call_ids = last, call_ids | widened
             groups.append(material[at:end + 1])
             at = end + 1
         return groups
@@ -724,27 +830,37 @@ class CompactionMixin:
         mechanism = {entry.position for entry in entries if entry.klass == "system"}
         mechanism |= attempt.summary_inputs
 
-        # 2. The tail and the material. At a gap the tail reaches back to the newest
-        # tool group (#32 D1). At the threshold everything outside the tail is chunked,
-        # with no minimum (#11, #12): where the tail leaves no material it yields down to
-        # its floor, and the estimate vetoes nothing the host's count requires (#56).
-        tail_start = self._tail_start(messages, mechanism, occasion)
+        # 2. The tail and the material. The tail takes what the target leaves, in whole
+        # groups, from its floor (D1) up to the ceiling that leaves the oldest group
+        # outside (#13, #31). At the threshold everything outside it is chunked, with no
+        # minimum (#11, #12).
+        try:
+            tail_start, tail_label = self._tail_plan(messages, mechanism, occasion)
+        except ToolPairingError as exc:
+            self._record_event(attempt, "tool_pairing_error", str(exc))
+            return self._abort(messages, f"the tail cannot be placed: {exc}")
+        logger.info("LCM tail: %s", tail_label)
+        unanswered = _unanswered_calls_at(messages, tail_start)
+        if unanswered:
+            # The forward check: a call at the boundary whose result is not in the list
+            # would be split from it (#13). The host never asks with an open call (#32
+            # §3); if it does, that is a defect to see, not to guess around.
+            self._record_event(attempt, "tool_result_missing_at_boundary",
+                               {"position": unanswered[0], "tool_call_ids": unanswered[1]})
+            return self._abort(
+                messages, f"the assistant row at position {unanswered[0]}, at the tail's boundary, made tool calls "
+                          f"whose results are not in the list ({', '.join(unanswered[1])})")
         material = [index for index in range(tail_start) if index not in mechanism]
         estimator = self._estimator()
         if not material:
-            floor = self._tail_floor(messages, mechanism, occasion)
-            if floor > tail_start:
-                logger.info("LCM fresh tail yields to its floor: %d entries -> %d",
-                            len(messages) - tail_start, len(messages) - floor)
-                tail_start = floor
-                material = [index for index in range(tail_start) if index not in mechanism]
-        if not material:
             if force_overflow or provider_rejected:
                 self._publish("_last_overflow_recovery_failed", True)
+            # The visible end (#7): above τ, nothing outside the tail's floor but the
+            # mechanism's layer.
             return self._abort(
                 messages,
-                f"{why_now}, and nothing is left to compact: outside the newest "
-                f"{'tool group' if len(messages) - tail_start > 1 else 'message'} "
+                f"{why_now}, and nothing is left to compact: the chain of summaries and the newest "
+                f"{'tool group' if len(messages) - tail_start > 1 else 'message'} fill the context; outside them "
                 f"stands only the mechanism's layer (the system row and the summaries)",
             )
         material_estimate = estimator.messages([messages[index] for index in material])

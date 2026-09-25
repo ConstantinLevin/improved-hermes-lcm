@@ -229,6 +229,12 @@ def register(ctx):
         def _on_post_api_request(**payload):
             turn_signals.response_arrived(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""))
 
+        def _on_pre_api_request(**payload):
+            # R10: the list a request sends, until the session's fixed prefix is measured.
+            turn_signals.request_sent(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""),
+                                      payload.get("conversation_history"))
+
+        register_hook("pre_api_request", _on_pre_api_request)
         register_hook("pre_llm_call", _on_pre_llm_call_turn)
         register_hook("post_tool_call", _on_post_tool_call)
         register_hook("post_api_request", _on_post_api_request)
