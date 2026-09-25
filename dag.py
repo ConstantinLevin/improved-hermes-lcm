@@ -16,8 +16,8 @@ from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
     NODES_FTS_SPEC,
-    ClosedConnection,
     ExternalContentFtsSpec,
+    LockedConnection,
     close_connection,
     open_store,
 )
@@ -137,13 +137,17 @@ class SummaryDAG:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
+        # Every read runs under the lock close() takes: a close waits for the read,
+        # or the read raises StoreClosedError (LockedConnection).
         self._db_lock = threading.RLock()
+        self._locked = LockedConnection(lambda: self._conn, self._db_lock)
         self._init_db()
 
     @property
-    def connection(self) -> "sqlite3.Connection | ClosedConnection":
-        """The SQLite connection. Once :meth:`close` has run it is a
-        :class:`ClosedConnection`, whose every use raises ``StoreClosedError``.
+    def connection(self) -> LockedConnection:
+        """The connection as diagnostics use it: every call runs under the lock
+        :meth:`close` takes, and ``execute`` returns its rows already fetched. Once
+        closed, every use raises ``StoreClosedError``.
 
         Exposed for read-oriented diagnostics and inspection -- FTS sync counts,
         integrity checks, latest-node lookups -- that need ad-hoc queries the DAG
@@ -151,7 +155,7 @@ class SummaryDAG:
         read-only: the tables behind it are the record's, written only by
         ``RecordStore``.
         """
-        return self._conn
+        return self._locked
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
@@ -165,7 +169,7 @@ class SummaryDAG:
     # -- Read ---------------------------------------------------------------
 
     def get_node(self, node_id: int) -> Optional[SummaryNode]:
-        row = self._conn.execute(
+        row = self._locked.execute(
             "SELECT * FROM summary_nodes WHERE node_id = ?", (node_id,)
         ).fetchone()
         return self._row_to_node(row) if row else None
@@ -176,14 +180,14 @@ class SummaryDAG:
         """Get nodes for a session, optionally filtered by depth."""
         with self._db_lock:
             if depth is not None:
-                rows = self._conn.execute(
+                rows = self._locked.execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ? AND depth = ?
                        ORDER BY seq LIMIT ?""",
                     (session_id, depth, limit),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = self._locked.execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ?
                        ORDER BY depth, seq LIMIT ?""",
@@ -194,7 +198,7 @@ class SummaryDAG:
 
     def get_session_node_count(self, session_id: str) -> int:
         """Count summary nodes for a session without loading node rows."""
-        row = self._conn.execute(
+        row = self._locked.execute(
             "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -202,7 +206,7 @@ class SummaryDAG:
 
     def get_session_depth_stats(self, session_id: str) -> Dict[int, Dict[str, int]]:
         """Aggregate per-depth node/token stats for a session."""
-        rows = self._conn.execute(
+        rows = self._locked.execute(
             """SELECT depth,
                       COUNT(*) AS count,
                       COALESCE(SUM(token_count), 0) AS tokens,
@@ -260,7 +264,7 @@ class SummaryDAG:
             try:
                 with self._db_lock:
                     if session_id is not None:
-                        rows = self._conn.execute(
+                        rows = self._locked.execute(
                             f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                                JOIN summary_nodes n ON n.node_id = fts.rowid
                                WHERE nodes_fts MATCH ? AND n.session_id = ?
@@ -268,7 +272,7 @@ class SummaryDAG:
                             (safe_query, session_id, fetch_limit, offset),
                         ).fetchall()
                     else:
-                        rows = self._conn.execute(
+                        rows = self._locked.execute(
                             f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                                JOIN summary_nodes n ON n.node_id = fts.rowid
                                WHERE nodes_fts MATCH ?
@@ -347,7 +351,7 @@ class SummaryDAG:
         source_match_cache: dict[int, bool] = {}
         while True:
             with self._db_lock:
-                rows = self._conn.execute(
+                rows = self._locked.execute(
                     f"""SELECT * FROM summary_nodes
                         WHERE {' AND '.join(where)}
                         LIMIT ? OFFSET ?""",
@@ -394,7 +398,7 @@ class SummaryDAG:
         if cache is not None and node_id in cache:
             return cache[node_id]
         legacy_blank_clause = _legacy_blank_source_clause("m.source")
-        row = self._conn.execute(
+        row = self._locked.execute(
             f"""
             WITH RECURSIVE source_walk(source_type, source_id) AS (
                 SELECT n.source_type, CAST(j.value AS INTEGER)

@@ -10,6 +10,7 @@ import logging
 import os
 import sqlite3
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from .db_bootstrap import (
     MESSAGES_FTS_SPEC,
     ExternalContentFtsSpec,
-    ClosedConnection,
+    LockedConnection,
     StoreRefusedError,
     close_connection,
     open_store,
@@ -273,6 +274,10 @@ class MessageStore:
         _prepare_private_sqlite_storage(self.db_path)
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
+        # Every read runs under the lock close() takes: a close waits for the read,
+        # or the read raises StoreClosedError (LockedConnection).
+        self._lock = threading.RLock()
+        self._locked = LockedConnection(lambda: self._conn, self._lock)
         self._init_db()
 
     def _init_db(self):
@@ -290,7 +295,7 @@ class MessageStore:
 
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
-        row = self._conn.execute(
+        row = self._locked.execute(
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
         ).fetchone()
         return self._row_to_dict(row) if row else None
@@ -303,7 +308,7 @@ class MessageStore:
         if not store_ids:
             return {}
         placeholders = ",".join("?" for _ in store_ids)
-        rows = self._conn.execute(
+        rows = self._locked.execute(
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
             store_ids,
         ).fetchall()
@@ -312,7 +317,7 @@ class MessageStore:
     def get_returned_tail(self, session_id: str) -> List[Dict[str, Any]]:
         """The fresh tail as it was returned: the record entries of the session's
         latest effective return, in their return positions."""
-        rows = self._conn.execute(
+        rows = self._locked.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ? AND store_id IN (
                    SELECT r.record_id FROM latest_returns l JOIN records r ON r.handle = l.record
@@ -324,7 +329,7 @@ class MessageStore:
 
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""
-        row = self._conn.execute(
+        row = self._locked.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -332,7 +337,7 @@ class MessageStore:
 
     def get_session_token_total(self, session_id: str) -> int:
         """Sum of token estimates for a session."""
-        row = self._conn.execute(
+        row = self._locked.execute(
             "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -356,7 +361,7 @@ class MessageStore:
             {where}
             """
         query_args: list[Any] = [_UNKNOWN_SOURCE, _UNKNOWN_SOURCE, *args]
-        row = self._conn.execute(query, query_args).fetchone()
+        row = self._locked.execute(query, query_args).fetchone()
 
         messages_total = int(row[0] or 0) if row else 0
         normalized_unknown = int(row[1] or 0) if row else 0
@@ -450,7 +455,7 @@ class MessageStore:
                     where.append("m.timestamp <= ?")
                     args.append(time_to)
                 args.extend([fetch_limit, offset])
-                rows = self._conn.execute(
+                rows = self._locked.execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
                               m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
                               m.ingested_at, m.observed_at, m.observed_at_source, m.seq, m.revises_node_id,
@@ -652,7 +657,7 @@ class MessageStore:
                 batch_limit = min(fetch_limit, candidate_cap - scanned_rows)
                 if batch_limit <= 0:
                     break
-                rows = self._conn.execute(
+                rows = self._locked.execute(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
                         WHERE {' AND '.join(where)}
@@ -669,7 +674,7 @@ class MessageStore:
                     boundary_timestamp = rows[-1][8]
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
-                        tie_rows = self._conn.execute(
+                        tie_rows = self._locked.execute(
                             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                                 FROM messages
                                 WHERE {' AND '.join(where)}
@@ -729,7 +734,7 @@ class MessageStore:
             offset = 0
             while offset < candidate_cap:
                 batch_limit = min(fetch_limit, candidate_cap - offset)
-                rows = self._conn.execute(
+                rows = self._locked.execute(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
                         WHERE {' AND '.join(where)}
@@ -775,9 +780,10 @@ class MessageStore:
     # -- Connection access --------------------------------------------------
 
     @property
-    def connection(self) -> sqlite3.Connection | ClosedConnection:
-        """The SQLite connection. Once :meth:`close` has run it is a
-        :class:`ClosedConnection`, whose every use raises ``StoreClosedError``.
+    def connection(self) -> LockedConnection:
+        """The connection as diagnostics use it: every call runs under the lock
+        :meth:`close` takes, and ``execute`` returns its rows already fetched. Once
+        closed, every use raises ``StoreClosedError``.
 
         Exposed for read-oriented diagnostics and inspection -- integrity /
         quick checks, FTS sync counts, schema health -- that need ad-hoc
@@ -785,29 +791,30 @@ class MessageStore:
         treat it as read-only: the tables behind it are the record's, written
         only by ``RecordStore``.
         """
-        return self._conn
+        return self._locked
 
     def commit(self) -> None:
         """Commit pending writes on the store connection.
 
         Used by the backup path's cross-connection flush so callers do not reach
-        the private connection. Requires a live connection: a closed store
-        raises, matching direct ``_conn.commit()`` use.
+        the private connection. A closed store raises ``StoreClosedError``.
         """
-        self._conn.commit()
+        with self._lock:
+            self._conn.commit()
 
     def backup(self, dest: sqlite3.Connection) -> None:
-        """Copy the store's database into the already-open ``dest`` connection.
-
-        Thin wrapper over ``sqlite3.Connection.backup`` so callers snapshot the
-        store without reaching its private connection. Requires a live
-        connection, matching direct ``_conn.backup(dest)`` use.
-        """
-        self._conn.backup(dest)
+        """Copy the store's database into the already-open ``dest`` connection,
+        under the lock :meth:`close` takes. A closed store raises
+        ``StoreClosedError``."""
+        with self._lock:
+            self._conn.backup(dest)
 
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self, reason: str = "closed") -> None:
-        """Close the connection; later use raises. The engine closes its helpers at
+        """Close the connection once a read on another thread has finished (the
+        lock every read takes); later use raises. The engine closes its helpers at
         plugin unload and when the engine is collected (``LCMEngine.close``)."""
-        self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the message reader")
+        with self._lock:
+            self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason,
+                                          owner="the message reader")

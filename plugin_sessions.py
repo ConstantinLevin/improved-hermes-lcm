@@ -58,18 +58,21 @@ class PluginSessions:
             self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the sessions")
 
     def find(self, host_session_id: str) -> Optional[str]:
-        row = self._conn.execute(
-            "SELECT handle FROM sessions WHERE host_session_id = ?",
-            (host_session_id,),
-        ).fetchone()
-        if row:
-            return str(row[0])
-        row = self._conn.execute(
-            "SELECT c.session FROM confirmations f JOIN compactions c ON c.compaction_id = f.compaction "
-            "WHERE f.host_session_after = ? ORDER BY f.compaction DESC LIMIT 1",
-            (host_session_id,),
-        ).fetchone()
-        return str(row[0]) if row else None
+        # Under the lock close() takes: a close waits for the read, or the read
+        # raises StoreClosedError.
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT handle FROM sessions WHERE host_session_id = ?",
+                (host_session_id,),
+            ).fetchone()
+            if row:
+                return str(row[0])
+            row = self._conn.execute(
+                "SELECT c.session FROM confirmations f JOIN compactions c ON c.compaction_id = f.compaction "
+                "WHERE f.host_session_after = ? ORDER BY f.compaction DESC LIMIT 1",
+                (host_session_id,),
+            ).fetchone()
+            return str(row[0]) if row else None
 
     def name_session(
         self,
