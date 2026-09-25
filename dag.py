@@ -49,31 +49,34 @@ from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_sourc
 logger = logging.getLogger(__name__)
 
 
-def _build_search_order_by(sort: str | None, recency_expr: str) -> str:
+def _build_search_order_by(sort: str | None, recency_expr: str, order_expr: str = "n.seq") -> str:
+    """Recency is the cover order (``order_expr``); ``recency_expr`` only ages a hit
+    for the hybrid blend."""
     normalized = normalize_search_sort(sort)
     if normalized == "relevance":
-        return f"rank ASC, {recency_expr} DESC"
+        return f"rank ASC, {order_expr} DESC"
     if normalized == "hybrid":
         return (
             f"(rank / (1 + (MAX(0.0, ((strftime('%s','now') - {recency_expr}) / 3600.0)) * {AGE_DECAY_RATE}))) ASC, "
-            f"{recency_expr} DESC"
+            f"{order_expr} DESC"
         )
-    return f"{recency_expr} DESC"
+    return f"{order_expr} DESC"
 
 
 def _fallback_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float, float]:
     normalized = normalize_search_sort(sort)
     score = float(node.search_rank or 0.0) * -1.0
     recency = float(node.latest_at or node.created_at or 0.0)
+    order = float(node.seq or 0)
     directness = float(node.search_directness or 0.0)
 
     if normalized == "relevance":
-        return (-score, -directness, -recency)
+        return (-score, -directness, -order)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - recency) / 3600.0)
         blended = score / (1 + (age_hours * AGE_DECAY_RATE))
-        return (-blended, -directness, -recency)
-    return (-recency, -score, -directness)
+        return (-blended, -directness, -order)
+    return (-order, -score, -directness)
 
 
 def _fts_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float, float]:
@@ -81,16 +84,17 @@ def _fts_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, 
     rank = node.search_rank
     rank_value = float(rank) if rank is not None else float("inf")
     recency = float(node.latest_at or node.created_at or 0.0)
+    order = float(node.seq or 0)
     directness = float(node.search_directness or 0.0)
 
     if normalized == "relevance":
-        return (rank_value, -directness, -recency)
+        return (rank_value, -directness, -order)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - recency) / 3600.0)
         strength = (-rank_value) if rank is not None else float("-inf")
         blended_strength = strength / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("-inf")
-        return (-blended_strength, -directness, -recency)
-    return (-recency, rank_value, 0.0)
+        return (-blended_strength, -directness, -order)
+    return (-order, rank_value, 0.0)
 
 
 def _fts_primary_value(node: "SummaryNode", sort: str | None) -> float:
@@ -127,6 +131,8 @@ class SummaryNode:
     expand_hint: str = ""  # "Expand for details about: ..."
     search_rank: float | None = None
     search_directness: float = 0.0
+    # Transcript order of the summary in the session's cover (the view's ``seq``).
+    seq: int = 0
 
 
 class SummaryDAG:
@@ -220,14 +226,14 @@ class SummaryDAG:
                 rows = self._conn.execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ? AND depth = ?
-                       ORDER BY created_at LIMIT ?""",
+                       ORDER BY seq LIMIT ?""",
                     (session_id, depth, limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ?
-                       ORDER BY depth, created_at LIMIT ?""",
+                       ORDER BY depth, seq LIMIT ?""",
                     (session_id, limit),
                 ).fetchall()
         return [self._row_to_node(r) for r in rows]
@@ -525,7 +531,8 @@ class SummaryDAG:
             earliest_at=row[9],
             latest_at=row[10],
             expand_hint=row[11] or "",
-            search_rank=row[12] if len(row) > 12 else None,
+            seq=int(row[12] or 0) if len(row) > 12 else 0,
+            search_rank=row[13] if len(row) > 13 else None,
         )
 
     def close(self) -> None:

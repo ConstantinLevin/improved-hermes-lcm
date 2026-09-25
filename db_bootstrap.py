@@ -233,6 +233,7 @@ CREATE TABLE compaction_inputs (
     PRIMARY KEY (compaction, position)
 );
 CREATE INDEX idx_compaction_inputs_row ON compaction_inputs(host_row_id);
+CREATE INDEX idx_compaction_inputs_record ON compaction_inputs(record);
 
 CREATE TABLE chunks (
     handle TEXT PRIMARY KEY,
@@ -303,6 +304,7 @@ CREATE TABLE revision_sources (
            != (source_compaction IS NOT NULL AND source_position IS NOT NULL)),
     CHECK ((source_compaction IS NULL) = (source_position IS NULL))
 );
+CREATE INDEX idx_revision_sources_record ON revision_sources(source_record);
 
 CREATE TABLE confirmations (
     compaction INTEGER NOT NULL UNIQUE REFERENCES compactions(compaction_id),
@@ -349,18 +351,29 @@ CREATE TABLE store_events (
 
 # What the tools read, as read-only views over the record, so that they run
 # unchanged (integer ids until #18). Only the session's active branch is visible,
-# as W7 defines it (#29), at its latest effective compaction:
+# as W7 defines it (#29), at its latest effective compaction, and what stood beside it:
 # - a compaction took effect when the host confirmed it, or its return was found
 #   adopted without a confirmation, and the host did not reject it;
 # - a record is visible when it is a record entry of that compaction's return (the
 #   tail) or a member of a chunk under one of its summaries. A reverted record, a
-#   record a revision replaced, a rewritten summary row and an unconfirmed attempt's
-#   records are none of these, so they stay invisible;
+#   record a revision replaced and an unconfirmed attempt's records are none of these,
+#   so they stay invisible;
+# - a summary row the host rewrote (a summary revision) is visible beside the chain,
+#   when an effective compaction recorded it, naming the summary it revises: what the
+#   agent's context held never becomes invisible. It is never chunked, since it holds
+#   a summary, and the cover re-emits the summary from its derivation;
 # - a summary is visible when that return holds it: the cover.
-# A record's ``timestamp`` is the time the record was written, as the old store's
-# was its write time; the host's own time is ``observed_at``, where the host gave one.
-# ``source`` is the platform the session had last stated when the record was written.
-_VIEWS_SQL = """
+# ``seq`` is the transcript order: a record entry stands at its return position, a
+# chunk member at its summary's position and its ordinal in the chunk, a summary
+# revision just before the summary it revises, and a summary just after its chunk.
+# Ids are the order of writing, never the transcript's: a host insertion or a revision
+# is written after rows it stands before.
+# A record's ``timestamp`` is the time of the compaction that stored it; the host's
+# own time is ``observed_at``, where the host gave one. ``source`` is the platform the
+# session had last stated when the record was written.
+_SEQ_COMPACTION = 1_000_000_000_000
+_SEQ_POSITION = 1_000_000
+_VIEWS_SQL = f"""
 CREATE VIEW effective_compactions AS
 SELECT c.compaction_id AS compaction_id, c.session AS session, c.began_at AS began_at
 FROM compactions c
@@ -370,9 +383,43 @@ WHERE (EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_i
 
 CREATE VIEW latest_returns AS
 SELECT cr.compaction AS compaction, cr.position AS position, cr.kind AS kind,
-       cr.record AS record, cr.derivation AS derivation
+       cr.record AS record, cr.derivation AS derivation,
+       cr.compaction * {_SEQ_COMPACTION} + cr.position * {_SEQ_POSITION} AS seq
 FROM compaction_returns cr
 WHERE cr.compaction IN (SELECT MAX(compaction_id) FROM effective_compactions GROUP BY session);
+
+CREATE VIEW summary_revisions AS
+WITH RECURSIVE revised(revision, derivation) AS (
+    SELECT s.revision, cr.derivation
+    FROM revision_sources s
+    JOIN compaction_returns cr
+      ON cr.compaction = s.source_compaction AND cr.position = s.source_position
+    WHERE cr.kind = 'summary'
+    UNION
+    SELECT s.revision, revised.derivation
+    FROM revision_sources s JOIN revised ON s.source_record = revised.revision
+)
+SELECT revision, derivation FROM revised;
+
+CREATE VIEW record_positions AS
+SELECT record, MIN(seq) AS seq FROM (
+    SELECT l.record AS record, l.seq AS seq
+    FROM latest_returns l WHERE l.kind = 'record'
+    UNION ALL
+    SELECT m.record, l.seq + 1 + m.ordinal
+    FROM latest_returns l
+    JOIN derivation_sources s ON s.derivation = l.derivation
+    JOIN chunk_members m ON m.chunk = s.chunk
+    WHERE l.kind = 'summary'
+    UNION ALL
+    SELECT x.revision, l.seq + {_SEQ_POSITION - 2}
+    FROM summary_revisions x
+    JOIN latest_returns l ON l.kind = 'summary' AND l.derivation = x.derivation
+    WHERE EXISTS (SELECT 1 FROM compaction_inputs i
+                  JOIN effective_compactions e ON e.compaction_id = i.compaction
+                  WHERE i.record = x.revision)
+)
+GROUP BY record;
 
 CREATE VIEW messages AS
 SELECT r.record_id AS store_id,
@@ -393,17 +440,13 @@ SELECT r.record_id AS store_id,
        CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
             THEN json_extract(r.raw, '$.timestamp') END AS observed_at,
        CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
-            THEN 'host_message_timestamp' END AS observed_at_source
-FROM records r
-JOIN compactions c ON c.compaction_id = r.compaction
-WHERE EXISTS (
-        SELECT 1 FROM latest_returns l
-        WHERE l.kind = 'record' AND l.record = r.handle)
-   OR EXISTS (
-        SELECT 1 FROM latest_returns l
-        JOIN derivation_sources s ON s.derivation = l.derivation
-        JOIN chunk_members m ON m.chunk = s.chunk
-        WHERE l.kind = 'summary' AND m.record = r.handle);
+            THEN 'host_message_timestamp' END AS observed_at_source,
+       p.seq AS seq,
+       (SELECT d.derivation_id FROM summary_revisions x JOIN derivations d ON d.handle = x.derivation
+        WHERE x.revision = r.handle LIMIT 1) AS revises_node_id
+FROM record_positions p
+JOIN records r ON r.handle = p.record
+JOIN compactions c ON c.compaction_id = r.compaction;
 
 CREATE VIEW summary_nodes AS
 SELECT d.derivation_id AS node_id,
@@ -413,9 +456,9 @@ SELECT d.derivation_id AS node_id,
        d.est_tokens AS token_count,
        (SELECT SUM(r.est_tokens) FROM chunk_members m JOIN records r ON r.handle = m.record
         WHERE m.chunk = ch.handle) AS source_token_count,
-       (SELECT json_group_array(x.record_id) FROM (
-            SELECT r.record_id AS record_id FROM chunk_members m JOIN records r ON r.handle = m.record
-            WHERE m.chunk = ch.handle ORDER BY m.ordinal) x) AS source_ids,
+       (SELECT json_group_array(r.record_id ORDER BY m.ordinal)
+        FROM chunk_members m JOIN records r ON r.handle = m.record
+        WHERE m.chunk = ch.handle) AS source_ids,
        'messages' AS source_type,
        d.created_at AS created_at,
        (SELECT MIN(CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
@@ -426,13 +469,12 @@ SELECT d.derivation_id AS node_id,
                         THEN json_extract(r.raw, '$.timestamp') END)
         FROM chunk_members m JOIN records r ON r.handle = m.record
         WHERE m.chunk = ch.handle) AS latest_at,
-       d.expand_hint AS expand_hint
+       d.expand_hint AS expand_hint,
+       l.seq + {_SEQ_POSITION - 1} AS seq
 FROM derivations d
+JOIN latest_returns l ON l.kind = 'summary' AND l.derivation = d.handle
 JOIN derivation_sources s ON s.derivation = d.handle AND s.ordinal = 0
-JOIN chunks ch ON ch.handle = s.chunk
-WHERE EXISTS (
-        SELECT 1 FROM latest_returns l
-        WHERE l.kind = 'summary' AND l.derivation = d.handle);
+JOIN chunks ch ON ch.handle = s.chunk;
 """
 
 _SCHEMA_SQL = _RECORD_SQL + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + "\n" + _VIEWS_SQL

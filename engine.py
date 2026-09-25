@@ -1065,43 +1065,6 @@ class LCMEngine(
     def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
         return self._fresh_tail_boundary(messages).start
 
-    def _get_session_fresh_tail(
-        self,
-        session_id: str,
-        *,
-        minimum_count: int = 0,
-    ) -> tuple[List[Dict[str, Any]], FreshTailBoundary]:
-        """Load and resolve a stored tail, expanding backward for tool pairing."""
-        total_count = int(self._store.get_session_count(session_id))
-        configured_count = max(minimum_count, int(self._config.fresh_tail_count or 0))
-        if self._config.fresh_tail_max_tokens > 0:
-            configured_count = max(1, configured_count)
-        if total_count <= 0 or configured_count <= 0:
-            return [], resolve_fresh_tail_boundary(
-                [],
-                fresh_tail_count=configured_count,
-                fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
-            )
-
-        load_limit = min(total_count, configured_count)
-        while True:
-            rows = self._store.get_session_tail(session_id, load_limit)
-            boundary = resolve_fresh_tail_boundary(
-                rows,
-                fresh_tail_count=configured_count,
-                fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
-            )
-            selected = rows[boundary.start:]
-            unresolved_tool_boundary = bool(
-                selected
-                and selected[0].get("role") == "tool"
-                and not boundary.tool_group_extended
-                and load_limit < total_count
-            )
-            if not unresolved_tool_boundary:
-                return selected, boundary
-            load_limit = min(total_count, max(load_limit + 1, load_limit * 2))
-
     @staticmethod
     def _leading_anchor_count(messages: List[Dict[str, Any]]) -> int:
         """Return the number of non-compactable leading messages.
@@ -1613,7 +1576,14 @@ class LCMEngine(
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         # The tools read the store, which is filled at compaction; what the agent's
-        # context holds now is in its context.
+        # context holds now is in its context. A list the host hands over is settled
+        # first, as at a turn's end and at the preflight: a confirmation waiting for
+        # its compaction's name, a return adopted without one, the bindings. So a
+        # summary a compaction inside this turn put into the context can be expanded
+        # at once.
+        messages = kwargs.get("messages")
+        if messages:
+            self._bind_from_list(messages)
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
             "lcm_expand": lcm_tools.lcm_expand,

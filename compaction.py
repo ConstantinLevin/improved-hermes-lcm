@@ -10,10 +10,13 @@ In order:
 2. The tail is the host's list from ``resolve_fresh_tail_boundary`` on, and never
    reaches back into the summaries the plugin returned. The material is every entry
    before the tail that is not the mechanism's layer (the host's system row, a
-   summary the plugin returned).
+   summary the plugin returned, also as the host rewrote it: a summary revision holds
+   a summary and is never chunked).
 3. The material is cut into chunks, in list order, each at most ``leaf_chunk_tokens``
-   (a greedy cut until #12). The compaction, its inputs, the new records and every
-   chunk are written before the first summariser call.
+   (a greedy cut until #12), only between groups: a tool call and its results stay in
+   one chunk, and a group larger than a chunk is a chunk of its own. The compaction,
+   its inputs, the new records and every chunk are written before the first
+   summariser call.
 4. Each chunk is summarised from its records as the store holds them, one call at a
    time, and the summary is written as a derivation when it arrives. A call that
    fails fails the compaction as a whole: the context stays as it was.
@@ -34,6 +37,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .escalation import summarize_with_escalation
+from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .record_write import _ATTEMPT, AttemptCancelled
 from .tokens import count_message_tokens, count_messages_tokens
@@ -209,18 +213,40 @@ class CompactionMixin:
         return text, level, budget
 
     @staticmethod
-    def _cut_chunks(messages: List[Dict[str, Any]], material: List[int], limit: int) -> List[List[int]]:
-        """The material's positions cut in list order into chunks of at most ``limit``
-        tokens; an entry larger than the limit is a chunk of its own."""
+    def _groups(messages: List[Dict[str, Any]], material: List[int]) -> List[List[int]]:
+        """The material in list order as groups a cut may not enter: an assistant row
+        that carries tool calls, with every result of those calls in the material and
+        whatever stands between them; every other entry alone. Calls and results are
+        matched by their ``tool_call_id``, the host's identity for the pair."""
+        groups: List[List[int]] = []
+        at = 0
+        while at < len(material):
+            message = messages[material[at]]
+            call_ids = {_tool_call_id(call) for call in (message.get("tool_calls") or [])} - {""}
+            end = at
+            if message.get("role") == "assistant" and call_ids:
+                for later in range(at + 1, len(material)):
+                    other = messages[material[later]]
+                    if other.get("role") == "tool" and str(other.get("tool_call_id") or "").strip() in call_ids:
+                        end = later
+            groups.append(material[at:end + 1])
+            at = end + 1
+        return groups
+
+    @classmethod
+    def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int) -> List[List[int]]:
+        """The material cut in list order into chunks of at most ``limit`` tokens, and
+        only between groups: a tool call is never separated from its results. A group
+        larger than the limit is a chunk of its own (#31: a chunk flexes by one group)."""
         chunks: List[List[int]] = []
         current: List[int] = []
         used = 0
-        for index in material:
-            tokens = count_message_tokens(messages[index])
+        for group in cls._groups(messages, material):
+            tokens = sum(count_message_tokens(messages[index]) for index in group)
             if current and used + tokens > limit:
                 chunks.append(current)
                 current, used = [], 0
-            current.append(index)
+            current.extend(group)
             used += tokens
         if current:
             chunks.append(current)

@@ -14,6 +14,8 @@ Use for discovery across current-session stored messages and summaries.
 - Prefer 1-3 distinctive terms or one quoted phrase because FTS5 combines extra terms with AND.
 - Keep `sort='recency'` for recent events, use `sort='relevance'` for the strongest older match, and use `sort='hybrid'` when both matter.
 - Exact role/time filters apply before limiting where supported. `time_from`/`time_to` compare the time a message was stored, which is the time of the compaction that stored it, not the time it was said.
+- `sort='recency'` follows the conversation's order, newest first.
+- A message hit with `revises_node_id` is a summary row as the host rewrote it in the context (for example with the task list folded in); `lcm_expand(node_id=…)` on that id opens the summary's sources.
 
 Do not treat a short search snippet as sufficient evidence for a detail-heavy answer.
 

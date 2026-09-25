@@ -41,7 +41,10 @@ logger = logging.getLogger(__name__)
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
+    """Recency is the transcript order (``_sort_seq``); the time only ages a hit for
+    the hybrid blend."""
     sort_timestamp = float(result.get("_sort_ts") or 0.0)
+    sort_order = float(result.get("_sort_seq") or 0.0)
     rank = result.get("_sort_rank")
     rank_value = float(rank) if rank is not None else float("inf")
     directness = float(result.get("_sort_directness") or 0.0)
@@ -59,7 +62,7 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     effective_directness = directness if result.get("type") == "message" else (directness * 0.8)
 
     if sort == "relevance":
-        return (rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
+        return (rank_value, -effective_directness, role_bias, -sort_order, type_bias)
 
     if sort == "hybrid":
         age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
@@ -70,13 +73,13 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
             blended,
             -effective_directness,
             role_bias,
-            -sort_timestamp,
+            -sort_order,
             type_bias,
         )
 
     if result.get("type") == "message":
-        return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
-    return (-sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
+        return (-sort_order, type_bias, role_bias, rank_value, 0.0, float("inf"))
+    return (-sort_order, type_bias, 0, rank_value, 0.0, role_bias)
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
     engine = kwargs.get("engine")
@@ -945,7 +948,9 @@ def _shape_message_hit(
         "snippet": hit.get("snippet", hit.get("content", "")[:200]),
         "from_current_session": has_current_session
         and hit["session_id"] == current_session_id,
+        **({"revises_node_id": hit["revises_node_id"]} if hit.get("revises_node_id") is not None else {}),
         "_sort_ts": timestamp_value,
+        "_sort_seq": hit.get("seq") or 0,
         "_sort_rank": hit.get("search_rank"),
         "_sort_directness": hit.get("_directness_score") or 0.0,
     }
@@ -965,6 +970,7 @@ def _shape_summary_hit(node: Any) -> dict[str, Any]:
         "latest_at": node.latest_at,
         "from_current_session": True,
         "_sort_ts": node.latest_at or node.created_at,
+        "_sort_seq": getattr(node, "seq", 0) or 0,
         "_sort_rank": node.search_rank,
         "_sort_directness": node.search_directness or 0.0,
     }
@@ -1087,6 +1093,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     results.sort(key=lambda result: _combined_result_sort_key(result, sort))
     for result in results:
         result.pop("_sort_ts", None)
+        result.pop("_sort_seq", None)
         result.pop("_sort_rank", None)
         result.pop("_sort_directness", None)
         result.pop("_hybrid_summary_override", None)
@@ -1218,6 +1225,10 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "next_content_offset": sliced["next_content_offset"],
             "has_more": sliced["has_more"],
         }
+        if stored.get("revises_node_id") is not None:
+            # A summary row the host rewrote: it stands beside the chain and revises
+            # this summary, which the context shows re-emitted from its derivation.
+            result["revises_node_id"] = stored["revises_node_id"]
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing
@@ -1682,27 +1693,21 @@ def _inspect_message_metadata(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: str) -> int:
-    highest = 0
-    rows = engine._dag.connection.execute(
+def _inspect_last_compacted_store_id(engine: "LCMEngine", session_id: str) -> int | None:
+    """The last record in transcript order that a summary covers (ids are the order
+    of writing, not the transcript's)."""
+    row = engine._store.connection.execute(
         """
-        SELECT source_ids
-        FROM summary_nodes
-        WHERE session_id = ? AND source_type = 'messages'
+        SELECT m.store_id FROM messages m
+        WHERE m.session_id = ? AND m.store_id NOT IN (
+            SELECT r.record_id FROM latest_returns l JOIN records r ON r.handle = l.record
+            WHERE l.kind = 'record' AND r.session = ?)
+          AND m.revises_node_id IS NULL
+        ORDER BY m.seq DESC LIMIT 1
         """,
-        (session_id,),
-    ).fetchall()
-    for (raw_source_ids,) in rows:
-        try:
-            source_ids = json.loads(raw_source_ids or "[]")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        for source_id in source_ids:
-            try:
-                highest = max(highest, int(source_id))
-            except (TypeError, ValueError, OverflowError):
-                continue
-    return highest
+        (session_id, session_id),
+    ).fetchone()
+    return int(row[0]) if row else None
 
 
 def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
@@ -1861,18 +1866,22 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
 
     store_totals_row = engine._store.connection.execute(
         """
-        SELECT COUNT(*), MIN(store_id), MAX(store_id), COALESCE(SUM(token_estimate), 0)
+        SELECT COUNT(*), COALESCE(SUM(token_estimate), 0),
+               (SELECT store_id FROM messages WHERE session_id = ? ORDER BY seq ASC LIMIT 1),
+               (SELECT store_id FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1)
         FROM messages
         WHERE session_id = ?
         """,
-        (session_id,),
+        (session_id, session_id, session_id),
     ).fetchone()
     message_total = int(store_totals_row[0] or 0) if store_totals_row else 0
-    min_store_id = store_totals_row[1] if store_totals_row else None
-    max_store_id = store_totals_row[2] if store_totals_row else None
-    estimated_tokens = int(store_totals_row[3] or 0) if store_totals_row else 0
+    estimated_tokens = int(store_totals_row[1] or 0) if store_totals_row else 0
+    first_store_id = store_totals_row[2] if store_totals_row else None
+    last_store_id = store_totals_row[3] if store_totals_row else None
     fresh_tail_count = max(0, int(engine._config.fresh_tail_count or 0))
-    fresh_tail_rows, fresh_tail_boundary = engine._get_session_fresh_tail(session_id)
+    # The fresh tail as the latest effective compaction returned it, in its positions.
+    fresh_tail_rows = engine._store.get_returned_tail(session_id)
+    fresh_tail_tokens = sum(int(row.get("token_estimate") or 0) for row in fresh_tail_rows)
     fresh_tail_display_rows = fresh_tail_rows[-limit:]
     fresh_tail_items = [
         _inspect_message_metadata(row)
@@ -1889,7 +1898,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
                source_type, created_at, earliest_at, latest_at, expand_hint
         FROM summary_nodes
         WHERE session_id = ?
-        ORDER BY created_at DESC, node_id DESC
+        ORDER BY seq DESC
         LIMIT ?
         """,
         (session_id, limit),
@@ -1911,7 +1920,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
         for row in latest_node_rows
     ]
 
-    highest_compacted_source_store_id = _inspect_highest_compacted_source_store_id(engine, session_id)
+    last_compacted_store_id = _inspect_last_compacted_store_id(engine, session_id)
 
     platform = engine.current_session_platform
 
@@ -1930,17 +1939,15 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
         "messages": {
             "total": message_total,
             "estimated_tokens": estimated_tokens,
-            "min_store_id": min_store_id,
-            "max_store_id": max_store_id,
+            "first_store_id": first_store_id,
+            "last_store_id": last_store_id,
             "fresh_tail_count": fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
             "effective_fresh_tail_count": len(fresh_tail_rows),
-            "effective_fresh_tail_tokens": fresh_tail_boundary.tokens,
+            "effective_fresh_tail_tokens": fresh_tail_tokens,
             "pre_tail_message_count": max(0, message_total - len(fresh_tail_rows)),
             "fresh_tail": {
                 "returned": len(fresh_tail_items),
-                "token_limited": fresh_tail_boundary.token_limited,
-                "tool_group_extended": fresh_tail_boundary.tool_group_extended,
                 "items": fresh_tail_items,
             },
         },
@@ -1954,7 +1961,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
                 "threshold_tokens": engine.threshold_tokens,
             },
             "frontier": {
-                "highest_compacted_source_store_id": highest_compacted_source_store_id,
+                "last_compacted_store_id": last_compacted_store_id,
             },
         },
         "dag": {
