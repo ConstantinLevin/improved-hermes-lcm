@@ -12,8 +12,8 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 - the call raises (a rate limit, a timeout, a connection or provider error);
 - the reply has no ``choices[0].message`` (malformed), or its ``content`` is empty;
 - the provider stopped the reply at its output limit (``finish_reason == "length"``);
-- the reply is not shorter than the text it summarises, both counted by the same
-  counter on the text the summariser was given (the interim acceptance until #10).
+- the reply is not shorter than the chunk's records, what the summary replaces in the
+  context, both counted by the same counter (the interim acceptance until #10).
 
 The budget is a target in the prompt text only. No ``max_tokens`` is passed, so the
 plugin never cuts a summary at an output limit of its own; a reply the provider cut at
@@ -213,6 +213,7 @@ def summarize_chunk(
     text: str,
     token_budget: int,
     *,
+    source_tokens: int,
     depth: int = 0,
     model: str = "",
     timeout: Optional[float] = None,
@@ -223,11 +224,13 @@ def summarize_chunk(
 ) -> tuple[str, int, str]:
     """Summarise one chunk: (summary, level, finish_reason), or ``SummaryFailure``.
 
+    ``source_tokens`` is the count of the chunk's records, what the summary replaces
+    in the context; a reply must come in below it, by the same counter (R6).
+
     Level 1; after a non-transient failure of level 1, level 2 once (today's texts,
     until #10). A transient failure that outlasts the deadline is not retried at
     level 2: the next level would meet the same provider with no time left.
     """
-    source_tokens = count_tokens(text)
     l1 = _build_l1_prompt(
         text,
         token_budget,

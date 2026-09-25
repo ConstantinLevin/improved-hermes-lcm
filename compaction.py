@@ -210,6 +210,7 @@ class CompactionMixin:
         text, level, finish_reason = summarize_chunk(
             self._serialize_messages(chunk_messages),
             budget,
+            source_tokens=source_tokens,
             depth=0,
             model=self._config.summary_model,
             timeout=self._config.summary_timeout_ms / 1000,
