@@ -90,16 +90,35 @@ def instruction_text(max_chars: int) -> str:
     return text
 
 
-def _prompt_texts(system_prompt: Any) -> Optional[list[str]]:
-    """The system prompt's text as the request carries it: a string, or the text of each
-    content block (a provider that takes the system prompt as blocks). None when the
-    request carries no system prompt the plugin can read."""
-    if isinstance(system_prompt, str):
-        return [system_prompt]
-    if isinstance(system_prompt, list):
-        texts = [block.get("text") for block in system_prompt if isinstance(block, dict)]
-        texts = [text for text in texts if isinstance(text, str)]
-        return texts or None
+SYSTEM_LEVEL_ROLES = ("system", "developer")
+
+
+def sent_system_prompt(system_prompt: Any, request_messages: Any) -> Optional[str]:
+    """The system-level prompt of one request as the host sent it, as one text; None when
+    the request carries none.
+
+    The hook's ``system_prompt`` is the request's own ``system`` (Anthropic Messages, a
+    string or text blocks; Bedrock Converse, ``{"text"}`` blocks and a ``cachePoint``) or
+    ``instructions`` (Codex Responses), else the first request message when its role is
+    ``system`` (``agent/conversation_loop.py:512``). Chat Completions sends GPT-5 and Codex
+    models that message with the role ``developer`` (``agent/transports/chat_completions.py:
+    321``), which the hook's field does not recognise, so the first message of
+    ``request_messages``, the request's own list, is read for either role.
+
+    Where the prompt is text blocks, their texts are joined with nothing between them, as
+    the host joins them back (``agent/prompt_caching.py:145``, ``:173``): the host splits
+    one prompt string into a static prefix and the rest to mark them for its cache, so the
+    same prompt is the same text, and the same key, in either shape."""
+    value = system_prompt
+    if value is None and isinstance(request_messages, list) and request_messages:
+        first = request_messages[0]
+        if isinstance(first, dict) and first.get("role") in SYSTEM_LEVEL_ROLES:
+            value = first.get("content")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        texts = [block.get("text") for block in value if isinstance(block, dict) and isinstance(block.get("text"), str)]
+        return "".join(texts) if texts else None
     return None
 
 
@@ -118,7 +137,7 @@ def _sections_present(prompt: str) -> tuple:
 
 # Guards each engine copy's set of the prompts it has checked; held only for a set lookup.
 _SEEN_LOCK = threading.Lock()
-_UNREADABLE = "unreadable"
+_NO_SYSTEM_PROMPT = "no system-level prompt"
 
 
 def _first_sight(engine: Any, key: str) -> bool:
@@ -136,8 +155,9 @@ def _first_sight(engine: Any, key: str) -> bool:
         return True
 
 
-def check_delivery(engine: Any, system_prompt: Any, *, host_session_id: str, text: Optional[str],
-                   host: Optional[HostSections], refused: Optional[str], record: Callable[..., None]) -> None:
+def check_delivery(engine: Any, system_prompt: Any, request_messages: Any, *, host_session_id: str,
+                   text: Optional[str], host: Optional[HostSections], refused: Optional[str],
+                   record: Callable[..., None]) -> None:
     """Check one request's system prompt for the plugin's exact section, once per distinct
     prompt of this engine copy (#16). Where it is missing, log a warning and record
     ``instruction_not_delivered`` with what the plugin knows: that it registered no section,
@@ -149,24 +169,24 @@ def check_delivery(engine: Any, system_prompt: Any, *, host_session_id: str, tex
     looked for exactly as the host frames it; ``refused`` is why the plugin registered
     none. ``engine`` is the LCM copy serving the request's session. ``record`` must not
     wait on the store: it runs on the host's hook thread."""
-    texts = _prompt_texts(system_prompt)
-    if texts is None:
-        if _first_sight(engine, _UNREADABLE):
-            logger.warning(
-                "LCM cannot check that its instruction reached the agent: the request of host session %s "
-                "carries no system prompt the plugin can read (%s)", host_session_id, type(system_prompt).__name__)
+    prompt = sent_system_prompt(system_prompt, request_messages)
+    if prompt is None:
+        if _first_sight(engine, _NO_SYSTEM_PROMPT):
+            fact = "the request the host sent carries no system-level prompt"
+            logger.warning("LCM's instruction is not in the request of host session %s: %s", host_session_id, fact)
+            record("instruction_not_delivered", {"host_session_id": host_session_id, "fact": fact})
         return
-    digest = hashlib.sha256("\x00".join(texts).encode("utf-8", "surrogatepass")).hexdigest()
+    digest = hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest()
     if not _first_sight(engine, digest):
         return
     framed = host.frame(SECTION_ID, text) if host is not None and text else None
-    if framed is not None and any(framed in part for part in texts):
+    if framed is not None and framed in prompt:
         return
     if refused is not None:
         fact = f"the plugin registered no section: {refused}"
     else:
         fact = "the system prompt the host sent does not carry the plugin's section"
-    present = _sections_present("\n\n".join(texts))
+    present = _sections_present(prompt)
     observed = [{"id": section.id, "chars": len(host.frame(section.id, section.content)) if host else
                  len(section.content)} for section in present]
     detail = {"host_session_id": host_session_id, "fact": fact,

@@ -105,8 +105,9 @@ def _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload
             logger.error("LCM could not hand over the store event %s: %s", kind, detail, exc_info=True)
 
     try:
-        check_delivery(active, payload.get("system_prompt"), host_session_id=session_id, text=instruction.text,
-                       host=instruction.host, refused=instruction.refused, record=_record)
+        check_delivery(active, payload.get("system_prompt"), payload.get("request_messages"),
+                       host_session_id=session_id, text=instruction.text, host=instruction.host,
+                       refused=instruction.refused, record=_record)
     except Exception:
         logger.warning("LCM could not check that its instruction reached the agent", exc_info=True)
 
