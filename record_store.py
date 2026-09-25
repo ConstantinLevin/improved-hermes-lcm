@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from .db_bootstrap import open_store
+from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .message_content import base64_like_strings, describe_image_part, image_parts, index_text
 from .tokens import count_message_tokens
@@ -133,11 +133,11 @@ class RecordStore:
             self._conn = None
             raise
 
-    def close(self) -> None:
-        conn = self._conn
-        if conn is not None:
-            conn.close()
-            self._conn = None
+    def close(self, reason: str = "closed") -> None:
+        """Close the connection once any statement or transaction of this helper on
+        another thread has finished (the helper's lock). Later use raises."""
+        with self._lock:
+            self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the record")
 
     @contextlib.contextmanager
     def _tx(self):

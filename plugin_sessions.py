@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .db_bootstrap import open_store
+from .db_bootstrap import close_connection, open_store
 from .handles import SESSION, new_handle
 
 logger = logging.getLogger(__name__)
@@ -51,11 +51,11 @@ class PluginSessions:
             self._conn = None
             raise
 
-    def close(self) -> None:
-        conn = self._conn
-        if conn is not None:
-            conn.close()
-            self._conn = None
+    def close(self, reason: str = "closed") -> None:
+        """Close the connection once a session write on another thread (a hook's) has
+        finished (the helper's lock). Later use raises."""
+        with self._lock:
+            self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the sessions")
 
     def find(self, host_session_id: str) -> Optional[str]:
         row = self._conn.execute(

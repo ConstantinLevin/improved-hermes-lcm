@@ -16,7 +16,9 @@ from typing import Any, Dict, List, Optional
 
 from .db_bootstrap import (
     NODES_FTS_SPEC,
+    ClosedConnection,
     ExternalContentFtsSpec,
+    close_connection,
     open_store,
 )
 from .search_query import (
@@ -139,14 +141,15 @@ class SummaryDAG:
         self._init_db()
 
     @property
-    def connection(self) -> Optional[sqlite3.Connection]:
-        """The live SQLite connection, or ``None`` once :meth:`close` has run.
+    def connection(self) -> "sqlite3.Connection | ClosedConnection":
+        """The SQLite connection. Once :meth:`close` has run it is a
+        :class:`ClosedConnection`, whose every use raises ``StoreClosedError``.
 
         Exposed for read-oriented diagnostics and inspection -- FTS sync counts,
         integrity checks, latest-node lookups -- that need ad-hoc queries the DAG
         does not wrap in a purpose-built method. Callers must treat it as
-        read-only and tolerate ``None``: the tables behind it are the record's,
-        written only by ``RecordStore``.
+        read-only: the tables behind it are the record's, written only by
+        ``RecordStore``.
         """
         return self._conn
 
@@ -445,14 +448,9 @@ class SummaryDAG:
             search_rank=row[13] if len(row) > 13 else None,
         )
 
-    def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
-            conn.close()
-            self._conn = None
-
-    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
+    def close(self, reason: str = "closed") -> None:
+        """Close the connection once a read of this helper on another thread has
+        finished (its lock); later use raises. The engine closes its helpers at plugin
+        unload and when the engine is collected (``LCMEngine.close``)."""
+        with self._db_lock:
+            self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the summary reader")

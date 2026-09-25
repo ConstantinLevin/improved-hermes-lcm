@@ -60,6 +60,52 @@ class StoreRefusedError(RuntimeError):
     """
 
 
+class StoreClosedError(RuntimeError):
+    """A connection to the store was used after it was closed. A closed handle is
+    never reused or reopened in place; the message names the store and why it was
+    closed."""
+
+
+class ClosedConnection:
+    """What a store helper holds once its connection is closed. It is false, and every
+    use raises :class:`StoreClosedError`, so a closed handle is never reused."""
+
+    def __init__(self, db_path: str | Path, reason: str):
+        self._db_path = str(db_path)
+        self._reason = reason
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __getattr__(self, name: str):
+        raise StoreClosedError(
+            f"LCM's connection to the store at {self._db_path} was closed ({self._reason}); "
+            f"a closed handle is never reused"
+        )
+
+
+def close_connection(conn, *, db_path: str | Path, reason: str, owner: str) -> ClosedConnection:
+    """Close one store connection and return what stands in its place.
+
+    A transaction still open on it is rolled back, and that is logged at WARNING:
+    nothing is rolled back silently. Closing an already closed connection changes
+    nothing.
+    """
+    if isinstance(conn, ClosedConnection):
+        return conn
+    if conn is not None:
+        try:
+            if conn.in_transaction:
+                logger.warning(
+                    "LCM rolled back an open transaction of %s on the store at %s while closing it (%s)",
+                    owner, db_path, reason,
+                )
+                conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+    return ClosedConnection(db_path, reason)
+
+
 def _refuse(path: str | Path, reason: str) -> StoreRefusedError:
     message = (
         f"LCM refuses the database at {path}: {reason}. Nothing in it was read or "

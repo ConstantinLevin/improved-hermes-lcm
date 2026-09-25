@@ -17,7 +17,9 @@ from typing import Any, Dict, List, Optional
 from .db_bootstrap import (
     MESSAGES_FTS_SPEC,
     ExternalContentFtsSpec,
+    ClosedConnection,
     StoreRefusedError,
+    close_connection,
     open_store,
     refuse_cross_vm_filesystem,
 )
@@ -773,14 +775,15 @@ class MessageStore:
     # -- Connection access --------------------------------------------------
 
     @property
-    def connection(self) -> sqlite3.Connection | None:
-        """The live SQLite connection, or ``None`` once :meth:`close` has run.
+    def connection(self) -> sqlite3.Connection | ClosedConnection:
+        """The SQLite connection. Once :meth:`close` has run it is a
+        :class:`ClosedConnection`, whose every use raises ``StoreClosedError``.
 
         Exposed for read-oriented diagnostics and inspection -- integrity /
         quick checks, FTS sync counts, schema health -- that need ad-hoc
         queries the store does not wrap in a purpose-built method. Callers must
-        treat it as read-only and tolerate ``None``: the tables behind it are the
-        record's, written only by ``RecordStore``.
+        treat it as read-only: the tables behind it are the record's, written
+        only by ``RecordStore``.
         """
         return self._conn
 
@@ -804,14 +807,7 @@ class MessageStore:
 
     # -- Lifecycle ----------------------------------------------------------
 
-    def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
-            conn.close()
-            self._conn = None
-
-    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
+    def close(self, reason: str = "closed") -> None:
+        """Close the connection; later use raises. The engine closes its helpers at
+        plugin unload and when the engine is collected (``LCMEngine.close``)."""
+        self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the message reader")

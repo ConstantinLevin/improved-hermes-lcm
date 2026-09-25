@@ -4,9 +4,11 @@ Implements the ContextEngine ABC. Replaces the built-in ContextCompressor with t
 plugin's own compaction over its record, which keeps what the host hands over.
 """
 
+import atexit
 import copy
 import json
 import logging
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,7 +20,7 @@ from .codex_routing import (
 )
 from .config import LCMConfig
 from .dag import SummaryDAG
-from .db_bootstrap import STORE_FILENAME, StoreRefusedError
+from .db_bootstrap import STORE_FILENAME, StoreClosedError, StoreRefusedError
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
     _ACTIVE_ENGINES_BY_CONVERSATION_ID,
@@ -68,6 +70,38 @@ logger = logging.getLogger(__name__)
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "plugin_session"
 
+# Set by an exit handler registered right after the first finalizer (which registers
+# the finalizers' own exit handler), so it runs before them: an engine's finalizer
+# can then say whether it runs at process exit or at collection.
+_PROCESS_EXITING = False
+_EXIT_MARK_REGISTERED = False
+
+
+def _mark_process_exiting() -> None:
+    global _PROCESS_EXITING
+    _PROCESS_EXITING = True
+
+
+def _register_exit_mark() -> None:
+    global _EXIT_MARK_REGISTERED
+    if not _EXIT_MARK_REGISTERED:
+        atexit.register(_mark_process_exiting)
+        _EXIT_MARK_REGISTERED = True
+
+
+def _close_helpers(helpers: tuple, label: str, reason_box: list) -> None:
+    """Close one engine's store helpers and say so. Run by ``LCMEngine.close`` with
+    its reason, and otherwise by the engine's finalizer, when the engine is collected
+    or the process exits. It holds the helpers, never the engine."""
+    reason = reason_box[0] or ("the process is exiting" if _PROCESS_EXITING else "its engine was collected")
+    for helper in helpers:
+        try:
+            helper.close(reason)
+        except Exception:
+            logger.warning("LCM could not close the %s of %s (%s)", type(helper).__name__, label, reason,
+                           exc_info=True)
+    logger.info("LCM closed the store connections of %s: %s", label, reason)
+
 
 class ReviewForkDetachRefused(RuntimeError):
     """Raised when the host detaches an engine copy from every session.
@@ -101,6 +135,8 @@ class LCMEngine(
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        # Why this engine's store connections were closed; None while they are open.
+        self._closed_reason: Optional[str] = None
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
@@ -261,31 +297,52 @@ class LCMEngine(
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind the store's helpers to one SQLite database: the record and its
-        sessions, and the tools' readers over its views."""
-        try:
-            self._store = MessageStore(db_path, hermes_home=hermes_home)
-            self._dag = SummaryDAG(db_path)
-            self._sessions = PluginSessions(db_path)
-            self._records = RecordStore(db_path)
-        except Exception:
-            self._close_storage()
-            raise
+        sessions, and the tools' readers over its views.
 
-    def _close_storage(self) -> None:
-        """Best-effort close of currently bound SQLite helpers."""
-        for attr in (
-            "_store",
-            "_dag",
-            "_sessions",
-            "_records",
-        ):
-            helper = getattr(self, attr, None)
-            close = getattr(helper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        Their connections are closed by :meth:`close`, and otherwise by a finalizer
+        when this engine is collected or the process exits: the host gives an engine
+        copy no teardown call (#20). The finalizer holds the helpers, never the engine.
+        """
+        helpers = []
+        try:
+            for build in (
+                lambda: MessageStore(db_path, hermes_home=hermes_home),
+                lambda: SummaryDAG(db_path),
+                lambda: PluginSessions(db_path),
+                lambda: RecordStore(db_path),
+            ):
+                helpers.append(build())
+        except Exception:
+            _close_helpers(tuple(helpers), f"an engine on {db_path}", ["its store could not be opened"])
+            raise
+        self._store, self._dag, self._sessions, self._records = helpers
+        self._close_box: list = [None]
+        self._storage_finalizer = weakref.finalize(
+            self, _close_helpers, tuple(helpers), f"engine {id(self):#x} on {db_path}", self._close_box,
+        )
+        _register_exit_mark()
+
+    def _close_storage(self, reason: str) -> None:
+        """Close the bound helpers now, once, with the reason given."""
+        finalizer = getattr(self, "_storage_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            self._close_box[0] = reason
+            finalizer()
+
+    def close(self, reason: str = "closed by its owner") -> None:
+        """Close this engine's store connections. Idempotent.
+
+        Each helper closes once any statement or transaction it runs on another
+        thread has finished; a transaction still open is rolled back with a warning.
+        Afterwards every use of the store raises ``StoreClosedError``: a closed
+        engine is never reopened or reused. Called at plugin unload for the engine
+        registered with the host; an engine copy is closed when it is collected.
+        """
+        if self._closed_reason is not None:
+            return
+        self._closed_reason = reason
+        self._unregister_active_engine_binding()
+        self._close_storage(reason)
 
 
     def _reset_profile_runtime_state(self) -> None:
@@ -327,8 +384,12 @@ class LCMEngine(
         current_db = Path(getattr(getattr(self, "_store", None), "db_path", ""))
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
+        if self._closed_reason is not None:
+            raise StoreClosedError(
+                f"LCM's engine was closed ({self._closed_reason}); a closed engine is never reopened"
+            )
 
-        self._close_storage()
+        self._close_storage(f"the engine was rebound to the store of {hermes_home}")
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
         self._reset_profile_runtime_state()
@@ -781,6 +842,9 @@ class LCMEngine(
         # its compaction's name, a return adopted without one, the bindings. So a
         # summary a compaction inside this turn put into the context can be expanded
         # at once.
+        if self._closed_reason is not None:
+            return json.dumps({"error": f"LCM's store connections of this engine were closed "
+                                        f"({self._closed_reason}); a closed engine is never reused"})
         messages = kwargs.get("messages")
         if messages:
             self._bind_from_list(messages)
