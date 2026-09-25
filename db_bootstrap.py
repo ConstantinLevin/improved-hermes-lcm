@@ -32,15 +32,17 @@ logger = logging.getLogger(__name__)
 # doctor's invariant check reads by (chunks by session, rejections by compaction),
 # so that a store without them is never opened. Format 6 stores beside a record's
 # estimate how many of its images the estimate left uncounted
-# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 9
+# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 10
 # records each failure of a chunk's call with its kind (``chunk_failures``,
 # insert-only), for the chunk that keeps failing (#7); a retry keeps every recorded
 # chunk of an unsettled attempt, so nothing about dispatch is stored (#33 D14 as
-# revised). Formats 7 and 8 were written only by unmerged commits of #61 and carried
-# a ``chunk_dispatches`` table this build does not declare; opening runs no DDL, so
-# each layout has its own name and is refused. A store of an earlier format is
-# refused and begun again (#29 W8: a change of format wipes the store).
-STORE_FORMAT = "ihl-store/9"
+# revised); and it indexes ``compaction_inputs`` by (compaction, record), which the
+# frozen cut reads inside the planning transaction. Formats 7 to 9 were written only
+# by unmerged commits of #61 (7 and 8 with a ``chunk_dispatches`` table, 9 without
+# that index); opening runs no DDL, so each layout has its own name and is refused.
+# A store of an earlier format is refused and begun again (#29 W8: a change of format
+# wipes the store).
+STORE_FORMAT = "ihl-store/10"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -359,6 +361,9 @@ CREATE TABLE compaction_inputs (
 );
 CREATE INDEX idx_compaction_inputs_row ON compaction_inputs(host_row_id);
 CREATE INDEX idx_compaction_inputs_record ON compaction_inputs(record);
+-- A member's host id as its attempt's list carried it, looked up per (compaction,
+-- record) by the frozen cut inside the planning transaction (#33 D14).
+CREATE INDEX idx_compaction_inputs_member ON compaction_inputs(compaction, record, position);
 
 CREATE TABLE chunks (
     handle TEXT PRIMARY KEY,

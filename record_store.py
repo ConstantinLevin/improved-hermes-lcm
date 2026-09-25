@@ -203,6 +203,10 @@ class RecordStore:
                 self._tx_depth = 0
             self._flush_events()
 
+    def transaction(self):
+        """One write transaction, or a savepoint inside an open one (``_tx``)."""
+        return self._tx()
+
     def planning(self):
         """The planning transaction of a compaction (#33 D14, revised 2026-09-25): one
         ``BEGIN IMMEDIATE`` around every store read the cut depends on and the write of
@@ -376,9 +380,23 @@ class RecordStore:
         """The state of a set of members over every chunk of the session that held
         exactly them (#33 D14, revised): "summarised" where one of them has a summary,
         which a retry reuses, else "cut": a recorded chunk, retried as the same chunk
-        whether or not its call was ever sent."""
-        chunks = [chunk for chunk, _ in self._chunks_with_members(session, records)]
-        return "summarised" if any(self._summarised(chunk) for chunk in chunks) else "cut"
+        whether or not its call was ever sent. Only chunks that have a summary and the
+        same first member are compared member by member, so the cost does not grow with
+        the attempts that cut the same chunk."""
+        wanted = [str(r) for r in records]
+        if not wanted:
+            return "cut"
+        for (chunk,) in self._q(
+            "SELECT DISTINCT m.chunk FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
+            "JOIN derivation_sources s ON s.chunk = m.chunk JOIN derivations d ON d.handle = s.derivation "
+            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ? AND d.kind = 'summary'",
+            (session, wanted[0]),
+        ):
+            members = [str(r) for (r,) in self._q(
+                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
+            if members == wanted:
+                return "summarised"
+        return "cut"
 
     def frozen_chunks(self, session: str, after: Optional[int]
                       ) -> tuple[list[FrozenChunk], list[tuple[str, int, tuple[str, ...]]]]:
@@ -412,26 +430,48 @@ class RecordStore:
         taken: set = set()
         frozen: list[FrozenChunk] = []
         unidentified: list[tuple[str, int, tuple[str, ...]]] = []
-        for compaction in compactions:
-            for (chunk,) in self._q("SELECT handle FROM chunks WHERE compaction = ? ORDER BY rowid", (compaction,)):
-                members = tuple(
-                    (str(record), int(row_id) if row_id is not None else None)
-                    for record, row_id in self._q(
-                        "SELECT m.record, (SELECT i.host_row_id FROM compaction_inputs i WHERE i.compaction = ? "
-                        "AND i.record = m.record ORDER BY i.position LIMIT 1) "
-                        "FROM chunk_members m WHERE m.chunk = ? ORDER BY m.ordinal",
-                        (compaction, chunk),
-                    )
-                )
-                records = [record for record, _ in members]
-                if not records or taken.intersection(records):
-                    continue
-                taken.update(records)
-                without = tuple(record for record, row_id in members if row_id is None)
-                if without:
-                    unidentified.append((str(chunk), compaction, without))
-                    continue
-                frozen.append(FrozenChunk(str(chunk), compaction, members, self.chunk_state(session, records)))
+        # The records already taken, as a TEMP table of this connection, so that an
+        # older attempt's chunk that overlaps one is left out in SQL, at its first
+        # overlapping member, without reading its members (the cost of the read no
+        # longer grows with the members of every unsettled attempt). TEMP touches no
+        # other connection and takes no lock of the store; it is emptied again at once.
+        with self._lock:
+            conn = self._conn
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS lcm_taken (record TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM temp.lcm_taken")
+            try:
+                for compaction in compactions:
+                    for (chunk,) in conn.execute(
+                        "SELECT ch.handle FROM chunks ch WHERE ch.session = ? AND ch.compaction = ? "
+                        "AND NOT EXISTS (SELECT 1 FROM chunk_members m JOIN temp.lcm_taken t ON t.record = m.record "
+                        "WHERE m.chunk = ch.handle) ORDER BY ch.rowid",
+                        (session, compaction),
+                    ).fetchall():
+                        # A member's host id as that attempt's list carried it
+                        # (idx_compaction_inputs_member).
+                        members = tuple(
+                            (str(record), int(row_id) if row_id is not None else None)
+                            for record, row_id in conn.execute(
+                                "SELECT m.record, (SELECT i.host_row_id FROM compaction_inputs i WHERE "
+                                "i.compaction = ? AND i.record = m.record ORDER BY i.position LIMIT 1) "
+                                "FROM chunk_members m WHERE m.chunk = ? ORDER BY m.ordinal",
+                                (compaction, chunk),
+                            ).fetchall()
+                        )
+                        records = [record for record, _ in members]
+                        if not records or taken.intersection(records):
+                            continue
+                        taken.update(records)
+                        conn.executemany("INSERT OR IGNORE INTO temp.lcm_taken(record) VALUES (?)",
+                                         [(record,) for record in records])
+                        without = tuple(record for record, row_id in members if row_id is None)
+                        if without:
+                            unidentified.append((str(chunk), compaction, without))
+                            continue
+                        frozen.append(FrozenChunk(str(chunk), compaction, members,
+                                                  self.chunk_state(session, records)))
+            finally:
+                conn.execute("DELETE FROM temp.lcm_taken")
         return frozen, unidentified
 
     def failure_streak(self, session: str, records: Sequence[str]) -> int:

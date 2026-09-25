@@ -28,7 +28,14 @@ In order:
    equally into ceil(B / c) chunks, cut at the group boundaries nearest k·B/n. No
    chunk below c/4 is ever cut (ruling on #61, 1): a part of the split that small
    merges into its smaller neighbour, which then exceeds c by the small parts it
-   absorbs, each below c/4, so it stays under 1.5c; a run
+   absorbs. c is a value that flexes by the small parts a chunk absorbs: a part of
+   the split stays under 1.5c, a D1 join into a kept chunk can add up to c/4 more
+   (about 1.75c), and an oversized group is a chunk of its own whatever its size. The
+   one hard bound is the summariser's input: after the cut, every chunk, kept and
+   joined ones included, is checked against what the summariser can read in one
+   call where the model table knows its window, and one it cannot read aborts the
+   compaction visibly (D4); where the table does not know it, the provider's own
+   refusal is a failure of kind ``request``, visible and counted; a run
    below c/4 joins the chunk of an adjacent oversized group, or, at the end of the
    material, stays raw and the tail begins at it. c is 50k provider tokens, cut in
    the plugin's estimate (characters / 4) as 50k / 1.51, #31's p50 of the provider's
@@ -283,11 +290,12 @@ def _split_run(sizes: List[int], limit: int) -> List[int]:
     summary and fails on every attempt. Where the groups leave no other way, as
     [c, 1, c], such a part merges into its smaller neighbour (the following one on a
     tie). That chunk is above ``limit`` by the small parts it absorbs, each below
-    c/4, one on either side at most, as [c/4 − 1, c, c/4 − 1] shows: so it stays
-    under 1.5c. This amends #12's "never above c" (orchestrator ruling on #61); the
-    check against the summariser's window after the cut still guards that it can be
-    read. The equal cut always finds a boundary: n is at least the fewest chunks
-    that cover the run, and every group of a run is at most ``limit``."""
+    c/4, one on either side at most, as [c/4 − 1, c, c/4 − 1] shows: so a part of the
+    split stays under 1.5c. c flexes by the small parts a chunk absorbs (orchestrator
+    ruling on #61; it amends #12's "never above c"); the hard bound is the check
+    against the summariser's input after the cut (D4). The equal cut always finds a
+    boundary: n is at least the fewest chunks that cover the run, and every group of
+    a run is at most ``limit``."""
     cuts = _equal_cuts(sizes, limit)
     if not cuts:
         return cuts
@@ -585,7 +593,8 @@ class CompactionMixin:
         return result
 
     def _tail_plan(self, messages: List[Dict[str, Any]], mechanism: set,
-                   occasion: Optional[Occasion] = None, frozen: Sequence[tuple] = ()) -> "TailPlan":
+                   occasion: Optional[Occasion] = None, frozen: Sequence[tuple] = (),
+                   fixed: Optional[tuple] = None) -> "TailPlan":
         """Where the tail begins, and how it was sized (#13, #31).
 
         The tail takes what the target leaves: after the compaction the context is
@@ -632,7 +641,8 @@ class CompactionMixin:
         summaries = sum(sizes[i] for i in mechanism if i not in system)
         total = sum(sizes[i] for i in outside)
         k, rho = float(self._config.estimate_ratio), _SUMMARY_BUDGET_SHARE
-        fixed, fixed_label = self._fixed_prefix()
+        # F as the caller read it before its planning transaction, else read here.
+        fixed, fixed_label = fixed if fixed is not None else self._fixed_prefix()
         reinserted = 0  # R_in, until #14
         target = self._geometry.target
         t = (target - fixed - k * summaries - reinserted - rho * k * total) / (k * (1 - rho))
@@ -806,10 +816,19 @@ class CompactionMixin:
                 )
             except BaseException as exc:
                 # A planning transaction still open is rolled back (#33 D14 as revised).
-                attempt.end_planning(exc)
+                try:
+                    attempt.end_planning(exc)
+                except Exception:
+                    logger.warning("LCM could not roll back the planning transaction", exc_info=True)
                 raise
-            # An early return inside it (an abort, a no-op) commits what it wrote.
-            attempt.end_planning()
+            # An early return inside it (an abort, a no-op) commits what it wrote; a
+            # commit that fails is a visible abort (#7), never an exception.
+            try:
+                attempt.end_planning()
+            except Exception as exc:
+                logger.warning("LCM could not commit the planning transaction", exc_info=True)
+                self._record_event(attempt, "planning_commit_failed", repr(exc))
+                result = self._abort(messages, f"the store could not commit the compaction's planning ({exc})")
         except AttemptCancelled:
             return messages
         except BaseException:
@@ -1063,6 +1082,9 @@ class CompactionMixin:
           a run takes the joined rows into its equal split. No kept chunk without a
           summary is ever released into a run: one below c/4 was cut again already,
           and one at c/4 or more ends the join.
+        - A join into a kept chunk that is itself up to 1.5c makes up to about 1.75c:
+          c flexes by the small parts a chunk absorbs, and the bound is the caller's
+          check of every chunk against the summariser's input (D4).
         Each join is recorded in ``joins``, and the caller records an event for it. A
         joined chunk has new members, so it is summarised afresh; it is recorded with
         this attempt's cut, so a retry keeps it and the join is not made again. Never
@@ -1258,16 +1280,32 @@ class CompactionMixin:
         if settings is None:
             return self._abort(messages, why_not)
 
+        # What need not be atomic with the cut is read or written before the planning
+        # transaction (pre-review of 78c2cbf): settling the previous return commits in a
+        # transaction of its own, its changes in memory made only after that commit; the
+        # fixed prefix F is a fact of the session helper, read here, so that nothing inside
+        # planning takes another lock or connection.
+        self._settle_from_list(messages)
+        fixed = self._fixed_prefix()
+
         # The planning transaction (#33 D14 as revised 2026-09-25): every store read the
         # cut depends on, from the identity on, and the write of the cut, in one
         # BEGIN IMMEDIATE, after the attempt's captured check is asked inside it. A
         # planner in another process waits for an earlier attempt's commit and reads its
-        # chunks. Nothing in it calls a model or does other I/O. compress() closes it on
-        # any early return or exception.
-        self._begin_planning(attempt)
+        # chunks. Nothing in it calls a model, does other I/O, or takes another lock or
+        # connection. compress() closes it on any early return or exception. A store
+        # failure opening or committing it is a visible abort (#7), never an exception.
+        try:
+            self._begin_planning(attempt)
+        except AttemptCancelled:
+            raise
+        except Exception as exc:
+            logger.warning("LCM could not open the planning transaction", exc_info=True)
+            attempt.end_planning(exc)
+            self._record_event(attempt, "planning_transaction_failed", repr(exc))
+            return self._abort(messages, f"the store could not begin the compaction's planning transaction ({exc})")
 
         # 1. Identity (#29 W3). A list that cannot be classified is not compacted.
-        self._settle_from_list(messages)
         entries = self._classify(attempt, messages)
         if entries is None:
             return self._abort(messages, attempt.error[1] if attempt.error else "the list could not be classified")
@@ -1304,7 +1342,7 @@ class CompactionMixin:
                                 "chunks": [{"chunk": chunk, "attempt": compaction, "without_identity": list(rows)}
                                            for chunk, compaction, rows in frozen.unidentified]})
         try:
-            plan = self._tail_plan(messages, mechanism, occasion, frozen.found)
+            plan = self._tail_plan(messages, mechanism, occasion, frozen.found, fixed=fixed)
         except ToolPairingError as exc:
             self._record_event(attempt, "tool_pairing_error", str(exc))
             return self._abort(messages, f"the tail cannot be placed: {exc}")
@@ -1456,8 +1494,15 @@ class CompactionMixin:
             logger.warning("LCM could not write the compaction", exc_info=True)
             self._record_event(attempt, "compaction_write_failed", repr(exc))
             return self._abort(messages, f"the store could not write the compaction ({exc})")
-        # The cut is recorded: commit the planning transaction before any call starts.
-        held_ms = attempt.end_planning()
+        # The cut is recorded: commit the planning transaction before any call starts. A
+        # commit that fails (the busy timeout, a full disk) wrote nothing: a visible
+        # abort, the context untouched (#7).
+        try:
+            held_ms = attempt.end_planning()
+        except Exception as exc:
+            logger.warning("LCM could not commit the planning transaction", exc_info=True)
+            self._record_event(attempt, "planning_commit_failed", repr(exc))
+            return self._abort(messages, f"the store could not commit the compaction's cut ({exc})")
         logger.info("LCM held the store's write lock for %.1f ms to plan and record the cut", held_ms or 0.0)
 
         # 4. One summary per chunk, from the chunk's records as stored, every chunk's call

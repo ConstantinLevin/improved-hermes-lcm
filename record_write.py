@@ -553,7 +553,10 @@ class RecordWriteMixin:
         return pairs
 
     def _bind(self, attempt: CompressAttempt, returns, insertions=()) -> None:
-        written = self._records.bind(attempt.compaction, returns, insertions)
+        self._bind_applied(attempt, self._records.bind(attempt.compaction, returns, insertions))
+
+    def _bind_applied(self, attempt: CompressAttempt, written) -> None:
+        """What a committed binding changes in memory."""
         attempt.bound_positions.update(written)
         if set(attempt.objects) <= attempt.bound_positions:
             self._returned_attempts.pop(attempt.compaction, None)
@@ -600,7 +603,13 @@ class RecordWriteMixin:
 
     def _settle_from_list(self, messages: Optional[List[Dict[str, Any]]]) -> None:
         """Read the keys of a list the host hands over: attribute a waiting
-        confirmation, find a return adopted without one, and bind stamped entries."""
+        confirmation, find a return adopted without one, and bind stamped entries.
+
+        All of it is one transaction of its own, each compaction a savepoint in it; what
+        it changes in memory (the waiting confirmation cleared, the bound positions, an
+        attempt no longer waited for) is applied only after that transaction committed,
+        so that memory never runs ahead of the store (pre-review of 78c2cbf). A failure
+        is logged and recorded as an event; nothing is changed in memory for it."""
         if not messages or not self._plugin_session or not self._returned_attempts:
             return
         keyed: set[int] = set()
@@ -609,36 +618,61 @@ class RecordWriteMixin:
                 key = parse_ret_key(message.get(RET_KEY))
                 if key is not None and key[0] in self._returned_attempts:
                     keyed.add(key[0])
-        for compaction in sorted(keyed):
-            attempt = self._returned_attempts.get(compaction)
-            if attempt is None or attempt.session != self._plugin_session:
-                continue
-            try:
-                store = self._records
-                if not store.is_settled(compaction):
-                    effective = store.effective_compaction(self._plugin_session)
-                    if effective is not None and compaction <= effective:
+        if not keyed:
+            return
+        store = self._records
+        applied: list = []   # in-memory changes, made once the transaction committed
+        # The waiting confirmation as this pass sees it: used by one compaction at most.
+        pending = getattr(self, "_pending_confirmation", None)
+        try:
+            with store.transaction():
+                for compaction in sorted(keyed):
+                    attempt = self._returned_attempts.get(compaction)
+                    if attempt is None or attempt.session != self._plugin_session:
                         continue
-                    pending = getattr(self, "_pending_confirmation", None)
-                    if pending is not None:
-                        store.confirm(compaction, host_session_before=pending.old_session_id,
-                                      host_session_after=pending.session_id, at=pending.at)
-                        self._pending_confirmation = None
-                    elif any(
-                        parse_ret_key(m.get(RET_KEY)) == (compaction, position)
-                        for m in messages if isinstance(m, dict)
-                        for position in attempt.summary_positions
-                    ):
-                        store.adopt(compaction, evidence="its returned summary entry stands in the next list")
-                    else:
+                    changes: list = []
+                    try:
+                        with store.transaction():   # a savepoint: this compaction, whole or not at all
+                            settled = store.is_settled(compaction)
+                            if not settled:
+                                effective = store.effective_compaction(self._plugin_session)
+                                if effective is not None and compaction <= effective:
+                                    pass
+                                elif pending is not None:
+                                    store.confirm(compaction, host_session_before=pending.old_session_id,
+                                                  host_session_after=pending.session_id, at=pending.at)
+                                    changes.append(("pending_cleared", pending))
+                                    settled = True
+                                elif any(
+                                    parse_ret_key(m.get(RET_KEY)) == (compaction, position)
+                                    for m in messages if isinstance(m, dict)
+                                    for position in attempt.summary_positions
+                                ):
+                                    store.adopt(compaction, evidence="its returned summary entry stands in the "
+                                                                     "next list")
+                                    settled = True
+                            if settled and store.effective_compaction(self._plugin_session) == compaction:
+                                written = store.bind(attempt.compaction,
+                                                     self._returns_to_bind(attempt, messages, own_objects_only=False),
+                                                     ())
+                                changes.append(("bound", (attempt, written)))
+                    except Exception as exc:
+                        logger.warning("LCM could not settle a returned compaction", exc_info=True)
+                        self._records.event("settle_write_failed", session=self._plugin_session,
+                                            compaction=compaction, detail=repr(exc))
                         continue
-                if store.effective_compaction(self._plugin_session) != compaction:
-                    continue
-                self._bind(attempt, self._returns_to_bind(attempt, messages, own_objects_only=False))
-            except Exception as exc:
-                logger.warning("LCM could not settle a returned compaction", exc_info=True)
-                self._records.event("settle_write_failed", session=self._plugin_session, compaction=compaction,
-                                    detail=repr(exc))
+                    if any(what == "pending_cleared" for what, _value in changes):
+                        pending = None
+                    applied.extend(changes)
+        except Exception as exc:
+            logger.warning("LCM could not commit the settling of returned compactions", exc_info=True)
+            self._records.event("settle_write_failed", session=self._plugin_session, detail=repr(exc))
+            return
+        for what, value in applied:
+            if what == "pending_cleared" and getattr(self, "_pending_confirmation", None) is value:
+                self._pending_confirmation = None
+            elif what == "bound":
+                self._bind_applied(*value)
 
     def record_rejected_compaction(self, *args: Any, **kwargs: Any) -> None:
         """The host refused the result this copy last returned (for example a grown one)."""

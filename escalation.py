@@ -37,9 +37,9 @@ failed by the chunk's own kind and level 2 by another, the failure is still the 
 
 An HTTP status is read the way the host reads it (``_host_status``): its error
 classifier's ``_extract_status_code`` first, then its auxiliary client's
-``_exc_http_status``; never an attribute guessed per provider. Neither reads the status
-of botocore's ``ClientError`` (Bedrock), so such a failure is kind ``other``: it fails
-visibly with its cause and does not count (the ask to Hermes: read it there).
+``_exc_http_status``, then, for botocore's ``ClientError`` (Bedrock), the status in its
+``response`` mapping, which the host's Bedrock adapter reads the same way; never an
+attribute guessed per provider.
 
 The budget is a target in the prompt text only. ``max_tokens`` is the summariser
 model's own output cap where the model table knows it (R5 b), and absent otherwise, so
@@ -282,8 +282,13 @@ def _host_status(exc: BaseException) -> Optional[int]:
     ``status_code`` or ``status`` over its cause chain, else a numeric code in its body;
     agent/error_classifier.py 1424 at Hermes 1b57acf94a), then the auxiliary client's
     ``_exc_http_status`` (``status_code`` on the exception or on its ``response``,
-    agent/auxiliary_client.py 3305), the one the host's ladder uses on this path. Never
-    an attribute guessed per provider; where neither finds one, None."""
+    agent/auxiliary_client.py 3305), the one the host's ladder uses on this path; then,
+    for botocore's ``ClientError`` (Bedrock), ``response["ResponseMetadata"]
+    ["HTTPStatusCode"]``: the host reads a ``ClientError`` by its ``response`` mapping
+    itself (``is_streaming_access_denied_error``, agent/bedrock_adapter.py 303-307 at
+    Hermes c6e0f2498e; the files above are unchanged there since 1b57acf94a), and
+    neither helper reads it (orchestrator ruling on 78c2cbf). Never an attribute guessed
+    per provider; where none finds one, None."""
     for module_name, helper in (("agent.error_classifier", "_extract_status_code"),
                                 ("agent.auxiliary_client", "_exc_http_status")):
         try:
@@ -291,6 +296,16 @@ def _host_status(exc: BaseException) -> Optional[int]:
             status = getattr(module, helper)(exc)
         except Exception:
             continue
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    try:
+        from botocore.exceptions import ClientError  # type: ignore
+    except ImportError:
+        return None
+    if isinstance(exc, ClientError):
+        response = getattr(exc, "response", None) or {}
+        metadata = response.get("ResponseMetadata") if isinstance(response, dict) else None
+        status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
         if isinstance(status, int) and not isinstance(status, bool):
             return status
     return None
