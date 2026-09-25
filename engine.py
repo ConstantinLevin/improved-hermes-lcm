@@ -28,10 +28,6 @@ from .engine_registry import (
     _remove_registry_entries_for_engine,
     resolve_active_lcm_engine,  # noqa: F401  (re-exported: hosts import it from .engine)
 )
-from .escalation import (
-    SummaryCircuitBreaker,
-    SummarySpendGuard,
-)
 from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
@@ -206,19 +202,6 @@ class LCMEngine(
         self.emit_automatic_compaction_status = False
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
-        self._summary_circuit_breaker = SummaryCircuitBreaker(
-            failure_threshold=self._config.summary_circuit_breaker_failure_threshold,
-            cooldown_seconds=self._config.summary_circuit_breaker_cooldown_seconds,
-        )
-        # Summary spend guard: process-local sliding window so a loop that
-        # keeps succeeding cannot burn auxiliary-model budget without bound. When
-        # tripped, escalation falls back to deterministic L3 truncation. Set
-        # summary_spend_max_calls=0 to disable.
-        self._summary_spend_guard = SummarySpendGuard(
-            max_calls=int(self._config.summary_spend_max_calls),
-            window_seconds=float(self._config.summary_spend_window_seconds),
-            backoff_seconds=float(self._config.summary_spend_backoff_seconds),
-        )
         self._last_overflow_recovery_failed = False
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""

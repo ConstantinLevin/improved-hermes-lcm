@@ -10,10 +10,6 @@ except Exception:  # pragma: no cover - optional fallback for minimal installs
     yaml = None
 
 
-def _parse_pattern_list(raw: str) -> list[str]:
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
 def _parse_int_env(key: str, default: int) -> int:
     raw = os.environ.get(key)
     if raw is None:
@@ -232,17 +228,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
-    _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
-    _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
     _EnvFieldSpec("summary_model", "LCM_SUMMARY_MODEL", str),
-    _EnvFieldSpec("summary_circuit_breaker_failure_threshold", "LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", int),
-    _EnvFieldSpec("summary_circuit_breaker_cooldown_seconds", "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", int),
-    _EnvFieldSpec("summary_spend_max_calls", "LCM_SUMMARY_SPEND_MAX_CALLS", int),
-    _EnvFieldSpec("summary_spend_window_seconds", "LCM_SUMMARY_SPEND_WINDOW_SECONDS", float),
-    _EnvFieldSpec("summary_spend_backoff_seconds", "LCM_SUMMARY_SPEND_BACKOFF_SECONDS", float),
     _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
     _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
     _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
@@ -264,9 +253,6 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fresh_tail_max_tokens",
     "leaf_chunk_tokens",
     "context_threshold",
-    "summary_spend_max_calls",
-    "summary_spend_window_seconds",
-    "summary_spend_backoff_seconds",
     "summary_timeout_ms",
 })
 
@@ -290,12 +276,6 @@ class LCMConfig:
     # threshold overrides remain authoritative.
     codex_gpt55_autoraise_enabled: bool = True
 
-    # -- Escalation ---
-    # L2 bullet budget as fraction of L1
-    l2_budget_ratio: float = 0.50
-    # L3 deterministic truncate token limit
-    l3_truncate_tokens: int = 512
-
     # -- Assembly guardrails ---
     # Hard cap for the assembled active context (0 = disabled)
     max_assembly_tokens: int = 0
@@ -309,19 +289,6 @@ class LCMConfig:
 
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
-    # Optional fallback summary models tried after summary_model/task default.
-    summary_fallback_models: list[str] = field(default_factory=list)
-    # Consecutive failed summary calls before a route is skipped temporarily.
-    summary_circuit_breaker_failure_threshold: int = 2
-    # Seconds to skip an open summary route before allowing a retry.
-    summary_circuit_breaker_cooldown_seconds: int = 300
-    # Sliding-window cap for paid/auxiliary summarizer calls before falling
-    # back to deterministic L3 truncation. 0 disables the spend guard.
-    summary_spend_max_calls: int = 24
-    # Window, in seconds, over which summary spend calls are counted.
-    summary_spend_window_seconds: float = 600.0
-    # Backoff, in seconds, after the spend window is exhausted.
-    summary_spend_backoff_seconds: float = 1800.0
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
     # Serialized summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
@@ -380,21 +347,6 @@ class LCMConfig:
             c.codex_gpt55_autoraise_enabled
         )
         _record("codex_gpt55_autoraise_enabled", source)
-        c.summary_spend_max_calls, source, warning = _parse_int_env_with_source(
-            "LCM_SUMMARY_SPEND_MAX_CALLS",
-            c.summary_spend_max_calls,
-        )
-        _record("summary_spend_max_calls", source, warning)
-        c.summary_spend_window_seconds, source, warning = _parse_float_env_with_source(
-            "LCM_SUMMARY_SPEND_WINDOW_SECONDS",
-            c.summary_spend_window_seconds,
-        )
-        _record("summary_spend_window_seconds", source, warning)
-        c.summary_spend_backoff_seconds, source, warning = _parse_float_env_with_source(
-            "LCM_SUMMARY_SPEND_BACKOFF_SECONDS",
-            c.summary_spend_backoff_seconds,
-        )
-        _record("summary_spend_backoff_seconds", source, warning)
         summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
             c.summary_timeout_ms
         )
@@ -411,10 +363,6 @@ class LCMConfig:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
-
-        raw_summary_fallback_models = os.environ.get("LCM_SUMMARY_FALLBACK_MODELS")
-        if raw_summary_fallback_models is not None:
-            c.summary_fallback_models = _parse_pattern_list(raw_summary_fallback_models)
 
         c.config_sources = config_sources
         c.config_source_warnings = config_source_warnings
