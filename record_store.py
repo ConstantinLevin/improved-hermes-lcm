@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import queue
 import sqlite3
 import threading
 import time
@@ -142,6 +143,9 @@ class RecordStore:
         # joins the outer transaction (the planning transaction, ``planning``).
         self._tx_depth = 0
         self._pending_events: list[tuple] = []
+        # Events handed over by a thread that must not wait on ``_lock`` (``event_deferred``):
+        # taken into ``_pending_events`` under the lock by the next flush.
+        self._deferred_events: queue.SimpleQueue = queue.SimpleQueue()
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
@@ -157,8 +161,10 @@ class RecordStore:
 
     def close(self, reason: str = "closed") -> None:
         """Close the connection once any statement or transaction of this helper on
-        another thread has finished (the helper's lock). Later use raises."""
+        another thread has finished (the helper's lock). Later use raises. Events still
+        pending, deferred ones included, are written first."""
         with self._lock:
+            self._flush_events()
             self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the record")
 
     @contextlib.contextmanager
@@ -250,10 +256,42 @@ class RecordStore:
             self._pending_events.append((time.time(), kind, session, compaction, text))
             self._flush_events()
 
+    def event_deferred(
+        self,
+        kind: str,
+        *,
+        session: Optional[str] = None,
+        compaction: Optional[int] = None,
+        detail: Any = None,
+    ) -> None:
+        """``event`` for a thread that must not wait on this helper's lock or on the
+        store's write lock, such as a host hook under the host's timeout. It logs the
+        event at once, hands it over through a queue that never blocks, and writes it
+        on a thread of its own; a transaction that commits first, or ``close``, writes
+        it too. It never raises."""
+        text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
+        logger.warning("LCM store event %s (session=%s compaction=%s): %s", kind, session, compaction, text)
+        self._deferred_events.put((time.time(), kind, session, compaction, text))
+        try:
+            threading.Thread(target=self._flush_events, name="lcm-event-writer", daemon=True).start()
+        except Exception:
+            logger.error("LCM could not start the writer for store event %s; it is written with the next "
+                         "transaction that commits", kind, exc_info=True)
+
+    def _take_deferred_events(self) -> None:
+        """Move the events handed over by ``event_deferred`` into the pending ones (under
+        ``_lock``)."""
+        while True:
+            try:
+                self._pending_events.append(self._deferred_events.get_nowait())
+            except queue.Empty:
+                return
+
     def _flush_events(self) -> None:
         """Write the events not written yet, in their own short transaction; inside an
         open transaction they wait for its end (``_tx`` flushes after its commit)."""
         with self._lock:
+            self._take_deferred_events()
             if not self._pending_events or self._conn is None or self._tx_depth:
                 return
             conn = self._conn

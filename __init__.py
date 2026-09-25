@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 def _instruction_not_delivered(engine, why: str) -> None:
     """The instruction cannot reach the agent: an error in the log and a store event,
-    which the doctor lists (#16). Compaction goes on; its summaries hedge themselves."""
+    which the doctor lists (#16). Compaction goes on, and the agent then works without the
+    instruction; the error and the event are the record of that."""
     logger.error("LCM cannot deliver its instruction to the agent: %s", why)
     try:
         engine._records.event("instruction_not_delivered", detail=why)
@@ -41,8 +42,7 @@ def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> "_Instructi
     renders the prompt: it returns the instruction only for a session this plugin's
     engine serves, found in the engine registry by the host's session id, and "" (which
     the host skips) for any other, so that an agent whose context engine is not LCM is
-    told nothing about LCM's summaries. Each render that returns the text is noted on the
-    engine copy it was returned for, which the delivery check reads."""
+    told nothing about LCM's summaries."""
     from .guidance import SECTION_ID, SKILLS, HostSections, InstructionRefused, instruction_text
 
     instruction = _Instruction()
@@ -59,7 +59,6 @@ def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> "_Instructi
                 active = resolve_active_lcm_engine(session_id=session_id) if session_id else None
                 if active is None or getattr(active, "name", None) != "lcm":
                     return ""
-                active._instruction_rendered = getattr(active, "_instruction_rendered", 0) + 1
                 return text
 
             register_section(SECTION_ID, _section, position="after_memory", max_chars=host.max_chars)
@@ -85,7 +84,13 @@ def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> "_Instructi
 
 def _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload) -> None:
     """The request's system prompt carries the plugin's section, for a session an LCM
-    engine serves; checked once per distinct prompt (#16). Never raises into the host."""
+    engine serves; checked once per distinct prompt (#16). Never raises into the host.
+
+    It runs on the host's hook thread, under the host's timeout for ``pre_api_request``,
+    so nothing in it waits on the store: the registry lookup holds the registry's lock
+    for a dictionary read, the check holds its own lock for a set lookup, and the event
+    is handed to ``RecordStore.event_deferred``, which queues it and writes it on a
+    thread of its own."""
     from .guidance import check_delivery
 
     session_id = str(payload.get("session_id") or "")
@@ -95,9 +100,9 @@ def _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload
 
     def _record(kind, detail):
         try:
-            active._records.event(kind, detail=detail)
+            active._records.event_deferred(kind, detail=detail)
         except Exception:
-            logger.debug("LCM could not record %s", kind, exc_info=True)
+            logger.error("LCM could not hand over the store event %s: %s", kind, detail, exc_info=True)
 
     try:
         check_delivery(active, payload.get("system_prompt"), host_session_id=session_id, text=instruction.text,
