@@ -245,14 +245,14 @@ class CompactionMixin:
         chunk_messages: List[Dict[str, Any]],
         *,
         focus_topic: Optional[str],
-        store_ids: List[int],
+        record_handles: List[str],
         settings: CallSettings,
     ) -> tuple[str, int, int, str]:
         """One chunk's summary: (text, level, budget, finish_reason), or
         ``SummaryFailure`` (#7), with the summariser's route and effort (#9).
 
-        The chunk's records are serialised as today (``_serialize_messages``, until #8).
-        The budget is a target in the prompt text, never an output limit. A wait
+        The summariser reads the chunk's records as the messages they were, whole
+        (#8, ``summariser_input``). The budget is a target in the prompt text, never an output limit. A wait
         between retries stops at once when the attempt is cancelled or superseded.
         """
         source_tokens = count_messages_tokens(chunk_messages)
@@ -269,19 +269,17 @@ class CompactionMixin:
                     return
                 time.sleep(min(_WAIT_SLICE_S, left))
 
+        facts = lookup_model(settings.route.model)
         text, level, finish_reason = summarize_chunk(
-            self._serialize_messages(chunk_messages),
+            list(zip(record_handles, chunk_messages)),
             budget,
             source_tokens=source_tokens,
             settings=settings,
+            # Images go in only where the model table says the summariser reads them.
+            reads_images=bool(facts is not None and facts.reads_images),
             depth=0,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
-            source_provenance={
-                "source_type": "messages",
-                "store_ids": store_ids,
-                "message_count": len(chunk_messages),
-            },
             wait=wait,
         )
         return text, level, budget, finish_reason
@@ -462,7 +460,7 @@ class CompactionMixin:
                 text, level, budget, finish_reason = self._summarize_chunk(
                     chunk_messages,
                     focus_topic=focus_topic,
-                    store_ids=[facts[record][3] for record in records],
+                    record_handles=records,
                     settings=settings,
                 )
             except Exception as exc:
