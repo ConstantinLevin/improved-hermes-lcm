@@ -32,12 +32,15 @@ logger = logging.getLogger(__name__)
 # doctor's invariant check reads by (chunks by session, rejections by compaction),
 # so that a store without them is never opened. Format 6 stores beside a record's
 # estimate how many of its images the estimate left uncounted
-# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 7
-# records which chunks' calls were dispatched and which failed (``chunk_dispatches``,
-# ``chunk_failures``), for the frozen cut on a retry and the chunk that keeps failing
-# (#33 D14, #7). A store of an earlier format is refused and begun again (#29 W8: a
-# change of format wipes the store).
-STORE_FORMAT = "ihl-store/7"
+# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 8
+# records which chunks' calls the host dispatched (``chunk_dispatches``) and each
+# failure with its kind (``chunk_failures``), both insert-only, for the frozen cut on a
+# retry and the chunk that keeps failing (#33 D14, #7). Format 7 had these tables
+# without the kind and without their triggers, and was written only by unmerged
+# commits of #61; opening runs no DDL, so it gets its own name and is refused. A store
+# of an earlier format is refused and begun again (#29 W8: a change of format wipes the
+# store).
+STORE_FORMAT = "ihl-store/8"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -256,6 +259,8 @@ INSERT_ONLY_TABLES = (
     "compaction_inputs",
     "chunks",
     "chunk_members",
+    "chunk_dispatches",
+    "chunk_failures",
     "derivations",
     "derivation_sources",
     "compaction_returns",
@@ -372,19 +377,21 @@ CREATE TABLE chunk_members (
 );
 CREATE INDEX idx_chunk_members_record ON chunk_members(record, ordinal);
 
--- A chunk's summariser call reached the provider (#33 D14): a retry keeps such a
--- chunk, found by its members, and never cuts it again.
+-- The host dispatched a request of a chunk's summariser call to the provider (its
+-- dispatch stamp, #33 D14): a retry keeps such a chunk, found by its members.
 CREATE TABLE chunk_dispatches (
     chunk TEXT NOT NULL REFERENCES chunks(handle),
     at REAL NOT NULL
 );
 CREATE INDEX idx_chunk_dispatches_chunk ON chunk_dispatches(chunk);
 
--- A chunk's call failed (#7): three consecutive attempts of the same members make
--- the chunk that keeps failing.
+-- A chunk's call failed, with the failure's kind (#7; ruling on #61, 2): the chunk's
+-- own failures (reply, request) in three consecutive attempts of the same members
+-- make the chunk that keeps failing; route, endpoint and other failures do not count.
 CREATE TABLE chunk_failures (
     chunk TEXT NOT NULL REFERENCES chunks(handle),
     at REAL NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('reply', 'request', 'route', 'endpoint', 'other')),
     error TEXT NOT NULL
 );
 CREATE INDEX idx_chunk_failures_chunk ON chunk_failures(chunk);

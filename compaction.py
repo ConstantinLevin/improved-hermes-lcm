@@ -25,19 +25,29 @@ In order:
 3. The material is cut into chunks of the size c (#31, #12), in list order and only
    between groups: a tool call and its results stay in one chunk. A group larger than
    c is a chunk of its own; between such groups, each run of material B is split
-   equally into ceil(B / c) chunks, cut at the group boundaries nearest k·B/n, never
-   a chunk above c. A run smaller than c/4 does not stand alone: it joins the chunk
-   of the adjacent oversized group. c is 50k provider tokens, cut in the plugin's
-   estimate (characters / 4) as 50k / 1.51, #31's p50 of the provider's count over
-   that estimate (``_chunk_limit``). On a retry after an unconfirmed attempt the cut
-   is frozen (#33 D14, #31): that attempt's chunks, found by their members' ``_row_id``s,
-   are kept where they were summarised (with their summary) or dispatched (retried as
-   the same chunk); a kept chunk wins over the tail's start, and one that reaches the
-   floor stays whole in the tail. Only the rest is split as above. A kept chunk is
-   frozen: nothing joins it, and a summarised one is never summarised again. A rest
-   below c/4 whose only neighbours are kept chunks waits in the tail where the tail
-   can take it within t, else stands alone. The compaction, its inputs, the new
-   records and every chunk are written before the first summariser call.
+   equally into ceil(B / c) chunks, cut at the group boundaries nearest k·B/n. No
+   chunk below c/4 is ever cut (ruling on #61, 1): a part of the split that small
+   merges into its smaller neighbour, which then exceeds c by the small parts it
+   absorbs, each below c/4, so it stays under 1.5c; a run
+   below c/4 joins the chunk of an adjacent oversized group, or, at the end of the
+   material, stays raw and the tail begins at it. c is 50k provider tokens, cut in
+   the plugin's estimate (characters / 4) as 50k / 1.51, #31's p50 of the provider's
+   count over that estimate (``_chunk_limit``). On a retry after an unconfirmed
+   attempt the cut is frozen (#33 D14, #31): that attempt's chunks, found by their
+   members' ``_row_id``s, are kept where they were summarised (with their summary) or
+   dispatched (retried as the same chunk); a kept chunk wins over the tail's start,
+   and one that reaches the floor stays whole in the tail. Only the rest is split as
+   above. A kept chunk is frozen, and a summarised one is never summarised again; the
+   one exception is a run below c/4 standing before or between kept chunks, which
+   joins one of them (D1), with an event each time: the join recurs where the joined
+   chunk is never dispatched. A chunk not found again, a dispatched one below c/4 by
+   today's estimate, and one with members that came without a host id (the gateway,
+   ask A1) are cut again, visibly: a warning and a store event. When only a rest below
+   c/4 stands outside the tail, nothing is compacted (a no-op, not a failure); where
+   such a rest would begin before the plugin's last summary (D3's shape), the
+   compaction is aborted, unchanged, with an event. The compaction,
+   its inputs, the new records and every chunk are written before the first
+   summariser call.
 4. Each chunk is summarised from its records as the store holds them. Every chunk's
    call is issued at once, on daemon workers of the plugin's own, through one limiter
    per endpoint and process; a call for the same records already in flight is joined,
@@ -47,10 +57,13 @@ In order:
    attempt is cancelled or superseded. A summary that cannot be written
    (``escalation.SummaryFailure``: no third level, nothing truncated) fails the
    compaction as a whole: the context stays as it was, and the host shows the cause.
-   A call's first dispatch and a chunk's failure are recorded in the store; a chunk
-   of the same members failing in three consecutive attempts is the chunk that keeps
-   failing (#7): a ``chunk_keeps_failing`` event and a cause that name it, and the
-   next occasion still retries it.
+   The host's dispatch of a call is recorded when the host stamps it (handed to the
+   provider's client); each failure of a call is recorded once, with its kind, and
+   judged where it is recorded, whether or not an attempt still waits for it. A chunk of the same members failing by its own fault (its
+   reply rejected, or its request rejected by the provider) in three consecutive
+   attempts is the chunk that keeps failing (#7): a ``chunk_keeps_failing`` event and
+   a cause that name it, and the next occasion still retries it. The endpoint's,
+   the route's and other failures are shown as such and do not count.
 5. The return is emitted from the record: the host's system row in place, then the
    cover (the previous return's summaries, each re-emitted from its derivation, then
    the new ones in chunk order), then the tail as the host's own dicts. It is
@@ -71,6 +84,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .escalation import (
+    OWN_FAILURE_KINDS,
     REASONING_EFFORTS,
     CallPath,
     CallSettings,
@@ -152,14 +166,26 @@ class Occasion:
 class TailPlan:
     """Where the tail begins and how it was sized (``_tail_plan``); with the chunks of
     an earlier attempt the cut keeps (``kept``) and those that reach the floor and stay
-    whole in the tail (``held``), each as (``FrozenChunk``, positions); and ``room``,
-    what a rest that waits may add to the tail by the estimate: up to t plus c/4."""
+    whole in the tail (``held``), each as (``FrozenChunk``, positions); and those it
+    does not keep after all (``recut``), each as (``FrozenChunk``, why)."""
 
     start: int
     label: str
     kept: List[tuple] = field(default_factory=list)
     held: List[tuple] = field(default_factory=list)
-    room: int = 0
+    recut: List[tuple] = field(default_factory=list)
+
+
+@dataclass
+class FrozenCandidates:
+    """The earlier attempts' chunks found in this list (``found``, each as
+    (``FrozenChunk``, positions)), those not found (``recut``, each as
+    (``FrozenChunk``, why)), and the chunks that carry a member without a host id
+    (``unidentified``, each as (chunk, attempt); ruling 3 on #61)."""
+
+    found: List[tuple] = field(default_factory=list)
+    recut: List[tuple] = field(default_factory=list)
+    unidentified: List[tuple] = field(default_factory=list)
 
 
 def _is_steer(message: Any) -> bool:
@@ -233,12 +259,51 @@ def _fewest_chunks(sizes: List[int], limit: int) -> int:
     return count
 
 
+def _smallest_for(limit: int) -> int:
+    """c/4 for a chunk size c: the smallest run that stands alone (#31). Counts are
+    whole tokens, so it is rounded up: a run of 8,278 is below 33,113 / 4 = 8,278.25.
+    One value for the cut, the preflight and the gateway's probe (ruling on #61, 1)."""
+    return max(1, math.ceil(limit * _SMALLEST_STANDALONE_RUN))
+
+
 def _split_run(sizes: List[int], limit: int) -> List[int]:
     """The equal split of one run of groups, each at most ``limit`` (#31): n chunks,
     n = ceil(B / limit), or more where the groups cannot be packed into that many
     without a chunk above ``limit``; each cut at the group boundary nearest k·B/n
     that keeps every chunk within ``limit`` and leaves a rest the remaining chunks
-    can hold. Returns the group index at which each chunk after the first begins."""
+    can hold. Returns the group index at which each chunk after the first begins.
+
+    No part is below c/4 (ruling on #61, 1): a chunk that small cannot have a shorter
+    summary and fails on every attempt. Where the groups leave no other way, as
+    [c, 1, c], such a part merges into its smaller neighbour (the following one on a
+    tie). That chunk is above ``limit`` by the small parts it absorbs, each below
+    c/4, one on either side at most, as [c/4 − 1, c, c/4 − 1] shows: so it stays
+    under 1.5c. This amends #12's "never above c" (orchestrator ruling on #61); the
+    check against the summariser's window after the cut still guards that it can be
+    read. The equal cut always finds a boundary: n is at least the fewest chunks
+    that cover the run, and every group of a run is at most ``limit``."""
+    cuts = _equal_cuts(sizes, limit)
+    if not cuts:
+        return cuts
+    smallest = _smallest_for(limit)
+    starts = [0] + cuts + [len(sizes)]
+    while len(starts) > 2:
+        weights = [sum(sizes[a:b]) for a, b in zip(starts, starts[1:])]
+        small = next((i for i, weight in enumerate(weights) if weight < smallest), None)
+        if small is None:
+            break
+        if small == 0:
+            merge_with = 1
+        elif small == len(weights) - 1:
+            merge_with = small - 1
+        else:
+            merge_with = small + 1 if weights[small + 1] <= weights[small - 1] else small - 1
+        # Removing the boundary between the part and its neighbour merges them.
+        del starts[max(small, merge_with)]
+    return starts[1:-1]
+
+
+def _equal_cuts(sizes: List[int], limit: int) -> List[int]:
     total = sum(sizes)
     if total <= limit:
         return []
@@ -307,15 +372,11 @@ class CompactionMixin:
         threshold = self._tau(raised=occasion.raised)
         provider_rough, rough_label = self._provider_estimate(rough)
         if provider_rough >= threshold:
-            mechanism = self._mechanism_positions(messages)
             try:
-                tail_start = self._tail_start(messages, mechanism, occasion)
+                material = self._material_outside_tail(messages, occasion)
             except ToolPairingError:
                 # compress() records the error and shows it; the preflight asks for it.
                 return self._mark_preflight_compression_requested()
-            material = self._estimator().messages(
-                [messages[index] for index in range(tail_start) if index not in mechanism]
-            )
             smallest = self._smallest_run()
             if material.tokens >= smallest:
                 return self._mark_preflight_compression_requested()
@@ -329,6 +390,32 @@ class CompactionMixin:
             logger.debug("LCM preflight: %s is below %s %d (%s)", rough_label,
                          "τ′" if occasion.raised else "τ", threshold, occasion.why)
         return False
+
+    def _material_outside_tail(self, messages: List[Dict[str, Any]], occasion: Occasion):
+        """The estimate of what stands outside the fresh tail and the mechanism's layer,
+        with the frozen cut, found by id only; nothing is written."""
+        mechanism = self._mechanism_positions(messages)
+        tail_start = self._tail_start(messages, mechanism, occasion)
+        return self._estimator().messages([messages[index] for index in range(tail_start) if index not in mechanism])
+
+    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        """The host's probe before the gateway's /compress (``ContextEngine``,
+        agent/context_engine.py 176; asked only on ``skip_without_window``,
+        agent/conversation_compression_manual.py 104-106): False makes the host say
+        "Nothing to compress yet." without calling ``compress()``. False only where
+        something stands outside the fresh tail and all of it is below c/4, which
+        ``compress()`` leaves raw (ruling on #61, 1); where nothing stands outside it,
+        ``compress()`` says why itself. Nothing is written."""
+        if self._geometry is None or not messages:
+            return True
+        try:
+            material = self._material_outside_tail(messages, self._classify_occasion(messages, force=True))
+        except ToolPairingError:
+            return True   # compress() records the error and shows it
+        except Exception:
+            logger.warning("LCM could not tell whether there is anything to compact", exc_info=True)
+            return True
+        return not (0 < material.tokens < self._smallest_run())
 
     def _classify_occasion(self, messages: List[Dict[str, Any]], *, force: bool) -> Occasion:
         """The occasion by the hooks and the list's structure, where both agree (#32
@@ -399,10 +486,9 @@ class CompactionMixin:
         return max(1, int(config.chunk_tokens / config.estimate_ratio))
 
     def _smallest_run(self) -> int:
-        """c/4 in the estimate's unit: the smallest run that stands alone (#31). Counts
-        are whole tokens, so the minimum is rounded up: a run of 8,278 is below
-        33,113 / 4 = 8,278.25."""
-        return max(1, math.ceil(self._chunk_limit() * _SMALLEST_STANDALONE_RUN))
+        """c/4 in the estimate's unit: the smallest run that stands alone (#31), the
+        same value the cut uses (``_smallest_for``)."""
+        return _smallest_for(self._chunk_limit())
 
     def _chunk_label(self) -> str:
         config = self._config
@@ -453,36 +539,38 @@ class CompactionMixin:
         return hypothesis, f"F {hypothesis} (a hypothesis until a response measures it, R10)"
 
     def _frozen_candidates(self, messages: List[Dict[str, Any]],
-                           records: Optional[Dict[int, str]] = None) -> List[tuple]:
+                           records: Optional[Dict[int, str]] = None) -> FrozenCandidates:
         """The chunks of the session's unconfirmed attempts a retry keeps (#33 D14),
         found in this list by their members' ``_row_id``s, as (``FrozenChunk``, the
         members' positions). A chunk is found only where every member stands in the
         list, in its order; with ``records`` (the classification's position -> record
         for rows the store already holds) each position must hold that very record,
         so that a row the host rewrote since makes a different chunk. Where no id
-        matches, as after a commit by another path, nothing is kept."""
+        matches, as after a commit by another path, nothing is kept. A chunk that is
+        not found, and one whose members came without a host id, are re-cut: the
+        caller says so visibly (ruling 3 on #61). Nothing is matched by content."""
+        result = FrozenCandidates()
         if not self._plugin_session:
-            return []
+            return result
         store = self._records
-        frozen = store.frozen_chunks(self._plugin_session, store.effective_compaction(self._plugin_session))
+        frozen, result.unidentified = store.frozen_chunks(
+            self._plugin_session, store.effective_compaction(self._plugin_session))
         if not frozen:
-            return []
+            return result
         position_of = {message["_row_id"]: index for index, message in enumerate(messages)
                        if isinstance(message, dict) and isinstance(message.get("_row_id"), int)}
-        found: List[tuple] = []
         for chunk in frozen:
-            positions = [position_of.get(row_id) if row_id is not None else None for _record, row_id in chunk.members]
-            if any(position is None for position in positions) or positions != sorted(positions):
-                logger.info("LCM does not find the %s chunk %s of attempt %d in this list: its members' ids do not "
-                            "all stand in it, in order; its rows are cut as new material", chunk.state, chunk.chunk,
-                            chunk.compaction)
-                continue
-            if records is not None and any(records.get(p) != r for p, r in zip(positions, chunk.records)):
-                logger.info("LCM does not keep the %s chunk %s of attempt %d: a member row was rewritten since",
-                            chunk.state, chunk.chunk, chunk.compaction)
-                continue
-            found.append((chunk, positions))
-        return sorted(found, key=lambda item: item[1][0])
+            positions = [position_of.get(row_id) for _record, row_id in chunk.members]
+            if any(position is None for position in positions):
+                result.recut.append((chunk, "a member's host id is not in this list"))
+            elif positions != sorted(positions):
+                result.recut.append((chunk, "its members' ids stand in this list out of order"))
+            elif records is not None and any(records.get(p) != r for p, r in zip(positions, chunk.records)):
+                result.recut.append((chunk, "a member row was rewritten since"))
+            else:
+                result.found.append((chunk, positions))
+        result.found.sort(key=lambda item: item[1][0])
+        return result
 
     def _tail_plan(self, messages: List[Dict[str, Any]], mechanism: set,
                    occasion: Optional[Occasion] = None, frozen: Sequence[tuple] = ()) -> "TailPlan":
@@ -513,7 +601,13 @@ class CompactionMixin:
         the mechanism's layer are kept. Where the tail would begin before the end of a
         kept chunk, the kept chunk wins and the tail begins after it. A kept chunk that
         reaches the floor is never cut: it stays whole in the tail this time (``held``),
-        and the tail begins at it."""
+        and the tail begins at it. A dispatched candidate below c/4 by today's estimate
+        (the same records give the same estimate, so only where c or the estimate's
+        ratio changed since it was cut) is not kept: no chunk below c/4 is ever
+        dispatched, however it arises (ruling on #61, 1), so its rows are cut again
+        (``recut``), which departs from D14's "a dispatched chunk is never re-cut". A
+        summarised one is kept whatever its size: it is not dispatched again, its
+        summary is reused."""
         check_tool_pairing(messages)
         first = max(mechanism) + 1 if mechanism else 0
         outside = [i for i in range(len(messages)) if i not in mechanism]
@@ -548,16 +642,21 @@ class CompactionMixin:
         mechanism_set = set(mechanism)
         kept: List[tuple] = []
         held: List[tuple] = []
+        recut: List[tuple] = []
         claimed: set = set()
+        smallest = self._smallest_run()
         for chunk, positions in frozen:
             low, high = positions[0], positions[-1]
             whole = (low >= first and low in group_of and group_of[low][0] == low and high in group_of
                      and group_of[high][-1] == high
                      and positions == [i for i in range(low, high + 1) if i not in mechanism_set])
             if not whole or claimed.intersection(positions):
-                logger.info("LCM does not keep the %s chunk %s: its members are no longer whole groups over "
-                            "consecutive entries of this list; its rows are cut as new material",
-                            chunk.state, chunk.chunk)
+                recut.append((chunk, "its members are no longer whole groups over consecutive entries of this list"))
+                continue
+            weight = sum(sizes[i] for i in positions)
+            if weight < smallest and chunk.state != "summarised":
+                recut.append((chunk, f"it holds {weight} tokens by today's estimate, below c/4 = {smallest}, and "
+                                     f"has no summary: it would be dispatched again"))
                 continue
             claimed.update(positions)
             (kept if high < floor else held).append((chunk, positions))
@@ -575,17 +674,16 @@ class CompactionMixin:
         if held:
             label += (f"; {len(held)} kept chunk{'' if len(held) == 1 else 's'} reach{'es' if len(held) == 1 else ''} "
                       f"the floor at {floor} and stay whole in the tail")
-        # What a rest that waits may add (ruling on #61): the tail flexes by at most c/4
-        # beyond t, so the context lands at most that rest's share above G.
-        room = max(0, int(t + self._smallest_run() - used))
-        return TailPlan(start, label, kept=kept, held=held, room=room)
+        return TailPlan(start, label, kept=kept, held=held, recut=recut)
 
     def _tail_start(self, messages: List[Dict[str, Any]], mechanism: set,
                     occasion: Optional[Occasion] = None) -> int:
-        """The tail's start for the preflight's estimate, the frozen cut included; the
-        members are found by id only (the preflight classifies nothing)."""
+        """The tail's start for an estimate that writes nothing (the preflight, the
+        gateway's probe), the frozen cut included; the members are found by id only
+        (nothing is classified here), and what is re-cut is recorded only by
+        ``compress()``."""
         try:
-            frozen = self._frozen_candidates(messages)
+            frozen = self._frozen_candidates(messages).found
         except Exception:
             logger.warning("LCM preflight could not read the earlier attempts' chunks", exc_info=True)
             frozen = []
@@ -750,7 +848,7 @@ class CompactionMixin:
                 focus_topic=focus_topic or "",
                 custom_instructions=custom_instructions,
                 path=CallPath(wait=call.wait, dispatch=call.dispatch, hold=call.limiter.hold,
-                              deadline=call.deadline),
+                              deadline=call.deadline, sent=call.sent),
             )
             return ChunkSummary(text=text, level=level, budget=budget, finish_reason=finish_reason,
                                 model=route.model, provider=route.provenance_provider(), effort=settings.effort)
@@ -766,32 +864,62 @@ class CompactionMixin:
         except (TypeError, ValueError):
             return DEFAULT_CALLS_PER_ENDPOINT
 
-    def _keeps_failing(self, attempt, chunk_handle: str, positions: List[int], why: str) -> Optional[str]:
-        """The chunk that keeps failing (#7, #33): where a chunk of exactly these
-        members failed in ``_KEEPS_FAILING_ATTEMPTS`` consecutive attempts, this one
-        included, a store event names it and the cause the host shows says so. Nothing
-        else changes: the next occasion retries it as the same chunk."""
-        records = [attempt.records[index] for index in positions]
-        try:
-            streak = self._records.failure_streak(attempt.session, records)
-        except Exception:
-            logger.warning("LCM could not count the failures of chunk %s", chunk_handle, exc_info=True)
-            return None
-        if streak < _KEEPS_FAILING_ATTEMPTS:
-            return None
-        self._record_event(attempt, "chunk_keeps_failing",
-                           {"chunk": chunk_handle, "members": len(records), "first_record": records[0],
-                            "last_record": records[-1], "attempts": streak, "error": why})
-        return (f"chunk {chunk_handle} ({len(records)} messages, records {records[0]} to {records[-1]}) failed in "
-                f"{streak} consecutive attempts, the last with: {why}. A chunk that keeps failing is a defect to "
-                f"debug (#7); the next occasion retries it as the same chunk")
+    def _judge_failure(self, attempt, chunk_handle: str, number: int, total: int, records: List[str],
+                       unidentified: bool, failure: str, kind: str, record: bool = True) -> str:
+        """Record a chunk's failure with its kind and say what the host shows for it,
+        where the failure is recorded, whether or not an attempt still waits for it
+        (ruling on #61, 4). A call several attempts joined is one trial of the chunk:
+        only the subscriber that ``record``s writes its failure and the events; the
+        others read the streak it left and name the chunk the same way.
 
-    def _deliver_for(self, attempt, chunk_handle: str, number: int, total: int):
+        Only the chunk's own failures count (ruling on #61, 2): a reply the checks
+        rejected, or a request the provider rejected. Where a chunk of exactly these
+        members failed by its own fault in ``_KEEPS_FAILING_ATTEMPTS`` consecutive
+        attempts, this one included, the chunk keeps failing (#7, #33): a store event
+        names it, and so does the cause. Where a member came without a host id (ruling
+        3 on #61, ask A1), the chunk's records are new at every attempt and its
+        earlier failures cannot be counted: each own failure of it is named. Nothing
+        else changes: the next occasion retries it."""
+        name = (f"chunk {chunk_handle} ({len(records)} message{'' if len(records) == 1 else 's'}, records "
+                f"{records[0]} to {records[-1]})" if records else f"chunk {chunk_handle}")
+        try:
+            if record:
+                streak = self._records.chunk_failed(chunk_handle, failure, kind=kind, session=attempt.session,
+                                                    records=records)
+            else:
+                streak = self._records.failure_streak(attempt.session, records)
+        except Exception as exc:
+            logger.warning("LCM could not %s the failure of chunk %d of %d (%s: %s)",
+                           "record" if record else "count", number, total, type(exc).__name__, exc)
+            streak = None
+        if kind not in OWN_FAILURE_KINDS:
+            whose = {"route": "another route answered or was resolved (#33 D9)",
+                     "endpoint": "the endpoint failed"}.get(kind, "a failure of no kind known as the chunk's own")
+            return (f"the summary of {name}, {number} of {total}, failed ({failure}): {whose}, which does not "
+                    f"count toward the chunk's own failures")
+        detail = {"chunk": chunk_handle, "members": len(records), "first_record": records[0] if records else None,
+                  "last_record": records[-1] if records else None, "error": failure}
+        if unidentified:
+            if record:
+                self._record_event(attempt, "chunk_failed_unidentified", detail)
+            return (f"{name} failed with: {failure}. Its members came without a host id (the host's list carries "
+                    f"none, ask A1), so whether it failed before cannot be counted")
+        if streak is not None and streak >= _KEEPS_FAILING_ATTEMPTS:
+            if record:
+                self._record_event(attempt, "chunk_keeps_failing", {**detail, "attempts": streak})
+            return (f"{name} failed in {streak} consecutive attempts, the last with: {failure}. A chunk that keeps "
+                    f"failing is a defect to debug (#7); the next occasion retries it as the same chunk")
+        return f"the summary of {name}, {number} of {total}, failed ({failure})"
+
+    def _deliver_for(self, attempt, chunk_handle: str, number: int, total: int, records: List[str],
+                     unidentified: bool):
         """How one attempt's chunk receives its call's outcome, on whichever thread has
         it: the summary is written as a derivation of this chunk (#33 Q17a: not fenced,
-        a fact about the chunk's content); a failure is recorded as a store event."""
+        a fact about the chunk's content); a failure is recorded and judged there
+        (``_judge_failure``), and the cause it gives is the attempt's."""
 
-        def deliver(summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool) -> Outcome:
+        def deliver(summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool,
+                    kind: Optional[str] = None, record: bool = True) -> Outcome:
             if summary is not None:
                 try:
                     derivation = self._write_summary(
@@ -813,14 +941,13 @@ class CompactionMixin:
                 self._record_event(attempt, "summary_call_abandoned",
                                    {"chunk": chunk_handle, "number": number, "reason": failure})
             else:
-                logger.warning("LCM summary of chunk %d of %d failed: %s", number, total, failure)
+                kind = kind or "other"
+                logger.warning("LCM summary of chunk %d of %d failed (%s): %s", number, total, kind, failure)
                 self._record_event(attempt, "summary_failed",
-                                   {"chunk": chunk_handle, "number": number, "error": failure})
-                try:
-                    self._records.chunk_failed(chunk_handle, failure or "")
-                except Exception as exc:
-                    logger.warning("LCM could not record the failure of chunk %d of %d (%s: %s)", number, total,
-                                   type(exc).__name__, exc)
+                                   {"chunk": chunk_handle, "number": number, "kind": kind, "error": failure})
+                cause = self._judge_failure(attempt, chunk_handle, number, total, records, unidentified,
+                                            failure or "", kind, record)
+                return Outcome(failure=failure, cause=cause)
             return Outcome(failure=failure)
 
         return deliver
@@ -869,37 +996,41 @@ class CompactionMixin:
     @classmethod
     def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int,
                     estimator: Optional[Estimator] = None, kept: Sequence[List[int]] = (),
-                    room: int = 0) -> List[List[int]]:
+                    summarised: Sequence[bool] = (),
+                    joins: Optional[List[dict]] = None) -> List[List[int]]:
         """The material cut in list order into chunks, only between groups: a tool
-        call is never separated from its results (#31, #12).
+        call is never separated from its results (#31, #12). No chunk below c/4 is ever
+        cut (ruling on #61, 1): a summary of a chunk that small cannot be shorter than
+        its source, so it would fail on every attempt (#7, ruling on #52).
 
         ``kept`` are the chunks of an earlier attempt the cut keeps (#33 D14), each as
-        its positions, whole groups of the material: each is one chunk with exactly
-        its members, frozen, and only the rest around them is split. Nothing ever joins
-        a kept chunk (orchestrator ruling on #61): a failed chunk is retried as the
-        same chunk, a summarised one is never summarised again.
+        its positions, whole groups of the material, and ``summarised`` says of each
+        whether it has a summary: each is one chunk with exactly its members, frozen,
+        and only the rest around them is split. Nothing joins a kept chunk (ruling on
+        #61), with the one exception below.
 
         A group larger than ``limit`` (c) is a chunk of its own: a chunk flexes by one
         group. The groups between such groups form runs; each run of B tokens is split
         equally (``_split_run``): ceil(B / c) chunks cut at the group boundaries nearest
-        k·B/n, so that no chunk of a first attempt is tiny and none is above c.
+        k·B/n, none below c/4.
 
-        A run smaller than ``limit`` × ``_SMALLEST_STANDALONE_RUN`` (c/4) does not
-        stand alone: it joins the chunk of the adjacent oversized group, the following
-        one where there is one (the work it opened), else the one before it (a run at
-        the end of the material), never jumping over a group, so the chunks stay
-        contiguous. A summary of a tiny chunk cannot be shorter than its source, so a
-        chunk of it alone would fail on every attempt (#7, orchestrator ruling on #52).
-        A run that is the whole material has nothing to join.
-
-        A tiny run whose neighbours are only kept chunks joins none of them. At the end
-        of the material it waits in the tail for more material: the tail flexes by it,
-        at most c/4 beyond t (``room``, by the estimate). Where even that flex cannot
-        take it (the tail already stands above t, as when a kept chunk is held at the
-        floor), the kept chunks alone do not bring the context to the target, and it
-        stands alone as its own chunk. A tiny run elsewhere between kept chunks cannot
-        wait in the tail, and stands alone. The rows that wait are in no chunk: the
-        caller moves the tail's start to the first of them.
+        A run below c/4 (``_smallest_for``) does not stand alone:
+        - it joins the chunk of an adjacent oversized group, the following one where
+          there is one (the work it opened), else the one before it;
+        - else, at the end of the material, alone or after a kept chunk, it stays raw:
+          its rows are in no chunk, and the caller begins the tail at the first of
+          them, so they join material at a later compaction;
+        - else it stands before or between kept chunks, and joins a neighbouring kept
+          chunk that has no summary yet, so that no summary is thrown away, the
+          following one first; where both are summarised, the following one (ruling on
+          #61, D1). Rows arrive only at the end of the list, so such a run is an
+          earlier chunk never dispatched, and falls below c/4 only where c or the
+          estimate changed since it was cut, or the host put rows among kept chunks.
+          The join is recorded in ``joins``, and the caller records an event for it
+          each time: where the joined chunk is never dispatched, the next attempt
+          finds the earlier kept chunk again and the join recurs. The joined chunk has
+          new members, so it is summarised afresh.
+        Never jumping over a chunk, so the chunks stay contiguous.
         """
         groups = cls._groups(messages, material)
         sizes = [sum(count_message_tokens(messages[index], estimator) for index in group) for group in groups]
@@ -934,35 +1065,50 @@ class CompactionMixin:
         if run:
             items.append(("run", run))
 
-        # A tiny run joins the adjacent oversized group's chunk, never a kept one.
-        smallest = limit * _SMALLEST_STANDALONE_RUN
-        attached: Dict[int, tuple] = {}   # item index of an oversized group -> (runs before, runs after)
+        # A tiny run joins an adjacent oversized group's chunk; at the end it stays raw;
+        # before or between kept chunks it joins one of them (D1).
+        smallest = _smallest_for(limit)
+        attached: Dict[int, tuple] = {}   # item index of a chunk it joins -> (runs before, runs after)
         standing: List[bool] = []
+
+        def has_summary(at: int) -> bool:
+            which = kept_of[items[at][1][0]]
+            return bool(summarised[which]) if which < len(summarised) else False
+
         for at, (kind, members) in enumerate(items):
             weight = sum(sizes[g] for g in members)
-            tiny = kind == "run" and len(items) > 1 and weight < smallest
-            if tiny and at + 1 < len(items) and items[at + 1][0] == "oversized":
-                before, after = attached.get(at + 1, ([], []))
-                attached[at + 1] = (before + members, after)
-                standing.append(False)
-            elif tiny and at > 0 and items[at - 1][0] == "oversized":
-                before, after = attached.get(at - 1, ([], []))
-                attached[at - 1] = (before, after + members)
-                standing.append(False)
-            elif tiny and at == len(items) - 1 and weight <= room:
-                standing.append(False)   # waits in the tail
-            else:
+            tiny = kind == "run" and weight < smallest
+            following = items[at + 1][0] if at + 1 < len(items) else None
+            preceding = items[at - 1][0] if at > 0 else None
+            if not tiny:
                 standing.append(True)
+                continue
+            standing.append(False)
+            if following == "oversized":
+                join = at + 1
+            elif preceding == "oversized":
+                join = at - 1
+            elif following is None:
+                continue   # stays raw: the tail begins at it
+            elif preceding == "kept" and has_summary(at + 1) and not has_summary(at - 1):
+                join = at - 1
+            else:
+                join = at + 1
+            before, after = attached.get(join, ([], []))
+            attached[join] = (before + members, after) if join > at else (before, after + members)
+            if items[join][0] == "kept" and joins is not None:
+                joins.append({"kept": [groups[items[join][1][0]][0], groups[items[join][1][-1]][-1]],
+                              "run": [groups[members[0]][0], groups[members[-1]][-1]],
+                              "tokens": weight, "summarised": has_summary(join),
+                              "side": "following" if join > at else "preceding"})
 
         chunks: List[List[int]] = []
         for at, (kind, members) in enumerate(items):
             if not standing[at]:
                 continue
-            if kind == "oversized":
+            if kind in ("oversized", "kept"):
                 before, after = attached.get(at, ([], []))
                 chunk_groups = [before + members + after]
-            elif kind == "kept":
-                chunk_groups = [members]
             else:
                 starts = [0] + _split_run([sizes[g] for g in members], limit) + [len(members)]
                 chunk_groups = [members[a:b] for a, b in zip(starts, starts[1:])]
@@ -1042,7 +1188,8 @@ class CompactionMixin:
         # outside (#13, #31). At the threshold everything outside it is chunked, with no
         # minimum (#11, #12).
         # On a retry the cut is frozen (#33 D14): the earlier attempt's summarised and
-        # dispatched chunks are found by their members' ids and records.
+        # dispatched chunks are found by their members' ids and records. What is cut
+        # again is said visibly (ruling 3 on #61).
         try:
             frozen = self._frozen_candidates(
                 messages, {entry.position: entry.record for entry in entries
@@ -1051,11 +1198,26 @@ class CompactionMixin:
             logger.warning("LCM could not read the earlier attempts' chunks", exc_info=True)
             self._record_event(attempt, "frozen_cut_unreadable", repr(exc))
             return self._abort(messages, f"the chunks of the earlier attempt could not be read ({exc})")
+        if frozen.unidentified:
+            # One line per attempt: without host ids no earlier chunk is ever found again,
+            # and a line per chunk would grow with every attempt (the gateway, ask A1).
+            attempts = sorted({compaction for _chunk, compaction in frozen.unidentified})
+            logger.warning("LCM cuts again %d dispatched or summarised chunks of %d earlier attempts: their members "
+                           "came without a host id (the host's list carries none, ask A1), so they cannot be found "
+                           "in this list", len(frozen.unidentified), len(attempts))
+            self._record_event(attempt, "frozen_cut_unidentified",
+                               {"chunks": len(frozen.unidentified), "attempts": attempts})
         try:
-            plan = self._tail_plan(messages, mechanism, occasion, frozen)
+            plan = self._tail_plan(messages, mechanism, occasion, frozen.found)
         except ToolPairingError as exc:
             self._record_event(attempt, "tool_pairing_error", str(exc))
             return self._abort(messages, f"the tail cannot be placed: {exc}")
+        for chunk, why in frozen.recut + plan.recut:
+            logger.warning("LCM cuts the %s chunk %s of attempt %d again: %s", chunk.state, chunk.chunk,
+                           chunk.compaction, why)
+            self._record_event(attempt, "frozen_chunk_recut",
+                               {"chunk": chunk.chunk, "state": chunk.state, "attempt": chunk.compaction,
+                                "reason": why})
         tail_start = plan.start
         logger.info("LCM tail: %s", plan.label)
         for chunk, positions in plan.held:
@@ -1064,19 +1226,29 @@ class CompactionMixin:
             # the chunk is not cut again: it stays whole in the tail this time.
             self._record_event(attempt, "kept_chunk_reaches_floor",
                                {"chunk": chunk.chunk, "state": chunk.state, "positions": [positions[0], positions[-1]]})
-        # The cut, before the boundary is checked: a rest below c/4 whose only neighbours
-        # are kept chunks joins none of them and may wait in the tail (ruling on #61).
+        # The cut, before the boundary is checked: a rest below c/4 at the end of the
+        # material stays raw and the tail begins at it (ruling on #61, 1).
         material = [index for index in range(tail_start) if index not in mechanism]
         estimator = self._estimator()
         limit = self._chunk_limit()
         chunks: List[List[int]] = []
+        waiting: List[int] = []
         if material:
+            joins: List[dict] = []
             try:
                 chunks = self._cut_chunks(messages, material, limit, estimator,
-                                          kept=[positions for _chunk, positions in plan.kept], room=plan.room)
+                                          kept=[positions for _chunk, positions in plan.kept],
+                                          summarised=[chunk.state == "summarised" for chunk, _p in plan.kept],
+                                          joins=joins)
             except ToolPairingError as exc:
                 self._record_event(attempt, "tool_pairing_error", str(exc))
                 return self._abort(messages, f"the material cannot be cut: {exc}")
+            for join in joins:
+                # The one exception to "nothing joins a kept chunk" (ruling on #61, D1).
+                logger.warning("LCM joins a run below c/4 (positions %d to %d) to the %s kept chunk at positions "
+                               "%d to %d: it stands between kept chunks, where it could never join anything else",
+                               join["run"][0], join["run"][1], join["side"], join["kept"][0], join["kept"][1])
+                self._record_event(attempt, "kept_chunk_joined", join)
             covered = {index for chunk in chunks for index in chunk}
             waiting = [index for index in material if index not in covered]
             if waiting:
@@ -1085,12 +1257,24 @@ class CompactionMixin:
                     self._record_event(attempt, "cut_left_rows_out", {"positions": waiting})
                     return self._abort(messages, f"the cut left rows outside every chunk that are not the end of "
                                                  f"the material (positions {waiting[0]} to {waiting[-1]})")
+                last_summary = max(mechanism) if mechanism else -1
+                if waiting[0] < last_summary:
+                    # D3's shape (orchestrator, #33): a row the host put before the plugin's
+                    # last summary is material. A rest that stays raw there cannot become
+                    # the tail, which would then hold the summaries after it; nothing is
+                    # changed, and the case is named. Whether the host produces it at all
+                    # is not established (its commit-time insertions land after them).
+                    self._record_event(attempt, "rest_before_last_summary",
+                                       {"positions": waiting, "last_summary": last_summary})
+                    return self._abort(
+                        messages, f"the rows below c/4 left raw at positions {waiting[0]} to {waiting[-1]} begin "
+                                  f"before the plugin's last summary at position {last_summary}: the tail cannot "
+                                  f"begin there, so nothing is compacted (the host put a row before a summary)")
                 tail_start = waiting[0]
                 material = [index for index in material if index < tail_start]
-                logger.info("LCM keeps %d rows below c/4 after the kept chunks in the tail (from position %d): "
-                            "nothing joins a kept chunk, and the tail flexes by them within t + c/4 (room %d by "
-                            "the estimate); they wait for more material",
-                            len(waiting), tail_start, plan.room)
+                logger.info("LCM leaves %d rows below c/4 at the end of the material raw (from position %d): the "
+                            "tail begins at them, and they join material at a later compaction",
+                            len(waiting), tail_start)
         unanswered = _unanswered_calls_at(messages, tail_start)
         if unanswered:
             # The forward check: a call at the boundary whose result is not in the list
@@ -1111,9 +1295,21 @@ class CompactionMixin:
             return self._abort(
                 messages, f"the tail's boundary at position {tail_start} would separate the call {crossing[0]!r} "
                           f"at position {crossing[1]} from its result at position {crossing[2]}")
+        if not material and waiting and not (force_overflow or provider_rejected):
+            # Only a rest below c/4 stands outside the tail: nothing to compact yet, not a
+            # failure (ruling on #61, 1), as the preflight says for the same list.
+            rest = estimator.messages([messages[index] for index in waiting])
+            return self._unchanged_return(
+                messages, f"nothing to compact: what stands outside the fresh tail is below the smallest run that "
+                          f"stands alone, c/4 ({rest.tokens} < {_smallest_for(limit)} tokens, {rest.label()}; "
+                          f"{self._chunk_label()}); it stays raw until more material joins it")
         if not material:
             if force_overflow or provider_rejected:
                 self._publish("_last_overflow_recovery_failed", True)
+            if waiting:
+                return self._abort(
+                    messages, f"{why_now}, and what stands outside the fresh tail is below the smallest run that "
+                              f"stands alone, c/4 ({len(waiting)} rows): nothing can be compacted now")
             # The visible end (#7): above τ, nothing outside the tail's floor but the
             # mechanism's layer.
             return self._abort(
@@ -1197,8 +1393,12 @@ class CompactionMixin:
                 raise AttemptCancelled()
             records = [attempt.records[index] for index in chunk]
             chunk_messages = [json.loads(facts[record][1]) for record in records]
+            # A member without a host id is recorded anew at every attempt, so this
+            # chunk's earlier failures cannot be counted (ruling 3 on #61).
+            unidentified = any(not isinstance(messages[index].get("_row_id"), int) for index in chunk)
             subscriber = Subscriber(wanted=still_wanted, hook=hook, deadline=deadline,
-                                    deliver=self._deliver_for(attempt, chunk_handle, number, len(chunks)),
+                                    deliver=self._deliver_for(attempt, chunk_handle, number, len(chunks),
+                                                              records, unidentified),
                                     on_done=lambda number=number: finished.put(number))
             # Attempts share a call only with the same summariser route and effort, the
             # rule a reuse applies (``summary_of_records``).
@@ -1212,7 +1412,7 @@ class CompactionMixin:
                 run=self._chunk_run(chunk_messages, focus_topic=focus_topic, record_handles=records,
                                     settings=settings),
                 describe=describe,
-                on_dispatch=lambda chunk_handle=chunk_handle: self._records.chunk_dispatched(chunk_handle),
+                on_sent=lambda chunk_handle=chunk_handle: self._records.chunk_dispatched(chunk_handle),
             )
             ways[way] = ways.get(way, 0) + 1
             subscribers.append(subscriber)
@@ -1238,10 +1438,12 @@ class CompactionMixin:
             received.add(number)
             outcome = subscribers[number - 1].outcome
             if outcome is None or outcome.failure is not None or not outcome.derivation:
+                # The failure was judged where it was recorded (ruling on #61, 4); this
+                # thread only shows what that said.
                 why = outcome.failure if outcome is not None and outcome.failure else "no summary was delivered"
-                cause = f"the summary of chunk {number} of {len(chunks)} failed ({why})"
-                kept_failing = self._keeps_failing(attempt, chunk_handles[number - 1], chunks[number - 1], why)
-                return self._abort(messages, kept_failing or cause)
+                cause = outcome.cause if outcome is not None and outcome.cause else \
+                    f"the summary of chunk {number} of {len(chunks)} failed ({why})"
+                return self._abort(messages, cause)
         # The return is ordered by the chunks, whatever order the summaries arrived in.
         new_derivations: List[str] = [s.outcome.derivation for s in subscribers]
 

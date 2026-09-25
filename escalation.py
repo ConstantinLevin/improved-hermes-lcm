@@ -29,6 +29,15 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
 
+Each failure carries a kind (``FAILURE_KINDS``). Only a reply the checks rejected and a
+request the provider rejected (HTTP 400, 413, 422) are the chunk's own and count toward
+"keeps failing"; another model answering (D9), a rate limit, a deadline and every other
+failure of the endpoint do not (ruling on #61, 2).
+
+A call is dispatched when the host says so: ``latency_info``'s ``provider_dispatch_ms``,
+stamped immediately before the request goes to the provider's client
+(``_DispatchStamp``). No time left, or a failure before that point, is no dispatch.
+
 The budget is a target in the prompt text only. ``max_tokens`` is the summariser
 model's own output cap where the model table knows it (R5 b), and absent otherwise, so
 the plugin never cuts a summary at an output limit of its own; a reply stopped at the
@@ -237,17 +246,38 @@ def configured_route_problem(config: Any) -> Optional[str]:
     return None
 
 
+# What a failure says about its chunk (#33; ruling on #61, 2): ``reply``, a reply the
+# plugin's checks rejected; ``request``, the provider rejecting the request (HTTP 400,
+# 413, 422); ``route``, another model answered or the host resolved another route (D9);
+# ``endpoint``, a rate limit, a timeout, a connection error, no time left, any other
+# status; ``other``, an exception that is none of these. Only the first two are the
+# chunk's own and count toward "keeps failing".
+FAILURE_KINDS = ("reply", "request", "route", "endpoint", "other")
+OWN_FAILURE_KINDS = frozenset({"reply", "request"})
+_REQUEST_REJECTED_STATUS = frozenset({400, 413, 422})
+
+
 class SummaryFailure(Exception):
     """A chunk's summary could not be written. ``transient`` failures were retried
-    until the deadline allowed no more; the others were retried once at level 2."""
+    until the deadline allowed no more; the others were retried once at level 2.
+    ``kind`` is one of ``FAILURE_KINDS``."""
 
-    def __init__(self, reason: str, *, transient: bool, detail: str = "",
+    def __init__(self, reason: str, *, transient: bool, kind: str, detail: str = "",
                  retry_after: Optional[float] = None) -> None:
         self.reason = reason
         self.transient = transient
+        self.kind = kind if kind in FAILURE_KINDS else "other"
         self.detail = detail
         self.retry_after = retry_after
         super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+def _failed_call_kind(exc: BaseException) -> str:
+    """A non-transient exception of the call, by its status code, never its message."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return "request" if status in _REQUEST_REJECTED_STATUS else "endpoint"
+    return "other"
 
 
 def _retry_after_seconds(exc: BaseException) -> Optional[float]:
@@ -372,13 +402,47 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
     return forms
 
 
+class _DispatchStamp(dict):
+    """``latency_info`` for ``call_llm``: the host stamps ``provider_dispatch_ms`` into
+    it once (``_stamp_latency_once``, agent/auxiliary_client.py 7842-7845 at Hermes
+    1b57acf94a, installed as the dispatch hook at 7875-7876), from
+    ``_notify_aux_dispatch``, which ``_create_with_progress_once`` calls immediately
+    before it hands the request to the provider's client (6970; 6993 for its
+    non-streamed retry). Every non-streamed send goes through it: the first try, the
+    same-provider retries, the recovery rungs and the fallback candidates
+    (``_relay_sync_completion``'s default callback, 2621; ``_primary``, 8030-8034). The
+    host's provider daemon carries the hook over (``_run_protected_sync_provider_call``,
+    459 and 473). ``sent`` is told there (#33 D14; ruling on #61, 2).
+
+    That is the limit of "dispatched": the request was handed to the provider's client.
+    A connection the endpoint then refuses is dispatched by this stamp too; the host
+    gives no later signal that the request reached the provider. The host's hook
+    swallows an exception at debug level (``_tick_hook``), so ``sent``'s own failure is
+    warned about here."""
+
+    def __init__(self, sent: Callable[[], None]) -> None:
+        super().__init__()
+        self._sent = sent
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        super().__setitem__(key, value)
+        if key == "provider_dispatch_ms":
+            try:
+                self._sent()
+            except Exception as exc:
+                logger.warning("LCM could not record that a summariser call was dispatched (%s: %s); a retry "
+                               "cuts its chunk again", type(exc).__name__, exc)
+
+
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
-               timeout: Optional[float] = None) -> tuple[str, str]:
+               timeout: Optional[float] = None,
+               sent: Optional[Callable[[], None]] = None) -> tuple[str, str]:
     """One call through the host. Returns (content, finish_reason); raises on any
     failure of the call, a reply from another model, or a reply of the wrong shape.
     ``timeout`` is what is left of the host's deadline at dispatch; with no host
     deadline none is passed, and the host's own applies (#33: no per-call timeout of
-    the plugin's own)."""
+    the plugin's own). ``sent`` is told when the host dispatches the request
+    (``_DispatchStamp``)."""
     from agent.auxiliary_client import call_llm
 
     route = settings.route
@@ -391,6 +455,11 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         "route_info": route_info,
         **route.call_kwargs(),
     }
+    if sent is not None:
+        # With a progress hook already installed (the plugin's worker always has one),
+        # passing latency_info does not change the host's path: call_llm installs its own
+        # no-op progress hook only where none is installed (7869-7873 at 1b57acf94a).
+        call_kwargs["latency_info"] = _DispatchStamp(sent)
     if settings.max_tokens:
         call_kwargs["max_tokens"] = settings.max_tokens
     if timeout is not None:
@@ -400,18 +469,18 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
     # plugin's: the host's label for a provider is not its normalised name (an explicit
     # "openai" route with a base URL is recorded as "custom", "x-ai" as "x-ai").
     if not route_info.routes:
-        raise SummaryFailure("reply on an unknown route", transient=False,
+        raise SummaryFailure("reply on an unknown route", transient=False, kind="route",
                              detail="the host recorded no route in route_info (#33 D9)")
     resolved, answered = route_info.routes[0], route_info.routes[-1]
     if resolved[1] not in _host_model_forms(route.model, resolved[0]):
         raise SummaryFailure(
-            "the host resolved the summariser's route to another model", transient=False,
+            "the host resolved the summariser's route to another model", transient=False, kind="route",
             detail=f"route_info names {resolved[0] or '?'}/{resolved[1] or '?'} for the summariser "
                    f"{route.describe()} (#33 D9)",
         )
     if answered != resolved:
         raise SummaryFailure(
-            "reply from another model", transient=False,
+            "reply from another model", transient=False, kind="route",
             detail=f"the host's route_info names {answered[0] or '?'}/{answered[1] or '?'} as the route that "
                    f"answered, the summariser is {route.describe()}, which the host resolved as "
                    f"{resolved[0]}/{resolved[1]} (#33 D9)",
@@ -420,15 +489,15 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         choice = response.choices[0]
         message = choice.message
     except Exception as exc:
-        raise SummaryFailure("malformed reply", transient=False,
+        raise SummaryFailure("malformed reply", transient=False, kind="reply",
                              detail=f"no choices[0].message ({type(exc).__name__})") from None
     finish_reason = getattr(choice, "finish_reason", None)
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
-        raise SummaryFailure("reply carries no summary", transient=False,
+        raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
                              detail=f"content is {type(content).__name__}, finish_reason {finish_reason!r}")
     if finish_reason == "length":
-        raise SummaryFailure("reply cut at the output limit", transient=False,
+        raise SummaryFailure("reply cut at the output limit", transient=False, kind="reply",
                              detail="finish_reason 'length'")
     return content, str(finish_reason) if finish_reason is not None else ""
 
@@ -448,12 +517,15 @@ class CallPath:
     call (a limiter slot, the host's deadline installed) and yields the deadline it is
     bounded by; ``hold`` passes a provider's ``Retry-After`` on to the endpoint;
     ``deadline`` is the host's deadline for the decision to retry; ``wait`` is the wait
-    between retries, which may give up. The defaults call directly on this thread."""
+    between retries, which may give up; ``sent`` is told when the host dispatches a
+    request of this chunk to the provider (``_DispatchStamp``). The defaults call
+    directly on this thread."""
 
     wait: Callable[[float], None] = _default_wait
     dispatch: Callable[[], Any] = _direct_dispatch
     hold: Callable[[float], None] = _no_hold
     deadline: Callable[[], Optional[float]] = _deadline
+    sent: Optional[Callable[[], None]] = None
 
 
 def _call_with_retries(
@@ -475,9 +547,9 @@ def _call_with_retries(
                     timeout = bound - time.monotonic()
                     if timeout <= 0:
                         raise SummaryFailure("summariser call not made, no time left before the host's deadline",
-                                             transient=True)
+                                             transient=True, kind="endpoint")
                 try:
-                    content, finish_reason = _call_once(messages, settings, timeout)
+                    content, finish_reason = _call_once(messages, settings, timeout, sent=path.sent)
                 except SummaryFailure:
                     raise
                 except Exception as exc:
@@ -495,7 +567,8 @@ def _call_with_retries(
             # What leaves here is its class and message, with every known secret removed.
             text = failure_text(exc, settings.secrets)
             if not _is_transient(exc):
-                raise SummaryFailure("summariser call failed", transient=False, detail=text) from None
+                raise SummaryFailure("summariser call failed", transient=False, kind=_failed_call_kind(exc),
+                                     detail=text) from None
             retry_after = _retry_after_seconds(exc)
             # The growing backoff always applies: a provider's Retry-After can only make
             # the wait longer, so a zero or expired one never makes a hot loop.
@@ -503,9 +576,10 @@ def _call_with_retries(
             deadline = path.deadline()
             if deadline is not None and time.monotonic() + delay >= deadline:
                 raise SummaryFailure("summariser call failed, no time left before the host's deadline",
-                                     transient=True, detail=text, retry_after=retry_after) from None
+                                     transient=True, kind="endpoint", detail=text,
+                                     retry_after=retry_after) from None
             if deadline is None and retries >= _NO_DEADLINE_RETRIES:
-                raise SummaryFailure("summariser call kept failing", transient=True,
+                raise SummaryFailure("summariser call kept failing", transient=True, kind="endpoint",
                                      detail=text, retry_after=retry_after) from None
             logger.warning("LCM summariser call failed transiently (%s); retrying in %.1fs", text, delay)
             path.wait(delay)
@@ -516,7 +590,7 @@ def _call_with_retries(
         # hold images the estimate could not count, and the numbers say so.
         reply_tokens = count_tokens(content)
         if reply_tokens >= source.tokens:
-            raise SummaryFailure("reply not shorter than its source", transient=False,
+            raise SummaryFailure("reply not shorter than its source", transient=False, kind="reply",
                                  detail=f"{reply_tokens} >= {source.tokens} tokens, {source.label()}")
         return content, finish_reason
 
@@ -574,6 +648,7 @@ def summarize_chunk(
             raise SummaryFailure(
                 f"level 1: {first}; level 2: {second.reason}",
                 transient=second.transient,
+                kind=second.kind,
                 detail=second.detail,
                 retry_after=second.retry_after,
             ) from second

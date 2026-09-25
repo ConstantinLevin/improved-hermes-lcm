@@ -25,10 +25,14 @@ failed summary (#9). The summariser reads a chunk's stored records as the messag
 full: tool calls and results whole, readable reasoning marked, images only where it reads them;
 encrypted reasoning is withheld until the plugin knows which provider produced it (#8). A
 compaction's summariser calls, one per chunk, run at once, through one limiter per endpoint
-(#33). A retry keeps the earlier attempt's cut: a chunk that was summarised keeps its summary, a
-chunk whose call was dispatched and failed is retried as the same chunk, and only the rest is cut
-again; a chunk of the same messages failing in three consecutive attempts is shown as an error
-naming it, and is still retried (#33, #7). Compaction runs
+(#33). No chunk below a quarter of the chunk size is ever sent: such a rest joins a neighbouring
+chunk or stays raw before the tail. A retry keeps the earlier attempt's cut: a chunk that was
+summarised keeps its summary, a chunk whose call the host dispatched is retried as the same chunk,
+and only the rest is cut again, visibly. A chunk of the same messages failing by its own fault
+(its reply rejected, or its request refused) in three consecutive attempts is shown as an error
+naming it, and is still retried; rate limits, deadlines and other endpoint failures do not count
+(#33, #7). Where the host's list carries no message ids, as in the gateway, a retry cannot find
+the earlier cut, and says so (ask A1). Compaction runs
 at a threshold derived from the model's window, raised by a margin while a turn runs, and
 brings the context down to a target G (#11, #31, #32); the material outside the tail is split
 into equal chunks of 50k provider tokens (#12), and the tail takes what the target leaves,

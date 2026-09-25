@@ -7,8 +7,9 @@ written in short transactions, none held open across a summariser call:
 1. the compaction, its inputs, a record for every input entry the store does not
    hold yet (the fresh tail included), their tool calls, and every chunk with its
    members, all before the first summariser call;
-2. each summary, as a derivation of its chunk, when it arrives; the first dispatch of a
-   chunk's call and each failure of it, when they happen (#33 D14, #7);
+2. each summary, as a derivation of its chunk, when it arrives; the host's first
+   dispatch of a chunk's call, and each failure of it with its kind, when they happen
+   (#33 D14, #7);
 3. what the plugin returned.
 
 The host confirms a compaction with ``on_session_start(boundary_reason="compression")``
@@ -330,8 +331,11 @@ class RecordStore:
     def _dispatched(self, chunk: str) -> bool:
         return bool(self._q("SELECT 1 FROM chunk_dispatches WHERE chunk = ? LIMIT 1", (chunk,)))
 
-    def _failed(self, chunk: str) -> bool:
-        return bool(self._q("SELECT 1 FROM chunk_failures WHERE chunk = ? LIMIT 1", (chunk,)))
+    def _failed_by_itself(self, chunk: str) -> bool:
+        """A failure of the chunk's own kind: its reply rejected, or its request
+        rejected by the provider (ruling on #61, 2)."""
+        return bool(self._q("SELECT 1 FROM chunk_failures WHERE chunk = ? AND kind IN ('reply', 'request') "
+                            "LIMIT 1", (chunk,)))
 
     def chunk_state(self, session: str, records: Sequence[str]) -> Optional[str]:
         """The state of a set of members over every chunk of the session that held
@@ -345,13 +349,17 @@ class RecordStore:
             return "dispatched"
         return None
 
-    def frozen_chunks(self, session: str, after: Optional[int]) -> list[FrozenChunk]:
+    def frozen_chunks(self, session: str, after: Optional[int]) -> tuple[list[FrozenChunk], list[tuple[str, int]]]:
         """The chunks a retry keeps (#33 D14, #31): those of the session's attempts
         after its effective compaction that the host neither confirmed, adopted nor
         rejected, whose members were summarised or dispatched, the newest attempt's cut
         first; a chunk that shares a record with one already taken is left out. Each
         member carries the ``_row_id`` its row had in that attempt's list: ids hold
-        until a commit (#29 W2 step 8), so the retry recognises the chunk by identity."""
+        until a commit (#29 W2 step 8), so the retry recognises the chunk by identity.
+
+        A chunk with a member whose row came without a ``_row_id`` (the gateway's
+        history; ruling 3 on #61, ask A1) can never be found again. Such chunks are
+        returned apart, as (chunk, compaction), and none is kept."""
         compactions = [int(c) for (c,) in self._q(
             "SELECT c.compaction_id FROM compactions c WHERE c.session = ? AND c.compaction_id > ? "
             "AND NOT EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
@@ -362,6 +370,7 @@ class RecordStore:
         )]
         taken: set = set()
         frozen: list[FrozenChunk] = []
+        unidentified: list[tuple[str, int]] = []
         for compaction in compactions:
             for (chunk,) in self._q("SELECT handle FROM chunks WHERE compaction = ? ORDER BY rowid", (compaction,)):
                 members = tuple(
@@ -380,18 +389,23 @@ class RecordStore:
                 if state is None:
                     continue
                 taken.update(records)
+                if any(row_id is None for _record, row_id in members):
+                    unidentified.append((str(chunk), compaction))
+                    continue
                 frozen.append(FrozenChunk(str(chunk), compaction, members, state))
-        return frozen
+        return frozen, unidentified
 
     def failure_streak(self, session: str, records: Sequence[str]) -> int:
         """In how many consecutive attempts, the newest first, a chunk of exactly these
-        members failed (#7, #33): a summary ends the streak; an attempt whose call never
-        reached an outcome (cancelled, abandoned) neither counts nor ends it."""
+        members failed by its own fault (#7, #33; ruling on #61, 2): a summary ends the
+        streak; an attempt that reached no outcome for it (cancelled, abandoned), or
+        whose failure was the route's, the endpoint's or another's, neither counts nor
+        ends it."""
         streak = 0
         for chunk, _compaction in self._chunks_with_members(session, records):
             if self._summarised(chunk):
                 break
-            if self._failed(chunk):
+            if self._failed_by_itself(chunk):
                 streak += 1
         return streak
 
@@ -399,10 +413,15 @@ class RecordStore:
         with self._tx() as conn:
             conn.execute("INSERT INTO chunk_dispatches(chunk, at) VALUES (?, ?)", (chunk, time.time()))
 
-    def chunk_failed(self, chunk: str, error: str) -> None:
+    def chunk_failed(self, chunk: str, error: str, *, kind: str, session: str, records: Sequence[str]) -> int:
+        """Record a failure of ``chunk`` with its kind, and return the streak of its
+        members, read inside the same transaction (ruling on #61, 4). The transaction
+        begins IMMEDIATE, so two threads or processes recording failures of the same
+        members read distinct streaks."""
         with self._tx() as conn:
-            conn.execute("INSERT INTO chunk_failures(chunk, at, error) VALUES (?, ?, ?)",
-                         (chunk, time.time(), str(error)))
+            conn.execute("INSERT INTO chunk_failures(chunk, at, kind, error) VALUES (?, ?, ?, ?)",
+                         (chunk, time.time(), kind, str(error)))
+            return self.failure_streak(session, records)
 
     def is_settled(self, compaction: int) -> bool:
         """Confirmed, adopted or rejected: the host's handling of it is known."""
