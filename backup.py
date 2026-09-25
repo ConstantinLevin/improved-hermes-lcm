@@ -148,7 +148,11 @@ class DailyBackup:
         return not (last_failure and now - float(last_failure) < RETRY_AFTER_FAILURE_SECONDS)
 
     def start_if_due(self) -> Optional[threading.Thread]:
-        """Start the backup on its own thread when one is due; never raises."""
+        """Start the backup on its own thread when one is due; never raises.
+
+        The whole decision and the thread's start run under ``_guard``, which
+        :meth:`stop` takes too: a stop waits for a start in progress, and once
+        stopped the backup never starts again."""
         with self._guard:
             if self._stop.is_set() or (self._thread is not None and self._thread.is_alive()):
                 return None
@@ -165,9 +169,12 @@ class DailyBackup:
             return thread
 
     def stop(self) -> None:
-        """Stop a running backup and wait for its thread; the slot stays as it was."""
-        self._stop.set()
-        thread = self._thread
+        """Stop the backup for good and wait for a running one to end; the slot stays
+        as it was. Taken under ``_guard``, so a start in progress finishes first (and
+        its thread is started, so it can be joined), and no start follows."""
+        with self._guard:
+            self._stop.set()
+            thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join()
 
@@ -194,7 +201,8 @@ class DailyBackup:
 
     def take(self) -> Optional[Path]:
         """Take the backup now, if this process gets the slot's lock and it is still
-        due. Returns the slot, or None when skipped."""
+        due. Returns the slot, or None when skipped. A stopped backup never takes."""
+        self._check_stop()
         directory = self.slot.parent
         _prepare_private_directory(directory)
         lock_path = directory / f".{self.slot.name}.lock"
@@ -217,9 +225,14 @@ class DailyBackup:
             tmp.unlink(missing_ok=True)  # a copy a killed process left behind
             os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
             store_uuid = self._copy(tmp)
+            self._check_stop()
             _fsync_path(tmp)
             self._check_copy(tmp, store_uuid)
+            # An interrupted backup publishes nothing: checked again right before
+            # each step that changes the slot.
+            self._check_stop()
             self._set_aside_foreign_slot(store_uuid)
+            self._check_stop()
             os.replace(tmp, self.slot)
             _fsync_path(self.slot.parent, directory=True)
         except BaseException:
@@ -274,6 +287,7 @@ class DailyBackup:
             failing = [report for report in copy_store.check_invariant() if report["status"] != "pass"]
         finally:
             copy_store.close("the backup's check ended")
+        self._check_stop()
         if failing:
             first = failing[0]
             problem = first["problems"][0] if first["problems"] else "a problem"
