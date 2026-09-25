@@ -292,7 +292,7 @@ def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:
 # Historical section headings — mirror upstream hermes-agent constants so that
 # the summariser has consistent structural anchors for grouping stale content.
 # These headings act as summariser guidance, not an enforced active-context
-# contract: _assemble_context() passes node.summary through as ordinary content,
+# contract: the return re-emits each summary's text as ordinary content,
 # so headings influence LLM attention rather than being hard reference-only
 # markers.  The practical effect is that LLMs naturally down-weight content
 # under "Historical" headings, but no code path enforces the boundary.
