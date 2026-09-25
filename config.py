@@ -1,4 +1,5 @@
 """LCM configuration with defaults and env var overrides."""
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -178,21 +179,28 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
     return default, "default"
 
 
-def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[int, str]:
-    cfg = _load_hermes_config_yaml()
+def _parse_calls_per_endpoint(raw: str) -> tuple[dict[str, int], str | None]:
+    """``LCM_SUMMARY_CALLS_PER_ENDPOINT``: a JSON object from an endpoint (the base URL a
+    summariser route names, or ``provider:<name>`` where it names none) to the most
+    summariser calls in flight there. Returns the mapping and a warning, if any."""
+    if not raw.strip():
+        return {}, None
     try:
-        auxiliary = cfg.get("auxiliary") or {}
-        if not isinstance(auxiliary, dict):
-            return default, "default"
-        compression = auxiliary.get("compression") or {}
-        if not isinstance(compression, dict):
-            return default, "default"
-        value = compression.get("timeout")
-        if value is None:
-            return default, "default"
-        return int(float(value) * 1000), "config_yaml:auxiliary.compression.timeout"
-    except Exception:
-        return default, "default"
+        value = json.loads(raw)
+    except ValueError:
+        return {}, "LCM_SUMMARY_CALLS_PER_ENDPOINT is not JSON; the default applies to every endpoint"
+    if not isinstance(value, dict):
+        return {}, "LCM_SUMMARY_CALLS_PER_ENDPOINT is not a JSON object; the default applies to every endpoint"
+    parsed: dict[str, int] = {}
+    bad: list[str] = []
+    for key, limit in value.items():
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 1:
+            parsed[str(key).strip().rstrip("/")] = limit
+        else:
+            bad.append(str(key))
+    warning = (f"LCM_SUMMARY_CALLS_PER_ENDPOINT: no positive integer for {', '.join(bad)}; the default applies there"
+               if bad else None)
+    return parsed, warning
 
 
 def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]:
@@ -239,7 +247,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("summary_reasoning_effort", "LCM_SUMMARY_REASONING_EFFORT", str),
     _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
     _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
-    _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
+    _EnvFieldSpec("summary_calls_in_flight", "LCM_SUMMARY_CALLS_IN_FLIGHT", int),
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
 )
@@ -258,7 +266,6 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fresh_tail_max_tokens",
     "leaf_chunk_tokens",
     "context_threshold",
-    "summary_timeout_ms",
 })
 
 
@@ -309,8 +316,15 @@ class LCMConfig:
     # Serialized summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
 
+    # -- Summariser calls in flight (#33) ---
+    # The most summariser calls at once to one endpoint, process-wide; per endpoint
+    # where summary_calls_per_endpoint names it (the base URL a summariser route names,
+    # or "provider:<name>" where it names none). There is no per-call timeout of the
+    # plugin's own: each call is bounded by the host's deadline at its dispatch.
+    summary_calls_in_flight: int = 8
+    summary_calls_per_endpoint: dict[str, int] = field(default_factory=dict)
+
     # -- Timeouts ---
-    summary_timeout_ms: int = 60_000
     expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
@@ -363,15 +377,12 @@ class LCMConfig:
             c.codex_gpt55_autoraise_enabled
         )
         _record("codex_gpt55_autoraise_enabled", source)
-        summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
-            c.summary_timeout_ms
+        c.summary_calls_per_endpoint, warning = _parse_calls_per_endpoint(
+            os.environ.get("LCM_SUMMARY_CALLS_PER_ENDPOINT", "")
         )
-        c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
-            "LCM_SUMMARY_TIMEOUT_MS",
-            summary_timeout_default,
-            default_source=summary_timeout_source,
-        )
-        _record("summary_timeout_ms", source, warning)
+        _record("summary_calls_per_endpoint",
+                "env:LCM_SUMMARY_CALLS_PER_ENDPOINT" if os.environ.get("LCM_SUMMARY_CALLS_PER_ENDPOINT") else "default",
+                warning)
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:

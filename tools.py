@@ -1832,7 +1832,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
                 if engine._config.summary_model else f"(the session's model: {engine.provider}/{engine.model})"
             ),
             "summary_reasoning_effort_default": engine._config.summary_reasoning_effort,
-            "summary_timeout_ms": engine._config.summary_timeout_ms,
+            "summary_calls_in_flight": engine._config.summary_calls_in_flight,
+            "summary_calls_per_endpoint": dict(engine._config.summary_calls_per_endpoint or {}),
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "config_sources": config_sources,
