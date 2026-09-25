@@ -359,6 +359,177 @@ class RecordStore:
         )
         return {int(row_id): str(record) for row_id, record in rows}
 
+    # --- The invariant (#29 W7, #34 D5) --------------------------------------------
+
+    def identity(self) -> dict[str, Any]:
+        rows = self._q("SELECT format, store_uuid, created_at FROM store_identity")
+        return {"format": rows[0][0], "store_uuid": rows[0][1], "created_at": rows[0][2]} if rows else {}
+
+    def recent_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [
+            {"at": at, "kind": kind, "session": session, "compaction": compaction, "detail": detail}
+            for at, kind, session, compaction, detail in self._q(
+                "SELECT at, kind, session, compaction, detail FROM store_events ORDER BY event_id DESC LIMIT ?",
+                (int(limit),),
+            )
+        ]
+
+    def check_invariant(self, max_problems: int = 20) -> list[dict[str, Any]]:
+        """W7, in the store, for each session's latest effective compaction.
+
+        - Every record on the branch, from the head (the last record entry of that
+          return) back along the predecessors to the session's first record, is a
+          record entry of the return or a member of a chunk the return's summary
+          entries reach, directly or through ``derivation_sources``; not both.
+        - No two chunks the return reaches share a record.
+        - The summary entries form a cover (#34 D5): complete (every chunk an
+          effective compaction of the session wrote with members on the branch is
+          covered), disjoint (by exactly one summary entry), contiguous (each entry
+          covers a contiguous run of chunks, and the entries stand in the order of
+          their runs' first chunks). Every summary entry reaches at least one chunk.
+
+        Returns one report per session: the compaction checked, counts, and the
+        problems found (at most ``max_problems`` listed, all counted).
+        """
+        reports: list[dict[str, Any]] = []
+        for session, compaction in self._q(
+            "SELECT session, MAX(compaction_id) FROM effective_compactions GROUP BY session ORDER BY session"
+        ):
+            reports.append(self._check_session(str(session), int(compaction), max_problems))
+        return reports
+
+    def _chunks_of(self, derivation: str, seen: Optional[set] = None) -> list[str]:
+        seen = set() if seen is None else seen
+        if derivation in seen or len(seen) > 4096:
+            return []
+        seen.add(derivation)
+        chunks: list[str] = []
+        for chunk, source in self._q(
+            "SELECT chunk, source_derivation FROM derivation_sources WHERE derivation = ? ORDER BY ordinal",
+            (derivation,),
+        ):
+            if chunk:
+                chunks.append(str(chunk))
+            elif source:
+                chunks.extend(self._chunks_of(str(source), seen))
+        return chunks
+
+    def _check_session(self, session: str, compaction: int, max_problems: int) -> dict[str, Any]:
+        problems: list[str] = []
+        problem_count = 0
+
+        def problem(text: str) -> None:
+            nonlocal problem_count
+            problem_count += 1
+            if len(problems) < max_problems:
+                problems.append(text)
+
+        returns = self._q(
+            "SELECT position, kind, record, derivation FROM compaction_returns WHERE compaction = ? ORDER BY position",
+            (compaction,),
+        )
+        record_entries = [str(r) for _p, kind, r, _d in returns if kind == "record" and r]
+        summary_entries = [(int(p), str(d)) for p, kind, _r, d in returns if kind == "summary" and d]
+
+        # The chunks each summary entry reaches, and the members of every chunk.
+        covered_by: dict[str, list[int]] = {}
+        entry_chunks: dict[int, list[str]] = {}
+        for position, derivation in summary_entries:
+            chunks = list(dict.fromkeys(self._chunks_of(derivation)))
+            entry_chunks[position] = chunks
+            if not chunks:
+                problem(f"summary entry {position} reaches no chunk")
+            for chunk in chunks:
+                covered_by.setdefault(chunk, []).append(position)
+        effective_chunks = [str(c) for (c,) in self._q(
+            "SELECT ch.handle FROM chunks ch JOIN effective_compactions e ON e.compaction_id = ch.compaction "
+            "WHERE ch.session = ? ORDER BY ch.rowid",
+            (session,),
+        )]
+        members: dict[str, list[str]] = {}
+        for chunk, record in self._q(
+            "SELECT m.chunk, m.record FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
+            "WHERE ch.session = ? ORDER BY m.chunk, m.ordinal",
+            (session,),
+        ):
+            members.setdefault(str(chunk), []).append(str(record))
+
+        # The branch: from the head back along the predecessors.
+        predecessor = {str(h): (str(p) if p else None) for h, p in self._q(
+            "SELECT handle, predecessor FROM records WHERE session = ?", (session,))}
+        branch: list[str] = []
+        if not record_entries:
+            problem("the return has no record entry, so the branch has no head")
+        else:
+            seen: set[str] = set()
+            cursor: Optional[str] = record_entries[-1]
+            while cursor is not None:
+                if cursor in seen:
+                    problem(f"the predecessors form a cycle at {cursor}")
+                    break
+                seen.add(cursor)
+                branch.append(cursor)
+                cursor = predecessor.get(cursor)
+            branch.reverse()
+        on_branch = {record: index for index, record in enumerate(branch)}
+
+        # Every record on the branch: a record entry, or under a reached chunk; not both.
+        in_tail = set(record_entries)
+        under_summary: dict[str, list[str]] = {}
+        for chunk in covered_by:
+            for record in members.get(chunk, []):
+                under_summary.setdefault(record, []).append(chunk)
+        for record in branch:
+            if record not in in_tail and record not in under_summary:
+                problem(f"record {record} on the branch is neither in the tail nor under a summary")
+            elif record in in_tail and record in under_summary:
+                problem(f"record {record} is both in the tail and under a summary")
+        for record, chunks in under_summary.items():
+            if len(chunks) > 1:
+                problem(f"record {record} is in {len(chunks)} chunks the return reaches: {', '.join(chunks)}")
+
+        # The cover: complete, disjoint, contiguous.
+        for chunk in effective_chunks:
+            if chunk not in covered_by and any(r in on_branch for r in members.get(chunk, [])):
+                problem(f"chunk {chunk} on the branch is covered by no summary entry")
+        for chunk, positions in covered_by.items():
+            if len(positions) > 1:
+                problem(f"chunk {chunk} is covered by {len(positions)} summary entries: {positions}")
+
+        def place(record: str) -> float:
+            """Where a record stands along the branch; one beside it (a host
+            insertion) stands just after the branch record it follows."""
+            steps = 0
+            cursor, offset = record, 0.0
+            while cursor is not None and cursor not in on_branch and steps < 10_000:
+                cursor, offset, steps = predecessor.get(cursor), 0.5, steps + 1
+            return (on_branch[cursor] + offset) if cursor in on_branch else float("inf")
+
+        order = sorted(covered_by, key=lambda c: min((place(r) for r in members.get(c, [])), default=float("inf")))
+        rank = {chunk: index for index, chunk in enumerate(order)}
+        previous_first = -1
+        for position, _derivation in summary_entries:
+            ranks = sorted(rank[c] for c in entry_chunks.get(position, []) if c in rank)
+            if not ranks:
+                continue
+            if ranks != list(range(ranks[0], ranks[0] + len(ranks))):
+                problem(f"summary entry {position} covers chunks that are not a contiguous run")
+            if ranks[0] < previous_first:
+                problem(f"summary entry {position} stands before an entry whose run begins earlier")
+            previous_first = ranks[0]
+
+        return {
+            "session": session,
+            "compaction": compaction,
+            "records_on_branch": len(branch),
+            "tail_records": len(record_entries),
+            "summary_entries": len(summary_entries),
+            "chunks_reached": len(covered_by),
+            "status": "pass" if problem_count == 0 else "fail",
+            "problem_count": problem_count,
+            "problems": problems,
+        }
+
     # --- Writing ------------------------------------------------------------------
 
     @staticmethod

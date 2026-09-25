@@ -8,7 +8,7 @@ Use read-only product tools before changing configuration or running an apply pa
 2. Send one normal message if the session has not been bound since restart.
 3. `lcm_status`: inspect runtime identity, database path, context pressure, summary/store counts, and filters.
 4. `lcm_inspect`: inspect current-session lineage, the stored fresh tail, and skip/no-op reasons without retrieving content.
-5. `lcm_doctor`: run database, FTS, configuration, and context-pressure diagnostics.
+5. `lcm_doctor`: run database, FTS, configuration, and context-pressure diagnostics, check the record's invariant (every record on the branch is in the returned tail or under exactly one summary of the latest compaction), and list the store's identity and its recent events (what the plugin could not do).
 
 If optional slash commands are enabled, `/lcm status` and `/lcm doctor` expose the corresponding operator views.
 

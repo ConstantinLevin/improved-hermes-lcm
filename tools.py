@@ -1964,7 +1964,25 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
-    # 6. Context pressure
+    # 6. The record's invariant (#29 W7, #34 D5), for every session's latest
+    # effective compaction.
+    try:
+        reports = engine._records.check_invariant()
+        failing = [report for report in reports if report["status"] != "pass"]
+        checks.append({
+            "check": "record_invariant",
+            "status": "fail" if failing else "pass",
+            "detail": {"sessions_checked": len(reports), "failing": failing}
+            if failing else f"{len(reports)} session(s) checked; every record on each branch is reached exactly once",
+        })
+    except Exception as e:
+        checks.append({
+            "check": "record_invariant",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 7. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
@@ -1981,9 +1999,21 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     elif any(ch["status"] == "warn" for ch in checks):
         overall = "warnings"
 
+    # The store's identity and its recent events (each one something the plugin
+    # could not do), listed, not judged: they are history, not the store's state.
+    try:
+        store_identity = engine._records.identity()
+    except Exception as e:
+        store_identity = {"error": str(e)}
+    try:
+        store_events = engine._records.recent_events()
+    except Exception as e:
+        store_events = [{"error": str(e)}]
     return json.dumps({
         "overall": overall,
         "runtime_identity": engine.get_runtime_identity(),
+        "store_identity": store_identity,
+        "store_events_recent": store_events,
         "checks": checks,
         "guidance": doctor_guidance_for_checks(checks),
     })
