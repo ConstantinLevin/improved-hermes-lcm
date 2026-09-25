@@ -1,170 +1,245 @@
-"""Token counting utilities for LCM.
+"""The plugin's token estimate (#21, R9): characters divided by four, over what the
+provider receives, labelled an estimate wherever it is shown.
 
-Uses tiktoken when available, falls back to char-based estimate.
+The plugin knowingly does not know the number of tokens; it counts by this estimate and
+says so ("Known, or nothing"). For a message, the characters are those the provider
+receives:
+
+- the content, with the ``api_content`` sidecar in its place for a user or assistant
+  row where the host sends the sidecar (``substitute_api_content``); a list's text
+  parts by their text, any other non-image part by its JSON; the ``_multimodal``
+  envelope by its parts;
+- each tool call's function name and arguments;
+- ``reasoning_content`` only where the provider receives it (``Estimator.reasoning_sent``,
+  the host's ``needs_reasoning_echo`` for the route; what the estimate must be good for
+  with reasoning is #21's open item 2).
+
+An image is not counted by the length of its data: it is counted by the rule of the
+model the count concerns, from the plugin's model table (#35), reading its size from
+its header and, on OpenAI, the part's own ``detail``; the algorithms are the providers'
+documented ones, cited where they are implemented. An image with no rule, no readable
+size or a ``detail`` its model does not support is left out and counted as "uncounted". The count is ``ceil(characters / 4)`` plus the images' tokens.
+
+On Claude, for tool results, the provider's count was 1.51 times this estimate at p50
+and 2.37 at p99 (#31); a value compared with provider tokens states its conversion
+where it is used.
 """
 
-import logging
-import threading
-from functools import lru_cache
-from typing import Any, Dict, List
+from __future__ import annotations
 
-from .message_content import normalize_content_value
+import json
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Optional
 
-logger = logging.getLogger(__name__)
+from .message_content import content_parts, is_image_part
 
-_CHARS_PER_TOKEN = 4
-_encoder = None
-_encoder_ready = False
-_encoder_lock = threading.Lock()
-_encoder_thread = None
-# Cache-key generation, bumped (under _encoder_lock) when the real encoder is
-# adopted. The memoized count is keyed on (text, generation), so an estimator
-# result computed before adoption can only ever be inserted under the old
-# generation: a cache_clear() alone cannot stop an in-flight LRU miss from
-# repopulating the cache with a stale estimate *after* the clear, but a stale
-# insert under a dead key is unreachable by post-adoption lookups.
-_encoder_generation = 0
-
-# Bound on how long a count_tokens() caller will wait for the FIRST encoder
-# load. tiktoken.get_encoding() downloads the BPE file over the network when
-# it is not already cached on disk; on restricted-egress hosts that request
-# can hang for minutes before failing (measured: ~127s per fresh process in a
-# production deployment), and _get_encoder() sits on the host's post-turn
-# hook path -- so the hang blocked reply delivery. Callers that hit the bound
-# use the char-based estimate; the real encoder is adopted (and the count
-# cache cleared) whenever the background load completes.
-_ENCODER_FIRST_WAIT_S = 2.0
+CHARS_PER_TOKEN = 4
+ESTIMATE_LABEL = "an estimate: characters / 4, images by the model table's rule"
 
 
-def _load_encoder():
-    """The (possibly network-backed) tiktoken load. Patchable in tests."""
-    import tiktoken
-    return tiktoken.get_encoding("cl100k_base")
+@dataclass(frozen=True)
+class Estimate:
+    tokens: int
+    uncounted_images: int = 0
+
+    def __add__(self, other: "Estimate") -> "Estimate":
+        return Estimate(self.tokens + other.tokens, self.uncounted_images + other.uncounted_images)
+
+    def label(self) -> str:
+        """The estimate's label, as it is shown."""
+        if self.uncounted_images:
+            return f"{ESTIMATE_LABEL}; {self.uncounted_images} images uncounted"
+        return ESTIMATE_LABEL
 
 
-def _encoder_loader() -> None:
-    global _encoder, _encoder_ready, _encoder_generation
-    enc = None
-    try:
-        enc = _load_encoder()
-    except Exception:
-        logger.debug("tiktoken not available, using char-based estimates")
-    with _encoder_lock:
-        _encoder = enc
-        _encoder_ready = True
-        if enc is not None:
-            # Counts for identical text change estimator -> encoder on
-            # adoption; bumping the generation retires every pre-adoption
-            # cache key, including ones an in-flight miss has yet to insert.
-            _encoder_generation += 1
-    if enc is not None:
-        # Memory hygiene only (correctness comes from the generation key):
-        # evict the now-unreachable old-generation entries.
-        _count_tokens_cached.cache_clear()
-
-
-def _get_encoder():
-    """Return the tiktoken encoder, never blocking on unbounded network I/O.
-
-    The load runs in a daemon thread. The first caller waits briefly
-    (_ENCODER_FIRST_WAIT_S) so the common already-cached-on-disk case still
-    gets exact counts immediately; after that, callers never wait -- they use
-    the estimator until the loader finishes.
-    """
-    global _encoder_thread
-    if _encoder_ready:
-        return _encoder
-    first = False
-    with _encoder_lock:
-        if _encoder_ready:
-            return _encoder
-        if _encoder_thread is None:
-            _encoder_thread = threading.Thread(
-                target=_encoder_loader, name="lcm-tiktoken-load", daemon=True
-            )
-            _encoder_thread.start()
-            first = True
-    if first:
-        _encoder_thread.join(timeout=_ENCODER_FIRST_WAIT_S)
-    return _encoder if _encoder_ready else None
-
-
-def _fallback_token_estimate(text: str) -> int:
-    # Latin text is ~4 chars/token, but CJK and other non-Latin scripts
-    # tokenize far denser (~1-2 tokens/char). A flat len//4 undercounts them
-    # ~3-4x, so preflight under-triggers and assembly can overflow the real
-    # budget. ASCII-only text is overwhelmingly common and can use the cheap
-    # legacy estimate without scanning every character.
-    length = len(text)
-    if length == 0:
-        return 0
-    if text.isascii():
-        return length // _CHARS_PER_TOKEN + 1
-    non_ascii = sum(1 for ch in text if ord(ch) > 127)
-    ratio = non_ascii / length
-    if ratio >= 0.5:
-        divisor = 1.5
-    elif ratio >= 0.2:
-        divisor = 2.5
-    else:
-        divisor = _CHARS_PER_TOKEN
-    return int(length / divisor) + 1
-
-
-def _count_tokens_core(text) -> int:
-    enc = _get_encoder()
-    if enc is not None:
-        try:
-            return len(enc.encode(text))
-        except Exception:
-            pass
-    if isinstance(text, str):
-        return _fallback_token_estimate(text)
-    return len(text) // _CHARS_PER_TOKEN + 1
-
-
-@lru_cache(maxsize=2048)
-def _count_tokens_cached(text: str, generation: int) -> int:
-    # tiktoken encoding is the dominant per-turn cost: assembly and preflight
-    # re-count the same content many times per turn. The counting function is
-    # stable within one encoder generation (see _encoder_generation), so a
-    # (content, generation) key is stable.
-    return _count_tokens_core(text)
-
-
-# Cap what the LRU may retain by reference. Very large strings are the ones
-# least likely to recur identically, and caching them would still let the
-# bounded LRU pin unnecessary memory; count those uncached (cost is
-# proportional to size either way).
-_MAX_CACHEABLE_TOKEN_TEXT_CHARS = 32_768
-
-
-def count_tokens(text) -> int:
-    """Count tokens in a string."""
+def count_tokens(text: Any) -> int:
+    """``ceil(characters / 4)`` of a text; a non-string value by its JSON."""
     if not text:
         return 0
-    # Only strings are memoized. Callers may pass non-string, unhashable values
-    # (e.g. tool_call arguments as a dict); preserve the legacy tolerance by
-    # counting those uncached rather than feeding them to the LRU.
-    if isinstance(text, str) and len(text) <= _MAX_CACHEABLE_TOKEN_TEXT_CHARS:
-        return _count_tokens_cached(text, _encoder_generation)
-    return _count_tokens_core(text)
+    if not isinstance(text, str):
+        try:
+            text = json.dumps(text, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(text)
+    return math.ceil(len(text) / CHARS_PER_TOKEN)
 
 
-def count_message_tokens(msg: Dict[str, Any]) -> int:
-    """Estimate tokens for a single OpenAI-format message."""
-    total = 4  # role + overhead
-    content = normalize_content_value(msg.get("content")) or ""
-    total += count_tokens(content)
-    for tc in msg.get("tool_calls") or []:
-        if isinstance(tc, dict):
-            fn = tc.get("function", {})
-            total += count_tokens(fn.get("name", ""))
-            total += count_tokens(fn.get("arguments", ""))
-        total += 3  # per-call overhead
-    return total
+def _anthropic_resized_size(width: int, height: int, max_edge: int, max_tokens: int) -> tuple[int, int]:
+    """The size Claude resizes an image to before padding: Anthropic's reference
+    implementation, as published in "Coordinates and bounding boxes", section "Resize
+    your image before uploading"
+    (https://platform.claude.com/docs/en/build-with-claude/vision-coordinates, read
+    2026-09-25), with the tier's limits from "Vision", "Resolution and token cost"
+    (https://platform.claude.com/docs/en/build-with-claude/vision)."""
+
+    def fits(w: int, h: int) -> bool:
+        return (
+            math.ceil(w / 28) * 28 <= max_edge
+            and math.ceil(h / 28) * 28 <= max_edge
+            and math.ceil(w / 28) * math.ceil(h / 28) <= max_tokens
+        )
+
+    if fits(width, height):
+        return (width, height)
+    if height > width:
+        resized_h, resized_w = _anthropic_resized_size(height, width, max_edge, max_tokens)
+        return (resized_w, resized_h)
+    # Binary search along the long edge for the largest aspect-preserving size that fits.
+    aspect_ratio = width / height
+    lo, hi = 1, width  # lo always fits; hi never fits
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if fits(mid, max(round(mid / aspect_ratio), 1)):
+            lo = mid
+        else:
+            hi = mid
+    return (lo, max(round(lo / aspect_ratio), 1))
 
 
-def count_messages_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Estimate total tokens for a message list."""
-    return sum(count_message_tokens(m) for m in messages)
+def _anthropic_image_tokens(rule, width: int, height: int) -> int:
+    """``ceil(w/28) * ceil(h/28)`` visual tokens of the resized image ("Vision",
+    "Resolution and token cost"), plus the constant measured on the route (#35).
+    Anthropic's image block has no ``detail``; a part's ``detail`` changes nothing."""
+    w, h = _anthropic_resized_size(width, height, rule.max_edge_px, rule.max_tokens)
+    return math.ceil(w / 28) * math.ceil(h / 28) + rule.measured_constant
+
+
+def _openai_image_tokens(rule, width: int, height: int, detail: str = "") -> Optional[int]:
+    """OpenAI's patch-based image tokenization, steps A-D as published in "Images and
+    vision", section "Calculating costs" / "Patch-based image tokenization"
+    (https://developers.openai.com/api/docs/guides/images-vision, read 2026-09-25), with
+    the ``detail`` level's limits from the same page's "Model sizing behavior". A level
+    the model does not support gives None (uncounted).
+
+    An image above 30,000 patches is rejected by the API, not resized; it is counted as
+    computed here, so that the estimate never reads lower than what the list holds."""
+    sizing = rule.for_detail(detail)
+    if sizing is None:
+        return None
+    # First, fit within the level's pixel-dimension limit, preserving aspect ratio,
+    # rounding to integer pixels, never enlarging. The page says "rounding"; it is read
+    # here as rounding to the nearest pixel, halves up.
+    w, h = width, height
+    if max(w, h) > sizing.max_edge_px:
+        scale = sizing.max_edge_px / max(w, h)
+        w, h = max(1, math.floor(w * scale + 0.5)), max(1, math.floor(h * scale + 0.5))
+    # A. Patches covering the image.
+    patches = math.ceil(w / 32) * math.ceil(h / 32)
+    # B. and C. Only where the level has a resizing patch budget and the image exceeds it.
+    if sizing.patch_budget is not None and patches > sizing.patch_budget:
+        shrink = math.sqrt((32 ** 2 * sizing.patch_budget) / (w * h))
+        adjusted = shrink * min(
+            math.floor(w * shrink / 32) / (w * shrink / 32),
+            math.floor(h * shrink / 32) / (h * shrink / 32),
+        )
+        resized_w, resized_h = math.floor(w * adjusted), math.floor(h * adjusted)
+        patches = math.ceil(resized_w / 32) * math.ceil(resized_h / 32)
+    # D. The model's multiplier, rounded up.
+    return math.ceil(patches * rule.multiplier)
+
+
+def image_detail(part: dict) -> str:
+    """The ``detail`` a part carries: ``image_url.detail`` (Chat Completions) or the
+    part's own ``detail`` (Responses ``input_image``); "" when it has none."""
+    if not isinstance(part, dict):
+        return ""
+    inner = part.get("image_url")
+    if isinstance(inner, dict) and isinstance(inner.get("detail"), str):
+        return inner["detail"]
+    return part["detail"] if isinstance(part.get("detail"), str) else ""
+
+
+@dataclass(frozen=True)
+class Estimator:
+    """The estimate for one model's context: ``image_model`` names whose image rule
+    counts images; ``reasoning_sent`` whether that provider receives
+    ``reasoning_content``."""
+
+    image_model: str = ""
+    reasoning_sent: bool = False
+
+    def image(self, part: dict) -> Optional[int]:
+        """One image's tokens by the model's rule, or None (uncounted)."""
+        from .image_size import image_dimensions
+        from .model_table import AnthropicImageRule, OpenAIImageRule, lookup
+
+        facts = lookup(self.image_model)
+        rule = facts.image_rule if facts is not None else None
+        if rule is None:
+            return None
+        size = image_dimensions(part)
+        if size is None:
+            return None
+        if isinstance(rule, AnthropicImageRule):
+            return _anthropic_image_tokens(rule, *size)
+        if isinstance(rule, OpenAIImageRule):
+            # The part's own detail decides; the model's default only where it has none.
+            return _openai_image_tokens(rule, *size, detail=image_detail(part))
+        return None
+
+    def _content(self, content: Any) -> tuple[int, int, int]:
+        """(characters, image tokens, uncounted images) of a content value."""
+        if content is None:
+            return 0, 0, 0
+        if isinstance(content, str):
+            return len(content), 0, 0
+        parts = content_parts(content)
+        if parts is None:
+            return len(json.dumps(content, ensure_ascii=False, default=str)), 0, 0
+        chars = images = uncounted = 0
+        for part in parts:
+            if is_image_part(part):
+                tokens = self.image(part)
+                if tokens is None:
+                    uncounted += 1
+                else:
+                    images += tokens
+            elif isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text") \
+                    and isinstance(part.get("text"), str):
+                chars += len(part["text"])
+            elif isinstance(part, str):
+                chars += len(part)
+            else:
+                chars += len(json.dumps(part, ensure_ascii=False, default=str))
+        return chars, images, uncounted
+
+    def message(self, message: Dict[str, Any]) -> Estimate:
+        if not isinstance(message, dict):
+            return Estimate(0)
+        content = message.get("content")
+        sidecar = message.get("api_content")
+        if isinstance(sidecar, str) and sidecar and message.get("role") in ("user", "assistant"):
+            content = sidecar
+        chars, image_tokens, uncounted = self._content(content)
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            chars += len(str(function.get("name") or ""))
+            arguments = function.get("arguments")
+            chars += len(arguments) if isinstance(arguments, str) else len(
+                json.dumps(arguments, ensure_ascii=False, default=str)) if arguments else 0
+        reasoning = message.get("reasoning_content")
+        if self.reasoning_sent and isinstance(reasoning, str):
+            chars += len(reasoning)
+        return Estimate(math.ceil(chars / CHARS_PER_TOKEN) + image_tokens, uncounted)
+
+    def messages(self, messages: Iterable[Dict[str, Any]]) -> Estimate:
+        total = Estimate(0)
+        for message in messages:
+            total = total + self.message(message)
+        return total
+
+
+_PLAIN = Estimator()
+
+
+def count_message_tokens(message: Dict[str, Any], estimator: Optional[Estimator] = None) -> int:
+    """A message's estimate in tokens (see the module docstring)."""
+    return (estimator or _PLAIN).message(message).tokens
+
+
+def count_messages_tokens(messages: Iterable[Dict[str, Any]], estimator: Optional[Estimator] = None) -> int:
+    """A list's estimate in tokens (see the module docstring)."""
+    return (estimator or _PLAIN).messages(messages).tokens

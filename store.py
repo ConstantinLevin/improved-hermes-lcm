@@ -52,7 +52,7 @@ _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
     "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id, "
-    "ingested_at, observed_at, observed_at_source, seq, revises_node_id"
+    "ingested_at, observed_at, observed_at_source, seq, revises_node_id, uncounted_images, content_type"
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
@@ -335,6 +335,14 @@ class MessageStore:
         ).fetchone()
         return row[0] if row else 0
 
+    def get_session_uncounted_images(self, session_id: str) -> int:
+        """The images the session's token estimates left uncounted (#35)."""
+        row = self._locked.execute(
+            "SELECT COALESCE(SUM(uncounted_images), 0) FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return row[0] if row else 0
+
     def get_session_token_total(self, session_id: str) -> int:
         """Sum of token estimates for a session."""
         row = self._locked.execute(
@@ -459,6 +467,7 @@ class MessageStore:
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
                               m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
                               m.ingested_at, m.observed_at, m.observed_at_source, m.seq, m.revises_node_id,
+                              m.uncounted_images, m.content_type,
                               rank as search_rank,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
@@ -764,6 +773,7 @@ class MessageStore:
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
             "ingested_at", "observed_at", "observed_at_source", "seq", "revises_node_id",
+            "uncounted_images", "content_type",
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))

@@ -30,8 +30,11 @@ logger = logging.getLogger(__name__)
 # makes the record the only store: the old path's tables are gone, and what the
 # tools read are views over the record (#29, #1). Format 5 adds the indexes the
 # doctor's invariant check reads by (chunks by session, rejections by compaction),
-# so that a store without them is never opened.
-STORE_FORMAT = "ihl-store/5"
+# so that a store without them is never opened. Format 6 stores beside a record's
+# estimate how many of its images the estimate left uncounted
+# (``records.est_uncounted_images``, #21, #35), and the views show it; a format-5
+# store is refused and begun again (#29 W8: a change of format wipes the store).
+STORE_FORMAT = "ihl-store/6"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -318,7 +321,8 @@ CREATE TABLE records (
     role TEXT,
     tool_call_id TEXT,
     text TEXT,
-    est_tokens INTEGER
+    est_tokens INTEGER,
+    est_uncounted_images INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_records_session ON records(session, record_id);
 
@@ -551,6 +555,8 @@ SELECT r.record_id AS store_id,
        json_extract(r.raw, '$.tool_name') AS tool_name,
        c.began_at AS timestamp,
        r.est_tokens AS token_estimate,
+       r.est_uncounted_images AS uncounted_images,
+       json_type(r.raw, '$.content') AS content_type,
        0 AS pinned,
        c.began_at AS ingested_at,
        CASE WHEN json_type(r.raw, '$.timestamp') IN ('integer', 'real')
@@ -572,6 +578,9 @@ SELECT d.derivation_id AS node_id,
        d.est_tokens AS token_count,
        (SELECT SUM(r.est_tokens) FROM chunk_members m JOIN records r ON r.handle = m.record
         WHERE m.chunk = ch.handle) AS source_token_count,
+       (SELECT COALESCE(SUM(r.est_uncounted_images), 0) FROM chunk_members m
+        JOIN records r ON r.handle = m.record
+        WHERE m.chunk = ch.handle) AS source_uncounted_images,
        (SELECT json_group_array(r.record_id ORDER BY m.ordinal)
         FROM chunk_members m JOIN records r ON r.handle = m.record
         WHERE m.chunk = ch.handle) AS source_ids,

@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 from .summariser_input import WireFacts, summariser_messages
-from .tokens import count_tokens
+from .tokens import Estimate, count_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -430,7 +430,7 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[
 def _call_with_retries(
     messages: list[dict[str, Any]],
     *,
-    source_tokens: int,
+    source: Estimate,
     settings: CallSettings,
     wait: Callable[[float], None],
 ) -> tuple[str, str]:
@@ -465,10 +465,12 @@ def _call_with_retries(
             retries += 1
             backoff = min(_BACKOFF_CAP_S, backoff * 2)
             continue
+        # Both sides by the plugin's estimate (R6); the reply is text, the source may
+        # hold images the estimate could not count, and the numbers say so.
         reply_tokens = count_tokens(content)
-        if reply_tokens >= source_tokens:
+        if reply_tokens >= source.tokens:
             raise SummaryFailure("reply not shorter than its source", transient=False,
-                                 detail=f"{reply_tokens} >= {source_tokens} tokens")
+                                 detail=f"{reply_tokens} >= {source.tokens} tokens, {source.label()}")
         return content, finish_reason
 
 
@@ -476,7 +478,7 @@ def summarize_chunk(
     records: list[tuple[str, dict]],
     token_budget: int,
     *,
-    source_tokens: int,
+    source: Estimate,
     settings: CallSettings,
     facts: WireFacts,
     depth: int = 0,
@@ -488,8 +490,8 @@ def summarize_chunk(
 
     ``records`` are the chunk's records as (handle, the host's dict as stored); the
     summariser reads them as the messages they were (#8, ``summariser_input``).
-    ``source_tokens`` is their count, what the summary replaces in the context; a
-    reply must come in below it, by the same counter (R6).
+    ``source`` is their estimate, what the summary replaces in the context; a reply
+    must come in below it, by the same counter (R6).
 
     Level 1; after a non-transient failure of level 1, level 2 once (today's texts,
     until #10). A transient failure that outlasts the deadline is not retried at
@@ -505,7 +507,7 @@ def summarize_chunk(
     )
     try:
         content, finish_reason = _call_with_retries(
-            l1, source_tokens=source_tokens, settings=settings, wait=wait)
+            l1, source=source, settings=settings, wait=wait)
         return content, 1, finish_reason
     except SummaryFailure as first:
         if first.transient:
@@ -520,7 +522,7 @@ def summarize_chunk(
         )
         try:
             content, finish_reason = _call_with_retries(
-                l2, source_tokens=source_tokens, settings=settings, wait=wait)
+                l2, source=source, settings=settings, wait=wait)
         except SummaryFailure as second:
             raise SummaryFailure(
                 f"level 1: {first}; level 2: {second.reason}",

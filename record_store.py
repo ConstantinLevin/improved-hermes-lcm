@@ -34,7 +34,7 @@ from typing import Any, Iterable, Optional, Sequence
 from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .message_content import base64_like_strings, describe_image_part, image_parts, index_text
-from .tokens import count_message_tokens
+from .tokens import Estimator
 
 logger = logging.getLogger(__name__)
 
@@ -645,6 +645,7 @@ class RecordStore:
         attempt_generation: Optional[int],
         entries: Sequence[InputEntry],
         chunks: Sequence[Sequence[int]] = (),
+        estimator: Optional[Estimator] = None,
     ) -> tuple[int, dict[int, str], list[str]]:
         """Transaction 1: the compaction, its inputs, the new records, their tool calls
         and the chunks.
@@ -659,6 +660,7 @@ class RecordStore:
         """
         records: dict[int, str] = {}
         chunk_handles: list[str] = []
+        uncounted: dict[str, int] = {}
         with self._tx() as conn:
             cid = conn.execute(
                 "INSERT INTO compactions(session, kind, host_session_before, attempt_generation, began_at) "
@@ -677,11 +679,13 @@ class RecordStore:
                         predecessor = records[entry.pred[1]]
                     elif entry.pred is not None:
                         predecessor = entry.pred[1]
+                    estimate = (estimator or Estimator()).message(message)
                     handle = self._insert_with_handle(
                         conn,
                         MESSAGE,
                         "INSERT INTO records(handle, session, predecessor, compaction, kind, raw, "
-                        "role, tool_call_id, text, est_tokens) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "role, tool_call_id, text, est_tokens, est_uncounted_images) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             session,
                             predecessor,
@@ -691,10 +695,13 @@ class RecordStore:
                             message.get("role"),
                             message.get("tool_call_id"),
                             index_text(message.get("content")),
-                            count_message_tokens(message),
+                            estimate.tokens,
+                            estimate.uncounted_images,
                         ),
                     )
                     records[entry.position] = handle
+                    if estimate.uncounted_images:
+                        uncounted[handle] = estimate.uncounted_images
                     if entry.klass == "revision":
                         for ordinal, source in enumerate(entry.sources):
                             if source[0] == "record":
@@ -742,6 +749,15 @@ class RecordStore:
                 chunk_handles.append(handle)
         for handle, message, _known in written:
             _warn_media(handle, message)
+        if uncounted:
+            # "Known, or nothing" (#35): the estimate of these records leaves images
+            # out, so every count over them reads lower than the context by those images.
+            logger.warning(
+                "LCM estimate leaves %d images uncounted (no image rule for model %r, or no readable size) "
+                "in records %s",
+                sum(uncounted.values()), (estimator or Estimator()).image_model,
+                ", ".join(f"{handle} ({count})" for handle, count in uncounted.items()),
+            )
         return int(cid), records, chunk_handles
 
     def _write_tool_calls(

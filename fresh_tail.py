@@ -8,10 +8,10 @@ check may move it back to the assistant that opened a tool-result group.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from .message_analysis import _tool_call_id
-from .tokens import count_message_tokens, count_messages_tokens
+from .tokens import Estimator, count_message_tokens, count_messages_tokens
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,7 @@ def resolve_fresh_tail_boundary(
     *,
     fresh_tail_count: int,
     fresh_tail_max_tokens: int = 0,
+    estimator: Optional[Estimator] = None,
 ) -> FreshTailBoundary:
     """Resolve the protected suffix without splitting assistant/tool groups.
 
@@ -78,7 +79,7 @@ def resolve_fresh_tail_boundary(
         used = 0
         token_start = message_count - 1
         for index in range(message_count - 1, count_start - 1, -1):
-            message_tokens = count_message_tokens(messages[index])
+            message_tokens = count_message_tokens(messages[index], estimator)
             if index != message_count - 1 and used + message_tokens > token_limit:
                 token_limited = True
                 break
@@ -93,7 +94,7 @@ def resolve_fresh_tail_boundary(
     return FreshTailBoundary(
         start=start,
         count=len(tail),
-        tokens=count_messages_tokens(tail),
+        tokens=count_messages_tokens(tail, estimator),
         count_limit=count_limit,
         token_limit=token_limit,
         token_limited=token_limited,
