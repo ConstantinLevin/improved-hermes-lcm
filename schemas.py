@@ -67,11 +67,10 @@ LCM_GREP = {
 LCM_EXPAND = {
     "name": "lcm_expand",
     "description": (
-        "Recover the original detail behind a summary node, externalized payload, or raw message. "
+        "Recover the original detail behind a summary node or a stored message. "
         "Mode selection (exactly one): node_id (current session only) returns the source messages "
-        "or lower-depth summaries that were compacted into a summary node; externalized_ref "
-        "(current session only) returns a stored externalized payload's content; store_id returns "
-        "a single raw message by store_id, suitable for drilling into lcm_grep message hits. "
+        "that were summarised into a summary node; store_id returns a single stored message, as it "
+        "was stored, by store_id, suitable for drilling into lcm_grep message hits. "
         "Output is bounded by max_tokens; raw recovery is pageable via content_offset "
         "(and source_offset/source_limit for node_id mode)."
     ),
@@ -85,16 +84,11 @@ LCM_EXPAND = {
                     "is not supported in this version."
                 ),
             },
-            "externalized_ref": {
-                "type": "string",
-                "description": "Externalized payload ref filename to expand instead of a summary node. Current-session only.",
-            },
             "store_id": {
                 "type": "integer",
                 "description": (
                     "Raw message store_id to fetch, as surfaced by an lcm_grep message hit. Returns the "
-                    "message's content paged by content_offset. If the row references an externalized "
-                    "payload, the ref is surfaced via 'externalized_ref'."
+                    "message's content paged by content_offset."
                 ),
             },
             "max_tokens": {
@@ -113,7 +107,7 @@ LCM_EXPAND = {
             },
             "content_offset": {
                 "type": "integer",
-                "description": "Character offset used to continue an oversized raw message, externalized payload, or store_id-mode message. Use next_content_offset from the previous response.",
+                "description": "Character offset used to continue an oversized raw message or store_id-mode message. Use next_content_offset from the previous response.",
                 "default": 0,
             },
         },
@@ -141,7 +135,7 @@ LCM_INSPECT = {
     "description": (
         "Inspect read-only LCM metadata for the current session: session/conversation "
         "lineage, message frontier and fresh tail, DAG compaction frontier, latest "
-        "compaction skip/no-op reason, and externalized payload refs and readability. "
+        "compaction skip/no-op reason. "
         "This is an operator inventory tool; "
         "use lcm_grep/lcm_expand when you need actual content."
     ),
@@ -210,7 +204,7 @@ LCM_EXPAND_QUERY = {
             },
             "context_max_tokens": {
                 "type": "integer",
-                "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
+                "description": "Expanded serialized summary/raw/child-source fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
                 "default": 32000,
             },
         },

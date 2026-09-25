@@ -33,7 +33,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 from .db_bootstrap import open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
-from .message_content import text_content_for_pattern_matching
+from .message_content import base64_like_strings, describe_image_part, image_parts, index_text
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,33 @@ def raw_json(message: dict) -> str:
         ensure_ascii=False,
         allow_nan=False,
     )
+
+
+def _warn_media(handle: str, message: dict) -> None:
+    """A message carrying images or base64 is stored as it came, and a warning is
+    logged (#3, #35). Images are found by structure; base64 inside a string only by
+    its shape, in a separate line that says so."""
+    try:
+        images = image_parts(message.get("content"))
+        if images:
+            logger.warning(
+                "LCM stored a %s message with %d image part(s) as it came, in record %s: %s",
+                message.get("role") or "?",
+                len(images),
+                handle,
+                "; ".join(describe_image_part(part) for part in images),
+            )
+        suspects = base64_like_strings(message)
+        if suspects:
+            logger.warning(
+                "LCM heuristic (by the text's shape, not a detection): the %s message in record %s "
+                "may carry base64 inside its text, stored as it came: %s",
+                message.get("role") or "?",
+                handle,
+                "; ".join(suspects),
+            )
+    except Exception:
+        logger.warning("LCM could not check record %s for media", handle, exc_info=True)
 
 
 def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
@@ -401,7 +428,7 @@ class RecordStore:
                             raw_json(message),
                             message.get("role"),
                             message.get("tool_call_id"),
-                            text_content_for_pattern_matching(message.get("content")),
+                            index_text(message.get("content")),
                             count_message_tokens(message),
                         ),
                     )
@@ -451,6 +478,8 @@ class RecordStore:
                     [(handle, ordinal, record) for ordinal, record in enumerate(members)],
                 )
                 chunk_handles.append(handle)
+        for handle, message, _known in written:
+            _warn_media(handle, message)
         return int(cid), records, chunk_handles
 
     def _write_tool_calls(

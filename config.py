@@ -237,7 +237,6 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
-    _EnvFieldSpec("large_output_externalization_path", "LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", str),
     _EnvFieldSpec("summary_model", "LCM_SUMMARY_MODEL", str),
     _EnvFieldSpec("summary_circuit_breaker_failure_threshold", "LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", int),
     _EnvFieldSpec("summary_circuit_breaker_cooldown_seconds", "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", int),
@@ -308,11 +307,6 @@ class LCMConfig:
     # Custom instructions injected into all summarization prompts
     custom_instructions: str = ""
 
-    # -- Ingest side files ---
-    # Directory for the side files that ingest writes for base64 payloads and
-    # quarantined assistant output (empty = auto under hermes home).
-    large_output_externalization_path: str = ""
-
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
     # Optional fallback summary models tried after summary_model/task default.
@@ -329,7 +323,7 @@ class LCMConfig:
     # Backoff, in seconds, after the spend window is exhausted.
     summary_spend_backoff_seconds: float = 1800.0
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
-    # Serialized summary/raw/child-source/externalized context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
+    # Serialized summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
 
     # -- Timeouts ---
