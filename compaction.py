@@ -40,7 +40,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from .escalation import summarize_chunk
+from .escalation import REASONING_EFFORTS, CallSettings, SummariserRoute, summarize_chunk
+from .model_table import lookup as lookup_model
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .record_write import _ATTEMPT, AttemptCancelled
@@ -148,6 +149,46 @@ class CompactionMixin:
         logger.warning("LCM compaction aborted: %s", cause)
         return messages
 
+    def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
+        """The summariser's route, effort and output cap, or the reason there is none
+        (#9). No part of the route is guessed: the session's route is what the host
+        handed ``update_model``; a configured one must name its provider."""
+        config = self._config
+        if config.summary_model or config.summary_provider:
+            if not (config.summary_model and config.summary_provider):
+                return None, ("the configured summariser is incomplete: LCM_SUMMARY_MODEL and "
+                              "LCM_SUMMARY_PROVIDER are set together or not at all")
+            route = SummariserRoute(
+                provider=config.summary_provider.strip(), model=config.summary_model.strip(),
+                base_url=config.summary_base_url.strip(), api_key=config.summary_api_key.strip(),
+                api_mode=config.summary_api_mode.strip(), source="configured",
+            )
+        else:
+            if not (self.model and self.provider):
+                return None, ("the session's model is not known: the host has not named its route "
+                              "through update_model, and no summariser is configured")
+            route = SummariserRoute(
+                provider=self.provider, model=self.model, base_url=self.base_url,
+                api_key=self.api_key, api_mode=self.api_mode, source="session",
+            )
+        effort = None
+        if self._plugin_session:
+            try:
+                effort = self._sessions.latest_fact(self._plugin_session, "effort")
+            except Exception as exc:
+                return None, f"the session's reasoning effort could not be read ({exc})"
+        effort = (effort or config.summary_reasoning_effort or "").strip().lower()
+        if effort not in REASONING_EFFORTS:
+            return None, (f"the summariser's reasoning effort {effort!r} is not one of the host's levels "
+                          f"({', '.join(sorted(REASONING_EFFORTS))})")
+        facts = lookup_model(route.model)
+        return CallSettings(
+            route=route,
+            effort=effort,
+            max_tokens=facts.output_cap if facts is not None else None,
+            timeout=config.summary_timeout_ms / 1000,
+        ), ""
+
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
@@ -192,9 +233,10 @@ class CompactionMixin:
         *,
         focus_topic: Optional[str],
         store_ids: List[int],
+        settings: CallSettings,
     ) -> tuple[str, int, int, str]:
         """One chunk's summary: (text, level, budget, finish_reason), or
-        ``SummaryFailure`` (#7).
+        ``SummaryFailure`` (#7), with the summariser's route and effort (#9).
 
         The chunk's records are serialised as today (``_serialize_messages``, until #8).
         The budget is a target in the prompt text, never an output limit. A wait
@@ -218,9 +260,8 @@ class CompactionMixin:
             self._serialize_messages(chunk_messages),
             budget,
             source_tokens=source_tokens,
+            settings=settings,
             depth=0,
-            model=self._config.summary_model,
-            timeout=self._config.summary_timeout_ms / 1000,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
             source_provenance={
@@ -365,8 +406,28 @@ class CompactionMixin:
         if material_tokens < self._config.leaf_chunk_tokens and not (force or force_overflow):
             return self._unchanged_return(messages, "the material outside the fresh tail is below one leaf chunk")
 
+        # The summariser, as far as anything can be written: its route and effort (#9).
+        settings, why_not = self._summariser_settings()
+        if settings is None:
+            return self._abort(messages, why_not)
+
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk.
         chunks = self._cut_chunks(messages, material, max(1, int(self._config.leaf_chunk_tokens)))
+        # A chunk the summariser cannot read in one call would fail on every attempt; it
+        # is never cut (the tiny-chunk rule on #52). Only where the model table knows
+        # the window; counted by the plugin's own counter, an estimate.
+        model_facts = lookup_model(settings.route.model)
+        if model_facts is not None and model_facts.context_window:
+            room = model_facts.context_window - (model_facts.output_cap or 0)
+            for number, chunk in enumerate(chunks, start=1):
+                tokens = count_messages_tokens([messages[index] for index in chunk])
+                if tokens > room:
+                    return self._abort(
+                        messages,
+                        f"chunk {number} of {len(chunks)} holds about {tokens} tokens (the plugin's estimate), "
+                        f"more than the summariser {settings.route.describe()} can read in one call "
+                        f"({model_facts.context_window} window less {model_facts.output_cap or 0} output)",
+                    )
         try:
             chunk_handles = self._write_compaction(attempt, entries, chunks, force=force)
         except Exception as exc:
@@ -389,6 +450,7 @@ class CompactionMixin:
                     chunk_messages,
                     focus_topic=focus_topic,
                     store_ids=[facts[record][3] for record in records],
+                    settings=settings,
                 )
             except Exception as exc:
                 # A SummaryFailure, or anything else the call raised: never truncated,
@@ -401,6 +463,7 @@ class CompactionMixin:
                 new_derivations.append(self._write_summary(
                     attempt, chunk_handle, text=text, level=level, budget=budget,
                     finish_reason=finish_reason, expand_hint=self._extract_expand_hint(text),
+                    model=settings.route.model, provider=settings.route.provider, effort=settings.effort,
                 ))
             except Exception as exc:
                 logger.warning("LCM could not write a summary", exc_info=True)

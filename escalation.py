@@ -1,4 +1,14 @@
-"""The summariser call for one chunk (#7).
+"""The summariser call for one chunk (#7, #9).
+
+The call names its whole route: provider, model, base URL, key and API mode, either
+the session's own as the host handed it to ``update_model`` or the one configured for
+the plugin (#9). It is made with no host task name (R8), so none of the host's
+``auxiliary.<task>`` settings reach it, with the reasoning effort passed through the
+host's ``reasoning_config``, and with ``route_info``, which the host fills with the
+route that answered. A reply from any other model than the summariser is a failure
+(#33 D9): the host's fallback ladder answers a timeout, a rate limit or another
+capacity error with the main agent's model or a configured fallback, and says so only
+there. When the main agent's model is the summariser, its answer is the summariser's.
 
 Two levels, each one call to the summariser with today's prompt text (#10 owns the
 texts): level 1 asks for a summary near the target budget; level 2, with today's
@@ -10,15 +20,16 @@ next occasion ("Ending in truncation"; "Lossless, precisely").
 What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 
 - the call raises (a rate limit, a timeout, a connection or provider error);
+- another model answered (``route_info`` names another provider or model);
 - the reply has no ``choices[0].message`` (malformed), or its ``content`` is empty;
 - the provider stopped the reply at its output limit (``finish_reason == "length"``);
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
 
-The budget is a target in the prompt text only. No ``max_tokens`` is passed, so the
-plugin never cuts a summary at an output limit of its own; a reply the provider cut at
-its default limit reports ``length`` and fails (#7; the output cap from the model table
-replaces this with #9). Where the host rewrites a missing finish reason to "stop" (its
+The budget is a target in the prompt text only. ``max_tokens`` is the summariser
+model's own output cap where the model table knows it (R5 b), and absent otherwise, so
+the plugin never cuts a summary at an output limit of its own; a reply stopped at the
+limit reports ``length`` and fails (#7). Where the host rewrites a missing finish reason to "stop" (its
 Codex adapter always; its streamed collector when no chunk carried one), a cut reply
 can still pass: that is the host's, and asked of Hermes (A-7.1).
 
@@ -38,9 +49,9 @@ import email.utils
 import logging
 import random
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
-from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 from .tokens import count_tokens
 
@@ -59,6 +70,31 @@ _BACKOFF_CAP_S = 30.0
 _TRANSIENT_STATUS = frozenset({408, 409, 429})
 # With no host deadline: 2, 4, 8, 16, 30, 30 s, then stop (the cap reached a second time).
 _NO_DEADLINE_RETRIES = 6
+
+
+# The levels the host's reasoning setting takes (``auxiliary.<task>.reasoning_effort``).
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+
+
+@dataclass(frozen=True)
+class SummariserRoute:
+    """The summariser's whole route, explicit at every call (#9). ``source`` says where
+    it came from: ``session`` (the host's ``update_model``) or ``configured``."""
+
+    provider: str
+    model: str
+    base_url: str = ""
+    api_key: str = ""
+    api_mode: str = ""
+    source: str = "session"
+
+    def call_kwargs(self) -> dict[str, str]:
+        fields = {"provider": self.provider, "model": self.model, "base_url": self.base_url,
+                  "api_key": self.api_key, "api_mode": self.api_mode}
+        return {key: value for key, value in fields.items() if value}
+
+    def describe(self) -> str:
+        return f"{self.provider}/{self.model}"
 
 
 class SummaryFailure(Exception):
@@ -134,20 +170,43 @@ def _default_wait(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _call_once(messages: list[dict[str, Any]], *, model: str, timeout: Optional[float]) -> tuple[str, str]:
+@dataclass(frozen=True)
+class CallSettings:
+    """Everything one summariser call is made with, the same at both levels."""
+
+    route: SummariserRoute
+    effort: str
+    max_tokens: Optional[int] = None
+    timeout: Optional[float] = None
+
+
+def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[str, str]:
     """One call through the host. Returns (content, finish_reason); raises on any
-    failure of the call or the reply's shape."""
+    failure of the call, a reply from another model, or a reply of the wrong shape."""
     from agent.auxiliary_client import call_llm
 
+    route = settings.route
+    route_info: dict[str, str] = {}
     call_kwargs: dict[str, Any] = {
-        "task": "compression",
+        "task": None,
         "messages": messages,
         "temperature": 0.3,
+        "reasoning_config": {"enabled": settings.effort != "none", "effort": settings.effort},
+        "route_info": route_info,
+        **route.call_kwargs(),
     }
-    apply_lcm_model_route(call_kwargs, model)
-    if timeout is not None:
-        call_kwargs["timeout"] = timeout
+    if settings.max_tokens:
+        call_kwargs["max_tokens"] = settings.max_tokens
+    if settings.timeout is not None:
+        call_kwargs["timeout"] = settings.timeout
     response = call_llm(**call_kwargs)
+    answered = (str(route_info.get("provider") or "").strip(), str(route_info.get("model") or "").strip())
+    if answered[0].lower() != route.provider.strip().lower() or answered[1] != route.model.strip():
+        raise SummaryFailure(
+            "reply from another model", transient=False,
+            detail=f"the host's route_info names {answered[0] or '?'}/{answered[1] or '?'}, "
+                   f"the summariser is {route.describe()} (#33 D9)",
+        )
     try:
         choice = response.choices[0]
         message = choice.message
@@ -169,8 +228,7 @@ def _call_with_retries(
     messages: list[dict[str, Any]],
     *,
     source_tokens: int,
-    model: str,
-    timeout: Optional[float],
+    settings: CallSettings,
     wait: Callable[[float], None],
 ) -> tuple[str, str]:
     """One level: transient failures retried while the deadline allows; a reply that
@@ -179,7 +237,7 @@ def _call_with_retries(
     retries = 0
     while True:
         try:
-            content, finish_reason = _call_once(messages, model=model, timeout=timeout)
+            content, finish_reason = _call_once(messages, settings)
         except SummaryFailure:
             raise
         except Exception as exc:
@@ -216,9 +274,8 @@ def summarize_chunk(
     token_budget: int,
     *,
     source_tokens: int,
+    settings: CallSettings,
     depth: int = 0,
-    model: str = "",
-    timeout: Optional[float] = None,
     focus_topic: str = "",
     custom_instructions: str = "",
     source_provenance: Mapping[str, Any] | None = None,
@@ -243,7 +300,7 @@ def summarize_chunk(
     )
     try:
         content, finish_reason = _call_with_retries(
-            l1, source_tokens=source_tokens, model=model, timeout=timeout, wait=wait)
+            l1, source_tokens=source_tokens, settings=settings, wait=wait)
         return content, 1, finish_reason
     except SummaryFailure as first:
         if first.transient:
@@ -259,7 +316,7 @@ def summarize_chunk(
         )
         try:
             content, finish_reason = _call_with_retries(
-                l2, source_tokens=source_tokens, model=model, timeout=timeout, wait=wait)
+                l2, source_tokens=source_tokens, settings=settings, wait=wait)
         except SummaryFailure as second:
             raise SummaryFailure(
                 f"level 1: {first}; level 2: {second.reason}",

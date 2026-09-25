@@ -232,6 +232,11 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
     _EnvFieldSpec("summary_model", "LCM_SUMMARY_MODEL", str),
+    _EnvFieldSpec("summary_provider", "LCM_SUMMARY_PROVIDER", str),
+    _EnvFieldSpec("summary_base_url", "LCM_SUMMARY_BASE_URL", str),
+    _EnvFieldSpec("summary_api_key", "LCM_SUMMARY_API_KEY", str),
+    _EnvFieldSpec("summary_api_mode", "LCM_SUMMARY_API_MODE", str),
+    _EnvFieldSpec("summary_reasoning_effort", "LCM_SUMMARY_REASONING_EFFORT", str),
     _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
     _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
     _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
@@ -288,7 +293,18 @@ class LCMConfig:
     custom_instructions: str = ""
 
     # -- Models ---
-    summary_model: str = ""       # empty = use Hermes auxiliary model
+    # The summariser (#9). Empty summary_model: the model running the session, on the
+    # route the host hands update_model. Set: that model, on the provider named in
+    # summary_provider (required with it), with the optional base URL, key and API mode;
+    # a model id only, never "provider/model".
+    summary_model: str = ""
+    summary_provider: str = ""
+    summary_base_url: str = ""
+    summary_api_key: str = ""     # never shown in status
+    summary_api_mode: str = ""
+    # The summariser's reasoning effort, the host's levels; a session's own value, set
+    # by the owner's command, is a session fact and wins (#9, #26).
+    summary_reasoning_effort: str = "medium"
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
     # Serialized summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000

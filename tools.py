@@ -1756,7 +1756,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
             "leaf_chunk_tokens": engine._config.leaf_chunk_tokens,
             "context_threshold": engine._config.context_threshold,
-            "summary_model": engine._config.summary_model or "(auxiliary)",
+            "summary_model": (
+                f"{engine._config.summary_provider}/{engine._config.summary_model}"
+                if engine._config.summary_model else f"(the session's model: {engine.provider}/{engine.model})"
+            ),
+            "summary_reasoning_effort_default": engine._config.summary_reasoning_effort,
             "summary_timeout_ms": engine._config.summary_timeout_ms,
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
