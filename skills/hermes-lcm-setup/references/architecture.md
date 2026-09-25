@@ -15,7 +15,8 @@ What was said after the last compaction is in the agent's context, not yet in th
 
 ## Scope model
 
-- The recall tools read the current session, across the host identifiers its compactions rotate through.
-- Hermes `session_search` covers host-tracked history outside `lcm-record.db`.
+The recall tools read the current session, across the host identifiers its compactions rotate through, and nothing outside it.
 
-Do not silently treat those stores or scopes as interchangeable.
+## What the agent is told
+
+The plugin tells the agent what the summaries in its context are through a section of the host's system prompt, `## Plugin Context: lcm`, whose text is `skills/hermes-lcm/references/recall-policy.md`. The host renders it once per session and again after every compaction. It is shown only to sessions whose context engine is LCM. The plugin also registers two skills, `hermes-lcm:summaries` (working with summaries) and `hermes-lcm:setup` (this one), which the agent reads with `skill_view`.

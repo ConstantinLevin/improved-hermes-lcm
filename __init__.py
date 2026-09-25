@@ -9,16 +9,60 @@ Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 
 import logging
 import os
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-def get_recall_policy() -> str:
-    """Load the canonical product policy without making bare imports package-dependent."""
-    from .guidance import get_recall_policy as _get_recall_policy
+def _instruction_not_delivered(engine, why: str) -> None:
+    """The instruction cannot reach the agent: an error in the log and a store event,
+    which the doctor lists (#16). Compaction goes on; its summaries hedge themselves."""
+    logger.error("LCM cannot deliver its instruction to the agent: %s", why)
+    try:
+        engine._records.event("instruction_not_delivered", detail=why)
+    except Exception:
+        logger.debug("LCM could not record that its instruction is not delivered", exc_info=True)
 
-    return _get_recall_policy()
+
+def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> None:
+    """The plugin's instruction as a section of the host's system prompt, and its two
+    skills, ``hermes-lcm:summaries`` and ``hermes-lcm:setup`` (#16).
+
+    The section's content is a callable the host gives the session's metadata when it
+    renders the prompt: it returns the instruction only for a session this plugin's
+    engine serves, found in the engine registry by the host's session id, and "" (which
+    the host skips) for any other, so that an agent whose context engine is not LCM is
+    told nothing about LCM's summaries."""
+    from .guidance import SECTION_ID, SECTION_MAX_CHARS, SKILLS, InstructionRefused, instruction_text
+
+    register_section = getattr(ctx, "register_system_prompt_section", None)
+    if not callable(register_section):
+        _instruction_not_delivered(engine, "the host offers no register_system_prompt_section to this plugin")
+    else:
+        try:
+            text = instruction_text()
+
+            def _section(info):
+                session_id = str((info or {}).get("session_id") or "")
+                active = resolve_active_lcm_engine(session_id=session_id) if session_id else None
+                if active is None or getattr(active, "name", None) != "lcm":
+                    return ""
+                return text
+
+            register_section(SECTION_ID, _section, position="after_memory", max_chars=SECTION_MAX_CHARS)
+        except InstructionRefused as exc:
+            _instruction_not_delivered(engine, str(exc))
+        except Exception as exc:
+            _instruction_not_delivered(engine, f"the host refused the section ({type(exc).__name__}: {exc})")
+
+    register_skill = getattr(ctx, "register_skill", None)
+    if not callable(register_skill):
+        logger.warning("LCM's skills are not registered: the host offers no register_skill to this plugin")
+        return
+    for name, path, description in SKILLS:
+        try:
+            register_skill(name, path, description=description)
+        except Exception as exc:
+            logger.warning("LCM could not register its skill %s (%s): %s", name, path, exc)
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -146,62 +190,13 @@ def register(ctx):
 
         on_unload(_close_registered_engine)
 
-    # Ship the same recall contract through both Hermes plugin skill
-    # registration (explicit qualified loads) and the installer's ordinary
-    # profile skill link (normal discovery). Older hosts simply lack this
-    # capability and keep their existing schema-driven behavior.
-    skill_root = Path(__file__).resolve().parent / "skills" / "hermes-lcm"
-    register_skill = getattr(ctx, "register_skill", None)
-    if callable(register_skill):
-        try:
-            register_skill(
-                "hermes-lcm",
-                skill_root,
-                description=(
-                    "Use, configure, diagnose, and recall exact evidence "
-                    "with the Hermes-LCM lossless context plugin."
-                ),
-            )
-        except Exception as exc:
-            logger.warning(
-                "LCM bundled skill registration did not complete; normal "
-                "profile skill discovery may still be available: %s",
-                exc,
-            )
+    # The instruction to the agent, as a system-prompt section, and the two skills
+    # (#16). No hook injects it: a hook's text rides on the user's message and is
+    # replayed on every later request, as if the user had written it (#36).
+    _register_instruction(ctx, engine, resolve_active_lcm_engine)
 
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
-        # Hermes invokes this hook after the context engine has received
-        # on_session_start(). Resolve through LCM's own registry so merely
-        # loading the plugin cannot inject guidance when another context
-        # engine is serving the turn. Capture one validated policy value for
-        # deterministic, byte-stable injection across eligible turns.
-        try:
-            recall_policy = get_recall_policy()
-
-            def _on_pre_llm_call(**payload):
-                session_id = str(payload.get("session_id") or "")
-                conversation_id = str(
-                    payload.get("conversation_id")
-                    or payload.get("gateway_session_key")
-                    or ""
-                )
-                active_engine = resolve_active_lcm_engine(
-                    session_id=session_id,
-                    conversation_id=conversation_id,
-                )
-                if active_engine is None or getattr(active_engine, "name", None) != "lcm":
-                    return None
-                return {"context": recall_policy}
-
-            register_hook("pre_llm_call", _on_pre_llm_call)
-        except Exception as exc:
-            logger.warning(
-                "LCM recall-policy hook registration did not complete; "
-                "tool schemas remain available: %s",
-                exc,
-            )
-
         # The host's explicit session signals: /new, and a delegate's parent.
         # They write into the store of the home this plugin was loaded for.
         def _on_session_reset(**payload):

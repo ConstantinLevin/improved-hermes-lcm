@@ -42,4 +42,5 @@ A session that was running continues from its host context, which holds summarie
 - Database exists but stays empty: nothing is stored before the session's first compaction; after one, verify plugin enablement, `context.engine`, profile, and database path.
 - Weak exact recall: verify source rows exist, query construction/scope is correct, and summary health is sound.
 - Conflicting summary and raw evidence: prefer the newer exact raw evidence and inspect lineage.
+- An `instruction_not_delivered` event in the doctor's recent events: the plugin could not give the host its system-prompt section (the host offers none to it, or the text is over the host's limit), so the agent is not told what its summaries are.
 - Path B/context-engine schema log: expected on hosts where plugin-registry handlers do not receive active messages; context-engine schemas and dispatch remain the healthy route.

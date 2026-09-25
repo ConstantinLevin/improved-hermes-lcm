@@ -40,14 +40,17 @@ brings the context down to a target G (#11, #31, #32); the material outside the 
 into equal chunks of 50k provider tokens (#12), and the tail takes what the target leaves,
 sized in tokens, in whole tool groups (#13). The plugin counts by its own estimate, characters
 divided by four, converted to provider tokens by a measured ratio and labelled as an estimate
-wherever it is shown (#21). The fork is not usable for its purpose yet: condensation (#34), the
+wherever it is shown (#21). The plugin tells the agent what its summaries are in a section of
+the host's system prompt, shown only where LCM is the session's context engine, and registers
+two skills, `hermes-lcm:summaries` and `hermes-lcm:setup`; no hook injects text into the user's
+messages (#16). The fork is not usable for its purpose yet: condensation (#34), the
 re-insertion inside a turn (#14) and the rest of the issues in this repository's tracker are
 still to come.
 
 ## Working on it
 
 This is a development path, not an install for use. `scripts/install.sh` links the checkout into
-`$HERMES_HOME/plugins/hermes-lcm` and the skill into `$HERMES_HOME/skills/hermes-lcm`. Hermes
+`$HERMES_HOME/plugins/hermes-lcm` and the summaries skill into `$HERMES_HOME/skills/hermes-lcm`. Hermes
 then needs both of these in its `config.yaml`:
 
 ```yaml

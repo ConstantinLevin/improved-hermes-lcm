@@ -1,8 +1,8 @@
 """Process-wide registry of active LCM runtime clones by session/lane.
 
 Isolated from ``engine.py`` (WS5 seam): LCM clones register their own
-session/conversation binding so the ``pre_llm_call`` recall-policy hook and the
-``/lcm`` command find the active clone instead of the process-wide plugin
+session/conversation binding so the system-prompt section of the instruction and
+the ``/lcm`` command find the active clone instead of the process-wide plugin
 singleton. The lock and the two weak
 registries live here alongside the pure resolver/matcher helpers that read
 them. ``engine.py`` imports the shared lock, the two registries, the removal
