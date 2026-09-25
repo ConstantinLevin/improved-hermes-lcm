@@ -221,6 +221,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("window_min_tokens", "LCM_WINDOW_MIN_TOKENS", int),
     _EnvFieldSpec("window_max_tokens", "LCM_WINDOW_MAX_TOKENS", int),
     _EnvFieldSpec("fixed_prefix_hypothesis_tokens", "LCM_FIXED_PREFIX_HYPOTHESIS_TOKENS", int),
+    _EnvFieldSpec("estimate_ratio_p99", "LCM_ESTIMATE_RATIO_P99", float),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
@@ -256,6 +257,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "window_min_tokens",
     "window_max_tokens",
     "fixed_prefix_hypothesis_tokens",
+    "estimate_ratio_p99",
 })
 
 # The geometry's weights (#31, Decided; R14): field, env var, parse type, default, and
@@ -274,7 +276,9 @@ _GEOMETRY_WEIGHTS = (
     ("window_max_tokens", "LCM_WINDOW_MAX_TOKENS", int, 2_000_000,
      "default: #21's upper bound on the window (R11)"),
     ("fixed_prefix_hypothesis_tokens", "LCM_FIXED_PREFIX_HYPOTHESIS_TOKENS", int, 32_000,
-     "default: a hypothesis (R10), F until the session's first response measures it"),
+     "default: a hypothesis (R10), F until a response of the session measures it"),
+    ("estimate_ratio_p99", "LCM_ESTIMATE_RATIO_P99", float, 2.37,
+     "default: #31 measured, p99 of the provider's count over characters / 4 on Claude"),
 )
 
 
@@ -302,9 +306,13 @@ class LCMConfig:
     window_min_tokens: int = 256_000
     window_max_tokens: int = 2_000_000
     # -- The tail (#13, #31): t = G - F - S - R_in, no message count ---
-    # F, the fixed prefix, is measured per plugin session at its first response (a
-    # session fact); until then this hypothesis stands in for it (R10).
+    # F, the fixed prefix, is measured at each response of a plugin session and kept
+    # where the list was smallest (a session fact); until the first, this hypothesis
+    # stands in for it (R10).
     fixed_prefix_hypothesis_tokens: int = 32_000
+    # The provider's count over the estimate at #31's p99: a measured F carries the error
+    # bound (p99 - p50) x the list it was measured with.
+    estimate_ratio_p99: float = 2.37
 
     # -- Assembly guardrails ---
     # Hard cap for the assembled active context (0 = disabled)

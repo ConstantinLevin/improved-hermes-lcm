@@ -381,22 +381,18 @@ class CompactionMixin:
         return max(start, max(mechanism) + 1 if mechanism else 0)
 
     def _fixed_prefix(self) -> tuple[int, str]:
-        """F, the fixed prefix in provider tokens (R10): measured once per plugin session
-        at its first response and recorded as the session fact ``fixed_prefix``; until
-        then the configured hypothesis (32k), labelled."""
-        value = None
-        if self._plugin_session:
-            try:
-                value = self._sessions.latest_fact(self._plugin_session, "fixed_prefix")
-            except Exception:
-                value = None
-        if value is not None:
-            try:
-                return max(0, int(value)), f"F {max(0, int(value))} (measured at the session's first response)"
-            except ValueError:
-                pass
+        """F, the fixed prefix in provider tokens (R10): the session's latest measurement
+        (``_measure_fixed_prefix``: the one taken with the smallest list), labelled with
+        its list and error bound; until the first, the configured hypothesis (32k)."""
+        try:
+            fact = self._fixed_prefix_fact()
+        except Exception:
+            fact = None
+        if fact is not None:
+            return int(fact["F"]), (f"F {fact['F']} (measured with a list of {fact.get('list_estimate')} by the "
+                                    f"estimate; up to {fact.get('error_bound')} too high at #31's p99)")
         hypothesis = int(self._config.fixed_prefix_hypothesis_tokens)
-        return hypothesis, f"F {hypothesis} (a hypothesis until the first response measures it, R10)"
+        return hypothesis, f"F {hypothesis} (a hypothesis until a response measures it, R10)"
 
     def _tail_plan(self, messages: List[Dict[str, Any]], mechanism: set,
                    occasion: Optional[Occasion] = None) -> tuple[int, str]:

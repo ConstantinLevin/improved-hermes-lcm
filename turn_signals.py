@@ -11,8 +11,8 @@ The hooks arrive on threads of their own, and the host clones the engine per age
   results (the host appends every result before the occasion after the round, #32 §3).
 - ``post_api_request`` of the same turn: a response arrived after them, so the list no
   longer ends with tool results.
-- ``pre_api_request`` of the same turn: the list a request sends, kept only until the
-  session's fixed prefix F is measured at its first response (R10).
+- ``pre_api_request`` of the same turn: the list a request sends, for the fixed prefix F
+  measured at each response (R10).
 - ``on_turn_complete`` (an engine method): the turn ended. The host skips it on some
   early exits (#32 P1), so a stale "in a turn" is possible; the list's structure then
   disagrees, and the occasion is a gap (D1).
@@ -113,23 +113,19 @@ def turn_ended(session_id: str, turn_id: Optional[str]) -> bool:
 
 
 def carry(old_session_id: str, new_session_id: str) -> None:
-    """A compaction boundary renamed the host session: its turn goes on under the new id,
-    and so does whatever is known of its fixed prefix."""
+    """A compaction boundary renamed the host session: its turn goes on under the new id."""
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return
     with _LOCK:
         current = _STATES.get(str(old_session_id))
         if current is not None:
             _STATES[str(new_session_id)] = current
-        if str(old_session_id) in _PREFIX_KNOWN:
-            _PREFIX_KNOWN.add(str(new_session_id))
 
 
-# R10: the list each request of a session sent (``pre_api_request``'s
-# ``conversation_history``, a shallow copy), kept only until the session's fixed prefix
-# is measured at its first response; then it is dropped and no longer kept.
+# R10: the list the newest request of a session sent (``pre_api_request``'s
+# ``conversation_history``, a shallow copy), for the fixed prefix measured at each
+# response. One list per session, replaced at every request.
 _REQUEST_LISTS: Dict[str, List[Any]] = {}
-_PREFIX_KNOWN: set = set()
 
 
 def request_sent(session_id: str, turn_id: str, conversation_history: Any) -> None:
@@ -141,23 +137,9 @@ def request_sent(session_id: str, turn_id: str, conversation_history: Any) -> No
         current = _STATES.get(str(session_id))
         if current is None or not current.in_turn or current.turn_id != str(turn_id or ""):
             return
-        if str(session_id) not in _PREFIX_KNOWN:
-            _REQUEST_LISTS[str(session_id)] = conversation_history
+        _REQUEST_LISTS[str(session_id)] = conversation_history
 
 
 def request_list(session_id: str) -> Optional[List[Any]]:
     with _LOCK:
         return _REQUEST_LISTS.get(str(session_id or ""))
-
-
-def prefix_known(session_id: str) -> bool:
-    with _LOCK:
-        return str(session_id or "") in _PREFIX_KNOWN
-
-
-def mark_prefix_known(session_id: str) -> None:
-    if not session_id:
-        return
-    with _LOCK:
-        _PREFIX_KNOWN.add(str(session_id))
-        _REQUEST_LISTS.pop(str(session_id), None)
