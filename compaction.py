@@ -14,7 +14,9 @@ In order:
    a summary and is never chunked).
 3. The material is cut into chunks, in list order, each at most ``leaf_chunk_tokens``
    (a greedy cut until #12), only between groups: a tool call and its results stay in
-   one chunk, and a group larger than a chunk is a chunk of its own. The compaction,
+   one chunk, and a group larger than a chunk is a chunk of its own. A run smaller
+   than a quarter of a chunk next to such a group, or at the end of the material,
+   joins the adjacent chunk instead of standing alone. The compaction,
    its inputs, the new records and every chunk are written before the first
    summariser call.
 4. Each chunk is summarised from its records as the store holds them, one call at a
@@ -52,6 +54,11 @@ _SUMMARY_FOOTER = "[Expand for details: {hint}]"
 
 # How often a wait between summariser retries asks the attempt's captured check.
 _WAIT_SLICE_S = 0.25
+
+# "The smallest run that stands alone", as a share of the chunk size c: a value for
+# #22's table (orchestrator ruling on #52). A smaller run next to an oversized group,
+# or at the end of the material, joins the adjacent chunk.
+_SMALLEST_STANDALONE_RUN = 0.25
 
 
 class CompactionMixin:
@@ -250,19 +257,63 @@ class CompactionMixin:
     def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int) -> List[List[int]]:
         """The material cut in list order into chunks of at most ``limit`` tokens, and
         only between groups: a tool call is never separated from its results. A group
-        larger than the limit is a chunk of its own (#31: a chunk flexes by one group)."""
+        larger than the limit is a chunk of its own (#31: a chunk flexes by one group).
+
+        A run smaller than ``limit`` × ``_SMALLEST_STANDALONE_RUN`` does not stand alone
+        where it stands next to such an oversized group, or at the end of the material:
+        it joins the adjacent chunk, never jumping over a group, so the chunks stay
+        contiguous. A chunk exists to bound the summariser's input; a run too small to
+        have a shorter summary would fail on every attempt (#7, orchestrator ruling on
+        #52). Next to an oversized group on both sides, it joins the following one,
+        the work it opened. A run that is the whole material has nothing to join.
+        """
         chunks: List[List[int]] = []
+        sizes: List[int] = []
+        oversized: List[bool] = []
         current: List[int] = []
         used = 0
         for group in cls._groups(messages, material):
             tokens = sum(count_message_tokens(messages[index]) for index in group)
             if current and used + tokens > limit:
                 chunks.append(current)
+                sizes.append(used)
+                oversized.append(False)
                 current, used = [], 0
             current.extend(group)
             used += tokens
+            if used > limit and len(current) == len(group):
+                # A group larger than the limit: a chunk of its own.
+                chunks.append(current)
+                sizes.append(used)
+                oversized.append(True)
+                current, used = [], 0
         if current:
             chunks.append(current)
+            sizes.append(used)
+            oversized.append(False)
+
+        smallest = limit * _SMALLEST_STANDALONE_RUN
+        at = 0
+        while at < len(chunks):
+            if sizes[at] >= smallest or oversized[at] or len(chunks) == 1:
+                at += 1
+                continue
+            if at + 1 < len(chunks) and oversized[at + 1]:
+                target = at + 1
+            elif at > 0 and oversized[at - 1]:
+                target = at - 1
+            elif at == len(chunks) - 1:
+                target = at - 1
+            else:
+                at += 1
+                continue
+            if target > at:
+                chunks[target] = chunks[at] + chunks[target]
+            else:
+                chunks[target] = chunks[target] + chunks[at]
+            sizes[target] += sizes[at]
+            del chunks[at], sizes[at], oversized[at]
+            at = max(0, min(at, target))
         return chunks
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
