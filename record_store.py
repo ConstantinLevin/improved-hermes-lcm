@@ -349,7 +349,7 @@ class RecordStore:
             return "dispatched"
         return None
 
-    def frozen_chunks(self, session: str, after: Optional[int]
+    def frozen_chunks(self, session: str, after: Optional[int], in_flight: Iterable[tuple] = ()
                       ) -> tuple[list[FrozenChunk], list[tuple[str, int, tuple[str, ...]]]]:
         """The chunks a retry keeps (#33 D14, #31): those of the session's attempts
         after its effective compaction that the host neither confirmed, adopted nor
@@ -357,6 +357,14 @@ class RecordStore:
         first; a chunk that shares a record with one already taken is left out. Each
         member carries the ``_row_id`` its row had in that attempt's list: ids hold
         until a commit (#29 W2 step 8), so the retry recognises the chunk by identity.
+
+        ``in_flight`` are the member records of the chunks whose call is still
+        registered in this process (``inflight.registered_records``, read before this):
+        such a chunk counts as dispatched though no dispatch row is written yet, so
+        that a worker past its last check is never re-cut under it (D14); the retry
+        keeps it and joins its call (D12). Across processes the host's session lock
+        serialises attempts on the same session, so no other process has a call of
+        this session in flight while a retry plans.
 
         A chunk with a member whose row came without a host identity (``_row_id``) can
         never be found again by identity: the gateway's replayed history carries none,
@@ -371,6 +379,7 @@ class RecordStore:
             "ORDER BY c.compaction_id DESC",
             (session, after or 0),
         )]
+        registered = {tuple(str(record) for record in records) for records in in_flight}
         taken: set = set()
         frozen: list[FrozenChunk] = []
         unidentified: list[tuple[str, int, tuple[str, ...]]] = []
@@ -389,6 +398,8 @@ class RecordStore:
                 if not records or taken.intersection(records):
                     continue
                 state = self.chunk_state(session, records)
+                if state is None and tuple(records) in registered:
+                    state = "dispatched"   # its call is in flight here, stamped or not yet
                 if state is None:
                     continue
                 taken.update(records)

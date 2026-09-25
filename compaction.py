@@ -39,8 +39,10 @@ In order:
    and one that reaches the floor stays whole in the tail. Only the rest is split as
    above. A kept chunk is frozen, and a summarised one is never summarised again; the
    one exception is a run below c/4 standing before or between kept chunks, which
-   joins one of them (D1), with an event each time: the join recurs where the joined
-   chunk is never dispatched. A chunk not found again, a dispatched one below c/4 by
+   joins one of them (D1), and goes on over contiguous neighbours until the chunk
+   holds c/4, releasing a summary where it must, with an event each time: the join
+   recurs where the joined chunk is never dispatched. A chunk whose call is still
+   registered in this process counts as dispatched while the retry plans. A chunk not found again, a dispatched one below c/4 by
    today's estimate, and one with rows that came without a host identity (the
    gateway's replayed history, host scaffolding never persisted; the ask to Hermes is
    A1) are cut again, visibly: a warning and a store event. When only a rest below
@@ -113,6 +115,7 @@ from .inflight import (
     host_progress_hook,
     join_or_start,
     limiter_for,
+    registered_records,
 )
 from .record_write import _ATTEMPT, AttemptCancelled
 from .tokens import Estimator, count_message_tokens, count_messages_tokens
@@ -549,13 +552,21 @@ class CompactionMixin:
         so that a row the host rewrote since makes a different chunk. Where no id
         matches, as after a commit by another path, nothing is kept. A chunk that is
         not found, and one with rows that came without a host identity, are re-cut: the
-        caller says so visibly (ruling 3 on #61). Nothing is matched by content."""
+        caller says so visibly (ruling 3 on #61). Nothing is matched by content.
+
+        A chunk whose call is still registered in this process counts as dispatched
+        (#33 D14, orchestrator ruling on 60a48c9): the registry is read first, under
+        its lock, then the store, so that a worker past its last cancellation check
+        that has not yet been stamped is never re-cut under it; the retry keeps the
+        chunk and joins its call (D12). Across processes the host's session lock
+        serialises attempts on the same session."""
         result = FrozenCandidates()
         if not self._plugin_session:
             return result
         store = self._records
+        in_flight = registered_records(self._plugin_session)
         frozen, result.unidentified = store.frozen_chunks(
-            self._plugin_session, store.effective_compaction(self._plugin_session))
+            self._plugin_session, store.effective_compaction(self._plugin_session), in_flight=in_flight)
         if not frozen:
             return result
         position_of = {message["_row_id"]: index for index, message in enumerate(messages)
@@ -1023,7 +1034,9 @@ class CompactionMixin:
         equally (``_split_run``): ceil(B / c) chunks cut at the group boundaries nearest
         k·B/n, none below c/4.
 
-        A run below c/4 (``_smallest_for``) does not stand alone:
+        Where the whole material is below c/4, nothing is cut: it stays raw, and the
+        caller makes the compaction a no-op. Otherwise a run below c/4
+        (``_smallest_for``) does not stand alone:
         - it joins the chunk of an adjacent oversized group, the following one where
           there is one (the work it opened), else the one before it;
         - else, at the end of the material, alone or after a kept chunk, it stays raw:
@@ -1035,11 +1048,19 @@ class CompactionMixin:
           #61, D1). Rows arrive only at the end of the list, so such a run is an
           earlier chunk never dispatched, and falls below c/4 only where c or the
           estimate changed since it was cut, or the host put rows among kept chunks.
-          The join is recorded in ``joins``, and the caller records an event for it
-          each time: where the joined chunk is never dispatched, the next attempt
-          finds the earlier kept chunk again and the join recurs. The joined chunk has
-          new members, so it is summarised afresh.
-        Never jumping over a chunk, so the chunks stay contiguous.
+        - Where the chunk a join makes is still below c/4 (its neighbour is a
+          summarised kept chunk that was cut at a smaller c), it goes on joining
+          contiguous neighbours by the same preference, a run last, until it holds
+          c/4 (orchestrator ruling on 60a48c9): a kept chunk is taken whole, and a
+          summary it releases is lossless, since the joined chunk is summarised again;
+          a run takes the joined rows into its equal split. No dispatched kept chunk
+          is ever released into a run: one below c/4 was cut again already, and one
+          at c/4 or more ends the join.
+        Each join is recorded in ``joins``, and the caller records an event for it each
+        time: where the joined chunk is never dispatched, the next attempt finds the
+        earlier kept chunk again and the join recurs. A joined chunk has new members,
+        so it is summarised afresh. Never jumping over a chunk, so the chunks stay
+        contiguous.
         """
         groups = cls._groups(messages, material)
         sizes = [sum(count_message_tokens(messages[index], estimator) for index in group) for group in groups]
@@ -1074,53 +1095,93 @@ class CompactionMixin:
         if run:
             items.append(("run", run))
 
-        # A tiny run joins an adjacent oversized group's chunk; at the end it stays raw;
-        # before or between kept chunks it joins one of them (D1).
         smallest = _smallest_for(limit)
-        attached: Dict[int, tuple] = {}   # item index of a chunk it joins -> (runs before, runs after)
-        standing: List[bool] = []
+        # The whole material below c/4 stays raw: nothing can be cut that is not below
+        # it (ruling 1; orchestrator ruling on 60a48c9). The caller makes it a no-op.
+        if sum(sizes) < smallest:
+            return []
 
-        def has_summary(at: int) -> bool:
-            which = kept_of[items[at][1][0]]
+        def summarised_kept(numbers: List[int]) -> bool:
+            which = kept_of[numbers[0]]
             return bool(summarised[which]) if which < len(summarised) else False
 
-        for at, (kind, members) in enumerate(items):
-            weight = sum(sizes[g] for g in members)
-            tiny = kind == "run" and weight < smallest
-            following = items[at + 1][0] if at + 1 < len(items) else None
-            preceding = items[at - 1][0] if at > 0 else None
-            if not tiny:
-                standing.append(True)
+        # Each item: [kind, group numbers, has a summary]. Kinds: "oversized" and
+        # "kept" (one chunk each), "joined" (one chunk made by a join), "run" (split
+        # equally), "raw" (the end of the material, left raw).
+        work: List[list] = [[kind, list(members), kind == "kept" and summarised_kept(members)]
+                            for kind, members in items]
+
+        def weight(item: list) -> int:
+            return sum(sizes[g] for g in item[1])
+
+        def positions(item: list) -> List[int]:
+            return [groups[item[1][0]][0], groups[item[1][-1]][-1]]
+
+        def target_for(at: int) -> Optional[int]:
+            """Where a tiny item at ``at`` joins: an oversized neighbour, the following
+            one first; a tiny run at the very end stays raw (None); else a neighbour
+            without a summary, then one with a summary, then a run, the following
+            one first on a tie (D1)."""
+            item = work[at]
+            following = at + 1 if at + 1 < len(work) else None
+            preceding = at - 1 if at > 0 else None
+            for side in (following, preceding):
+                if side is not None and work[side][0] == "oversized":
+                    return side
+            if following is None and item[0] == "run":
+                return None
+            rank = {"joined": 0, "kept": 1, "run": 3}
+
+            def cost(side: int) -> tuple:
+                neighbour = work[side]
+                return (rank.get(neighbour[0], 3) + (1 if neighbour[0] == "kept" and neighbour[2] else 0),
+                        0 if side == following else 1)
+
+            sides = [side for side in (following, preceding) if side is not None]
+            return min(sides, key=cost)
+
+        # A run below c/4 joins its neighbours until the chunk it makes holds at least
+        # c/4, over as many contiguous neighbours as that takes: an oversized group
+        # ends it at once; a kept chunk is taken whole, releasing its summary where it
+        # has one (lossless: the joined chunk is summarised again); a run takes the
+        # joined rows into its equal split. Every join is recorded (``joins``).
+        at = 0
+        while at < len(work):
+            item = work[at]
+            if item[0] not in ("run", "joined") or weight(item) >= smallest:
+                at += 1
                 continue
-            standing.append(False)
-            if following == "oversized":
-                join = at + 1
-            elif preceding == "oversized":
-                join = at - 1
-            elif following is None:
-                continue   # stays raw: the tail begins at it
-            elif preceding == "kept" and has_summary(at + 1) and not has_summary(at - 1):
-                join = at - 1
+            side = target_for(at)
+            if side is None:
+                item[0] = "raw"   # stays raw: the tail begins at it
+                at += 1
+                continue
+            neighbour = work[side]
+            low, high = min(at, side), max(at, side)
+            merged_groups = work[low][1] + work[high][1]
+            if joins is not None and neighbour[0] in ("kept", "joined", "run"):
+                joins.append({"run": positions(item), "tokens": weight(item), "kept": positions(neighbour),
+                              "joined": neighbour[0], "summarised": bool(neighbour[2]),
+                              "side": "following" if side > at else "preceding",
+                              "result_tokens": weight(item) + weight(neighbour)})
+            if neighbour[0] == "oversized":
+                merged = ["oversized", merged_groups, False]
+            elif neighbour[0] == "run":
+                merged = ["run", merged_groups, False]
             else:
-                join = at + 1
-            before, after = attached.get(join, ([], []))
-            attached[join] = (before + members, after) if join > at else (before, after + members)
-            if items[join][0] == "kept" and joins is not None:
-                joins.append({"kept": [groups[items[join][1][0]][0], groups[items[join][1][-1]][-1]],
-                              "run": [groups[members[0]][0], groups[members[-1]][-1]],
-                              "tokens": weight, "summarised": has_summary(join),
-                              "side": "following" if join > at else "preceding"})
+                merged = ["joined", merged_groups, False]
+            work[low:high + 1] = [merged]
+            at = low
 
         chunks: List[List[int]] = []
-        for at, (kind, members) in enumerate(items):
-            if not standing[at]:
+        for kind, members, _summary in work:
+            if kind == "raw":
                 continue
-            if kind in ("oversized", "kept"):
-                before, after = attached.get(at, ([], []))
-                chunk_groups = [before + members + after]
-            else:
+            if kind == "run":
                 starts = [0] + _split_run([sizes[g] for g in members], limit) + [len(members)]
                 chunk_groups = [members[a:b] for a, b in zip(starts, starts[1:])]
+            else:
+                chunk_groups = [members]
             for group_numbers in chunk_groups:
                 chunks.append([index for g in group_numbers for index in groups[g]])
         return chunks
@@ -1258,10 +1319,15 @@ class CompactionMixin:
                 self._record_event(attempt, "tool_pairing_error", str(exc))
                 return self._abort(messages, f"the material cannot be cut: {exc}")
             for join in joins:
-                # The one exception to "nothing joins a kept chunk" (ruling on #61, D1).
-                logger.warning("LCM joins a run below c/4 (positions %d to %d) to the %s kept chunk at positions "
-                               "%d to %d: it stands between kept chunks, where it could never join anything else",
-                               join["run"][0], join["run"][1], join["side"], join["kept"][0], join["kept"][1])
+                # The one exception to "nothing joins a kept chunk" (ruling on #61, D1),
+                # continued until the chunk holds c/4 (ruling on 60a48c9).
+                logger.warning("LCM joins material below c/4 (positions %d to %d, %d tokens) to the %s %s at "
+                               "positions %d to %d%s, making %d tokens: nothing below c/4 is dispatched",
+                               join["run"][0], join["run"][1], join["tokens"], join["side"],
+                               {"kept": "kept chunk", "joined": "joined chunk", "run": "run"}[join["joined"]],
+                               join["kept"][0], join["kept"][1],
+                               ", releasing its summary (it is summarised again)" if join["summarised"] else "",
+                               join["result_tokens"])
                 self._record_event(attempt, "kept_chunk_joined", join)
             covered = {index for chunk in chunks for index in chunk}
             waiting = [index for index in material if index not in covered]

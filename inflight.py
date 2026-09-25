@@ -391,6 +391,18 @@ _REGISTRY_LOCK = threading.Lock()
 _WORKER_NUMBERS = itertools.count(1)
 
 
+def registered_records(session: str) -> set[tuple]:
+    """The member records, in order, of every chunk of ``session`` whose call is
+    registered in this process, read under the registry lock (#33 D14, D12). A retry
+    counts such a chunk as dispatched while it plans its cut: a worker can have passed
+    its last cancellation check and not yet reached the host's dispatch stamp. A call
+    leaves the registry only after its outcome is delivered, so after any stamp of it
+    was written; read before the store, no call can go from "registered, not stamped"
+    to "stamped" unseen."""
+    with _REGISTRY_LOCK:
+        return {key[1] for key, call in _REGISTRY.items() if key[0] == session and not call.closed}
+
+
 def _close(call: ChunkCall, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool,
            kind: Optional[str] = None) -> None:
     """Deliver to every subscriber, then close the call and leave the registry, in that
