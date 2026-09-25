@@ -1955,7 +1955,6 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "last": {
                 "status": full_status.get("last_compression_status", "idle"),
                 "noop_reason": full_status.get("last_compression_noop_reason", ""),
-                "condensation_suppressed_reason": full_status.get("condensation_suppressed_reason", ""),
                 "compression_count": engine.compression_count,
                 "last_prompt_tokens": engine.last_prompt_tokens,
                 "threshold_tokens": engine.threshold_tokens,
@@ -2005,7 +2004,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     full_status = engine.get_status()
     source_lineage = full_status.get("source_lineage")
     runtime_identity = full_status.get("runtime_identity")
-    ingest_reconciliation = full_status.get("ingest_reconciliation")
     config_sources = full_status.get("config_sources") or {}
     config_source_warnings = full_status.get("config_source_warnings") or []
     ignored_config_yaml_lcm_keys = full_status.get("ignored_config_yaml_lcm_keys") or []
@@ -2014,12 +2012,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "session_id": session_id,
         "compression_count": engine.compression_count,
         "total_compactions": full_status.get("total_compactions", 0),
-        "total_compactions_scope": full_status.get(
-            "total_compactions_scope", "current_conversation"
-        ),
+        "total_compactions_scope": full_status.get("total_compactions_scope", ""),
         "last_compression_status": full_status.get("last_compression_status", "idle"),
         "last_compression_noop_reason": full_status.get("last_compression_noop_reason", ""),
-        "threshold_full_sweep": full_status.get("threshold_full_sweep"),
         "model": full_status.get("model", ""),
         "provider": full_status.get("provider", ""),
         "raw_context_length": full_status.get("raw_context_length", engine.context_length),
@@ -2056,17 +2051,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "fresh_tail_count": engine._config.fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
             "leaf_chunk_tokens": engine._config.leaf_chunk_tokens,
-            "dynamic_leaf_chunk_enabled": engine._config.dynamic_leaf_chunk_enabled,
-            "dynamic_leaf_chunk_max": engine._config.dynamic_leaf_chunk_max,
-            "cache_friendly_condensation_enabled": engine._config.cache_friendly_condensation_enabled,
-            "cache_friendly_min_debt_groups": engine._config.cache_friendly_min_debt_groups,
-            "threshold_full_sweep_enabled": engine._config.threshold_full_sweep_enabled,
-            "summary_prefix_target_tokens": engine._config.summary_prefix_target_tokens,
-            "threshold_full_sweep_max_passes": 12,
-            "threshold_full_sweep_max_seconds": 120,
             "context_threshold": engine._config.context_threshold,
-            "max_depth": engine._config.incremental_max_depth,
-            "condensation_fanin": engine._config.condensation_fanin,
             "summary_model": engine._config.summary_model or "(auxiliary)",
             "summary_timeout_ms": engine._config.summary_timeout_ms,
             "summary_spend_max_calls": engine._config.summary_spend_max_calls,
@@ -2079,7 +2064,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "ignored_config_yaml_lcm_keys": ignored_config_yaml_lcm_keys,
         "source_lineage": source_lineage,
         "preset_suggestion": preset_status_payload(engine),
-        "ingest_reconciliation": ingest_reconciliation,
         "runtime_identity": runtime_identity,
     })
 
@@ -2108,27 +2092,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "status": "fail",
             "detail": str(e),
         })
-
-    # Ingest health: a swallowed persistence error means turns were not
-    # durably stored, silently breaking the lossless guarantee. Surface it.
-    ingest_failures = int(getattr(engine, "_ingest_failure_count", 0) or 0)
-    consecutive_failures = int(getattr(engine, "_consecutive_ingest_failures", 0) or 0)
-    if consecutive_failures > 0:
-        ingest_status = "fail"
-    elif ingest_failures > 0:
-        ingest_status = "warn"
-    else:
-        ingest_status = "pass"
-    checks.append({
-        "check": "ingest_health",
-        "status": ingest_status,
-        "detail": {
-            "total_failures": ingest_failures,
-            "consecutive_failures": consecutive_failures,
-            "last_error": getattr(engine, "_last_ingest_error", "") or "",
-            "last_error_time": getattr(engine, "_last_ingest_error_time", 0) or 0,
-        } if ingest_failures else "no ingest failures recorded",
-    })
 
     try:
         conn = engine._store.connection
@@ -2296,10 +2259,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         config_warnings.append("runtime context_threshold > 0.95 leaves very little headroom")
     if runtime_context_threshold < 0.3:
         config_warnings.append("runtime context_threshold < 0.3 triggers compaction very early")
-    if c.condensation_fanin < 2:
-        config_warnings.append("condensation_fanin < 2 creates excessive depth growth")
-    if c.incremental_max_depth == 0:
-        config_warnings.append("incremental_max_depth=0 disables condensation entirely")
     for warning in getattr(c, "config_source_warnings", []) or []:
         config_warnings.append(warning)
     for key in getattr(c, "ignored_config_yaml_lcm_keys", []) or []:

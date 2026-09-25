@@ -1,33 +1,24 @@
-"""Side files for payloads the ingest path moves out of stored messages.
+"""Readers for the side files the old ingest path wrote, which the tools still call
+(E's to settle).
 
-The ingest path moves embedded base64 and quarantined assistant output into
-JSON side files beside the store and leaves a placeholder in the message.
-These helpers write, find and read those side files. The optional large-output
-externalization that also used them is gone.
+The old ingest moved embedded base64 and quarantined assistant output into JSON
+side files beside the store and left a placeholder in the message. The record
+writes nothing of the kind; these helpers locate and read the side files for the
+tools' externalized-payload expansion and the doctor.
 """
 
 from __future__ import annotations
 
 import codecs
 import errno
-import hashlib
 import json
 import logging
 import os
-import re
-import time
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
 
 DEFAULT_LARGE_OUTPUT_DIRNAME = "lcm-large-outputs"
 _SESSION_ID_VALUE_SPAN_KEY = "_session_id_value_span"
-
-
-def _placeholder_metadata(value: Any) -> str:
-    text = str(value or "?")
-    safe = re.sub(r"[^A-Za-z0-9_.:/-]+", "-", text).strip("-")
-    return (safe or "?")[:120]
-
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +46,6 @@ def _is_unsupported_filesystem_capability(
     if exc.errno in _UNSUPPORTED_FILESYSTEM_ERRNOS:
         return True
     return windows_directory_access and os.name == "nt" and isinstance(exc, PermissionError)
-
-
-def _safe_stub(value: str, fallback: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", (value or "").strip())
-    return (text or fallback)[:48]
-
-
-def _content_digest_prefix(content: str) -> str:
-    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
 
 
 def _fsync_directory(path: Path) -> None:
@@ -164,37 +146,6 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
         except OSError as exc:
             logger.warning("Could not restrict LCM externalized payload directory permissions for %s: %s", path, exc)
     return path
-
-
-def _unlink_partial_payload(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("Could not remove partial LCM externalized payload %s: %s", path, exc)
-
-
-def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
-    data = json.dumps(payload, ensure_ascii=False, indent=2)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = -1
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(path.parent)
-    except OSError:
-        _unlink_partial_payload(path)
-        raise
-    finally:
-        if fd >= 0:
-            os.close(fd)
-
-
-def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
-    return get_large_output_storage_dir(config, hermes_home=hermes_home, create=True)
 
 
 def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -355,103 +306,4 @@ def read_externalized_payload_metadata_prefix(
             )
         )
     return prefix_text, content_key_seen, prefix_truncated
-
-
-def find_externalized_payload_for_message(
-    content: str,
-    *,
-    tool_call_id: str = "",
-    session_id: str = "",
-    kind: str | None = "tool_result",
-    role: str = "",
-    config,
-    hermes_home: str = "",
-) -> Dict[str, Any] | None:
-    if not content:
-        return None
-    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
-    if not storage_dir.exists() or not storage_dir.is_dir():
-        return None
-
-    digest_prefix = _content_digest_prefix(content)
-    candidates = sorted(storage_dir.glob(f"*_{digest_prefix}_*.json"))
-    fallback_match = None
-    for path in candidates:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if kind is not None and payload.get("kind", "tool_result") != kind:
-            continue
-        if (payload.get("tool_call_id") or "") != (tool_call_id or ""):
-            continue
-        payload_role = payload.get("role") or ""
-        if role and payload_role and payload_role != role:
-            continue
-        if payload.get("content") != content:
-            continue
-        summary = _externalized_summary(path, payload)
-        payload_session_id = (payload.get("session_id") or "")
-        if session_id:
-            if payload_session_id == session_id:
-                return summary
-            continue
-        if fallback_match is None:
-            fallback_match = summary
-    return fallback_match
-
-
-def externalize_ingest_payload(
-    content: str,
-    *,
-    role: str = "",
-    session_id: str = "",
-    field_path: str = "",
-    config,
-    hermes_home: str = "",
-    kind: str = "ingest_payload",
-) -> Dict[str, Any] | None:
-    if not content:
-        return None
-    try:
-        storage_dir = resolve_large_output_storage_dir(config, hermes_home=hermes_home)
-    except OSError as exc:
-        logger.warning("LCM ingest payload externalization skipped (non-blocking): %s", exc)
-        return None
-
-    digest_prefix = _content_digest_prefix(content)
-    timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    unique_suffix = f"{time.time_ns():x}"
-    kind_stub = _safe_stub(kind, "ingest_payload")
-    field_stub = re.sub(r"[^A-Za-z0-9_.-]+", "-", field_path or "payload")[:48]
-    filename = f"{timestamp}_{kind_stub}_{field_stub}_{digest_prefix}_{unique_suffix}.json"
-    path = storage_dir / filename
-    payload = {
-        "kind": kind,
-        "role": role,
-        "session_id": session_id,
-        "field_path": field_path,
-        "content": content,
-        "content_chars": len(content),
-        "content_bytes": len(content.encode("utf-8")),
-        "created_at": time.time(),
-    }
-    try:
-        _write_externalized_payload(path, payload)
-    except OSError as exc:
-        logger.warning("LCM ingest payload externalization skipped (non-blocking): %s", exc)
-        return None
-
-    summary = _externalized_summary(path, payload)
-    placeholder = (
-        f"[Externalized LCM ingest payload: kind={_placeholder_metadata(summary.get('kind') or kind)}; "
-        f"field={_placeholder_metadata(summary.get('field_path') or '?')}; chars={summary.get('content_chars', 0)}; "
-        f"bytes={summary.get('content_bytes', 0)}; ref={summary.get('ref', '')}]"
-    )
-    return {
-        "placeholder": placeholder,
-        "path": path,
-        "payload": payload,
-    }
-
 

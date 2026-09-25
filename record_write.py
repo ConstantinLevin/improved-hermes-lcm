@@ -95,7 +95,6 @@ class CompressAttempt:
     session: str
     outcome: Dict[str, Any] = field(default_factory=dict)
     count_increment: int = 0
-    compacted: bool = False
     messages: Optional[List[Dict[str, Any]]] = None
     compaction: Optional[int] = None
     records: Dict[int, str] = field(default_factory=dict)
@@ -128,10 +127,6 @@ class PendingConfirmation:
     old_session_id: str
     session_id: str
     at: float
-
-
-def current_attempt() -> Optional[CompressAttempt]:
-    return _ATTEMPT.get()
 
 
 class RecordWriteMixin:
@@ -177,7 +172,6 @@ class RecordWriteMixin:
             self.compression_count += 1
             return self.compression_count
         attempt.count_increment += 1
-        attempt.compacted = True
         return self.compression_count + attempt.count_increment
 
     def _apply_attempt_outcome(self, attempt: CompressAttempt) -> None:

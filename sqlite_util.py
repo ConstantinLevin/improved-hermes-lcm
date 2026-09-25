@@ -1,20 +1,11 @@
-"""SQLite lock-contention helpers shared by the LCM engine.
-
-Isolated from ``engine.py`` (WS5 seam): lock-contention detection, bounded
-``busy_timeout`` changes, and transaction-preserving savepoints are pure SQLite
-concerns with no engine state. Callers keep their own policy constants (for
-example the session-end timeout budget).
-"""
+"""SQLite file helpers: create and restrict the store's files with private modes."""
 
 from __future__ import annotations
 
 import errno
 import os
 from pathlib import Path
-import sqlite3
 import stat
-from contextlib import contextmanager
-from typing import Iterator, List
 
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -228,31 +219,3 @@ def _create_private_sqlite_file(path: Path) -> bool:
         return created
     finally:
         os.close(directory_fd)
-
-
-
-
-def _sqlite_busy_timeout_ms(conn: sqlite3.Connection) -> int:
-    row = conn.execute("PRAGMA busy_timeout").fetchone()
-    return int(row[0]) if row and row[0] is not None else 0
-
-
-@contextmanager
-def _temporary_sqlite_busy_timeout(
-    connections: List[sqlite3.Connection | None],
-    timeout_ms: int,
-) -> Iterator[None]:
-    """Temporarily bound SQLite lock waits for gateway-critical paths."""
-    bounded_timeout = max(0, int(timeout_ms))
-    originals: list[tuple[sqlite3.Connection, int]] = []
-    for conn in connections:
-        if conn is None:
-            continue
-        original = _sqlite_busy_timeout_ms(conn)
-        conn.execute(f"PRAGMA busy_timeout={bounded_timeout}")
-        originals.append((conn, original))
-    try:
-        yield
-    finally:
-        for conn, original in reversed(originals):
-            conn.execute(f"PRAGMA busy_timeout={original}")

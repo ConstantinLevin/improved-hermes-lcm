@@ -51,8 +51,6 @@ _SUMMARY_FOOTER = "[Expand for details: {hint}]"
 
 class CompactionMixin:
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        if self._compression_boundary_cooldown_active():
-            return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
             return True
@@ -372,7 +370,6 @@ class CompactionMixin:
 
         number = self._publish_compaction_counted()
         duration_ms = (time.perf_counter() - started) * 1000.0
-        self._publish("_last_compaction_duration_ms", duration_ms)
         self._publish("_last_compression_status", "compacted")
         self._publish("_last_compression_noop_reason", "")
         self._publish("_last_compress_aborted", False)
