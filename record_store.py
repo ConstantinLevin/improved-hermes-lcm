@@ -276,23 +276,27 @@ class RecordStore:
         model: Optional[str],
         provider: Optional[str],
         effort: Optional[str],
+        any_route: bool = False,
     ) -> Optional[ChunkSummary]:
         """The latest summary already written of a chunk of this session with exactly
         these member records, in this order, by the same summariser route and effort, or
         None (#33 D12: a second attempt reuses a summary already written). Records are
-        matched by handle, never by content."""
+        matched by handle, never by content. With ``any_route`` the route and effort do
+        not matter: a summarised chunk the frozen cut keeps is never summarised again
+        (#33 D14, orchestrator ruling on #61)."""
         if not records:
             return None
         for chunk, _compaction in self._chunks_with_members(session, records):
             if chunk == exclude_chunk:
                 continue
+            route_clause = "" if any_route else "AND d.model IS ? AND d.provider IS ? AND d.effort IS ? "
+            args = (chunk,) if any_route else (chunk, model or None, provider or None, effort or None)
             rows = self._q(
                 "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort "
                 "FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
                 "WHERE s.chunk = ? AND s.ordinal = 0 AND d.kind = 'summary' "
-                "AND d.model IS ? AND d.provider IS ? AND d.effort IS ? "
-                "ORDER BY d.derivation_id DESC LIMIT 1",
-                (chunk, model or None, provider or None, effort or None),
+                + route_clause + "ORDER BY d.derivation_id DESC LIMIT 1",
+                args,
             )
             if rows:
                 text, level, budget, finish_reason, model_, provider_, effort_ = rows[0]
