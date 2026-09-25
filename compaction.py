@@ -432,7 +432,8 @@ class CompactionMixin:
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
-                 force: bool = False) -> List[Dict[str, Any]]:
+                 force: bool = False,
+                 bypass_cooldown: bool = False) -> List[Dict[str, Any]]:
         """Run one compaction attempt.
 
         The host's cancellation check and the attempt's generation are captured here,
@@ -440,10 +441,20 @@ class CompactionMixin:
         its input at once and sets nothing. Engine attributes are set only when the
         attempt returns and is the host's current working attempt; a terminal status
         is left on every failure under the same rule.
+
+        ``bypass_cooldown``: the host hands a keyword on only to an engine whose
+        signature names it (``_supported_compression_kwargs``,
+        agent/conversation_compression.py 1771-1792 at 7b761da). It passes this one
+        when the provider rejected a request as too long (agent/turn_overflow.py
+        162-165, with the request's size as ``current_tokens``) and on its stall retry
+        of an occasion already under way (agent/compression_facade.py 282). The
+        provider's refusal is the real count: it compacts whatever τ says (#56).
         """
         attempt = self._begin_attempt()
         if attempt.cancelled():
             return messages
+        # The host's native compaction switch, read where the host reads it (#32 D2).
+        self._check_host_native_compaction()
         token = _ATTEMPT.set(attempt)
         try:
             result = self._compress_impl(
@@ -451,6 +462,7 @@ class CompactionMixin:
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
+                provider_rejected=bool(bypass_cooldown),
             )
         except AttemptCancelled:
             return messages
@@ -648,7 +660,8 @@ class CompactionMixin:
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
                        focus_topic: Optional[str] = None,
-                       force: bool = False) -> List[Dict[str, Any]]:
+                       force: bool = False,
+                       provider_rejected: bool = False) -> List[Dict[str, Any]]:
         attempt = _ATTEMPT.get()
         if self._closed_reason is not None:
             return self._abort(
@@ -689,11 +702,18 @@ class CompactionMixin:
             count, count_label = int(current_tokens), f"the host's count {int(current_tokens)}"
         else:
             count, count_label = self._provider_estimate(count_messages_tokens(messages, self._estimator()))
-        if not (force or force_overflow) and count < tau:
+        if not (force or force_overflow or provider_rejected) and count < tau:
             return self._unchanged_return(
                 messages, f"below the threshold: {count_label} < τ {tau} ({occasion.why}; {self._geometry.label()})")
-        why_now = ("the compaction was forced" if force else "the context overflowed" if force_overflow
-                   else f"{count_label} is at or above τ {tau}")
+        if force:
+            why_now = "the compaction was forced"
+        elif force_overflow:
+            why_now = "the context overflowed"
+        elif count < tau:
+            why_now = (f"the host required it after the provider rejected the request or a stalled attempt "
+                       f"({count_label}, below τ {tau})")
+        else:
+            why_now = f"{count_label} is at or above τ {tau}"
         logger.info("LCM compacts: %s; %s", why_now, occasion.why)
 
         # 1. Identity (#29 W3). A list that cannot be classified is not compacted.
@@ -719,7 +739,7 @@ class CompactionMixin:
                 tail_start = floor
                 material = [index for index in range(tail_start) if index not in mechanism]
         if not material:
-            if force_overflow:
+            if force_overflow or provider_rejected:
                 self._publish("_last_overflow_recovery_failed", True)
             return self._abort(
                 messages,

@@ -137,8 +137,19 @@ def _host_native_compaction_configured(cfg: dict[str, Any] | None = None) -> boo
     """Whether the host's config.yaml opts into native server-side compaction on its
     OpenAI Responses routes (``compression.codex_responses_native``, read by the host's
     agent_init with its own truthy rule, utils.is_truthy_value). Read to be refused, not
-    to be followed (#11, #24, #32 D2)."""
-    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    to be followed (#11, #24, #32 D2).
+
+    Read where the host reads it for each agent it builds: its
+    ``hermes_cli.config.load_config_readonly()`` (agent/agent_init.py 2458-2466 at
+    7b761da), which follows the host's own home and profile; the plugin's own read of
+    ``HERMES_HOME/config.yaml`` only where that cannot be imported. The returned dict is
+    only read, never written (the host's cache)."""
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config_readonly  # type: ignore
+            cfg = load_config_readonly()
+        except Exception:
+            cfg = _load_hermes_config_yaml()
     compression = cfg.get("compression") if isinstance(cfg, dict) else None
     if not isinstance(compression, dict):
         return False

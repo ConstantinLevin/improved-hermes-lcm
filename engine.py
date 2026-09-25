@@ -16,7 +16,7 @@ from agent.context_engine import ContextEngine
 
 from . import turn_signals
 from .codex_routing import _codex_oauth_context_cap
-from .config import LCMConfig
+from .config import LCMConfig, _host_native_compaction_configured
 from .geometry import Geometry, geometry
 from .dag import SummaryDAG
 from .db_bootstrap import STORE_FILENAME, StoreClosedError, StoreRefusedError
@@ -172,7 +172,9 @@ class LCMEngine(
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
-        self._native_compaction_refusal = self._refuse_host_native_compaction()
+        self._native_compaction_on = False
+        self._native_compaction_refusal = ""
+        self._check_host_native_compaction()
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -435,7 +437,7 @@ class LCMEngine(
             )
         return raw_context_length, None, ""
 
-    def _refuse_host_native_compaction(self) -> str:
+    def _check_host_native_compaction(self, on: Optional[bool] = None) -> None:
         """With the plugin active there is one compaction, the plugin's (#11, #24, #32
         D2).
 
@@ -444,28 +446,41 @@ class LCMEngine(
         routes: gpt-5.6 on api.openai.com or the Codex backend, gpt-6-astra on official
         Codex OAuth (``agent/native_compaction.py`` at 7b761da). The provider then
         compacts the context itself at ``threshold_tokens − 8,192``, beside the plugin
-        and outside its record. The host reads the switch from the agent
-        (``agent.codex_responses_native_compaction``, set by ``agent/agent_init.py`` and
-        the TUI from config.yaml) and gates it on agent attributes only; no engine call
-        reaches them, so the engine cannot switch it off. The refusal is the visible
-        part: an ERROR at every engine creation, a store event, and the status. What
-        would prevent it is asked of Hermes (an engine that owns compaction turns
-        native compaction off)."""
-        if not getattr(self._config, "host_native_compaction", False):
-            return ""
-        message = (
+        and outside its record. The host reads the switch from its config for each agent
+        it builds (``agent.codex_responses_native_compaction``, set by
+        ``agent/agent_init.py`` and the TUI) and gates it on agent attributes only; no
+        engine call reaches the agent, so the engine can neither see the live value nor
+        switch it off. It re-reads the switch where the host reads it (``config``
+        ``_host_native_compaction_configured``) at every engine creation, every
+        ``update_model``, every ``on_session_start`` and every ``compress()``. On each
+        change to "on" the refusal is visible: an ERROR and a store event; the status
+        always shows the current value. What would prevent it is asked of Hermes (an
+        engine that owns compaction turns native compaction off)."""
+        if on is None:
+            try:
+                on = _host_native_compaction_configured()
+            except Exception:
+                logger.debug("LCM could not read the host's native compaction switch", exc_info=True)
+                on = bool(getattr(self._config, "host_native_compaction", False)) or self._native_compaction_on
+        was = self._native_compaction_on
+        self._native_compaction_on = bool(on)
+        if not on:
+            self._native_compaction_refusal = ""
+            return
+        self._native_compaction_refusal = (
             "LCM refuses the host's native server-side compaction (config.yaml compression.codex_responses_native "
             "is on): with LCM as the context engine there is one compaction, LCM's. On an eligible OpenAI Responses "
             "route the provider would compact the context itself at threshold_tokens - 8192, beside LCM and "
             "outside its record. The engine cannot switch it off; set compression.codex_responses_native: false."
         )
-        logger.error(message)
+        if was:
+            return
+        logger.error(self._native_compaction_refusal)
         try:
-            self._records.event("host_native_compaction_refused", session=None,
+            self._records.event("host_native_compaction_refused", session=getattr(self, "_plugin_session", "") or None,
                                 detail={"config": "compression.codex_responses_native"})
         except Exception:
             logger.debug("LCM could not record the refusal of native compaction", exc_info=True)
-        return message
 
     # -- The published threshold and the host's compaction parameters (#32 D2, R16) --
 
@@ -829,6 +844,7 @@ class LCMEngine(
     def on_session_start(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
+        self._check_host_native_compaction()
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
@@ -901,9 +917,27 @@ class LCMEngine(
         only the id, never the host's database. An empty id is the host detaching the
         copy of its background-review fork; it is recorded on this copy's own session
         and refused (``ReviewForkDetachRefused``).
+
+        On a reset-only switch the host calls no ``on_session_start``
+        (``run_agent.py`` ``reset_session_state`` at 7b761da), so the host session id
+        this copy keys on changes here, together with its plugin session: the hooks
+        name the agent's new id, and the classification, ``threshold_tokens`` and
+        ``on_turn_complete`` must read the same one. A turn still open under the old id
+        (an exit that skipped ``on_turn_complete``, #32 P1) is closed: the old session
+        ends on this agent at the switch, and a later ``/resume`` of it opens a new turn
+        through ``pre_llm_call``.
         """
         if session_id:
+            previous = str(self._session_id or "")
+            if previous and previous != session_id:
+                if not self._review_fork and turn_signals.turn_ended(previous, None):
+                    logger.info("LCM closed the turn left open under %s at the switch to %s", previous, session_id)
+                self._reset_session_scoped_runtime_state()
+                if not self._conversation_id or self._conversation_id == previous:
+                    self._conversation_id = session_id
+            self._session_id = session_id
             self._name_plugin_session(session_id, signal="bind_session_state", platform=None)
+            self._register_active_engine_binding()
             return
         # This copy is the review fork's: its turn end never touches the hook state of
         # the session whose id its agent reuses (C1).
@@ -1007,6 +1041,7 @@ class LCMEngine(
         return identity
 
     def get_status(self) -> Dict[str, Any]:
+        self._check_host_native_compaction()  # the current value of the host's switch
         status = super().get_status()
         status.update({
             "compression_count": self.compression_count,
@@ -1037,6 +1072,7 @@ class LCMEngine(
             "tau_raised": self._geometry.tau_raised if self._geometry is not None else None,
             "target": self._geometry.target if self._geometry is not None else None,
             "turn": self._turn_label(),
+            "host_native_compaction": self._native_compaction_on,
             "native_compaction_refused": self._native_compaction_refusal or None,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
@@ -1077,6 +1113,7 @@ class LCMEngine(
         self.api_mode = str(api_mode or "")
         self._set_context_length(context_length, source="update_model")
         self._update_model_pending_session_start = True
+        self._check_host_native_compaction()
 
     # -- Internal: overflow recovery ----------------------------------------
 
