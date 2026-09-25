@@ -15,17 +15,21 @@ the provider named. A call holds its slot only while the provider has it: a wait
 between retries gives the slot back.
 
 **The registry.** Calls are registered process-wide by (plugin session, the chunk's
-member records in order). A second attempt that cuts the same chunk joins the call in
-flight instead of making another, and its hook receives the call's progress; where no
-call is in flight, a summary of the same records already written by the same
-summariser route and effort is reused (#33 D12). A registry is per process: another
-process never joins, but reuses a summary once written.
+member records in order, the summariser route, the effort). A second attempt that cuts
+the same chunk with the same summariser and effort joins the call in flight instead of
+making another, and its hook receives the call's progress; where no call is in flight,
+a summary of the same records already written by the same summariser route and effort
+is reused (#33 D12). Joining and reuse apply the one rule. A registry is per process:
+another process never joins, but reuses a summary once written. An entry exists only
+with a live worker; a call nobody wants any more leaves the registry at the moment
+that is decided, so no later attempt joins a call being given up.
 
 **What the worker carries (D10, R4).** The host's progress hook, read on the
 ``compress()`` thread, ticks on the worker for every streamed payload of the call
 (``aux_progress_hook``); with a joined call the worker ticks every subscribed attempt's
-hook. The host's deadline, read on the ``compress()`` thread (``aux_stream_deadline``),
-bounds each call: its ``timeout`` is the deadline less the time of dispatch (#33: no
+hook. The host's deadline, read on the ``compress()`` thread and captured with the call
+when an attempt subscribes (``aux_stream_deadline``), bounds each call: its ``timeout``
+is the deadline less the time of dispatch (#33: no
 per-call timeout of the plugin's own), and the host's stream consumer stops there. The
 worker marks its calls interrupt-protected (``aux_interrupt_protection``) without a
 cancellation source: installing the attempt's cancellation check there would make the
@@ -201,11 +205,13 @@ class Subscriber:
 
     def __init__(self, *, wanted: Callable[[], bool], hook: Optional[Callable[[], Any]],
                  deadline: Optional[float],
-                 deliver: Callable[[Optional[ChunkSummary], Optional[str], bool], Outcome]) -> None:
+                 deliver: Callable[[Optional[ChunkSummary], Optional[str], bool], Outcome],
+                 on_done: Optional[Callable[[], None]] = None) -> None:
         self._wanted = wanted
         self.hook = hook
         self.deadline = deadline
         self._deliver = deliver
+        self._on_done = on_done
         self.done = threading.Event()
         self.outcome: Optional[Outcome] = None
 
@@ -217,6 +223,8 @@ class Subscriber:
             return False
 
     def finish(self, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool = False) -> None:
+        """Deliver, then say so: the outcome is set before ``done`` and before
+        ``on_done`` is called, so whoever is told reads a complete outcome."""
         try:
             self.outcome = self._deliver(summary, failure, abandoned)
         except BaseException as exc:  # a store closed meanwhile, or anything else: never swallowed silently
@@ -224,6 +232,11 @@ class Subscriber:
             self.outcome = Outcome(failure=f"the summary could not be written ({type(exc).__name__}: {exc})")
         finally:
             self.done.set()
+            if self._on_done is not None:
+                try:
+                    self._on_done()
+                except Exception:
+                    logger.warning("LCM could not report a chunk's outcome to its attempt", exc_info=True)
 
 
 class ChunkCall:
@@ -236,14 +249,25 @@ class ChunkCall:
         self._lock = threading.Lock()
         self._subscribers: list[Subscriber] = []
         self._delivered = 0
+        self._deadline: Optional[float] = None
         self.closed = False
 
     def add(self, subscriber: Subscriber) -> bool:
-        """Subscribe, unless the call has closed. Called under the registry lock."""
+        """Subscribe, unless the call has closed. Called under the registry lock.
+
+        The host's deadline is captured here, as each attempt subscribes, and held with
+        the call: the latest of the subscribers' deadlines, or none where one of them
+        has none. It does not change when an attempt leaves, so a dispatched call always
+        carries it."""
         if self.closed:
             return False
         with self._lock:
+            first = not self._subscribers
             self._subscribers.append(subscriber)
+            if first:
+                self._deadline = subscriber.deadline
+            elif self._deadline is not None:
+                self._deadline = None if subscriber.deadline is None else max(self._deadline, subscriber.deadline)
         return True
 
     def subscribers(self) -> list[Subscriber]:
@@ -270,18 +294,30 @@ class ChunkCall:
                     logger.debug("LCM: an attempt's progress hook failed", exc_info=True)
 
     def deadline(self) -> Optional[float]:
-        """The latest deadline among the attempts that still want the call; None where
-        one of them has no host deadline."""
-        deadlines = [s.deadline for s in self.subscribers() if s.wanted()]
-        if not deadlines or any(d is None for d in deadlines):
-            return None
-        return max(deadlines)
+        """The host's deadline captured with the call (``add``)."""
+        with self._lock:
+            return self._deadline
+
+    def still_needed(self) -> bool:
+        """Whether any attempt still wants the call. Where none does, the call leaves
+        the registry and closes at once, in one step under the registry lock, before
+        its abandonment is delivered: an attempt that comes later starts a call of its
+        own instead of joining one that is being given up."""
+        if self.wanted():
+            return True
+        with _REGISTRY_LOCK:
+            if self.wanted():
+                return True
+            self.closed = True
+            if _REGISTRY.get(self.key) is self:
+                del _REGISTRY[self.key]
+        return False
 
     def wait(self, seconds: float) -> None:
         """A wait between retries, given up as soon as no attempt wants the call."""
         end = time.monotonic() + max(0.0, seconds)
         while True:
-            if not self.wanted():
+            if not self.still_needed():
                 raise CallAbandoned()
             left = end - time.monotonic()
             if left <= 0:
@@ -291,11 +327,16 @@ class ChunkCall:
     @contextlib.contextmanager
     def dispatch(self) -> Iterator[Optional[float]]:
         """One provider call: a slot of the endpoint's limiter, held for the call only,
-        and the host's deadline installed for the host's stream consumer. Yields the
-        deadline the call is bounded by."""
-        if not self.limiter.acquire(self.limit, self.wanted):
+        and the call's captured deadline installed for the host's stream consumer.
+        Yields that deadline. Where every attempt left while the slot was being granted,
+        nothing is dispatched: the slot is given back and the call is abandoned. A
+        ``Retry-After`` is to be passed to ``hold`` inside this scope, before the slot is
+        given back, so that no queued call dispatches in between."""
+        if not self.limiter.acquire(self.limit, self.still_needed):
             raise CallAbandoned()
         try:
+            if not self.still_needed():
+                raise CallAbandoned()
             deadline = self.deadline()
             with _scope(_host_stream_deadline, deadline):
                 yield deadline
@@ -315,7 +356,8 @@ def in_flight(key: tuple) -> Optional[ChunkCall]:
 
 def _close(call: ChunkCall, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool) -> None:
     """Deliver to every subscriber, then close the call and leave the registry, in that
-    order: a summary is in the store before a later attempt can miss the call."""
+    order: a summary is in the store before a later attempt can miss the call. An
+    abandoned call has already left the registry (``still_needed``)."""
     while True:
         with _REGISTRY_LOCK:
             pending = call.take_undelivered()
@@ -355,7 +397,14 @@ def join_or_start(
     describe: Callable[[BaseException], str],
 ) -> str:
     """Join the call in flight for ``key``, reuse a summary already written, or start
-    the call on a new daemon worker. Returns "joined", "reused" or "started"."""
+    the call on a new daemon worker. Returns "joined", "reused", "started", or "failed"
+    when the worker could not start: then no entry is registered, and the subscriber is
+    told of the failure, visibly.
+
+    ``key`` holds everything two attempts must share to share a call: the session, the
+    chunk's member records in order, the summariser route and the effort (the rule a
+    reuse applies too)."""
+    start_failure: Optional[str] = None
     with _REGISTRY_LOCK:
         call = _REGISTRY.get(key)
         if call is not None and call.add(subscriber):
@@ -364,12 +413,23 @@ def join_or_start(
         if reused is None:
             call = ChunkCall(key, limiter, limit)
             call.add(subscriber)
-            _REGISTRY[key] = call
             context = contextvars.copy_context()
-            threading.Thread(
-                target=context.run, args=(_worker, call, run, describe),
-                name=f"lcm-summary-{next(_WORKER_NUMBERS)}", daemon=True,
-            ).start()
-            return "started"
+            try:
+                threading.Thread(
+                    target=context.run, args=(_worker, call, run, describe),
+                    name=f"lcm-summary-{next(_WORKER_NUMBERS)}", daemon=True,
+                ).start()
+            except BaseException as exc:
+                call.closed = True
+                start_failure = f"the summariser call's worker could not start ({type(exc).__name__}: {exc})"
+            else:
+                # Registered only with a live worker. The worker cannot close the call
+                # before this: closing takes the registry lock, held here.
+                _REGISTRY[key] = call
+                return "started"
+    if start_failure is not None:
+        logger.warning("LCM %s", start_failure)
+        subscriber.finish(None, start_failure)
+        return "failed"
     subscriber.finish(reused, None)
     return "reused"

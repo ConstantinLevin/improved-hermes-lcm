@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -589,6 +590,9 @@ class CompactionMixin:
 
         subscribers: List[Subscriber] = []
         ways: Dict[str, int] = {}
+        # Every chunk's outcome arrives here, once, after it is complete: the one place
+        # the compress() thread reads outcomes from.
+        finished: "queue.Queue[int]" = queue.Queue()
         for number, (chunk_handle, chunk) in enumerate(zip(chunk_handles, chunks), start=1):
             # A cancelled or no longer current attempt starts no further call (#29 W2 step 2).
             if not still_wanted():
@@ -596,9 +600,13 @@ class CompactionMixin:
             records = [attempt.records[index] for index in chunk]
             chunk_messages = [json.loads(facts[record][1]) for record in records]
             subscriber = Subscriber(wanted=still_wanted, hook=hook, deadline=deadline,
-                                    deliver=self._deliver_for(attempt, chunk_handle, number, len(chunks)))
+                                    deliver=self._deliver_for(attempt, chunk_handle, number, len(chunks)),
+                                    on_done=lambda number=number: finished.put(number))
+            # Attempts share a call only with the same summariser route and effort, the
+            # rule a reuse applies (``summary_of_records``).
             way = join_or_start(
-                (attempt.session, tuple(records)), subscriber, limiter=limiter, limit=limit,
+                (attempt.session, tuple(records), route.model, route.provenance_provider(), settings.effort),
+                subscriber, limiter=limiter, limit=limit,
                 reuse=lambda records=records, chunk_handle=chunk_handle: self._records.summary_of_records(
                     attempt.session, records, exclude_chunk=chunk_handle, model=route.model,
                     provider=route.provenance_provider(), effort=settings.effort),
@@ -615,21 +623,23 @@ class CompactionMixin:
         # The compress() thread waits for its chunks, asking the attempt's captured check
         # all the while (R4): cancelled or superseded, it returns its input at once and
         # sets nothing; the calls in flight run on and their summaries are written (D13).
-        # A chunk that failed fails the compaction as a whole, the context unchanged (#7);
-        # the summaries written stay for the retry.
-        while True:
+        # A chunk that failed, or has no derivation, fails the compaction as a whole, the
+        # context unchanged (#7), through _abort, never an exception; the summaries
+        # written stay for the retry. Each outcome is read once, when its chunk reports
+        # it complete, so no outcome is judged half-written.
+        received: set = set()
+        while len(received) < len(subscribers):
             if not still_wanted():
                 raise AttemptCancelled()
-            for number, subscriber in enumerate(subscribers, start=1):
-                if subscriber.done.is_set() and subscriber.outcome is not None \
-                        and subscriber.outcome.failure is not None:
-                    return self._abort(
-                        messages, f"the summary of chunk {number} of {len(chunks)} failed "
-                                  f"({subscriber.outcome.failure})")
-            pending = [s for s in subscribers if not s.done.is_set()]
-            if not pending:
-                break
-            pending[0].done.wait(_WAIT_SLICE_S)
+            try:
+                number = finished.get(timeout=_WAIT_SLICE_S)
+            except queue.Empty:
+                continue
+            received.add(number)
+            outcome = subscribers[number - 1].outcome
+            if outcome is None or outcome.failure is not None or not outcome.derivation:
+                why = outcome.failure if outcome is not None and outcome.failure else "no summary was delivered"
+                return self._abort(messages, f"the summary of chunk {number} of {len(chunks)} failed ({why})")
         # The return is ordered by the chunks, whatever order the summaries arrived in.
         new_derivations: List[str] = [s.outcome.derivation for s in subscribers]
 

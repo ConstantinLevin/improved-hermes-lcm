@@ -476,7 +476,18 @@ def _call_with_retries(
                     if timeout <= 0:
                         raise SummaryFailure("summariser call not made, no time left before the host's deadline",
                                              transient=True)
-                content, finish_reason = _call_once(messages, settings, timeout)
+                try:
+                    content, finish_reason = _call_once(messages, settings, timeout)
+                except SummaryFailure:
+                    raise
+                except Exception as exc:
+                    retry_after = _retry_after_seconds(exc)
+                    if retry_after and _is_transient(exc):
+                        # The endpoint said when: no call to it before then, this one's
+                        # or another's. Held here, inside the dispatch scope, before the
+                        # slot is given back, so no queued call dispatches in between.
+                        path.hold(retry_after)
+                    raise
         except SummaryFailure:
             raise
         except Exception as exc:
@@ -486,9 +497,6 @@ def _call_with_retries(
             if not _is_transient(exc):
                 raise SummaryFailure("summariser call failed", transient=False, detail=text) from None
             retry_after = _retry_after_seconds(exc)
-            if retry_after:
-                # The endpoint said when: no call to it before then, this one's or another's.
-                path.hold(retry_after)
             # The growing backoff always applies: a provider's Retry-After can only make
             # the wait longer, so a zero or expired one never makes a hot loop.
             delay = max(retry_after or 0.0, backoff * random.uniform(0.8, 1.2))
