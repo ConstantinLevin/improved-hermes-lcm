@@ -40,7 +40,16 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from .escalation import REASONING_EFFORTS, CallSettings, SummariserRoute, summarize_chunk
+from .escalation import (
+    REASONING_EFFORTS,
+    CallSettings,
+    SummariserRoute,
+    SummaryFailure,
+    _host_provider,
+    configured_route_problem,
+    failure_text,
+    summarize_chunk,
+)
 from .model_table import lookup as lookup_model
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
@@ -154,19 +163,24 @@ class CompactionMixin:
         (#9). No part of the route is guessed: the session's route is what the host
         handed ``update_model``; a configured one must name its provider."""
         config = self._config
-        if config.summary_model or config.summary_provider:
-            if not (config.summary_model and config.summary_provider):
-                return None, ("the configured summariser is incomplete: LCM_SUMMARY_MODEL and "
-                              "LCM_SUMMARY_PROVIDER are set together or not at all")
+        problem = configured_route_problem(config)
+        if problem is not None:
+            # Refused when the configuration was loaded, and every compaction says why.
+            return None, problem
+        secrets = tuple(s for s in (config.summary_api_key, self.api_key) if isinstance(s, str) and s)
+        if config.summary_model:
             route = SummariserRoute(
                 provider=config.summary_provider.strip(), model=config.summary_model.strip(),
-                base_url=config.summary_base_url.strip(), api_key=config.summary_api_key.strip(),
+                base_url=config.summary_base_url.strip(), api_key=config.summary_api_key,
                 api_mode=config.summary_api_mode.strip(), source="configured",
             )
         else:
             if not (self.model and self.provider):
                 return None, ("the session's model is not known: the host has not named its route "
                               "through update_model, and no summariser is configured")
+            if not self.base_url and _host_provider(self.provider) == "custom":
+                return None, ("the session's route names provider custom without a base URL: the host "
+                              "would borrow an endpoint of its own, which the session did not name")
             route = SummariserRoute(
                 provider=self.provider, model=self.model, base_url=self.base_url,
                 api_key=self.api_key, api_mode=self.api_mode, source="session",
@@ -176,7 +190,7 @@ class CompactionMixin:
             try:
                 effort = self._sessions.latest_fact(self._plugin_session, "effort")
             except Exception as exc:
-                return None, f"the session's reasoning effort could not be read ({exc})"
+                return None, f"the session's reasoning effort could not be read ({type(exc).__name__})"
         effort = (effort or config.summary_reasoning_effort or "").strip().lower()
         if effort not in REASONING_EFFORTS:
             return None, (f"the summariser's reasoning effort {effort!r} is not one of the host's levels "
@@ -187,6 +201,7 @@ class CompactionMixin:
             effort=effort,
             max_tokens=facts.output_cap if facts is not None else None,
             timeout=config.summary_timeout_ms / 1000,
+            secrets=secrets,
         ), ""
 
     def compress(self, messages: List[Dict[str, Any]],
@@ -454,11 +469,15 @@ class CompactionMixin:
                 )
             except Exception as exc:
                 # A SummaryFailure, or anything else the call raised: never truncated,
-                # never swallowed. The context stays as it was (#7).
-                logger.warning("LCM summary of chunk %d of %d failed", number, len(chunks), exc_info=True)
+                # never swallowed. The context stays as it was (#7). What is logged,
+                # stored and shown is the failure's class and message with every known
+                # secret removed; never a traceback, which could carry request headers.
+                text = settings.scrub(str(exc)) if isinstance(exc, SummaryFailure) \
+                    else failure_text(exc, settings.secrets)
+                logger.warning("LCM summary of chunk %d of %d failed: %s", number, len(chunks), text)
                 self._record_event(attempt, "summary_failed",
-                                   {"chunk": chunk_handle, "number": number, "error": repr(exc)})
-                return self._abort(messages, f"the summary of chunk {number} of {len(chunks)} failed ({exc})")
+                                   {"chunk": chunk_handle, "number": number, "error": text})
+                return self._abort(messages, f"the summary of chunk {number} of {len(chunks)} failed ({text})")
             try:
                 new_derivations.append(self._write_summary(
                     attempt, chunk_handle, text=text, level=level, budget=budget,
