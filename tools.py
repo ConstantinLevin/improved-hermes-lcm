@@ -1825,7 +1825,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
-            "leaf_chunk_tokens": engine._config.leaf_chunk_tokens,
+            "chunk_tokens": engine._config.chunk_tokens,
+            "estimate_ratio": engine._config.estimate_ratio,
+            "chunk": engine._chunk_label(),
             "context_threshold": engine._config.context_threshold,
             "summary_model": (
                 f"{engine._config.summary_provider}/{engine._config.summary_model}"
