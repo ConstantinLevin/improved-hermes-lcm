@@ -402,13 +402,21 @@ def _worker(call: ChunkCall, run: Callable[[ChunkCall], ChunkSummary],
     with _scope(_host_interrupt_protection, active=True), _scope(_host_progress_hook, call.tick):
         try:
             summary = run(call)
-        except CallAbandoned:
-            abandoned = True
-            failure = "no attempt wants the summary any more (each was cancelled or superseded)"
-        except BaseException as exc:  # a SummaryFailure, or anything else: never swallowed
-            failure = describe(exc)
-            # A SummaryFailure names its kind; anything else is of none the plugin knows.
-            kind = getattr(exc, "kind", None) or "other"
+        except BaseException as exc:  # a SummaryFailure, an abandonment, or anything else: never swallowed
+            # An own failure observed before the call ended otherwise (level 1 rejected,
+            # then level 2 abandoned or raised) is the call's failure, recorded once
+            # (``escalation.summarize_chunk``; Codex review of 3da00d9).
+            observed = getattr(exc, "observed_failure", None)
+            if observed is not None:
+                failure = f"{describe(observed)}; then {type(exc).__name__}"
+                kind = getattr(observed, "kind", None) or "other"
+            elif isinstance(exc, CallAbandoned):
+                abandoned = True
+                failure = "no attempt wants the summary any more (each was cancelled or superseded)"
+            else:
+                failure = describe(exc)
+                # A SummaryFailure names its kind; anything else is of none the plugin knows.
+                kind = getattr(exc, "kind", None) or "other"
     _close(call, summary, failure, abandoned, kind)
 
 

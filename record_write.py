@@ -392,10 +392,18 @@ class RecordWriteMixin:
         def known_row(index: int, row_id: Optional[int], message: Dict[str, Any], base: str,
                       merged: List[str]) -> None:
             """A row the store already holds as ``base``: referenced when unchanged,
-            else revised. A record beside the chain keeps its revisions beside it."""
+            else revised. A record beside the chain keeps its revisions beside it.
+
+            Where ``base`` is the record an unconfirmed attempt wrote for this very row
+            (its ``_row_id`` in ``reusable``, #33 D14), that record already holds what
+            the row absorbed then: the row is a new revision only if it was rewritten
+            since. Otherwise a merged row would be recorded anew at every retry, and a
+            frozen chunk holding it would never be found again."""
             nonlocal chain
             beside_chain = side.get(base, False) and all(side.get(r, False) for r in merged)
-            if merged or (base in facts and rewritten(message, facts[base][1])):
+            changed = base in facts and rewritten(message, facts[base][1])
+            from_retry = row_id is not None and reusable.get(row_id) == base
+            if changed or (merged and not from_retry):
                 originals = [base] + [r for r in merged if r != base]
                 pred = (chain if chain is not None else fallback) if beside_chain \
                     else predecessor_of(earliest(originals))
@@ -433,10 +441,13 @@ class RecordWriteMixin:
                 continue
             if index == 0 and message.get("role") == "system":
                 entries.append(InputEntry(index, row_id, "system"))
+            elif row_id is not None and row_id in reusable:
+                # A row an unconfirmed attempt already recorded, a bound host insertion
+                # included: the same record while unchanged (#33 D14; Codex review of
+                # 3da00d9), before it is taken for a new host insertion.
+                known_row(index, row_id, message, reusable[row_id], merged)
             elif row_id is not None and row_id in insertions:
                 entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
-            elif row_id is not None and row_id in reusable:
-                known_row(index, row_id, message, reusable[row_id], merged)
             elif index < last_bound_index:
                 entries.append(InputEntry(index, row_id, "host_insertion", message=message, pred=beside))
             elif merged:

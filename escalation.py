@@ -636,14 +636,14 @@ def summarize_chunk(
         if first.transient:
             raise
         logger.warning("LCM level-1 summary failed (%s); trying level 2", first)
-        l2 = summariser_messages(
-            records,
-            instructions=_l2_instructions(int(token_budget * _L2_BUDGET_RATIO), focus_topic=focus_topic,
-                                          custom_instructions=custom_instructions),
-            request=request,
-            facts=facts,
-        )
         try:
+            l2 = summariser_messages(
+                records,
+                instructions=_l2_instructions(int(token_budget * _L2_BUDGET_RATIO), focus_topic=focus_topic,
+                                              custom_instructions=custom_instructions),
+                request=request,
+                facts=facts,
+            )
             content, finish_reason = _call_with_retries(
                 l2, source=source, settings=settings, path=path)
         except SummaryFailure as second:
@@ -663,6 +663,19 @@ def summarize_chunk(
                 detail=second.detail,
                 retry_after=second.retry_after,
             ) from second
+        except BaseException as exc:
+            # Level 2 ended by something that is no summary failure: the call abandoned
+            # because no attempt wants it any more (``inflight.CallAbandoned``), or any
+            # other exception. An own failure observed at level 1 is still recorded
+            # (Codex review of 3da00d9): it rides the exception, and the worker delivers
+            # it as the call's one failure (``inflight._worker``).
+            if first.kind in OWN_FAILURE_KINDS and getattr(exc, "observed_failure", None) is None:
+                try:
+                    exc.observed_failure = first
+                except Exception:
+                    logger.warning("LCM could not carry the level-1 failure (%s) past %s", first,
+                                   type(exc).__name__)
+            raise
         return content, 2, finish_reason
 
 
