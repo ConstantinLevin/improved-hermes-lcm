@@ -62,7 +62,7 @@ _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
     "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id, "
-    "ingested_at, observed_at, observed_at_source"
+    "ingested_at, observed_at, observed_at_source, seq, revises_node_id"
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
@@ -237,23 +237,26 @@ def _build_search_order_by(
     sort: str | None,
     timestamp_expr: str,
     role_penalty_expr: str | None = None,
+    order_expr: str = "m.seq",
 ) -> str:
+    """Recency is the transcript order (``order_expr``, the view's ``seq``), never
+    the ids; ``timestamp_expr`` only ages a hit for the hybrid blend."""
     normalized = normalize_search_sort(sort)
     order_parts: list[str] = []
     if normalized == "relevance":
         if role_penalty_expr:
-            order_parts.extend(["rank ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"])
+            order_parts.extend(["rank ASC", f"{role_penalty_expr} ASC", f"{order_expr} DESC"])
         else:
-            order_parts.extend(["rank ASC", f"{timestamp_expr} DESC"])
+            order_parts.extend(["rank ASC", f"{order_expr} DESC"])
         return ", ".join(order_parts)
     if normalized == "hybrid":
         blended = f"(rank / (1 + (MAX(0.0, ((strftime('%s','now') - {timestamp_expr}) / 3600.0)) * {AGE_DECAY_RATE})))"
         if role_penalty_expr:
-            order_parts.extend([f"{blended} ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"])
+            order_parts.extend([f"{blended} ASC", f"{role_penalty_expr} ASC", f"{order_expr} DESC"])
         else:
-            order_parts.extend([f"{blended} ASC", f"{timestamp_expr} DESC"])
+            order_parts.extend([f"{blended} ASC", f"{order_expr} DESC"])
         return ", ".join(order_parts)
-    order_parts.append(f"{timestamp_expr} DESC")
+    order_parts.append(f"{order_expr} DESC")
     if role_penalty_expr:
         order_parts.append(f"{role_penalty_expr} ASC")
     order_parts.append("rank ASC")
@@ -265,15 +268,16 @@ def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple
     score = float(result.get("_fallback_score") or 0.0)
     directness = float(result.get("_directness_score") or 0.0)
     timestamp = float(result.get("timestamp") or 0.0)
+    order = float(result.get("seq") or 0.0)
     role_bias = _message_role_bias(result.get("role"))
 
     if normalized == "relevance":
-        return (-score, -directness, role_bias, -timestamp)
+        return (-score, -directness, role_bias, -order)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
         blended = score / (1 + (age_hours * AGE_DECAY_RATE))
-        return (-blended, -directness, role_bias, -timestamp)
-    return (-timestamp, role_bias, -score, -directness)
+        return (-blended, -directness, role_bias, -order)
+    return (-order, role_bias, -score, -directness)
 
 
 def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
@@ -282,15 +286,16 @@ def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[floa
     rank_value = float(rank) if rank is not None else float("inf")
     directness = float(result.get("_directness_score") or 0.0)
     timestamp = float(result.get("timestamp") or 0.0)
+    order = float(result.get("seq") or 0.0)
     role_bias = _message_role_bias(result.get("role"))
 
     if normalized == "relevance":
-        return (rank_value, -directness, role_bias, -timestamp)
+        return (rank_value, -directness, role_bias, -order)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
         blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
-        return (blended, -directness, role_bias, -timestamp)
-    return (-timestamp, role_bias, rank_value, 0.0)
+        return (blended, -directness, role_bias, -order)
+    return (-order, role_bias, rank_value, 0.0)
 
 
 def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
@@ -487,16 +492,15 @@ class MessageStore:
         self,
         session_id: str,
         *,
-        after_store_id: int = 0,
+        after_seq: int = 0,
         limit: int = 100,
         roles: list[str] | None = None,
         time_from: float | None = None,
         time_to: float | None = None,
     ) -> List[Dict[str, Any]]:
-        """Load one ordered raw-message page for a session.
+        """Load one page of a session's stored messages in transcript order.
 
-        ``after_store_id`` is exclusive so callers can use the previous page's
-        ``next_cursor`` without duplicating the cursor row.
+        ``after_seq`` is exclusive: pass the last row's ``seq`` to continue.
         """
         where, args = self._session_load_where(
             session_id,
@@ -504,13 +508,26 @@ class MessageStore:
             time_from=time_from,
             time_to=time_to,
         )
-        where.append("store_id > ?")
-        args.extend([after_store_id, limit])
+        where.append("seq > ?")
+        args.extend([after_seq, limit])
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE {' AND '.join(where)}
-               ORDER BY store_id LIMIT ?""",
+               ORDER BY seq LIMIT ?""",
             args,
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_returned_tail(self, session_id: str) -> List[Dict[str, Any]]:
+        """The fresh tail as it was returned: the record entries of the session's
+        latest effective return, in their return positions."""
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE session_id = ? AND store_id IN (
+                   SELECT r.record_id FROM latest_returns l JOIN records r ON r.handle = l.record
+                   WHERE l.kind = 'record' AND r.session = ?)
+               ORDER BY seq""",
+            (session_id, session_id),
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -912,7 +929,7 @@ class MessageStore:
                 rows = self._conn.execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
                               m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
-                              m.ingested_at, m.observed_at, m.observed_at_source,
+                              m.ingested_at, m.observed_at, m.observed_at_source, m.seq, m.revises_node_id,
                               rank as search_rank,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
@@ -1083,7 +1100,7 @@ class MessageStore:
                 directness_expr = f"(({unique_score_expr}) * 5.0) - MIN(({repetition_expr}), 6)"
             order_args.extend(directness_args)
             order_by = (
-                f"ORDER BY timestamp DESC, {role_bias} ASC, ({score_expr}) DESC, "
+                f"ORDER BY seq DESC, {role_bias} ASC, ({score_expr}) DESC, "
                 f"({directness_expr}) DESC, store_id DESC"
             )
 
@@ -1182,7 +1199,7 @@ class MessageStore:
 
             order_by = (
                 f"ORDER BY {primary_expr} DESC, ({exact_expr}) DESC, ({directness_expr}) DESC, "
-                f"{role_bias} ASC, timestamp DESC, store_id DESC"
+                f"{role_bias} ASC, seq DESC"
             )
             candidate_cap = compute_search_candidate_cap(limit)
             offset = 0
@@ -1217,7 +1234,7 @@ class MessageStore:
         cols = [
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
-            "ingested_at", "observed_at", "observed_at_source",
+            "ingested_at", "observed_at", "observed_at_source", "seq", "revises_node_id",
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))

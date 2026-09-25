@@ -1,21 +1,21 @@
-"""The write at a compaction, beside the old path (#29 W2 and W3; #33 D12).
+"""The write at a compaction (#29 W2 and W3; #33 D12).
 
-The old path stays authoritative for the summariser, the assembly and the tools; the
-record written here is a shadow until the read switch. What is written, and when:
+The record is the only store: the summariser reads from it, the return is emitted
+from it, and the tools read views over it. What is written, and when:
 
 - ``compress()`` captures, at its entry and on its own thread, the host's
   cancellation check for this attempt and the attempt's generation, and never reads
   either from the engine again (a newer attempt overwrites the engine attribute).
-- At the first leaf pass: the compaction, its inputs, a record for every input entry
-  the store does not hold yet, and their tool calls (transaction 1). Input entries
-  are classified against the previous effective return by the host's ``_row_id`` and
-  the plugin's in-memory key only, never by content.
-- Before each summariser call: the chunk with its members. When the summary arrives:
-  the derivation, also after a cancellation (a summary is a fact about its chunk and
-  makes nothing active).
-- Before every write of live state (the old path's DAG node, its frontier) and before
-  the return, the captured check is asked; a cancelled or no longer current attempt
-  writes none of them and returns its input.
+- Input entries are classified against the previous effective return by the host's
+  ``_row_id`` and the plugin's in-memory key only, never by content. Where that
+  fails, nothing is written and the compaction is aborted with its cause.
+- Transaction 1: the compaction, its inputs, a record for every input entry the store
+  does not hold yet, their tool calls, and every chunk with its members.
+- Each summary, as a derivation of its chunk, when it arrives, also after a
+  cancellation (a summary is a fact about its chunk and makes nothing active).
+- Before each summariser call and before the return, the captured check is asked; a
+  cancelled or no longer current attempt starts no further call, writes no return and
+  returns its input.
 - The confirmation ``on_session_start(boundary_reason="compression")`` carries no list.
   The committed attempt is the one whose own returned dicts the host stamped with a new
   ``_row_id`` at this commit (``hermes_state_messages.py:515-535``). Each dict is bound
@@ -43,7 +43,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .record_store import RET_KEY, InputEntry, parse_ret_key, raw_json
+from .record_store import RET_KEY, InputEntry, parse_ret_key
+from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -96,10 +97,14 @@ class CompressAttempt:
     count_increment: int = 0
     compacted: bool = False
     messages: Optional[List[Dict[str, Any]]] = None
-    index_by_working: Optional[Dict[int, int]] = None
     compaction: Optional[int] = None
     records: Dict[int, str] = field(default_factory=dict)
-    shadow_ok: bool = True
+    # Why the list could not be classified: (event kind, the text the host shows).
+    error: Optional[tuple] = None
+    # The return of the session's effective compaction the list was classified against.
+    effective_returns: Dict[int, tuple] = field(default_factory=dict)
+    # The list positions that stand for a summary of that return.
+    summary_inputs: set = field(default_factory=set)
     # What was returned: the list object, each keyed dict by its position, the
     # _row_id each carried when it was returned, and which positions are summaries.
     returned: Optional[List[Dict[str, Any]]] = None
@@ -181,16 +186,9 @@ class RecordWriteMixin:
         if attempt.count_increment:
             self.compression_count += attempt.count_increment
 
-    def _record_compaction_telemetry(self) -> None:
-        record = getattr(self, "_record_successful_compaction_telemetry", None)
-        if callable(record):
-            record()
+    # --- The write at a compaction ----------------------------------------------------
 
-    # --- Shadow writes --------------------------------------------------------------
-
-    def _shadow_failed(self, attempt: Optional[CompressAttempt], kind: str, detail: Any) -> None:
-        if attempt is not None:
-            attempt.shadow_ok = False
+    def _record_event(self, attempt: Optional[CompressAttempt], kind: str, detail: Any) -> None:
         self._records.event(
             kind,
             session=attempt.session if attempt is not None else self._plugin_session or None,
@@ -198,39 +196,35 @@ class RecordWriteMixin:
             detail=detail,
         )
 
-    def _shadow_begin(self, attempt: CompressAttempt, *, force: bool) -> None:
-        """Transaction 1, once per attempt, at its first leaf pass."""
-        if attempt.compaction is not None or not attempt.shadow_ok:
-            return
-        if not attempt.session:
-            self._shadow_failed(attempt, "no_plugin_session", "compress() on an engine copy that names no plugin session")
-            return
-        messages = attempt.messages or []
-        try:
-            self._settle_from_list(messages)
-            classified = self._classify(attempt, messages)
-            if classified is None:
-                return
-            compaction, records = self._records.begin_compaction(
-                session=attempt.session,
-                kind="full" if force else "threshold",
-                host_session_before=self._session_id or None,
-                attempt_generation=attempt.generation if isinstance(attempt.generation, int) else None,
-                entries=classified,
-            )
-        except Exception as exc:
-            logger.warning("LCM shadow write of the compaction failed", exc_info=True)
-            self._shadow_failed(attempt, "compaction_write_failed", repr(exc))
-            return
+    def _write_compaction(
+        self,
+        attempt: CompressAttempt,
+        entries: List[InputEntry],
+        chunks: List[List[int]],
+        *,
+        force: bool,
+    ) -> List[str]:
+        """Transaction 1: the compaction, its inputs, the new records, their tool calls
+        and every chunk. Returns the chunk handles; raises when the write fails."""
+        compaction, records, chunk_handles = self._records.begin_compaction(
+            session=attempt.session,
+            kind="full" if force else "threshold",
+            host_session_before=self._session_id or None,
+            attempt_generation=attempt.generation if isinstance(attempt.generation, int) else None,
+            entries=entries,
+            chunks=chunks,
+        )
         attempt.compaction = compaction
         attempt.records = records
+        return chunk_handles
 
     def _classify(self, attempt: CompressAttempt, messages: List[Dict[str, Any]]) -> Optional[List[InputEntry]]:
         """Classify the list against the session's effective return (#29 W3, W4).
 
         Every entry is identified first, by the plugin's key or the host's _row_id, and
         only an identified row is compared with what the store holds for it. An error
-        is recorded as an event and nothing is written for this compaction (None).
+        is recorded as an event, its cause is kept on the attempt for the host's
+        message, and nothing is written for this compaction (None).
         """
         store = self._records
         effective = store.effective_compaction(attempt.session)
@@ -238,9 +232,21 @@ class RecordWriteMixin:
         bound = store.bound_rows(effective) if effective is not None else {}
         insertions = store.bound_insertions(effective) if effective is not None else set()
         reusable = store.unconfirmed_inputs(attempt.session, effective)
+        attempt.effective_returns = returned
+
+        causes = {
+            "return_not_found": "no message identity from the host: none of the entries is bound to the "
+                                "last compaction, so the plugin cannot tell what it holds (see ask A1)",
+            "bound_entry_twice": "two entries of the list are bound to the same returned row",
+            "bound_summary_missing": "a summary the plugin returned is missing from the list",
+            "bound_record_missing_interior": "a row the plugin returned is missing from the middle of the list "
+                                             "and was merged into no other row",
+            "unbound_summary_row": "a row flagged as a compaction summary is not one the plugin returned",
+        }
 
         def fail(kind: str, detail: Any) -> None:
-            self._shadow_failed(attempt, kind, detail)
+            attempt.error = (kind, causes.get(kind, kind))
+            self._record_event(attempt, kind, detail)
 
         # 1. Where the effective return stands in the list, by identity.
         found: Dict[int, int] = {}      # list index -> returned position
@@ -381,6 +387,8 @@ class RecordWriteMixin:
                 position = found[index]
                 kind, record, _derivation, raw = returned[position]
                 if kind == "summary":
+                    # The mechanism's layer: never material; the cover re-emits it.
+                    attempt.summary_inputs.add(index)
                     prior = current(None, row_id)
                     if prior is not None:
                         known_row(index, row_id, message, prior, merged)
@@ -414,73 +422,40 @@ class RecordWriteMixin:
                 chain = ("entry", index)
         return entries
 
-    def _shadow_chunk(self, attempt: Optional[CompressAttempt], working_members: List[Dict[str, Any]]) -> Optional[str]:
-        if attempt is None or not attempt.shadow_ok or attempt.compaction is None:
-            return None
-        index = attempt.index_by_working or {}
-        positions = [index.get(id(message)) for message in working_members]
-        members = [attempt.records.get(pos) if pos is not None else None for pos in positions]
-        if not members or any(member is None for member in members):
-            self._shadow_failed(attempt, "chunk_member_without_record", {"positions": positions})
-            return None
-        try:
-            return self._records.write_chunk(session=attempt.session, compaction=attempt.compaction, members=members)
-        except Exception as exc:
-            logger.warning("LCM shadow write of a chunk failed", exc_info=True)
-            self._shadow_failed(attempt, "chunk_write_failed", repr(exc))
-            return None
-
-    def _shadow_derivation(
+    def _write_summary(
         self,
-        attempt: Optional[CompressAttempt],
-        chunk: Optional[str],
+        attempt: CompressAttempt,
+        chunk: str,
         *,
         text: str,
         level: Optional[int],
-        est_tokens: Optional[int],
-    ) -> None:
-        if attempt is None or chunk is None or attempt.compaction is None:
-            return
-        try:
-            self._records.write_derivation(
-                compaction=attempt.compaction,
-                chunk=chunk,
-                text=text,
-                model=self._config.summary_model or None,
-                provider=None,
-                level=level,
-                budget=None,
-                est_tokens=est_tokens,
-            )
-        except Exception as exc:
-            logger.warning("LCM shadow write of a summary failed", exc_info=True)
-            self._shadow_failed(attempt, "derivation_write_failed", repr(exc))
+        budget: Optional[int],
+        expand_hint: Optional[str],
+    ) -> str:
+        """A summary as a derivation of its chunk, in its own transaction; raises when
+        the write fails."""
+        return self._records.write_derivation(
+            compaction=attempt.compaction,
+            chunk=chunk,
+            text=text,
+            model=self._config.summary_model or None,
+            provider=None,
+            level=level,
+            budget=budget,
+            est_tokens=count_tokens(text),
+            expand_hint=expand_hint,
+        )
 
-    def _shadow_returns(self, attempt: Optional[CompressAttempt], result: List[Dict[str, Any]]) -> None:
-        """Write the return and key the returned dicts. The caller has asked the
-        attempt's captured check just before."""
-        if attempt is None or not attempt.shadow_ok or attempt.compaction is None:
-            return
-        by_object = {id(message): pos for pos, message in enumerate(attempt.messages or [])}
-        entries: list[tuple[int, str, Optional[str], Optional[str], Optional[str]]] = []
-        try:
-            for position, message in enumerate(result):
-                input_position = by_object.get(id(message))
-                if input_position is not None and input_position in attempt.records:
-                    entries.append((position, "record", attempt.records[input_position], None, None))
-                elif message.get("_compressed_summary") is True and input_position is None:
-                    entries.append((position, "summary", None, None, raw_json(message)))
-                elif input_position == 0 and message.get("role") == "system":
-                    continue  # the host's system row, returned in place, not recorded
-                else:
-                    self._shadow_failed(attempt, "return_entry_unknown",
-                                        {"position": position, "role": message.get("role")})
-                    return
-            self._records.write_returns(attempt.compaction, entries)
-        except Exception as exc:
-            logger.warning("LCM shadow write of the return failed", exc_info=True)
-            self._shadow_failed(attempt, "return_write_failed", repr(exc))
-            return
+    def _write_return(
+        self,
+        attempt: CompressAttempt,
+        result: List[Dict[str, Any]],
+        entries: List[tuple],
+    ) -> None:
+        """Write the return, (position, kind, record, derivation, raw) per recorded
+        entry, and key the returned dicts. The caller has asked the attempt's captured
+        check just before; raises when the write fails."""
+        self._records.write_returns(attempt.compaction, entries)
         for position, kind, _record, _derivation, _raw in entries:
             message = result[position]
             message[RET_KEY] = f"{attempt.compaction}:{position}"

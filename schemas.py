@@ -3,7 +3,8 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Full-text search over the current session's past conversation content in the LCM database. "
+        "Full-text search over the current session's past conversation content in the LCM database, "
+        "which stores it at each compaction. "
         "Returns both raw messages and summary nodes across all depths. "
         "Use lcm_expand(store_id=...) on a message hit or lcm_expand(node_id=...) on a summary hit "
         "to drill into its full content."
@@ -44,14 +45,16 @@ LCM_GREP = {
             "time_from": {
                 "anyOf": [{"type": "number"}, {"type": "string"}],
                 "description": (
-                    "Optional inclusive minimum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
+                    "Optional inclusive minimum time a message was stored (the time of the compaction that stored it, "
+                    "not the time it was said). Accepts Unix seconds or timezone-aware ISO 8601; "
                     "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
                 ),
             },
             "time_to": {
                 "anyOf": [{"type": "number"}, {"type": "string"}],
                 "description": (
-                    "Optional inclusive maximum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
+                    "Optional inclusive maximum time a message was stored (the time of the compaction that stored it, "
+                    "not the time it was said). Accepts Unix seconds or timezone-aware ISO 8601; "
                     "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
                 ),
             },
