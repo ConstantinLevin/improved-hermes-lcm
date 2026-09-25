@@ -793,22 +793,6 @@ class MessageStore:
         """
         return self._locked
 
-    def commit(self) -> None:
-        """Commit pending writes on the store connection.
-
-        Used by the backup path's cross-connection flush so callers do not reach
-        the private connection. A closed store raises ``StoreClosedError``.
-        """
-        with self._lock:
-            self._conn.commit()
-
-    def backup(self, dest: sqlite3.Connection) -> None:
-        """Copy the store's database into the already-open ``dest`` connection,
-        under the lock :meth:`close` takes. A closed store raises
-        ``StoreClosedError``."""
-        with self._lock:
-            self._conn.backup(dest)
-
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self, reason: str = "closed") -> None:

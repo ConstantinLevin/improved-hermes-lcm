@@ -12,7 +12,7 @@ Start here:
 1. Confirm that the `hermes-lcm` plugin is enabled and `context.engine` is `lcm`.
 2. For exact historical claims, use the recall workflow instead of trusting a compacted summary.
 3. Use `lcm_status`, `lcm_inspect`, and `lcm_doctor` before changing configuration or attempting repair.
-4. Treat slash-command apply paths as mutations: preview first, keep backups, and require the user's authorization.
+4. Treat slash-command apply paths as mutations: preview first and require the user's authorization. The store's backup is automatic and daily (`references/diagnostics.md`).
 5. Load the relevant reference rather than guessing arguments or lifecycle semantics.
 
 Reference map:

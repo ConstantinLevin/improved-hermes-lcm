@@ -7,15 +7,15 @@ from typing import Any
 
 DOCTOR_ACTION_SAFE_IGNORE = "safe/ignore"
 DOCTOR_ACTION_INSPECT = "inspect"
-DOCTOR_ACTION_BACKUP_FIRST_CLEANUP = "backup-first cleanup"
+DOCTOR_ACTION_REBUILD = "rebuild"
 
 
 def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
     """Return operator triage guidance for one lcm_doctor check.
 
     Guidance is deliberately conservative: most warning classes are inspect-only
-    evidence, and any mutation path is framed as preview/backup/apply rather than
-    implied automatic cleanup.
+    evidence. The one mutation offered, rebuilding a full-text index, rebuilds
+    derived data from the insert-only record; the store's backup is the daily slot.
     """
     status = str(check.get("status") or "")
     if status not in {"warn", "fail"}:
@@ -29,7 +29,8 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
     rationale = "operator review required before changing persisted LCM state"
 
     if name == "database_integrity":
-        command = "stop and inspect the SQLite database path; restore from backup if integrity_check is not ok"
+        command = ("stop and inspect the SQLite database path; if integrity_check is not ok, restore the "
+                   "daily backup slot by hand (skill reference: diagnostics, Restore)")
     elif name == "schema_core_tables":
         command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before repair or restore"
     elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:
@@ -39,11 +40,12 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
             warning_only = True
             rationale = "the deep FTS check could not run, but this is not evidence that the index is corrupt"
         else:
-            action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
-            command = "back up the database, then rebuild the FTS index from the stored rows"
-            rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
+            action = DOCTOR_ACTION_REBUILD
+            command = "rebuild the FTS index from the stored records (`/lcm doctor repair apply`)"
+            rationale = "the index is derived from the insert-only record; rebuilding it cannot lose a record"
     elif name == "sqlite_storage":
-        command = "inspect journal/quick_check output and database/WAL size; restore from backup if SQLite reports corruption"
+        command = ("inspect journal/quick_check output and database size; if SQLite reports corruption, restore "
+                   "the daily backup slot by hand (skill reference: diagnostics, Restore)")
     elif name == "orphaned_dag_nodes":
         command = "inspect affected DAG/source IDs; do not auto-delete summaries without confirming recall impact"
         if status == "warn":
