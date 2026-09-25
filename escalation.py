@@ -23,7 +23,7 @@ Codex adapter always; its streamed collector when no chunk carried one), a cut r
 can still pass: that is the host's, and asked of Hermes (A-7.1).
 
 Transient failures (HTTP 408/409/429/5xx, connection errors, timeouts) are retried at
-the same level after the provider's ``Retry-After``, else after 2 s doubling to 30 s
+the same level after the longer of the provider's ``Retry-After`` and 2 s doubling to 30 s
 with jitter, while the host's deadline allows (#33). With no host deadline the retries
 stop once the backoff has reached its 30 s cap a second time. Each wait is sliced and
 calls ``wait`` so that the caller can stop a cancelled attempt at once.
@@ -187,7 +187,9 @@ def _call_with_retries(
                 raise SummaryFailure("summariser call failed", transient=False,
                                      detail=f"{type(exc).__name__}: {exc}") from exc
             retry_after = _retry_after_seconds(exc)
-            delay = retry_after if retry_after is not None else backoff * random.uniform(0.8, 1.2)
+            # The growing backoff always applies: a provider's Retry-After can only make
+            # the wait longer, so a zero or expired one never makes a hot loop.
+            delay = max(retry_after or 0.0, backoff * random.uniform(0.8, 1.2))
             deadline = _deadline()
             if deadline is not None and time.monotonic() + delay >= deadline:
                 raise SummaryFailure("summariser call failed, no time left before the host's deadline",
@@ -335,7 +337,6 @@ def _build_l1_prompt(
     focus_topic: str = "",
     custom_instructions: str = "",
     source_provenance: Mapping[str, Any] | None = None,
-    source_content_token_budget: int | None = None,
 ) -> list[dict[str, str]]:
     """Build a role-separated Level 1 prompt over untrusted source data."""
     depth_guidance = {
@@ -380,7 +381,6 @@ Target approximately {int(token_budget)} tokens.{focus_guidance}{custom_guidance
                 source_provenance=source_provenance,
             )
         ],
-        source_content_token_budget=source_content_token_budget,
     )
 
 
@@ -391,7 +391,6 @@ def _build_l2_prompt(
     custom_instructions: str = "",
     source_provenance: Mapping[str, Any] | None = None,
     source_depth: int = 0,
-    source_content_token_budget: int | None = None,
 ) -> list[dict[str, str]]:
     """Build a role-separated Level 2 prompt over untrusted source data."""
     focus_guidance = ""
@@ -426,5 +425,4 @@ Drop reasoning, alternatives considered, and process detail.{focus_guidance}{cus
                 source_provenance=source_provenance,
             )
         ],
-        source_content_token_budget=source_content_token_budget,
     )
