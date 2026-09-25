@@ -1596,15 +1596,9 @@ class LCMEngine(
         self._reset_session_scoped_runtime_state()
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
-        """Move the old session's summary nodes into the new one.
-
-        This reassigns session ownership for the summary nodes, but it does
-        not rewrite the nodes' descendant raw-message lineage: a carried-over
-        node belongs to the new session while its sources stay with the old one.
-        """
-        if not old_session_id or not new_session_id or old_session_id == new_session_id:
-            return 0
-        return self._dag.reassign_session_nodes(old_session_id, new_session_id)
+        """Nothing is carried into a new session: /new is new, and what a session
+        holds stays in the store under its own session. Returns the number moved, 0."""
+        return 0
 
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:

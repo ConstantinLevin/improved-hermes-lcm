@@ -101,8 +101,7 @@ class CompressAttempt:
     records: Dict[int, str] = field(default_factory=dict)
     # Why the list could not be classified: (event kind, the text the host shows).
     error: Optional[tuple] = None
-    # The session's effective compaction the list was classified against, and its return.
-    effective: Optional[int] = None
+    # The return of the session's effective compaction the list was classified against.
     effective_returns: Dict[int, tuple] = field(default_factory=dict)
     # The list positions that stand for a summary of that return.
     summary_inputs: set = field(default_factory=set)
@@ -233,7 +232,6 @@ class RecordWriteMixin:
         bound = store.bound_rows(effective) if effective is not None else {}
         insertions = store.bound_insertions(effective) if effective is not None else set()
         reusable = store.unconfirmed_inputs(attempt.session, effective)
-        attempt.effective = effective
         attempt.effective_returns = returned
 
         causes = {

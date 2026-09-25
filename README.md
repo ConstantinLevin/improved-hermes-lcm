@@ -14,9 +14,11 @@ documents, release notes and lossless-claw importer removed, and two false lossl
 deleted. Upstream's opt-in subsystems (recall, embeddings, evidence, assertions, rollups,
 extraction) and the switches that lose data on request (redaction, large-output externalisation,
 transcript GC, ignore patterns, deletion on `/new`, cleanup commands) are removed too; the agent
-gets six tools. Its behaviour is otherwise upstream's,
-including every loss listed below. None of what the fork will do instead is built. The fork is
-not usable for its purpose yet; the work is the issues in this repository's tracker.
+gets six tools. The store and the compaction path are the fork's: the plugin keeps its own
+record, filled at each compaction from what the host hands over, verbatim, and the context a
+compaction returns is emitted from that record (#29, #1, #3). The rest of its behaviour is
+upstream's, including every loss listed below. The fork is not usable for its purpose yet; the
+work is the issues in this repository's tracker.
 
 ## What upstream does badly, and what the fork will do instead
 
@@ -34,14 +36,6 @@ Each line was read in this tree's code.
   for the task "compression"; with no `summary_model` configured, the host picks the model
   (`escalation.py`, `config.py`). The fork's summariser will default to the model running the
   session (#9).
-- **Rewrites what it stores, and drops reasoning.** Every message passes
-  `protect_message_for_ingest` before it is written, which can put a placeholder where the content
-  was, and the messages table has no column for reasoning (`store.py`). The fork's store will keep
-  what the host hands over verbatim, every field, reasoning included (#3).
-- **Invents tool results.** When the assembled context holds a tool call without its result, a
-  result reading "[Result from earlier conversation — see context summary above]" is inserted
-  (`engine.py`, `_sanitize_tool_pairs`, from `compaction.py`). The fork will never invent or drop
-  a tool result; a call without its result is an error whose cause gets removed (#14).
 - **Sizes the fresh tail by message count.** The verbatim tail is the newest 32 messages; a token
   cap exists but is off by default (`fresh_tail.py`, `config.py`). The fork will size the tail in
   tokens, as a weight of the real window (#13).
