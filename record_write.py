@@ -425,9 +425,10 @@ class RecordWriteMixin:
         level: Optional[int],
         budget: Optional[int],
         expand_hint: Optional[str],
+        finish_reason: Optional[str] = None,
     ) -> str:
         """A summary as a derivation of its chunk, in its own transaction; raises when
-        the write fails."""
+        the write fails. ``finish_reason`` is the provider's, as the host reported it."""
         return self._records.write_derivation(
             compaction=attempt.compaction,
             chunk=chunk,
@@ -438,6 +439,7 @@ class RecordWriteMixin:
             budget=budget,
             est_tokens=count_tokens(text),
             expand_hint=expand_hint,
+            finish_reason=finish_reason,
         )
 
     def _write_return(

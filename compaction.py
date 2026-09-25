@@ -14,12 +14,16 @@ In order:
    a summary and is never chunked).
 3. The material is cut into chunks, in list order, each at most ``leaf_chunk_tokens``
    (a greedy cut until #12), only between groups: a tool call and its results stay in
-   one chunk, and a group larger than a chunk is a chunk of its own. The compaction,
+   one chunk, and a group larger than a chunk is a chunk of its own. A run smaller
+   than a quarter of a chunk next to such a group, or at the end of the material,
+   joins the adjacent chunk instead of standing alone. The compaction,
    its inputs, the new records and every chunk are written before the first
    summariser call.
 4. Each chunk is summarised from its records as the store holds them, one call at a
-   time, and the summary is written as a derivation when it arrives. A call that
-   fails fails the compaction as a whole: the context stays as it was.
+   time, and the summary is written as a derivation when it arrives. A summary that
+   cannot be written (``escalation.SummaryFailure``: no third level, nothing
+   truncated) fails the compaction as a whole: the context stays as it was, and the
+   host shows the cause.
 5. The return is emitted from the record: the host's system row in place, then the
    cover (the previous return's summaries, each re-emitted from its derivation, then
    the new ones in chunk order), then the tail as the host's own dicts. It is
@@ -36,7 +40,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from .escalation import summarize_with_escalation
+from .escalation import summarize_chunk
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .record_write import _ATTEMPT, AttemptCancelled
@@ -47,6 +51,14 @@ logger = logging.getLogger(__name__)
 # The words around a summary row (Decision 8, until #10 writes them).
 _SUMMARY_HEADER = "[Recent Summary (d0, node {node_id})]"
 _SUMMARY_FOOTER = "[Expand for details: {hint}]"
+
+# How often a wait between summariser retries asks the attempt's captured check.
+_WAIT_SLICE_S = 0.25
+
+# "The smallest run that stands alone", as a share of the chunk size c: a value for
+# #22's table (orchestrator ruling on #52). A smaller run next to an oversized group,
+# or at the end of the material, joins the adjacent chunk.
+_SMALLEST_STANDALONE_RUN = 0.25
 
 
 class CompactionMixin:
@@ -180,26 +192,35 @@ class CompactionMixin:
         *,
         focus_topic: Optional[str],
         store_ids: List[int],
-    ) -> tuple[str, int, int]:
-        """One summariser call for one chunk: (text, level, budget).
+    ) -> tuple[str, int, int, str]:
+        """One chunk's summary: (text, level, budget, finish_reason), or
+        ``SummaryFailure`` (#7).
 
-        The chunk's records are serialised as today (``_serialize_messages``, until #8)
-        and summarised through the escalation, whose last level truncates (until #7).
+        The chunk's records are serialised as today (``_serialize_messages``, until #8).
+        The budget is a target in the prompt text, never an output limit. A wait
+        between retries stops at once when the attempt is cancelled or superseded.
         """
         source_tokens = count_messages_tokens(chunk_messages)
         budget = min(max(2000, int(source_tokens * 0.20)), 12000)
-        text, level = summarize_with_escalation(
-            text=self._serialize_messages(chunk_messages),
+        attempt = _ATTEMPT.get()
+
+        def wait(seconds: float) -> None:
+            end = time.monotonic() + max(0.0, seconds)
+            while True:
+                if not self._live_write_allowed(attempt):
+                    raise AttemptCancelled()
+                left = end - time.monotonic()
+                if left <= 0:
+                    return
+                time.sleep(min(_WAIT_SLICE_S, left))
+
+        text, level, finish_reason = summarize_chunk(
+            self._serialize_messages(chunk_messages),
+            budget,
             source_tokens=source_tokens,
-            token_budget=budget,
             depth=0,
             model=self._config.summary_model,
-            fallback_models=self._config.summary_fallback_models,
-            circuit_breaker=self._summary_circuit_breaker,
-            spend_guard=self._summary_spend_guard,
             timeout=self._config.summary_timeout_ms / 1000,
-            l2_budget_ratio=self._config.l2_budget_ratio,
-            l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
             source_provenance={
@@ -207,8 +228,9 @@ class CompactionMixin:
                 "store_ids": store_ids,
                 "message_count": len(chunk_messages),
             },
+            wait=wait,
         )
-        return text, level, budget
+        return text, level, budget, finish_reason
 
     @staticmethod
     def _groups(messages: List[Dict[str, Any]], material: List[int]) -> List[List[int]]:
@@ -235,19 +257,63 @@ class CompactionMixin:
     def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int) -> List[List[int]]:
         """The material cut in list order into chunks of at most ``limit`` tokens, and
         only between groups: a tool call is never separated from its results. A group
-        larger than the limit is a chunk of its own (#31: a chunk flexes by one group)."""
+        larger than the limit is a chunk of its own (#31: a chunk flexes by one group).
+
+        A run smaller than ``limit`` × ``_SMALLEST_STANDALONE_RUN`` does not stand alone
+        where it stands next to such an oversized group, or at the end of the material:
+        it joins the adjacent chunk, never jumping over a group, so the chunks stay
+        contiguous. A chunk exists to bound the summariser's input; a run too small to
+        have a shorter summary would fail on every attempt (#7, orchestrator ruling on
+        #52). Next to an oversized group on both sides, it joins the following one,
+        the work it opened. A run that is the whole material has nothing to join.
+        """
         chunks: List[List[int]] = []
+        sizes: List[int] = []
+        oversized: List[bool] = []
         current: List[int] = []
         used = 0
         for group in cls._groups(messages, material):
             tokens = sum(count_message_tokens(messages[index]) for index in group)
             if current and used + tokens > limit:
                 chunks.append(current)
+                sizes.append(used)
+                oversized.append(False)
                 current, used = [], 0
             current.extend(group)
             used += tokens
+            if used > limit and len(current) == len(group):
+                # A group larger than the limit: a chunk of its own.
+                chunks.append(current)
+                sizes.append(used)
+                oversized.append(True)
+                current, used = [], 0
         if current:
             chunks.append(current)
+            sizes.append(used)
+            oversized.append(False)
+
+        smallest = limit * _SMALLEST_STANDALONE_RUN
+        at = 0
+        while at < len(chunks):
+            if sizes[at] >= smallest or oversized[at] or len(chunks) == 1:
+                at += 1
+                continue
+            if at + 1 < len(chunks) and oversized[at + 1]:
+                target = at + 1
+            elif at > 0 and oversized[at - 1]:
+                target = at - 1
+            elif at == len(chunks) - 1:
+                target = at - 1
+            else:
+                at += 1
+                continue
+            if target > at:
+                chunks[target] = chunks[at] + chunks[target]
+            else:
+                chunks[target] = chunks[target] + chunks[at]
+            sizes[target] += sizes[at]
+            del chunks[at], sizes[at], oversized[at]
+            at = max(0, min(at, target))
         return chunks
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
@@ -319,12 +385,14 @@ class CompactionMixin:
             records = [attempt.records[index] for index in chunk]
             chunk_messages = [json.loads(facts[record][1]) for record in records]
             try:
-                text, level, budget = self._summarize_chunk(
+                text, level, budget, finish_reason = self._summarize_chunk(
                     chunk_messages,
                     focus_topic=focus_topic,
                     store_ids=[facts[record][3] for record in records],
                 )
             except Exception as exc:
+                # A SummaryFailure, or anything else the call raised: never truncated,
+                # never swallowed. The context stays as it was (#7).
                 logger.warning("LCM summary of chunk %d of %d failed", number, len(chunks), exc_info=True)
                 self._record_event(attempt, "summary_failed",
                                    {"chunk": chunk_handle, "number": number, "error": repr(exc)})
@@ -332,7 +400,7 @@ class CompactionMixin:
             try:
                 new_derivations.append(self._write_summary(
                     attempt, chunk_handle, text=text, level=level, budget=budget,
-                    expand_hint=self._extract_expand_hint(text),
+                    finish_reason=finish_reason, expand_hint=self._extract_expand_hint(text),
                 ))
             except Exception as exc:
                 logger.warning("LCM could not write a summary", exc_info=True)

@@ -843,8 +843,17 @@ def _synthesize_expansion_answer(
     content = response.choices[0].message.content
     if not isinstance(content, str):
         content = str(content) if content else ""
-    from .escalation import _strip_reasoning_blocks
-    return _strip_reasoning_blocks(content).strip()
+    return _QUERY_THINK_BLOCK_RE.sub("", content).strip() if "<" in content else content.strip()
+
+
+# The query's own reply handling, moved here from the summariser's module, which no
+# longer strips anything by pattern (#9). The query is #19's.
+_QUERY_THINK_BLOCK_RE = re.compile(
+    r"<(?P<tag>think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\s*>"
+    r".*?"
+    r"</(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _shape_message_hit(
@@ -1749,9 +1758,6 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "context_threshold": engine._config.context_threshold,
             "summary_model": engine._config.summary_model or "(auxiliary)",
             "summary_timeout_ms": engine._config.summary_timeout_ms,
-            "summary_spend_max_calls": engine._config.summary_spend_max_calls,
-            "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
-            "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "config_sources": config_sources,

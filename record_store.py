@@ -810,6 +810,7 @@ class RecordStore:
         budget: Optional[int],
         est_tokens: Optional[int],
         expand_hint: Optional[str] = None,
+        finish_reason: Optional[str] = None,
     ) -> str:
         with self._tx() as conn:
             handle = self._insert_with_handle(
@@ -817,9 +818,9 @@ class RecordStore:
                 DERIVATION,
                 "INSERT INTO derivations(handle, kind, text, compaction, model, provider, effort, prompt, "
                 "budget, finish_reason, level, est_tokens, expand_hint, created_at) "
-                "VALUES (?, 'summary', ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?)",
-                (text, compaction, model or None, provider or None, budget, level, est_tokens,
-                 expand_hint, time.time()),
+                "VALUES (?, 'summary', ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)",
+                (text, compaction, model or None, provider or None, budget, finish_reason or None, level,
+                 est_tokens, expand_hint, time.time()),
             )
             conn.execute(
                 "INSERT INTO derivation_sources(derivation, ordinal, chunk, source_derivation) VALUES (?, 0, ?, NULL)",
