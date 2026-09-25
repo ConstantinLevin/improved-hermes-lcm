@@ -133,6 +133,25 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
 _SUPPORTED_LCM_CONFIG_YAML_KEYS: frozenset = frozenset()
 
 
+def _host_native_compaction_configured(cfg: dict[str, Any] | None = None) -> bool:
+    """Whether the host's config.yaml opts into native server-side compaction on its
+    OpenAI Responses routes (``compression.codex_responses_native``, read by the host's
+    agent_init with its own truthy rule, utils.is_truthy_value). Read to be refused, not
+    to be followed (#11, #24, #32 D2)."""
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    compression = cfg.get("compression") if isinstance(cfg, dict) else None
+    if not isinstance(compression, dict):
+        return False
+    value = compression.get("codex_responses_native", False)
+    try:
+        from utils import is_truthy_value  # type: ignore  # the host's own rule
+        return bool(is_truthy_value(value))
+    except Exception:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
     cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
@@ -325,6 +344,9 @@ class LCMConfig:
     config_sources: dict[str, str] = field(default_factory=dict)
     config_source_warnings: list[str] = field(default_factory=list)
     ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
+    # The host's own opt-in to native server-side compaction, as its config.yaml sets
+    # it: read only to be refused visibly (the engine cannot switch it off, #32 D2).
+    host_native_compaction: bool = False
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
@@ -339,6 +361,9 @@ class LCMConfig:
                 config_source_warnings.append(warning)
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        c.host_native_compaction = _host_native_compaction_configured()
+        if c.host_native_compaction:
+            _record("host_native_compaction", "config_yaml:compression.codex_responses_native")
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.

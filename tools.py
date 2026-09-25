@@ -1800,6 +1800,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "tau_raised": full_status.get("tau_raised"),
         "target": full_status.get("target"),
         "turn": full_status.get("turn"),
+        "native_compaction_refused": full_status.get("native_compaction_refused"),
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
         "last_input_tokens": engine.last_input_tokens,
@@ -2012,6 +2013,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         config_warnings.append("fresh_tail_count < 2 may cause aggressive compaction")
     if engine.context_length and engine._geometry is None:
         config_warnings.append(f"no compaction: {engine._geometry_error}")
+    if engine._native_compaction_refusal:
+        config_warnings.append(engine._native_compaction_refusal)
     for warning in getattr(c, "config_source_warnings", []) or []:
         config_warnings.append(warning)
     for key in getattr(c, "ignored_config_yaml_lcm_keys", []) or []:

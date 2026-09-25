@@ -172,6 +172,7 @@ class LCMEngine(
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
+        self._native_compaction_refusal = self._refuse_host_native_compaction()
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -433,6 +434,38 @@ class LCMEngine(
                 "codex_oauth_context_cap",
             )
         return raw_context_length, None, ""
+
+    def _refuse_host_native_compaction(self) -> str:
+        """With the plugin active there is one compaction, the plugin's (#11, #24, #32
+        D2).
+
+        The host's opt-in ``compression.codex_responses_native`` (default off) makes it
+        send ``context_management`` with every request on its eligible OpenAI Responses
+        routes: gpt-5.6 on api.openai.com or the Codex backend, gpt-6-astra on official
+        Codex OAuth (``agent/native_compaction.py`` at 7b761da). The provider then
+        compacts the context itself at ``threshold_tokens − 8,192``, beside the plugin
+        and outside its record. The host reads the switch from the agent
+        (``agent.codex_responses_native_compaction``, set by ``agent/agent_init.py`` and
+        the TUI from config.yaml) and gates it on agent attributes only; no engine call
+        reaches them, so the engine cannot switch it off. The refusal is the visible
+        part: an ERROR at every engine creation, a store event, and the status. What
+        would prevent it is asked of Hermes (an engine that owns compaction turns
+        native compaction off)."""
+        if not getattr(self._config, "host_native_compaction", False):
+            return ""
+        message = (
+            "LCM refuses the host's native server-side compaction (config.yaml compression.codex_responses_native "
+            "is on): with LCM as the context engine there is one compaction, LCM's. On an eligible OpenAI Responses "
+            "route the provider would compact the context itself at threshold_tokens - 8192, beside LCM and "
+            "outside its record. The engine cannot switch it off; set compression.codex_responses_native: false."
+        )
+        logger.error(message)
+        try:
+            self._records.event("host_native_compaction_refused", session=None,
+                                detail={"config": "compression.codex_responses_native"})
+        except Exception:
+            logger.debug("LCM could not record the refusal of native compaction", exc_info=True)
+        return message
 
     # -- The published threshold and the host's compaction parameters (#32 D2, R16) --
 
@@ -1004,6 +1037,7 @@ class LCMEngine(
             "tau_raised": self._geometry.tau_raised if self._geometry is not None else None,
             "target": self._geometry.target if self._geometry is not None else None,
             "turn": self._turn_label(),
+            "native_compaction_refused": self._native_compaction_refusal or None,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),

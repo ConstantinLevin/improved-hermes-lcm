@@ -103,6 +103,7 @@ def _status_text(engine) -> str:
         f"total_compactions_scope: {status.get('total_compactions_scope', 'current_conversation')}",
         f"last_compression_status: {status.get('last_compression_status', 'idle')}",
         f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
+        f"native_compaction_refused: {status.get('native_compaction_refused') or '(not configured)'}",
         f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",
         f"raw_context_length: {status.get('raw_context_length', 0) if session_bound else '(uninitialized)'}",
         f"effective_context_length_cap: {status.get('effective_context_length_cap') or '(none)'}",
