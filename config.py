@@ -232,14 +232,6 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
-    _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
-    _EnvFieldSpec("condensation_fanin", "LCM_CONDENSATION_FANIN", int),
-    _EnvFieldSpec("dynamic_leaf_chunk_enabled", "LCM_DYNAMIC_LEAF_CHUNK_ENABLED", bool),
-    _EnvFieldSpec("dynamic_leaf_chunk_max", "LCM_DYNAMIC_LEAF_CHUNK_MAX", int),
-    _EnvFieldSpec("cache_friendly_condensation_enabled", "LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", bool),
-    _EnvFieldSpec("cache_friendly_min_debt_groups", "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", int),
-    _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
-    _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
@@ -298,24 +290,6 @@ class LCMConfig:
     # when LCM is inheriting the host compression threshold. Explicit LCM
     # threshold overrides remain authoritative.
     codex_gpt55_autoraise_enabled: bool = True
-    # Max condensation depth (-1 = unlimited, 0 = leaf only)
-    incremental_max_depth: int = 3
-    # How many same-depth summaries trigger condensation
-    condensation_fanin: int = 4
-    # When enabled, leaf compaction may use a larger working chunk size based on backlog pressure
-    dynamic_leaf_chunk_enabled: bool = False
-    # Upper bound for the working dynamic leaf chunk threshold
-    dynamic_leaf_chunk_max: int = 40_000
-    # When enabled, suppress follow-on condensation after a leaf pass unless
-    # enough uncondensed same-depth summaries have accumulated
-    cache_friendly_condensation_enabled: bool = False
-    # Minimum number of same-depth fanin groups before one follow-on
-    # condensation pass is allowed in cache-friendly mode
-    cache_friendly_min_debt_groups: int = 2
-    # Opt into one bounded synchronous sweep after threshold pressure is reached.
-    threshold_full_sweep_enabled: bool = False
-    # Target frontier-summary size after a sweep (0 = derive one leaf budget).
-    summary_prefix_target_tokens: int = 0
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1

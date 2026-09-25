@@ -1,14 +1,8 @@
-"""Summary DAG — hierarchical compaction graph.
+"""The tools' reader of summaries: the ``summary_nodes`` view over the record.
 
-Each node is a summary of source material (raw messages or lower-depth
-summaries). Nodes form a directed acyclic graph where edges point from
-a summary to its sources.
-
-Depth semantics:
-  D0 — leaf summaries of raw messages (minutes timescale)
-  D1 — condensation of D0 nodes (hours)
-  D2 — condensation of D1 nodes (days)
-  D3+ — further condensation (weeks/months)
+A node is a summary of one chunk of stored messages, as the session's latest
+effective return holds it (the cover). It writes nothing; the record is written
+by ``RecordStore`` at compactions. Condensed summaries come with #34.
 """
 
 import json
@@ -151,8 +145,8 @@ class SummaryDAG:
         Exposed for read-oriented diagnostics and inspection -- FTS sync counts,
         integrity checks, latest-node lookups -- that need ad-hoc queries the DAG
         does not wrap in a purpose-built method. Callers must treat it as
-        read-only and tolerate ``None``; writes still go through the DAG's own
-        methods so the ``_db_lock`` contract stays in one place.
+        read-only and tolerate ``None``: the tables behind it are the record's,
+        written only by ``RecordStore``.
         """
         return self._conn
 
@@ -164,50 +158,6 @@ class SummaryDAG:
             self._conn.close()
             self._conn = None
             raise
-
-    # -- Write --------------------------------------------------------------
-
-    def add_node(self, node: SummaryNode) -> int:
-        """Insert a summary node and return its node_id."""
-        with self._db_lock:
-            cur = self._conn.execute(
-                """INSERT INTO summary_nodes
-                   (session_id, depth, summary, token_count, source_token_count,
-                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    node.session_id,
-                    node.depth,
-                    node.summary,
-                    node.token_count,
-                    node.source_token_count,
-                    json.dumps(node.source_ids),
-                    node.source_type,
-                    node.created_at or time.time(),
-                    node.earliest_at,
-                    node.latest_at,
-                    node.expand_hint,
-                ),
-            )
-            self._conn.commit()
-            node.node_id = cur.lastrowid
-            return node.node_id
-
-
-    def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:
-        """Move all nodes from one session_id to another.
-
-        Used for /new carry-over where retained summaries should become part of
-        the fresh session while preserving node IDs and node-to-node links.
-        """
-        with self._db_lock:
-            cur = self._conn.execute(
-                "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
-                (new_session_id, old_session_id),
-            )
-            moved = cur.rowcount
-            self._conn.commit()
-        return moved
 
     # -- Read ---------------------------------------------------------------
 
@@ -268,28 +218,6 @@ class SummaryDAG:
             }
             for row in rows
         }
-
-
-    def get_uncondensed_at_depth(self, session_id: str, depth: int,
-                                  limit: int = 100) -> List[SummaryNode]:
-        """Get nodes at a depth that haven't been condensed yet.
-
-        A node is 'uncondensed' if it's not referenced as a source by
-        any higher-depth node.
-        """
-        with self._db_lock:
-            rows = self._conn.execute(
-                """SELECT n.* FROM summary_nodes n
-                   WHERE n.session_id = ? AND n.depth = ?
-                   AND n.node_id NOT IN (
-                       SELECT json_each.value FROM summary_nodes p,
-                       json_each(p.source_ids)
-                       WHERE p.session_id = ? AND p.depth > ? AND p.source_type = 'nodes'
-                   )
-                   ORDER BY n.created_at LIMIT ?""",
-                (session_id, depth, session_id, depth, limit),
-            ).fetchall()
-        return [self._row_to_node(r) for r in rows]
 
     # -- Search -------------------------------------------------------------
 
@@ -496,24 +424,6 @@ class SummaryDAG:
         if cache is not None:
             cache[node_id] = matched
         return matched
-
-    def get_source_time_window(self, node_ids: List[int]) -> tuple[float | None, float | None]:
-        if not node_ids:
-            return None, None
-        placeholders = ",".join("?" * len(node_ids))
-        with self._db_lock:
-            row = self._conn.execute(
-                f"""SELECT
-                        MIN(COALESCE(earliest_at, created_at)),
-                        MAX(COALESCE(latest_at, created_at))
-                    FROM summary_nodes
-                    WHERE node_id IN ({placeholders})""",
-                node_ids,
-            ).fetchone()
-        if not row:
-            return None, None
-        return row[0], row[1]
-
 
     # -- Helpers ------------------------------------------------------------
 

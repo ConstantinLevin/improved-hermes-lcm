@@ -1,23 +1,16 @@
-from __future__ import annotations
+"""The tools' reader of stored messages: the ``messages`` view over the record.
 
-"""Immutable-first message store — the source of truth.
-
-Every message is persisted durably in SQLite. The normal model is append-only,
-with one narrow opt-in exception: already-externalized summarized tool-result
-rows may be rewritten to compact GC tombstones while preserving the original
-row identity (`store_id`) for DAG/source lookup.
+It writes nothing; the record is written by ``RecordStore`` at compactions.
 """
 
+from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import sqlite3
 import stat
-import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,8 +21,6 @@ from .db_bootstrap import (
     open_store,
     refuse_cross_vm_filesystem,
 )
-from .config import LCMConfig
-from .ingest_protection import protect_message_for_ingest
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -49,11 +40,7 @@ from .search_query import (
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
-from .message_content import normalize_content_value as _normalize_content_value
-from .sqlite_util import (
-    _create_private_sqlite_file,
-    _temporary_sqlite_busy_timeout,
-)
+from .sqlite_util import _create_private_sqlite_file
 
 logger = logging.getLogger(__name__)
 
@@ -159,43 +146,6 @@ def _normalize_source_value(source: str | None) -> str:
 
 def _normalize_conversation_id_value(conversation_id: str | None) -> str:
     return (conversation_id or "").strip()
-
-
-def _normalize_observed_at(value: Any) -> float | None:
-    """Return a trustworthy host/source timestamp without inventing one.
-
-    Numeric Unix seconds and timezone-aware ISO-8601 strings are accepted.
-    Naive wall-clock strings, booleans, non-finite values, and non-positive
-    values are rejected so LCM write time is never silently relabelled as
-    source observation time.
-    """
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        observed_at = float(value)
-    elif isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        try:
-            observed_at = float(raw)
-        except ValueError:
-            try:
-                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                return None
-            if parsed.tzinfo is None or parsed.utcoffset() is None:
-                return None
-            observed_at = parsed.timestamp()
-    else:
-        return None
-    if not math.isfinite(observed_at) or observed_at <= 0:
-        return None
-    try:
-        datetime.fromtimestamp(observed_at, tz=timezone.utc)
-    except (OSError, OverflowError, ValueError):
-        return None
-    return observed_at
 
 
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
@@ -316,29 +266,11 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
+    def __init__(self, db_path: str | Path, *, hermes_home: str = ""):
         self.db_path = Path(db_path)
         _prepare_private_sqlite_storage(self.db_path)
-        self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
-        # ``self._conn`` is shared across threads (the connection is opened with
-        # ``check_same_thread=False``). SQLite's own C-level mutex serializes
-        # statements at the engine layer, but the Python ``sqlite3`` module
-        # releases the GIL while the C call runs. Under heavy thread contention
-        # with concurrent HTTPS clients in the same process, downstream
-        # operators have observed on-disk corruption that is consistent with
-        # external bytes landing inside SQLite's write path (e.g. the first
-        # 28 bytes of the database file replaced with a TLS record header +
-        # ciphertext while the "SQLit" magic remains intact).
-        #
-        # This re-entrant lock is defense-in-depth: it forces all write call
-        # sites that use ``self._conn`` to be serialized at the Python layer,
-        # eliminating any window where Python-side buffer reuse or memory
-        # aliasing could intersect SQLite's flush of a write. It does not
-        # change semantics for single-threaded callers and adds only a single
-        # uncontended ``RLock.acquire``/``release`` pair per operation.
-        self._write_lock = threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -352,95 +284,7 @@ class MessageStore:
             self._conn = None
             raise
 
-    # -- Write operations ---------------------------------------------------
-
-    def append(self, session_id: str, msg: Dict[str, Any],
-               token_estimate: int = 0, source: str = "",
-               conversation_id: str = "") -> int:
-        """Persist a message and return its store_id."""
-        msg = protect_message_for_ingest(
-            msg,
-            config=self._ingest_protection_config,
-            hermes_home=self._hermes_home,
-            session_id=session_id,
-        )
-        tool_calls = msg.get("tool_calls")
-        tc_json = json.dumps(tool_calls) if tool_calls else None
-        observed_at = _normalize_observed_at(msg.get("timestamp"))
-        ingested_at = time.time()
-
-        with self._write_lock:
-            cur = self._conn.execute(
-                """INSERT INTO messages
-                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    _normalize_source_value(source),
-                    _normalize_conversation_id_value(conversation_id),
-                    msg.get("role", "unknown"),
-                    _normalize_content_value(msg.get("content")),
-                    msg.get("tool_call_id"),
-                    tc_json,
-                    msg.get("tool_name"),
-                    ingested_at,
-                    token_estimate,
-                    0,
-                    ingested_at,
-                    observed_at,
-                    "host_message_timestamp" if observed_at is not None else None,
-                ),
-            )
-            self._conn.commit()
-            return cur.lastrowid
-
-
-    def _append_protected_batch(self, session_id: str,
-                                messages: List[Dict[str, Any]],
-                                token_estimates: List[int] | None = None,
-                                source: str = "",
-                                conversation_id: str = "") -> List[int]:
-        """Persist messages that already passed ``protect_messages_for_ingest``."""
-        if token_estimates is None:
-            token_estimates = [0] * len(messages)
-
-        ids = []
-        with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
-                tc = msg.get("tool_calls")
-                tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
-                observed_at = _normalize_observed_at(msg.get("timestamp"))
-                cur = self._conn.execute(
-                    """INSERT INTO messages
-                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        _normalize_source_value(source),
-                        _normalize_conversation_id_value(conversation_id),
-                        msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
-                        msg.get("tool_call_id"),
-                        tc_json,
-                        msg.get("tool_name"),
-                        ts,
-                        est,
-                        0,
-                        ts,
-                        observed_at,
-                        "host_message_timestamp" if observed_at is not None else None,
-                    ),
-                )
-                ids.append(cur.lastrowid)
-        return ids
-
-
-    # -- Read operations ----------------------------------------------------
+    # -- Read operations (over the record's views) ---------------------------- ----------------------------------------------------
 
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
@@ -531,48 +375,6 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-
-    def get_session_messages(self, session_id: str,
-                             limit: int = 10000) -> List[Dict[str, Any]]:
-        """Get all messages for a session, ordered by store_id."""
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ?
-               ORDER BY store_id LIMIT ?""",
-            (session_id, limit),
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
-
-    def get_session_messages_after(self, session_id: str,
-                                   after_store_id: int = 0,
-                                   limit: int = 10000) -> List[Dict[str, Any]]:
-        """Get session messages after a store_id, ordered by store_id."""
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND store_id > ?
-               ORDER BY store_id LIMIT ?""",
-            (session_id, after_store_id, limit),
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
-
-    def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
-        """Get the latest messages for a session, returned in store order."""
-        if limit <= 0:
-            return []
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-               FROM (
-                   SELECT {_MESSAGE_SELECT_COLUMNS}
-                   FROM messages
-                   WHERE session_id = ?
-                   ORDER BY store_id DESC
-                   LIMIT ?
-               )
-               ORDER BY store_id""",
-            (session_id, limit),
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
-
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""
         row = self._conn.execute(
@@ -620,231 +422,6 @@ class MessageStore:
             "legacy_blank_source_messages": legacy_blank,
             "effective_unknown_messages": normalized_unknown + legacy_blank,
         }
-
-
-    def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
-        if not store_ids:
-            return None, None
-        placeholders = ",".join("?" * len(store_ids))
-        row = self._conn.execute(
-            f"SELECT MIN(timestamp), MAX(timestamp) FROM messages WHERE store_id IN ({placeholders})",
-            store_ids,
-        ).fetchone()
-        if not row:
-            return None, None
-        return row[0], row[1]
-
-    # -- Metadata key/value JSON --------------------------------------------
-
-    def read_metadata_json(self, key: str) -> Any:
-        """Return the JSON-decoded value stored under ``key`` in the metadata table.
-
-        Returns ``None`` when the connection is closed, the key is absent, or the
-        stored value is empty. JSON decoding is deliberately *not* wrapped: a
-        malformed value raises, so callers keep the ``try``/``except`` scoping
-        that decides whether one bad key aborts a multi-key load or is skipped.
-        Reads are unlocked, matching the store's other read paths (``_write_lock``
-        guards writes only).
-        """
-        conn = self._conn
-        if conn is None:
-            return None
-        row = conn.execute(
-            "SELECT value FROM metadata WHERE key = ?",
-            (key,),
-        ).fetchone()
-        if not row or not row[0]:
-            return None
-        return json.loads(str(row[0]))
-
-    def write_metadata_json(
-        self,
-        keys: list[str],
-        serialized: str,
-        *,
-        skip_unchanged: bool = False,
-    ) -> bool:
-        """Write the pre-serialized JSON string ``serialized`` to every key in ``keys``.
-
-        Serialization stays with the caller so it keeps control of ``sort_keys``
-        and payload shape. Runs under the store write lock and issues at most one
-        commit. With ``skip_unchanged=True`` a key already holding ``serialized``
-        is left untouched and the commit is skipped entirely when nothing changed
-        -- the ingest-hot-path optimization used by the placeholder count/ordinal
-        writers. Returns ``True`` if any key was written.
-        """
-        conn = self._conn
-        if conn is None:
-            return False
-        wrote = False
-        with self._write_lock:
-            for key in keys:
-                if skip_unchanged:
-                    existing = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
-                    if existing is not None and existing[0] == serialized:
-                        continue
-                conn.execute(
-                    """
-                    INSERT INTO metadata(key, value)
-                    VALUES(?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (key, serialized),
-                )
-                wrote = True
-            if wrote:
-                conn.commit()
-        return wrote
-
-    # -- Compaction telemetry ------------------------------------------------
-
-    @staticmethod
-    def _compaction_telemetry_key(conversation_id: str) -> str:
-        return f"compaction_telemetry:{conversation_id}"
-
-    def read_compaction_telemetry(self, conversation_id: str) -> Optional[Dict[str, Any]]:
-        """Return the persisted per-conversation compaction-telemetry record, or None.
-
-        Best-effort: a closed connection, missing/empty row, or malformed JSON all
-        yield None. Telemetry is diagnostic and must never block a turn. Reads are
-        unlocked, matching the store's other read paths.
-        """
-        if not conversation_id:
-            return None
-        try:
-            data = self.read_metadata_json(self._compaction_telemetry_key(conversation_id))
-        except (ValueError, TypeError):
-            return None
-        return data if isinstance(data, dict) else None
-
-    def increment_compaction_telemetry(
-        self,
-        conversation_id: str,
-        increment: int,
-        updates: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        """Atomically increment and update one conversation's telemetry record."""
-        if not conversation_id:
-            return None
-        if isinstance(increment, bool) or not isinstance(increment, int) or increment < 0:
-            raise ValueError("compaction telemetry increment must be a non-negative integer")
-        conn = self._conn
-        if conn is None:
-            return None
-
-        key = self._compaction_telemetry_key(conversation_id)
-        with self._write_lock:
-            try:
-                # Separate MessageStore instances have separate Python locks.
-                # Acquire SQLite's write reservation before reading so this
-                # read-modify-write serializes across every connection. This is
-                # best-effort telemetry on the completed-compaction hot path, so
-                # permit only a tightly bounded overlap before skipping instead
-                # of inheriting the connection's 30s wait.
-                with _temporary_sqlite_busy_timeout([conn], 100):
-                    conn.execute("BEGIN IMMEDIATE")
-                    row = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?",
-                        (key,),
-                    ).fetchone()
-                    try:
-                        existing = json.loads(str(row[0])) if row and row[0] else {}
-                    except (ValueError, TypeError):
-                        existing = {}
-                    if not isinstance(existing, dict):
-                        existing = {}
-
-                # Per-runtime high-water marks make a committed increment
-                # idempotent when its caller observes an ambiguous exception.
-                # Retain enough recent epochs for overlapping runtimes without
-                # allowing this diagnostic metadata row to grow forever.
-                watermarks = []
-                raw_watermarks = existing.get("counter_epoch_watermarks", [])
-                if isinstance(raw_watermarks, list):
-                    watermarks = [
-                        item
-                        for item in raw_watermarks
-                        if (
-                            isinstance(item, list)
-                            and len(item) == 2
-                            and isinstance(item[0], str)
-                            and item[0]
-                            and isinstance(item[1], int)
-                            and not isinstance(item[1], bool)
-                            and item[1] >= 0
-                        )
-                    ]
-                effective_increment = increment
-                counter_epoch = updates.get("counter_epoch")
-                target_count = updates.get("compression_count_at_record")
-                if (
-                    isinstance(counter_epoch, str)
-                    and counter_epoch
-                    and isinstance(target_count, int)
-                    and not isinstance(target_count, bool)
-                    and target_count >= 0
-                ):
-                    prior_count = next(
-                        (item[1] for item in watermarks if item[0] == counter_epoch),
-                        0,
-                    )
-                    effective_increment = max(0, target_count - prior_count)
-                    watermarks = [item for item in watermarks if item[0] != counter_epoch]
-                    watermarks.append([counter_epoch, max(prior_count, target_count)])
-                    watermarks = watermarks[-64:]
-
-                current_total = existing.get("total_compactions", 0)
-                if (
-                    isinstance(current_total, bool)
-                    or not isinstance(current_total, int)
-                    or current_total < 0
-                ):
-                    current_total = 0
-                proposed_total = updates.get("total_compactions", current_total)
-                if (
-                    isinstance(proposed_total, bool)
-                    or not isinstance(proposed_total, int)
-                    or proposed_total < 0
-                ):
-                    proposed_total = current_total
-                stale_across_compaction = (
-                    effective_increment == 0 and proposed_total < current_total
-                )
-                record = dict(existing)
-                if stale_across_compaction:
-                    compaction_sensitive = {
-                        "turns_since_leaf_compaction",
-                        "peak_prompt_tokens_since_leaf_compaction",
-                        "last_leaf_compaction_at",
-                        "last_compaction_duration_ms",
-                    }
-                    record.update(
-                        (field, value)
-                        for field, value in updates.items()
-                        if field not in compaction_sensitive
-                    )
-                else:
-                    record.update(updates)
-                record["conversation_id"] = conversation_id
-                record["counter_epoch_watermarks"] = watermarks
-                record["total_compactions"] = current_total + effective_increment
-                conn.execute(
-                    """
-                    INSERT INTO metadata(key, value)
-                    VALUES(?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (key, json.dumps(record, sort_keys=True)),
-                )
-                conn.commit()
-                return record
-            except Exception:
-                if conn.in_transaction:
-                    conn.rollback()
-                raise
-
 
     # -- Search -------------------------------------------------------------
 
@@ -1257,8 +834,8 @@ class MessageStore:
         Exposed for read-oriented diagnostics and inspection -- integrity /
         quick checks, FTS sync counts, schema health -- that need ad-hoc
         queries the store does not wrap in a purpose-built method. Callers must
-        treat it as read-only and tolerate ``None``; writes still go through the
-        store's own methods so the ``_write_lock`` contract stays in one place.
+        treat it as read-only and tolerate ``None``: the tables behind it are the
+        record's, written only by ``RecordStore``.
         """
         return self._conn
 

@@ -231,10 +231,6 @@ class RecordStore:
             (compaction, compaction, compaction),
         ))
 
-    def compaction_session(self, compaction: int) -> Optional[str]:
-        rows = self._q("SELECT session FROM compactions WHERE compaction_id = ?", (compaction,))
-        return str(rows[0][0]) if rows else None
-
     def return_entries(self, compaction: int) -> dict[int, tuple[str, Optional[str], Optional[str], Optional[str]]]:
         """position -> (kind, record, derivation, raw of a returned summary)."""
         return {

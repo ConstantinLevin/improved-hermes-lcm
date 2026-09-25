@@ -4,7 +4,7 @@
 engine's SQLite connections and snapshots the store to a timestamped file.
 It is a pure function that
 take the engine so the command layer (``command.py``) keeps only the text
-formatting, and the store/dag/lifecycle connection handling lives in one place.
+formatting, and the connection handling lives in one place.
 """
 
 from __future__ import annotations
@@ -60,9 +60,6 @@ def flush_engine_connections(engine) -> None:
     """
     engine._store.commit()
     engine._dag._conn.commit()
-    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
-    if lifecycle_conn is not None:
-        lifecycle_conn.commit()
 
 
 def backup_database(engine) -> dict[str, Any]:

@@ -1,7 +1,8 @@
 """Hermes LCM Plugin — Lossless Context Management.
 
-Replaces the built-in ContextCompressor with a DAG-based context engine
-that persists every message and provides structured retrieval tools.
+Replaces the built-in ContextCompressor with a context engine that keeps what the
+host hands it at each compaction in its own record, returns summaries of the older
+part of the context, and provides tools to retrieve the originals.
 
 Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 """
@@ -53,31 +54,6 @@ def _host_forwards_registered_tool_messages(ctx) -> bool:
         except Exception:
             return False
     return bool(capability)
-
-
-def _engine_bound_session_id(engine) -> str:
-    """Return the host session identifier an LCM engine copy is bound to."""
-    return str(
-        getattr(engine, "bound_session_id", "")
-        or getattr(engine, "_session_id", "")
-        or ""
-    )
-
-
-def _ensure_engine_bound_to_session(
-    active_engine,
-    session_id: str,
-    *,
-    platform: str = "",
-    conversation_id: str = "",
-) -> None:
-    session_id = str(session_id or "")
-    if session_id and _engine_bound_session_id(active_engine) != session_id:
-        active_engine.on_session_start(
-            session_id,
-            platform=platform,
-            conversation_id=conversation_id or None,
-        )
 
 
 def _session_context_value(name: str) -> str:
@@ -291,8 +267,5 @@ def register(ctx):
         logger.info("LCM slash command registration disabled (set LCM_ENABLE_SLASH_COMMAND=1 to enable /lcm)")
     else:
         logger.info("LCM slash command registration unavailable on this Hermes host; continuing without /lcm")
-
-    # Nothing is ingested per turn: the store is filled at compaction (#29 W2), so
-    # the plugin registers no post_llm_call hook.
 
     logger.info("LCM plugin loaded — lossless context management active")
