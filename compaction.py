@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -229,8 +230,10 @@ class CompactionMixin:
         return max(1, int(config.chunk_tokens / config.estimate_ratio))
 
     def _smallest_run(self) -> int:
-        """c/4 in the estimate's unit: the smallest run that stands alone (#31)."""
-        return max(1, int(self._chunk_limit() * _SMALLEST_STANDALONE_RUN))
+        """c/4 in the estimate's unit: the smallest run that stands alone (#31). Counts
+        are whole tokens, so the minimum is rounded up: a run of 8,278 is below
+        33,113 / 4 = 8,278.25."""
+        return max(1, math.ceil(self._chunk_limit() * _SMALLEST_STANDALONE_RUN))
 
     def _chunk_label(self) -> str:
         config = self._config
