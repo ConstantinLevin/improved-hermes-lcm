@@ -28,10 +28,6 @@ class LCMPreset:
     provenance: Mapping[str, Any] = dataclass_field(default_factory=dict)
     notes: str = ""
 
-    @property
-    def policy_key(self) -> str:
-        return f"{self.name}@{self.policy_version}"
-
 
 # Fields a runtime preset may override. Their env var and parse type come from
 # the shared config field spec (config.ENV_FIELD_SPECS) so the mapping is not

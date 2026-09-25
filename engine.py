@@ -482,11 +482,6 @@ class LCMEngine(
         return True
 
     @property
-    def bound_session_id(self) -> str:
-        """The host session identifier this engine copy is bound to."""
-        return self._session_id
-
-    @property
     def current_session_id(self) -> str:
         """The plugin session this engine copy serves; the tools read this one. It
         spans the host identifiers a compaction rotates through."""
@@ -1053,10 +1048,3 @@ class LCMEngine(
             else db_path.parent
         )
         return backup_root / "backups" / "lcm"
-
-    # -- Lifecycle ---------------------------------------------------------
-
-    def shutdown(self):
-        self._unregister_active_engine_binding()
-        self._store.close()
-        self._dag.close()
