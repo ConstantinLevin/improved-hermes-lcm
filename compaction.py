@@ -8,16 +8,20 @@ In order:
    Where it cannot be, the compaction is aborted: nothing is written, the host keeps
    its list and shows the cause.
 2. The tail takes what the target leaves, t = G − F − S − R_in (#13, #31), sized in
-   the plugin's estimate with #31's conversion (``_tail_plan``), in whole groups: a
-   tool call is never separated from its result, and the forward check aborts where
-   a call at the boundary has no result. Its floor is D1's (the newest message, or
-   the newest tool group); its ceiling leaves the oldest group outside; it never
-   reaches back into the summaries the plugin returned. The material is every entry
-   before the tail that is not the mechanism's layer (the host's system row, a
-   summary the plugin returned, also as the host rewrote it: a summary revision holds
-   a summary and is never chunked). Compaction runs at τ, forced, or on a provider's
-   rejection; no minimum material applies. Where the floor alone is left, the
-   compaction aborts visibly: the chain and the newest turn fill the context.
+   the plugin's estimate with #31's conversion (``_tail_plan``), in whole groups of
+   the cut's own grouping over the whole list: a tool call is never separated from
+   its result. A tool row with an empty ``tool_call_id``, or one no assistant row
+   before it made, is an error wherever it stands, checked once before any boundary.
+   The forward check aborts where the boundary would separate a call from its result
+   in either direction, or where a call at the boundary has no result. Its floor is
+   D1's (the newest message, or the newest tool group); its ceiling leaves the oldest
+   group outside; it never reaches back into the summaries the plugin returned. The
+   material is every entry before the tail that is not the mechanism's layer (the
+   host's system row, a summary the plugin returned, also as the host rewrote it: a
+   summary revision holds a summary and is never chunked). Compaction runs at τ,
+   forced, or on a provider's rejection; no minimum material applies. Where the floor
+   alone is left, the compaction aborts visibly: the chain and the newest turn fill
+   the context.
 3. The material is cut into chunks of the size c (#31, #12), in list order and only
    between groups: a tool call and its results stay in one chunk. A group larger than
    c is a chunk of its own; between such groups, each run of material B is split
@@ -71,7 +75,7 @@ from .model_table import lookup as lookup_model
 from .summariser_input import wire_facts
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
-from .fresh_tail import ToolPairingError, _assistant_group_start
+from .fresh_tail import ToolPairingError, check_tool_pairing
 from .inflight import (
     DEFAULT_CALLS_PER_ENDPOINT,
     ChunkCall,
@@ -166,12 +170,25 @@ def _unanswered_calls_at(messages: List[Dict[str, Any]], boundary: int) -> Optio
     return None
 
 
-def _newest_tool_group_start(messages: List[Dict[str, Any]]) -> Optional[int]:
-    """Where the newest tool group begins: the assistant row that opened the newest tool
-    result, or that result where no opening row is found; None without tool rows."""
-    for at in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[at], dict) and messages[at].get("role") == "tool":
-            return _assistant_group_start(messages, at)
+def _pairs_crossing(messages: List[Dict[str, Any]], boundary: int) -> Optional[tuple]:
+    """(call id, position of its call, position of its result) of a pair the boundary
+    separates: a call outside (before the boundary) whose result stands inside, or a
+    result outside whose call stands inside; None where there is none. Matched by
+    ``tool_call_id``, whether or not the result of a call outside is anywhere else."""
+    made: Dict[str, int] = {}
+    for position, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                call_id = _tool_call_id(call)
+                if call_id:
+                    made.setdefault(call_id, position)
+    for position, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        call_id = str(message.get("tool_call_id") or "").strip()
+        call_at = made.get(call_id)
+        if call_at is not None and (call_at < boundary) != (position < boundary):
+            return call_id, call_at, position
     return None
 
 
@@ -364,21 +381,33 @@ class CompactionMixin:
                 f"/ {config.estimate_ratio}, #31's p50 of the provider's count over characters / 4")
 
     @staticmethod
-    def _tail_floor(messages: List[Dict[str, Any]], mechanism: set, occasion: Optional[Occasion] = None) -> int:
-        """The least the tail keeps (#31, #32 D1): the newest message; where the list
-        ends inside a tool group, or with steer rows after one, that group from the
-        assistant that opened it; at a gap, the newest tool group and everything after
-        it; never before the last entry of the mechanism's layer."""
+    def _tail_floor(messages: List[Dict[str, Any]], mechanism: set, groups: List[List[int]],
+                    occasion: Optional[Occasion] = None) -> int:
+        """The least the tail keeps (#31, #32 D1), always the start of one of ``groups``
+        (the cut's grouping of every entry outside the mechanism's layer): the group of
+        the newest message; where the list ends with steer rows, the group of the row
+        before them; at a gap, the newest tool group and everything after it. Never
+        before the last entry of the mechanism's layer; a group that stands across it
+        is a ``ToolPairingError``."""
+        first = max(mechanism) + 1 if mechanism else 0
+        group_of = {index: group for group in groups for index in group}
         at = len(messages) - 1
         while at > 0 and _is_steer(messages[at]):
             at -= 1
-        start = _assistant_group_start(messages, at) if not _is_steer(messages[at]) else len(messages) - 1
-        start = min(start, len(messages) - 1)
+        if _is_steer(messages[at]):
+            at = len(messages) - 1
+        start = group_of[at][0] if at in group_of else at
         if occasion is not None and occasion.gap:
-            group = _newest_tool_group_start(messages)
-            if group is not None:
-                start = min(start, group)
-        return max(start, max(mechanism) + 1 if mechanism else 0)
+            tools = [index for index in group_of
+                     if isinstance(messages[index], dict) and messages[index].get("role") == "tool"]
+            if tools:
+                start = min(start, group_of[max(tools)][0])
+        start = max(start, first)
+        group = group_of.get(start)
+        if group is not None and group[0] != start:
+            raise ToolPairingError(f"the tool group from position {group[0]} to {group[-1]} stands across "
+                                   f"the summaries the plugin returned")
+        return start
 
     def _fixed_prefix(self) -> tuple[int, str]:
         """F, the fixed prefix in provider tokens (R10): the session's latest measurement
@@ -407,21 +436,27 @@ class CompactionMixin:
             t = (G − F − k·S − R_in − ρ·k·X) / (k·(1 − ρ))
 
         X is every entry that is not the mechanism's layer, S the summaries the list
-        already holds, F per R10, R_in 0 until #14 re-inserts the instruction. The walk
-        goes back from the newest group, whole groups only, while the sum stays within
-        t. Its floor is D1's; its ceiling leaves the oldest group of the material
-        outside, so that something is chunked. The floor wins over the ceiling. The
-        room for #34: condensation shrinks S before this is sized, and T_def is its
-        guarantee on t; neither is built here."""
+        already holds, F per R10, R_in 0 until #14 re-inserts the instruction.
+
+        Every boundary is the start of a group of one grouping, the cut's
+        (``_groups``), taken once over every entry outside the mechanism's layer, after
+        the pairing is checked over the whole list (``check_tool_pairing``). The walk
+        goes back from the floor, whole groups only, while the sum stays within t. The
+        floor is D1's; the ceiling leaves the oldest group outside, so that something
+        is chunked. The floor wins over the ceiling. The room for #34: condensation
+        shrinks S before this is sized, and T_def is its guarantee on t; neither is
+        built here."""
+        check_tool_pairing(messages)
         first = max(mechanism) + 1 if mechanism else 0
-        floor = self._tail_floor(messages, mechanism, occasion)
+        outside = [i for i in range(len(messages)) if i not in mechanism]
+        groups = self._groups(messages, outside)
+        floor = self._tail_floor(messages, mechanism, groups, occasion)
         if self._geometry is None:
             return floor, "no geometry: the floor only"
         estimator = self._estimator()
         sizes = [estimator.message(message).tokens if isinstance(message, dict) else 0 for message in messages]
         system = {0} if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system" else set()
         summaries = sum(sizes[i] for i in mechanism if i not in system)
-        outside = [i for i in range(len(messages)) if i not in mechanism]
         total = sum(sizes[i] for i in outside)
         k, rho = float(self._config.estimate_ratio), _SUMMARY_BUDGET_SHARE
         fixed, fixed_label = self._fixed_prefix()
@@ -430,18 +465,16 @@ class CompactionMixin:
         t = (target - fixed - k * summaries - reinserted - rho * k * total) / (k * (1 - rho))
         start = floor
         used = sum(sizes[floor:])
-        candidates = [i for i in range(first, floor)]
-        for group in reversed(self._groups(messages, candidates)):
+        for group in reversed([group for group in groups if first <= group[0] < floor]):
             weight = sum(sizes[i] for i in group)
             if used + weight > t:
                 break
             start, used = group[0], used + weight
-        groups = self._groups(messages, outside)
         ceiling = groups[1][0] if len(groups) >= 2 else len(messages)
         if start < ceiling:
             start = min(ceiling, floor)
             used = sum(sizes[start:])
-        label =(f"t {max(0, int(t))} by the estimate ({max(0, int(t * k))} provider tokens): G {target} − "
+        label = (f"t {max(0, int(t))} by the estimate ({max(0, int(t * k))} provider tokens): G {target} − "
                  f"{fixed_label} − {k}·S {summaries} − R_in {reinserted} − {rho}·{k}·X {total}, over {k}·(1 − {rho}); "
                  f"the tail holds {used} by the estimate from position {start}")
         return start, label
@@ -665,8 +698,10 @@ class CompactionMixin:
         that carries tool calls, with every result of those calls in the material and
         whatever stands between them; every other entry alone. Calls and results are
         matched by their ``tool_call_id``, the host's identity for the pair. The span
-        closes over every assistant inside it: where a second assistant's calls are
-        answered after the first one's results, its results join the group too."""
+        closes over every assistant inside it: a group runs from the first call to the
+        last result of any call it holds, so interleaved calls stay in one group. A tool
+        row that no group of the material opened (an empty or unknown
+        ``tool_call_id``, or a call outside the material) is a ``ToolPairingError``."""
 
         def calls(index: int) -> set:
             message = messages[material[index]]
@@ -677,6 +712,11 @@ class CompactionMixin:
         groups: List[List[int]] = []
         at = 0
         while at < len(material):
+            if messages[material[at]].get("role") == "tool":
+                raise ToolPairingError(
+                    f"the tool row at position {material[at]} answers "
+                    f"{str(messages[material[at]].get('tool_call_id') or '').strip() or 'no call'!r}, a call no "
+                    f"assistant row of the material before it made")
             end = at
             call_ids = calls(at)
             while call_ids:
@@ -846,7 +886,17 @@ class CompactionMixin:
             return self._abort(
                 messages, f"the assistant row at position {unanswered[0]}, at the tail's boundary, made tool calls "
                           f"whose results are not in the list ({', '.join(unanswered[1])})")
-        material = [index for index in range(tail_start) if index not in mechanism]
+        crossing = _pairs_crossing(messages, tail_start)
+        if crossing:
+            # The boundary would separate a call from its result (#13): the grouping
+            # rules it out, so this is a defect to see.
+            self._record_event(attempt, "tool_pair_across_boundary",
+                               {"tool_call_id": crossing[0], "call": crossing[1], "result": crossing[2],
+                                "boundary": tail_start})
+            return self._abort(
+                messages, f"the tail's boundary at position {tail_start} would separate the call {crossing[0]!r} "
+                          f"at position {crossing[1]} from its result at position {crossing[2]}")
+        material =[index for index in range(tail_start) if index not in mechanism]
         estimator = self._estimator()
         if not material:
             if force_overflow or provider_rejected:
@@ -868,7 +918,11 @@ class CompactionMixin:
 
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk.
         limit = self._chunk_limit()
-        chunks = self._cut_chunks(messages, material, limit, estimator)
+        try:
+            chunks = self._cut_chunks(messages, material, limit, estimator)
+        except ToolPairingError as exc:
+            self._record_event(attempt, "tool_pairing_error", str(exc))
+            return self._abort(messages, f"the material cannot be cut: {exc}")
         logger.info("LCM cut %d tokens of material into %d chunk%s (%s)", material_estimate.tokens, len(chunks),
                     "" if len(chunks) == 1 else "s", self._chunk_label())
         # A chunk the summariser cannot read in one call would fail on every attempt; it

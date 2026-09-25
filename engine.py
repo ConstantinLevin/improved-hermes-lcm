@@ -363,6 +363,9 @@ class LCMEngine(
         if self._closed_reason is not None:
             return
         self._closed_reason = reason
+        if not getattr(self, "_review_fork", False):
+            # The list its session's last request sent is not kept past the engine (R10).
+            turn_signals.drop_request_list(self._session_id)
         self._unregister_active_engine_binding()
         self._close_storage(reason)
 
@@ -741,10 +744,11 @@ class LCMEngine(
         and its error bound, (p99 − p50) × that list in provider tokens: F reads that
         much too high where the provider counts the list at #31's p99 instead of its
         p50. Until the first measurement F is the 32k hypothesis."""
-        if not self._plugin_session or self.last_prompt_tokens <= 0 or self._review_fork:
+        if self._review_fork or self.last_prompt_tokens <= 0:
             return
-        sent = turn_signals.request_list(self._session_id)
-        if sent is None:
+        # The list is taken: this response measures it once, and it is not kept after.
+        sent = turn_signals.take_request_list(self._session_id)
+        if sent is None or not self._plugin_session:
             return
         try:
             estimate = self._estimator().messages([m for m in sent if isinstance(m, dict)]).tokens
@@ -972,8 +976,11 @@ class LCMEngine(
         if session_id:
             previous = str(self._session_id or "")
             if previous and previous != session_id:
-                if not self._review_fork and turn_signals.turn_ended(previous, None):
-                    logger.info("LCM closed the turn left open under %s at the switch to %s", previous, session_id)
+                if not self._review_fork:
+                    if turn_signals.turn_ended(previous, None):
+                        logger.info("LCM closed the turn left open under %s at the switch to %s", previous,
+                                    session_id)
+                    turn_signals.drop_request_list(previous)
                 self._reset_session_scoped_runtime_state()
                 if not self._conversation_id or self._conversation_id == previous:
                     self._conversation_id = session_id
