@@ -50,8 +50,8 @@ retry. These all rest on host internals (the thread-locals of
 (``escalation.FAILURE_KINDS``), so the attempt can tell the chunk's own failures from
 the endpoint's; the first subscriber a failure reaches records it, the others only
 read what it recorded, so a call several attempts joined is one trial of the chunk.
-The first time the host stamps a dispatch of the call
-(``escalation._DispatchStamp``), ``ChunkCall.sent`` tells the attempt that started it.
+Whether a call was ever sent is not recorded: a retry keeps every recorded chunk
+(#33 D14 as revised), and the registry only serves joining (D12).
 """
 
 from __future__ import annotations
@@ -252,15 +252,10 @@ class Subscriber:
 class ChunkCall:
     """One chunk's summariser call in flight, and the attempts subscribed to it."""
 
-    def __init__(self, key: tuple, limiter: EndpointLimiter, limit: int,
-                 on_sent: Optional[Callable[[], None]] = None) -> None:
+    def __init__(self, key: tuple, limiter: EndpointLimiter, limit: int) -> None:
         self.key = key
         self.limiter = limiter
         self.limit = limit
-        # Told once, when the host first dispatches a request of this call to the
-        # provider (``sent``; #33 D14: a dispatched chunk is kept on a retry).
-        self._on_sent = on_sent
-        self._sent = False
         # Whether a subscriber has written the call's failure into the store.
         self._failure_recorded = False
         self._lock = threading.Lock()
@@ -314,21 +309,6 @@ class ChunkCall:
         """The host's deadline captured with the call (``add``)."""
         with self._lock:
             return self._deadline
-
-    def sent(self) -> None:
-        """The host dispatched a request of this call to the provider (its dispatch
-        stamp, ``escalation._DispatchStamp``): ``on_sent`` records it, until once it has
-        succeeded. A write that raises leaves the dispatch unrecorded, so the host's next
-        stamp of this call (a retry, level 2) records it; the exception goes on to the
-        stamp, which warns. It runs on the thread the host sends from (the worker, or the
-        host's protected provider thread, which carries the hook over)."""
-        with self._lock:
-            if self._sent:
-                return
-        if self._on_sent is not None:
-            self._on_sent()
-        with self._lock:
-            self._sent = True
 
     def failure_recorded(self) -> bool:
         """Whether a subscriber has written the call's failure into the store."""
@@ -391,18 +371,6 @@ _REGISTRY_LOCK = threading.Lock()
 _WORKER_NUMBERS = itertools.count(1)
 
 
-def registered_records(session: str) -> set[tuple]:
-    """The member records, in order, of every chunk of ``session`` whose call is
-    registered in this process, read under the registry lock (#33 D14, D12). A retry
-    counts such a chunk as dispatched while it plans its cut: a worker can have passed
-    its last cancellation check and not yet reached the host's dispatch stamp. A call
-    leaves the registry only after its outcome is delivered, so after any stamp of it
-    was written; read before the store, no call can go from "registered, not stamped"
-    to "stamped" unseen."""
-    with _REGISTRY_LOCK:
-        return {key[1] for key, call in _REGISTRY.items() if key[0] == session and not call.closed}
-
-
 def _close(call: ChunkCall, summary: Optional[ChunkSummary], failure: Optional[str], abandoned: bool,
            kind: Optional[str] = None) -> None:
     """Deliver to every subscriber, then close the call and leave the registry, in that
@@ -453,13 +421,11 @@ def join_or_start(
     reuse: Callable[[], Optional[ChunkSummary]],
     run: Callable[[ChunkCall], ChunkSummary],
     describe: Callable[[BaseException], str],
-    on_sent: Optional[Callable[[], None]] = None,
 ) -> str:
     """Join the call in flight for ``key``, reuse a summary already written, or start
     the call on a new daemon worker. Returns "joined", "reused", "started", or "failed"
     when the worker could not start: then no entry is registered, and the subscriber is
-    told of the failure, visibly. ``on_sent`` is told when the host first dispatches a
-    request of a call started here (``ChunkCall.sent``).
+    told of the failure, visibly.
 
     ``key`` holds everything two attempts must share to share a call: the session, the
     chunk's member records in order, the summariser route and the effort (the rule a
@@ -471,7 +437,7 @@ def join_or_start(
             return "joined"
         reused = reuse()
         if reused is None:
-            call = ChunkCall(key, limiter, limit, on_sent=on_sent)
+            call = ChunkCall(key, limiter, limit)
             call.add(subscriber)
             context = contextvars.copy_context()
             try:

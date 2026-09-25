@@ -32,25 +32,28 @@ In order:
    below c/4 joins the chunk of an adjacent oversized group, or, at the end of the
    material, stays raw and the tail begins at it. c is 50k provider tokens, cut in
    the plugin's estimate (characters / 4) as 50k / 1.51, #31's p50 of the provider's
-   count over that estimate (``_chunk_limit``). On a retry after an unconfirmed
-   attempt the cut is frozen (#33 D14, #31): that attempt's chunks, found by their
-   members' ``_row_id``s, are kept where they were summarised (with their summary) or
-   dispatched (retried as the same chunk); a kept chunk wins over the tail's start,
-   and one that reaches the floor stays whole in the tail. Only the rest is split as
-   above. A kept chunk is frozen, and a summarised one is never summarised again; the
-   one exception is a run below c/4 standing before or between kept chunks, which
-   joins one of them (D1), and goes on over contiguous neighbours until the chunk
-   holds c/4, releasing a summary where it must, with an event each time: the join
-   recurs where the joined chunk is never dispatched. A chunk whose call is still
-   registered in this process counts as dispatched while the retry plans. A chunk not found again, a dispatched one below c/4 by
-   today's estimate, and one with rows that came without a host identity (the
-   gateway's replayed history, host scaffolding never persisted; the ask to Hermes is
-   A1) are cut again, visibly: a warning and a store event. When only a rest below
-   c/4 stands outside the tail, nothing is compacted (a no-op, not a failure); where
-   such a rest would begin before the plugin's last summary (D3's shape), the
-   compaction is aborted, unchanged, with an event. The compaction,
-   its inputs, the new records and every chunk are written before the first
-   summariser call.
+   count over that estimate (``_chunk_limit``). A chunk is frozen once its cut is
+   recorded (#33 D14 as revised 2026-09-25, #31): a retry, in any process, keeps every
+   recorded chunk of the session's unsettled attempts, found by its members'
+   ``_row_id``s, whether or not its call was ever sent: a summarised one with its
+   summary, any other retried as the same chunk. A kept chunk wins over the tail's
+   start, and one that reaches the floor stays whole in the tail. Only the rest is
+   split as above. A kept chunk is frozen, and a summarised one is never summarised
+   again; the one exception is a run below c/4 standing before or between kept
+   chunks, which joins one of them (D1), and goes on over contiguous neighbours until
+   the chunk holds c/4, releasing a summary where it must, with an event. A chunk not
+   found again, one without a summary below c/4 by today's estimate, and one with
+   rows that came without a host identity (the gateway's replayed history, host
+   scaffolding never persisted; the ask to Hermes is A1) are cut again, visibly: a
+   warning and a store event. When only a rest below c/4 stands outside the tail,
+   nothing is compacted (a no-op, not a failure); where such a rest would begin
+   before the plugin's last summary (D3's shape), the compaction is aborted,
+   unchanged, with an event. Steps 1 to 3 run in one planning transaction
+   (``RecordStore.planning``: BEGIN IMMEDIATE, the attempt's captured check asked
+   first inside it): every store read the cut depends on, the cut, and the write of
+   the compaction, its inputs, the new records and every chunk, all before the first
+   summariser call. A planner in another process waits for an earlier attempt's
+   commit and reads its chunks.
 4. Each chunk is summarised from its records as the store holds them. Every chunk's
    call is issued at once, on daemon workers of the plugin's own, through one limiter
    per endpoint and process; a call for the same records already in flight is joined,
@@ -60,9 +63,9 @@ In order:
    attempt is cancelled or superseded. A summary that cannot be written
    (``escalation.SummaryFailure``: no third level, nothing truncated) fails the
    compaction as a whole: the context stays as it was, and the host shows the cause.
-   The host's dispatch of a call is recorded when the host stamps it (handed to the
-   provider's client); each failure of a call is recorded once, with its kind, and
-   judged where it is recorded, whether or not an attempt still waits for it. A chunk of the same members failing by its own fault (its
+   Each failure of a call is recorded once, with its kind, and judged where it is
+   recorded, whether or not an attempt still waits for it. A chunk of the same
+   members failing by its own fault (its
    reply rejected, or its request rejected by the provider) in three consecutive
    attempts is the chunk that keeps failing (#7): a ``chunk_keeps_failing`` event and
    a cause that name it, and the next occasion still retries it. The endpoint's,
@@ -115,7 +118,6 @@ from .inflight import (
     host_progress_hook,
     join_or_start,
     limiter_for,
-    registered_records,
 )
 from .record_write import _ATTEMPT, AttemptCancelled
 from .tokens import Estimator, count_message_tokens, count_messages_tokens
@@ -554,19 +556,17 @@ class CompactionMixin:
         not found, and one with rows that came without a host identity, are re-cut: the
         caller says so visibly (ruling 3 on #61). Nothing is matched by content.
 
-        A chunk whose call is still registered in this process counts as dispatched
-        (#33 D14, orchestrator ruling on 60a48c9): the registry is read first, under
-        its lock, then the store, so that a worker past its last cancellation check
-        that has not yet been stamped is never re-cut under it; the retry keeps the
-        chunk and joins its call (D12). Across processes the host's session lock
-        serialises attempts on the same session."""
+        Every recorded chunk of an unsettled attempt is a candidate, whether or not its
+        call was ever sent (#33 D14 as revised): ``compress()`` reads it inside its
+        planning transaction, so a chunk an attempt in another process recorded before
+        is always seen; a call still in flight here is joined through the registry
+        (D12)."""
         result = FrozenCandidates()
         if not self._plugin_session:
             return result
         store = self._records
-        in_flight = registered_records(self._plugin_session)
         frozen, result.unidentified = store.frozen_chunks(
-            self._plugin_session, store.effective_compaction(self._plugin_session), in_flight=in_flight)
+            self._plugin_session, store.effective_compaction(self._plugin_session))
         if not frozen:
             return result
         position_of = {message["_row_id"]: index for index, message in enumerate(messages)
@@ -613,13 +613,12 @@ class CompactionMixin:
         the mechanism's layer are kept. Where the tail would begin before the end of a
         kept chunk, the kept chunk wins and the tail begins after it. A kept chunk that
         reaches the floor is never cut: it stays whole in the tail this time (``held``),
-        and the tail begins at it. A dispatched candidate below c/4 by today's estimate
-        (the same records give the same estimate, so only where c or the estimate's
-        ratio changed since it was cut) is not kept: no chunk below c/4 is ever
-        dispatched, however it arises (ruling on #61, 1), so its rows are cut again
-        (``recut``), which departs from D14's "a dispatched chunk is never re-cut". A
-        summarised one is kept whatever its size: it is not dispatched again, its
-        summary is reused."""
+        and the tail begins at it. A candidate without a summary below c/4 by today's
+        estimate (the same records give the same estimate, so only where c or the
+        estimate's ratio changed since it was cut) is not kept: no chunk below c/4 is
+        ever sent, however it arises (ruling on #61, 1), so its rows are cut again
+        (``recut``), the one departure from "a recorded chunk is frozen". A summarised
+        one is kept whatever its size: it is not sent again, its summary is reused."""
         check_tool_pairing(messages)
         first = max(mechanism) + 1 if mechanism else 0
         outside = [i for i in range(len(messages)) if i not in mechanism]
@@ -668,7 +667,7 @@ class CompactionMixin:
             weight = sum(sizes[i] for i in positions)
             if weight < smallest and chunk.state != "summarised":
                 recut.append((chunk, f"it holds {weight} tokens by today's estimate, below c/4 = {smallest}, and "
-                                     f"has no summary: it would be dispatched again"))
+                                     f"has no summary: it would be sent below c/4"))
                 continue
             claimed.update(positions)
             (kept if high < floor else held).append((chunk, positions))
@@ -797,13 +796,20 @@ class CompactionMixin:
         self._check_host_native_compaction()
         token = _ATTEMPT.set(attempt)
         try:
-            result = self._compress_impl(
-                messages,
-                current_tokens=current_tokens,
-                focus_topic=focus_topic,
-                force=force,
-                provider_rejected=bool(bypass_cooldown),
-            )
+            try:
+                result = self._compress_impl(
+                    messages,
+                    current_tokens=current_tokens,
+                    focus_topic=focus_topic,
+                    force=force,
+                    provider_rejected=bool(bypass_cooldown),
+                )
+            except BaseException as exc:
+                # A planning transaction still open is rolled back (#33 D14 as revised).
+                attempt.end_planning(exc)
+                raise
+            # An early return inside it (an abort, a no-op) commits what it wrote.
+            attempt.end_planning()
         except AttemptCancelled:
             return messages
         except BaseException:
@@ -860,7 +866,7 @@ class CompactionMixin:
                 focus_topic=focus_topic or "",
                 custom_instructions=custom_instructions,
                 path=CallPath(wait=call.wait, dispatch=call.dispatch, hold=call.limiter.hold,
-                              deadline=call.deadline, sent=call.sent),
+                              deadline=call.deadline),
             )
             return ChunkSummary(text=text, level=level, budget=budget, finish_reason=finish_reason,
                                 model=route.model, provider=route.provenance_provider(), effort=settings.effort)
@@ -1045,22 +1051,22 @@ class CompactionMixin:
         - else it stands before or between kept chunks, and joins a neighbouring kept
           chunk that has no summary yet, so that no summary is thrown away, the
           following one first; where both are summarised, the following one (ruling on
-          #61, D1). Rows arrive only at the end of the list, so such a run is an
-          earlier chunk never dispatched, and falls below c/4 only where c or the
-          estimate changed since it was cut, or the host put rows among kept chunks.
+          #61, D1). Rows arrive only at the end of the list and every recorded chunk
+          is kept, so such a run arises only from a chunk without a summary cut again
+          after c or the estimate changed, or from rows the host put among kept
+          chunks.
         - Where the chunk a join makes is still below c/4 (its neighbour is a
           summarised kept chunk that was cut at a smaller c), it goes on joining
           contiguous neighbours by the same preference, a run last, until it holds
           c/4 (orchestrator ruling on 60a48c9): a kept chunk is taken whole, and a
           summary it releases is lossless, since the joined chunk is summarised again;
-          a run takes the joined rows into its equal split. No dispatched kept chunk
-          is ever released into a run: one below c/4 was cut again already, and one
-          at c/4 or more ends the join.
-        Each join is recorded in ``joins``, and the caller records an event for it each
-        time: where the joined chunk is never dispatched, the next attempt finds the
-        earlier kept chunk again and the join recurs. A joined chunk has new members,
-        so it is summarised afresh. Never jumping over a chunk, so the chunks stay
-        contiguous.
+          a run takes the joined rows into its equal split. No kept chunk without a
+          summary is ever released into a run: one below c/4 was cut again already,
+          and one at c/4 or more ends the join.
+        Each join is recorded in ``joins``, and the caller records an event for it. A
+        joined chunk has new members, so it is summarised afresh; it is recorded with
+        this attempt's cut, so a retry keeps it and the join is not made again. Never
+        jumping over a chunk, so the chunks stay contiguous.
         """
         groups = cls._groups(messages, material)
         sizes = [sum(count_message_tokens(messages[index], estimator) for index in group) for group in groups]
@@ -1245,6 +1251,21 @@ class CompactionMixin:
             why_now = f"{count_label} is at or above τ {tau}"
         logger.info("LCM compacts: %s; %s", why_now, occasion.why)
 
+        # The summariser, as far as anything can be written: its route and effort (#9).
+        # Read before the planning transaction: nothing of the cut depends on it but the
+        # check that the summariser can read each chunk.
+        settings, why_not = self._summariser_settings()
+        if settings is None:
+            return self._abort(messages, why_not)
+
+        # The planning transaction (#33 D14 as revised 2026-09-25): every store read the
+        # cut depends on, from the identity on, and the write of the cut, in one
+        # BEGIN IMMEDIATE, after the attempt's captured check is asked inside it. A
+        # planner in another process waits for an earlier attempt's commit and reads its
+        # chunks. Nothing in it calls a model or does other I/O. compress() closes it on
+        # any early return or exception.
+        self._begin_planning(attempt)
+
         # 1. Identity (#29 W3). A list that cannot be classified is not compacted.
         self._settle_from_list(messages)
         entries = self._classify(attempt, messages)
@@ -1257,8 +1278,8 @@ class CompactionMixin:
         # groups, from its floor (D1) up to the ceiling that leaves the oldest group
         # outside (#13, #31). At the threshold everything outside it is chunked, with no
         # minimum (#11, #12).
-        # On a retry the cut is frozen (#33 D14): the earlier attempt's summarised and
-        # dispatched chunks are found by their members' ids and records. What is cut
+        # On a retry the cut is frozen (#33 D14 as revised): every recorded chunk of the
+        # unsettled attempts is found by its members' ids and records. What is cut
         # again is said visibly (ruling 3 on #61).
         try:
             frozen = self._frozen_candidates(
@@ -1275,7 +1296,7 @@ class CompactionMixin:
             attempts = sorted({compaction for _chunk, compaction, _rows in frozen.unidentified})
             named = "; ".join(f"chunk {chunk} (rows without identity: records {', '.join(rows)})"
                               for chunk, _compaction, rows in frozen.unidentified)
-            logger.warning("LCM cuts again %d dispatched or summarised chunks of %d earlier attempts, each with rows "
+            logger.warning("LCM cuts again %d recorded chunks of %d earlier attempts, each with rows "
                            "that came without a host identity, so they cannot be found in this list by identity: %s. "
                            "The ask to Hermes: A1", len(frozen.unidentified), len(attempts), named)
             self._record_event(attempt, "frozen_cut_unidentified",
@@ -1322,7 +1343,7 @@ class CompactionMixin:
                 # The one exception to "nothing joins a kept chunk" (ruling on #61, D1),
                 # continued until the chunk holds c/4 (ruling on 60a48c9).
                 logger.warning("LCM joins material below c/4 (positions %d to %d, %d tokens) to the %s %s at "
-                               "positions %d to %d%s, making %d tokens: nothing below c/4 is dispatched",
+                               "positions %d to %d%s, making %d tokens: nothing below c/4 is sent",
                                join["run"][0], join["run"][1], join["tokens"], join["side"],
                                {"kept": "kept chunk", "joined": "joined chunk", "run": "run"}[join["joined"]],
                                join["kept"][0], join["kept"][1],
@@ -1400,12 +1421,8 @@ class CompactionMixin:
             )
         material_estimate = estimator.messages([messages[index] for index in material])
 
-        # The summariser, as far as anything can be written: its route and effort (#9).
-        settings, why_not = self._summariser_settings()
-        if settings is None:
-            return self._abort(messages, why_not)
-
-        # 3. Transaction 1: the compaction, its inputs, the new records and every chunk.
+        # 3. Transaction 1: the compaction, its inputs, the new records and every chunk,
+        # the last step of the planning transaction.
         logger.info("LCM cut %d tokens of material into %d chunk%s (%s)", material_estimate.tokens, len(chunks),
                     "" if len(chunks) == 1 else "s", self._chunk_label())
         # Kept chunks as they were, by their positions: summarised ones reuse their summary
@@ -1413,9 +1430,9 @@ class CompactionMixin:
         kept_state = {tuple(positions): chunk.state for chunk, positions in plan.kept}
         if kept_state:
             states = list(kept_state.values())
-            logger.info("LCM keeps the cut of an earlier attempt (#33 D14): %d of its chunks as they were "
-                        "(%d summarised, %d dispatched)", len(states), states.count("summarised"),
-                        states.count("dispatched"))
+            logger.info("LCM keeps the cut of earlier attempts (#33 D14): %d recorded chunks as they were "
+                        "(%d summarised, %d retried as the same chunk)", len(states), states.count("summarised"),
+                        states.count("cut"))
         # A chunk the summariser cannot read in one call would fail on every attempt; it
         # is never cut (the tiny-chunk rule on #52). Only where the model table knows
         # the window; counted by the plugin's estimate, its images by the summariser's rule.
@@ -1439,6 +1456,9 @@ class CompactionMixin:
             logger.warning("LCM could not write the compaction", exc_info=True)
             self._record_event(attempt, "compaction_write_failed", repr(exc))
             return self._abort(messages, f"the store could not write the compaction ({exc})")
+        # The cut is recorded: commit the planning transaction before any call starts.
+        held_ms = attempt.end_planning()
+        logger.info("LCM held the store's write lock for %.1f ms to plan and record the cut", held_ms or 0.0)
 
         # 4. One summary per chunk, from the chunk's records as stored, every chunk's call
         # issued at once (#12, #33): each joins the call in flight for the same records,
@@ -1494,7 +1514,6 @@ class CompactionMixin:
                 run=self._chunk_run(chunk_messages, focus_topic=focus_topic, record_handles=records,
                                     settings=settings),
                 describe=describe,
-                on_sent=lambda chunk_handle=chunk_handle: self._records.chunk_dispatched(chunk_handle),
             )
             ways[way] = ways.get(way, 0) + 1
             subscribers.append(subscriber)

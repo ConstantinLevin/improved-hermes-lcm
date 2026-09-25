@@ -35,9 +35,11 @@ request the provider rejected (HTTP 400, 413, 422) are the chunk's own and count
 response and every other failure of the endpoint do not (ruling on #61, 2). Where level 1
 failed by the chunk's own kind and level 2 by another, the failure is still the chunk's.
 
-A call is dispatched when the host says so: ``latency_info``'s ``provider_dispatch_ms``,
-stamped immediately before the request goes to the provider's client
-(``_DispatchStamp``). No time left, or a failure before that point, is no dispatch.
+An HTTP status is read the way the host reads it (``_host_status``): its error
+classifier's ``_extract_status_code`` first, then its auxiliary client's
+``_exc_http_status``; never an attribute guessed per provider. Neither reads the status
+of botocore's ``ClientError`` (Bedrock), so such a failure is kind ``other``: it fails
+visibly with its cause and does not count (the ask to Hermes: read it there).
 
 The budget is a target in the prompt text only. ``max_tokens`` is the summariser
 model's own output cap where the model table knows it (R5 b), and absent otherwise, so
@@ -274,9 +276,30 @@ class SummaryFailure(Exception):
         super().__init__(f"{reason}: {detail}" if detail else reason)
 
 
+def _host_status(exc: BaseException) -> Optional[int]:
+    """The HTTP status of a failed call, read the way the host reads it (orchestrator
+    ruling on f881fd2): ``agent.error_classifier._extract_status_code`` (the exception's
+    ``status_code`` or ``status`` over its cause chain, else a numeric code in its body;
+    agent/error_classifier.py 1424 at Hermes 1b57acf94a), then the auxiliary client's
+    ``_exc_http_status`` (``status_code`` on the exception or on its ``response``,
+    agent/auxiliary_client.py 3305), the one the host's ladder uses on this path. Never
+    an attribute guessed per provider; where neither finds one, None."""
+    for module_name, helper in (("agent.error_classifier", "_extract_status_code"),
+                                ("agent.auxiliary_client", "_exc_http_status")):
+        try:
+            module = __import__(module_name, fromlist=[helper])
+            status = getattr(module, helper)(exc)
+        except Exception:
+            continue
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
 def _failed_call_kind(exc: BaseException) -> str:
-    """A non-transient exception of the call, by its status code, never its message."""
-    status = getattr(exc, "status_code", None)
+    """A non-transient exception of the call, by its HTTP status as the host reads it
+    (``_host_status``), never by its message."""
+    status = _host_status(exc)
     if isinstance(status, int):
         return "request" if status in _REQUEST_REJECTED_STATUS else "endpoint"
     return "other"
@@ -306,8 +329,9 @@ def _retry_after_seconds(exc: BaseException) -> Optional[float]:
 
 
 def _is_transient(exc: BaseException) -> bool:
-    """By the exception's class and status code, never by its message."""
-    status = getattr(exc, "status_code", None)
+    """By the exception's class and its HTTP status as the host reads it
+    (``_host_status``), never by its message."""
+    status = _host_status(exc)
     if isinstance(status, int):
         return status in _TRANSIENT_STATUS or status >= 500
     if isinstance(exc, (TimeoutError, ConnectionError)):
@@ -404,48 +428,13 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
     return forms
 
 
-class _DispatchStamp(dict):
-    """``latency_info`` for ``call_llm``: the host stamps ``provider_dispatch_ms`` into
-    it once (``_stamp_latency_once``, agent/auxiliary_client.py 7842-7845 at Hermes
-    1b57acf94a, installed as the dispatch hook at 7875-7876), from
-    ``_notify_aux_dispatch``, which ``_create_with_progress_once`` calls immediately
-    before it hands the request to the provider's client (6970; 6993 for its
-    non-streamed retry). Every non-streamed send goes through it: the first try, the
-    same-provider retries, the recovery rungs and the fallback candidates
-    (``_relay_sync_completion``'s default callback, 2621; ``_primary``, 8030-8034). The
-    host's provider daemon carries the hook over (``_run_protected_sync_provider_call``,
-    459 and 473). ``sent`` is told there (#33 D14; ruling on #61, 2).
-
-    That is the limit of "dispatched": the request was handed to the provider's client.
-    A connection the endpoint then refuses is dispatched by this stamp too; the host
-    gives no later signal that the request reached the provider. The host's hook
-    swallows an exception at debug level (``_tick_hook``), so ``sent``'s own failure is
-    warned about here."""
-
-    def __init__(self, sent: Callable[[], None]) -> None:
-        super().__init__()
-        self._sent = sent
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        super().__setitem__(key, value)
-        if key == "provider_dispatch_ms":
-            try:
-                self._sent()
-            except Exception as exc:
-                logger.warning("LCM could not record that a summariser call was dispatched (%s: %s); the "
-                               "call's next send records it, else a retry cuts its chunk again",
-                               type(exc).__name__, exc)
-
-
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
-               timeout: Optional[float] = None,
-               sent: Optional[Callable[[], None]] = None) -> tuple[str, str]:
+               timeout: Optional[float] = None) -> tuple[str, str]:
     """One call through the host. Returns (content, finish_reason); raises on any
     failure of the call, a reply from another model, or a reply of the wrong shape.
     ``timeout`` is what is left of the host's deadline at dispatch; with no host
     deadline none is passed, and the host's own applies (#33: no per-call timeout of
-    the plugin's own). ``sent`` is told when the host dispatches the request
-    (``_DispatchStamp``)."""
+    the plugin's own)."""
     from agent.auxiliary_client import call_llm
 
     route = settings.route
@@ -458,11 +447,6 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         "route_info": route_info,
         **route.call_kwargs(),
     }
-    if sent is not None:
-        # With a progress hook already installed (the plugin's worker always has one),
-        # passing latency_info does not change the host's path: call_llm installs its own
-        # no-op progress hook only where none is installed (7869-7873 at 1b57acf94a).
-        call_kwargs["latency_info"] = _DispatchStamp(sent)
     if settings.max_tokens:
         call_kwargs["max_tokens"] = settings.max_tokens
     if timeout is not None:
@@ -523,15 +507,12 @@ class CallPath:
     call (a limiter slot, the host's deadline installed) and yields the deadline it is
     bounded by; ``hold`` passes a provider's ``Retry-After`` on to the endpoint;
     ``deadline`` is the host's deadline for the decision to retry; ``wait`` is the wait
-    between retries, which may give up; ``sent`` is told when the host dispatches a
-    request of this chunk to the provider (``_DispatchStamp``). The defaults call
-    directly on this thread."""
+    between retries, which may give up. The defaults call directly on this thread."""
 
     wait: Callable[[float], None] = _default_wait
     dispatch: Callable[[], Any] = _direct_dispatch
     hold: Callable[[float], None] = _no_hold
     deadline: Callable[[], Optional[float]] = _deadline
-    sent: Optional[Callable[[], None]] = None
 
 
 def _call_with_retries(
@@ -555,7 +536,7 @@ def _call_with_retries(
                         raise SummaryFailure("summariser call not made, no time left before the host's deadline",
                                              transient=True, kind="endpoint")
                 try:
-                    content, finish_reason = _call_once(messages, settings, timeout, sent=path.sent)
+                    content, finish_reason = _call_once(messages, settings, timeout)
                 except SummaryFailure:
                     raise
                 except Exception as exc:

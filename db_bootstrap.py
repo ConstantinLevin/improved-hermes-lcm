@@ -32,15 +32,15 @@ logger = logging.getLogger(__name__)
 # doctor's invariant check reads by (chunks by session, rejections by compaction),
 # so that a store without them is never opened. Format 6 stores beside a record's
 # estimate how many of its images the estimate left uncounted
-# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 8
-# records which chunks' calls the host dispatched (``chunk_dispatches``) and each
-# failure with its kind (``chunk_failures``), both insert-only, for the frozen cut on a
-# retry and the chunk that keeps failing (#33 D14, #7). Format 7 had these tables
-# without the kind and without their triggers, and was written only by unmerged
-# commits of #61; opening runs no DDL, so it gets its own name and is refused. A store
-# of an earlier format is refused and begun again (#29 W8: a change of format wipes the
-# store).
-STORE_FORMAT = "ihl-store/8"
+# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 9
+# records each failure of a chunk's call with its kind (``chunk_failures``,
+# insert-only), for the chunk that keeps failing (#7); a retry keeps every recorded
+# chunk of an unsettled attempt, so nothing about dispatch is stored (#33 D14 as
+# revised). Formats 7 and 8 were written only by unmerged commits of #61 and carried
+# a ``chunk_dispatches`` table this build does not declare; opening runs no DDL, so
+# each layout has its own name and is refused. A store of an earlier format is
+# refused and begun again (#29 W8: a change of format wipes the store).
+STORE_FORMAT = "ihl-store/9"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -259,7 +259,6 @@ INSERT_ONLY_TABLES = (
     "compaction_inputs",
     "chunks",
     "chunk_members",
-    "chunk_dispatches",
     "chunk_failures",
     "derivations",
     "derivation_sources",
@@ -376,14 +375,6 @@ CREATE TABLE chunk_members (
     UNIQUE (chunk, record)
 );
 CREATE INDEX idx_chunk_members_record ON chunk_members(record, ordinal);
-
--- The host dispatched a request of a chunk's summariser call to the provider (its
--- dispatch stamp, #33 D14): a retry keeps such a chunk, found by its members.
-CREATE TABLE chunk_dispatches (
-    chunk TEXT NOT NULL REFERENCES chunks(handle),
-    at REAL NOT NULL
-);
-CREATE INDEX idx_chunk_dispatches_chunk ON chunk_dispatches(chunk);
 
 -- A chunk's call failed, with the failure's kind (#7; ruling on #61, 2): the chunk's
 -- own failures (reply, request) in three consecutive attempts of the same members

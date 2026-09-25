@@ -36,6 +36,7 @@ An engine copy writes only for its own plugin session.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -115,6 +116,24 @@ class CompressAttempt:
     # Set when compress() has returned: the attempt then wants no further summariser
     # call; a call already in flight runs to its end and its summary is written (#33 D13).
     over: bool = False
+    # The planning transaction while it is open (``RecordStore.planning``): from the
+    # identity step to the write of the cut (#33 D14 as revised). ``end_planning``
+    # commits it, or rolls it back when the attempt ends with an exception.
+    planning: Optional[contextlib.ExitStack] = None
+    planning_began: float = 0.0
+
+    def end_planning(self, exc: Optional[BaseException] = None) -> Optional[float]:
+        """Close the planning transaction if it is open: commit, or roll back with
+        ``exc``. Returns how long it held the store's write lock, in milliseconds."""
+        stack, self.planning = self.planning, None
+        if stack is None:
+            return None
+        held = (time.perf_counter() - self.planning_began) * 1000.0
+        if exc is None:
+            stack.close()
+        else:
+            stack.__exit__(type(exc), exc, exc.__traceback__)
+        return held
 
     def cancelled(self) -> bool:
         if not callable(self.check):
@@ -194,6 +213,17 @@ class RecordWriteMixin:
             detail=detail,
         )
 
+    def _begin_planning(self, attempt: CompressAttempt) -> None:
+        """Open the planning transaction (``RecordStore.planning``: ``BEGIN IMMEDIATE``)
+        and ask the attempt's captured check at once, inside it (#33 D14 as revised). A
+        planner in another process waits here for an earlier attempt's commit, and so
+        reads its chunks; an attempt cancelled or superseded before this point writes no
+        cut. The transaction stays open until the cut is written (``end_planning``)."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(self._records.planning())
+        attempt.planning, attempt.planning_began = stack, time.perf_counter()
+        self._require_live_write()
+
     def _write_compaction(
         self,
         attempt: CompressAttempt,
@@ -203,7 +233,8 @@ class RecordWriteMixin:
         force: bool,
     ) -> List[str]:
         """Transaction 1: the compaction, its inputs, the new records, their tool calls
-        and every chunk. Returns the chunk handles; raises when the write fails."""
+        and every chunk, inside the planning transaction when one is open. Returns the
+        chunk handles; raises when the write fails."""
         compaction, records, chunk_handles = self._records.begin_compaction(
             session=attempt.session,
             kind="full" if force else "threshold",

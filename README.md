@@ -26,9 +26,10 @@ full: tool calls and results whole, readable reasoning marked, images only where
 encrypted reasoning is withheld until the plugin knows which provider produced it (#8). A
 compaction's summariser calls, one per chunk, run at once, through one limiter per endpoint
 (#33). No chunk below a quarter of the chunk size is ever sent: such a rest joins a neighbouring
-chunk or stays raw before the tail. A retry keeps the earlier attempt's cut: a chunk that was
-summarised keeps its summary, a chunk whose call the host dispatched is retried as the same chunk,
-and only the rest is cut again, visibly. A chunk of the same messages failing by its own fault
+chunk or stays raw before the tail. Every chunk is recorded before any of its calls starts, and a
+retry, in any process, keeps every recorded chunk of the earlier attempts: a summarised one keeps
+its summary, any other is retried as the same chunk, and only what is new is cut. A chunk of the
+same messages failing by its own fault
 (its reply rejected, or its request refused) in three consecutive attempts is shown as an error
 naming it, and is still retried; rate limits, deadlines and other endpoint failures do not count
 (#33, #7). A chunk with rows that came without a host identity (the gateway's replayed

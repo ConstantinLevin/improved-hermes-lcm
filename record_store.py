@@ -6,10 +6,10 @@ written in short transactions, none held open across a summariser call:
 
 1. the compaction, its inputs, a record for every input entry the store does not
    hold yet (the fresh tail included), their tool calls, and every chunk with its
-   members, all before the first summariser call;
-2. each summary, as a derivation of its chunk, when it arrives; the host's first
-   dispatch of a chunk's call, and each failure of it with its kind, when they happen
-   (#33 D14, #7);
+   members, all before the first summariser call, in the planning transaction that
+   also holds every read the cut depends on (``planning``; #33 D14 as revised);
+2. each summary, as a derivation of its chunk, when it arrives; each failure of a
+   chunk's call with its kind, when it happens (#7);
 3. what the plugin returned.
 
 The host confirms a compaction with ``on_session_start(boundary_reason="compression")``
@@ -99,7 +99,7 @@ def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
 class FrozenChunk:
     """A chunk of an unconfirmed attempt that a retry keeps (#33 D14): its members as
     (record, the host's ``_row_id`` when it was cut), in order, and its state,
-    "summarised" or "dispatched"."""
+    "summarised" (its summary is reused) or "cut" (retried as the same chunk)."""
 
     chunk: str
     compaction: int
@@ -138,6 +138,9 @@ class RecordStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._lock = threading.RLock()
+        # How deep the thread that holds ``_lock`` is inside ``_tx``: an inner ``_tx``
+        # joins the outer transaction (the planning transaction, ``planning``).
+        self._tx_depth = 0
         self._pending_events: list[tuple] = []
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(
             str(self.db_path),
@@ -163,17 +166,51 @@ class RecordStore:
         """One short write transaction. It never stays open: when the body or the
         COMMIT fails (in rollback-journal mode a COMMIT can fail on the busy timeout
         while a reader holds its shared lock), the transaction is rolled back before
-        the error is raised, so that no lock of the shadow ever blocks a live write."""
+        the error is raised, so that no lock of the shadow ever blocks a live write.
+        Inside an open transaction of this helper on the same thread it is a savepoint
+        of that transaction: a failed inner block is undone whole, and the outer one
+        commits or rolls back."""
         with self._lock:
+            if self._tx_depth:
+                conn = self._conn
+                name = f"lcm_inner_{self._tx_depth}"
+                conn.execute(f"SAVEPOINT {name}")
+                self._tx_depth += 1
+                try:
+                    yield conn
+                    conn.execute(f"RELEASE {name}")
+                except BaseException:
+                    try:
+                        conn.execute(f"ROLLBACK TO {name}")
+                        conn.execute(f"RELEASE {name}")
+                    except Exception:
+                        logger.error("LCM could not undo a failed step inside a transaction in %s", self.db_path,
+                                     exc_info=True)
+                    raise
+                finally:
+                    self._tx_depth -= 1
+                return
             conn = self._conn
             conn.execute("BEGIN IMMEDIATE")
+            self._tx_depth = 1
             try:
                 yield conn
                 conn.execute("COMMIT")
             except BaseException:
                 self._rollback(conn)
                 raise
+            finally:
+                self._tx_depth = 0
             self._flush_events()
+
+    def planning(self):
+        """The planning transaction of a compaction (#33 D14, revised 2026-09-25): one
+        ``BEGIN IMMEDIATE`` around every store read the cut depends on and the write of
+        the cut, so that a planner in another process waits for an earlier attempt's
+        commit and sees its chunks. Every write inside it joins it. Nothing inside it
+        calls a model or does other I/O; it holds the write lock for as long as the
+        plan and the write take."""
+        return self._tx()
 
     def _rollback(self, conn: sqlite3.Connection) -> None:
         if not conn.in_transaction:
@@ -210,9 +247,10 @@ class RecordStore:
             self._flush_events()
 
     def _flush_events(self) -> None:
-        """Write the events not written yet, in their own short transaction."""
+        """Write the events not written yet, in their own short transaction; inside an
+        open transaction they wait for its end (``_tx`` flushes after its commit)."""
         with self._lock:
-            if not self._pending_events or self._conn is None:
+            if not self._pending_events or self._conn is None or self._tx_depth:
                 return
             conn = self._conn
             try:
@@ -328,43 +366,35 @@ class RecordStore:
             "SELECT 1 FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
             "WHERE s.chunk = ? AND d.kind = 'summary' LIMIT 1", (chunk,)))
 
-    def _dispatched(self, chunk: str) -> bool:
-        return bool(self._q("SELECT 1 FROM chunk_dispatches WHERE chunk = ? LIMIT 1", (chunk,)))
-
     def _failed_by_itself(self, chunk: str) -> bool:
         """A failure of the chunk's own kind: its reply rejected, or its request
         rejected by the provider (ruling on #61, 2)."""
         return bool(self._q("SELECT 1 FROM chunk_failures WHERE chunk = ? AND kind IN ('reply', 'request') "
                             "LIMIT 1", (chunk,)))
 
-    def chunk_state(self, session: str, records: Sequence[str]) -> Optional[str]:
+    def chunk_state(self, session: str, records: Sequence[str]) -> str:
         """The state of a set of members over every chunk of the session that held
-        exactly them (#33 D14): "summarised" where one of them has a summary,
-        "dispatched" where a call for one of them reached the provider, else None
-        (never dispatched: its rows are cut again)."""
+        exactly them (#33 D14, revised): "summarised" where one of them has a summary,
+        which a retry reuses, else "cut": a recorded chunk, retried as the same chunk
+        whether or not its call was ever sent."""
         chunks = [chunk for chunk, _ in self._chunks_with_members(session, records)]
-        if any(self._summarised(chunk) for chunk in chunks):
-            return "summarised"
-        if any(self._dispatched(chunk) for chunk in chunks):
-            return "dispatched"
-        return None
+        return "summarised" if any(self._summarised(chunk) for chunk in chunks) else "cut"
 
-    def frozen_chunks(self, session: str, after: Optional[int], in_flight: Iterable[tuple] = ()
+    def frozen_chunks(self, session: str, after: Optional[int]
                       ) -> tuple[list[FrozenChunk], list[tuple[str, int, tuple[str, ...]]]]:
-        """The chunks a retry keeps (#33 D14, #31): those of the session's attempts
-        after its effective compaction that the host neither confirmed, adopted nor
-        rejected, whose members were summarised or dispatched, the newest attempt's cut
-        first; a chunk that shares a record with one already taken is left out. Each
-        member carries the ``_row_id`` its row had in that attempt's list: ids hold
-        until a commit (#29 W2 step 8), so the retry recognises the chunk by identity.
+        """The chunks a retry keeps (#33 D14 as revised 2026-09-25, #31): every chunk
+        recorded by the session's attempts after its effective compaction that the host
+        neither confirmed, adopted nor rejected, whether or not its call was ever sent.
+        A chunk is recorded with its members before any call of its attempt starts,
+        in the planning transaction (``planning``), and is frozen from then on. Read
+        inside the next attempt's planning transaction, so a planner in another
+        process waits for an earlier attempt's commit and sees its chunks.
 
-        ``in_flight`` are the member records of the chunks whose call is still
-        registered in this process (``inflight.registered_records``, read before this):
-        such a chunk counts as dispatched though no dispatch row is written yet, so
-        that a worker past its last check is never re-cut under it (D14); the retry
-        keeps it and joins its call (D12). Across processes the host's session lock
-        serialises attempts on the same session, so no other process has a call of
-        this session in flight while a retry plans.
+        The newest attempt's cut comes first, and a chunk that shares a record with
+        one already taken is left out: a safety net only, since the planning
+        transaction orders the attempts. Each member carries the ``_row_id`` its row
+        had in that attempt's list: ids hold until a commit (#29 W2 step 8), so the
+        retry recognises the chunk by identity.
 
         A chunk with a member whose row came without a host identity (``_row_id``) can
         never be found again by identity: the gateway's replayed history carries none,
@@ -379,7 +409,6 @@ class RecordStore:
             "ORDER BY c.compaction_id DESC",
             (session, after or 0),
         )]
-        registered = {tuple(str(record) for record in records) for records in in_flight}
         taken: set = set()
         frozen: list[FrozenChunk] = []
         unidentified: list[tuple[str, int, tuple[str, ...]]] = []
@@ -397,17 +426,12 @@ class RecordStore:
                 records = [record for record, _ in members]
                 if not records or taken.intersection(records):
                     continue
-                state = self.chunk_state(session, records)
-                if state is None and tuple(records) in registered:
-                    state = "dispatched"   # its call is in flight here, stamped or not yet
-                if state is None:
-                    continue
                 taken.update(records)
                 without = tuple(record for record, row_id in members if row_id is None)
                 if without:
                     unidentified.append((str(chunk), compaction, without))
                     continue
-                frozen.append(FrozenChunk(str(chunk), compaction, members, state))
+                frozen.append(FrozenChunk(str(chunk), compaction, members, self.chunk_state(session, records)))
         return frozen, unidentified
 
     def failure_streak(self, session: str, records: Sequence[str]) -> int:
@@ -423,10 +447,6 @@ class RecordStore:
             if self._failed_by_itself(chunk):
                 streak += 1
         return streak
-
-    def chunk_dispatched(self, chunk: str) -> None:
-        with self._tx() as conn:
-            conn.execute("INSERT INTO chunk_dispatches(chunk, at) VALUES (?, ?)", (chunk, time.time()))
 
     def chunk_failed(self, chunk: str, error: str, *, kind: str, session: str, records: Sequence[str]) -> int:
         """Record a failure of ``chunk`` with its kind, and return the streak of its
