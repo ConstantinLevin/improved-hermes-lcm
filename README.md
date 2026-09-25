@@ -25,7 +25,10 @@ failed summary (#9). The summariser reads a chunk's stored records as the messag
 full: tool calls and results whole, readable reasoning marked, images only where it reads them;
 encrypted reasoning is withheld until the plugin knows which provider produced it (#8). A
 compaction's summariser calls, one per chunk, run at once, through one limiter per endpoint
-(#33). Compaction runs
+(#33). A retry keeps the earlier attempt's cut: a chunk that was summarised keeps its summary, a
+chunk whose call was dispatched and failed is retried as the same chunk, and only the rest is cut
+again; a chunk of the same messages failing in three consecutive attempts is shown as an error
+naming it, and is still retried (#33, #7). Compaction runs
 at a threshold derived from the model's window, raised by a margin while a turn runs, and
 brings the context down to a target G (#11, #31, #32); the material outside the tail is split
 into equal chunks of 50k provider tokens (#12), and the tail takes what the target leaves,

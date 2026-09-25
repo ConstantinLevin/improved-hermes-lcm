@@ -32,9 +32,12 @@ logger = logging.getLogger(__name__)
 # doctor's invariant check reads by (chunks by session, rejections by compaction),
 # so that a store without them is never opened. Format 6 stores beside a record's
 # estimate how many of its images the estimate left uncounted
-# (``records.est_uncounted_images``, #21, #35), and the views show it; a format-5
-# store is refused and begun again (#29 W8: a change of format wipes the store).
-STORE_FORMAT = "ihl-store/6"
+# (``records.est_uncounted_images``, #21, #35), and the views show it. Format 7
+# records which chunks' calls were dispatched and which failed (``chunk_dispatches``,
+# ``chunk_failures``), for the frozen cut on a retry and the chunk that keeps failing
+# (#33 D14, #7). A store of an earlier format is refused and begun again (#29 W8: a
+# change of format wipes the store).
+STORE_FORMAT = "ihl-store/7"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -367,6 +370,24 @@ CREATE TABLE chunk_members (
     PRIMARY KEY (chunk, ordinal),
     UNIQUE (chunk, record)
 );
+CREATE INDEX idx_chunk_members_record ON chunk_members(record, ordinal);
+
+-- A chunk's summariser call reached the provider (#33 D14): a retry keeps such a
+-- chunk, found by its members, and never cuts it again.
+CREATE TABLE chunk_dispatches (
+    chunk TEXT NOT NULL REFERENCES chunks(handle),
+    at REAL NOT NULL
+);
+CREATE INDEX idx_chunk_dispatches_chunk ON chunk_dispatches(chunk);
+
+-- A chunk's call failed (#7): three consecutive attempts of the same members make
+-- the chunk that keeps failing.
+CREATE TABLE chunk_failures (
+    chunk TEXT NOT NULL REFERENCES chunks(handle),
+    at REAL NOT NULL,
+    error TEXT NOT NULL
+);
+CREATE INDEX idx_chunk_failures_chunk ON chunk_failures(chunk);
 
 CREATE TABLE derivations (
     derivation_id INTEGER PRIMARY KEY AUTOINCREMENT,

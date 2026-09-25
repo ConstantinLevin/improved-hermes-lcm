@@ -242,10 +242,15 @@ class Subscriber:
 class ChunkCall:
     """One chunk's summariser call in flight, and the attempts subscribed to it."""
 
-    def __init__(self, key: tuple, limiter: EndpointLimiter, limit: int) -> None:
+    def __init__(self, key: tuple, limiter: EndpointLimiter, limit: int,
+                 on_dispatch: Optional[Callable[[], None]] = None) -> None:
         self.key = key
         self.limiter = limiter
         self.limit = limit
+        # Told once, when the call first reaches the provider (#33 D14: a dispatched
+        # chunk is kept on a retry, never cut again).
+        self._on_dispatch = on_dispatch
+        self.dispatched = False
         self._lock = threading.Lock()
         self._subscribers: list[Subscriber] = []
         self._delivered = 0
@@ -337,6 +342,14 @@ class ChunkCall:
         try:
             if not self.still_needed():
                 raise CallAbandoned()
+            if not self.dispatched:
+                self.dispatched = True
+                if self._on_dispatch is not None:
+                    try:
+                        self._on_dispatch()
+                    except Exception as exc:
+                        logger.warning("LCM could not record that a summariser call was dispatched (%s: %s); a "
+                                       "retry cuts its chunk again", type(exc).__name__, exc)
             deadline = self.deadline()
             with _scope(_host_stream_deadline, deadline):
                 yield deadline
@@ -395,11 +408,13 @@ def join_or_start(
     reuse: Callable[[], Optional[ChunkSummary]],
     run: Callable[[ChunkCall], ChunkSummary],
     describe: Callable[[BaseException], str],
+    on_dispatch: Optional[Callable[[], None]] = None,
 ) -> str:
     """Join the call in flight for ``key``, reuse a summary already written, or start
     the call on a new daemon worker. Returns "joined", "reused", "started", or "failed"
     when the worker could not start: then no entry is registered, and the subscriber is
-    told of the failure, visibly.
+    told of the failure, visibly. ``on_dispatch`` is told when a call started here first
+    reaches the provider.
 
     ``key`` holds everything two attempts must share to share a call: the session, the
     chunk's member records in order, the summariser route and the effort (the rule a
@@ -411,7 +426,7 @@ def join_or_start(
             return "joined"
         reused = reuse()
         if reused is None:
-            call = ChunkCall(key, limiter, limit)
+            call = ChunkCall(key, limiter, limit, on_dispatch=on_dispatch)
             call.add(subscriber)
             context = contextvars.copy_context()
             try:

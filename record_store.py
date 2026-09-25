@@ -7,7 +7,8 @@ written in short transactions, none held open across a summariser call:
 1. the compaction, its inputs, a record for every input entry the store does not
    hold yet (the fresh tail included), their tool calls, and every chunk with its
    members, all before the first summariser call;
-2. each summary, as a derivation of its chunk, when it arrives;
+2. each summary, as a derivation of its chunk, when it arrives; the first dispatch of a
+   chunk's call and each failure of it, when they happen (#33 D14, #7);
 3. what the plugin returned.
 
 The host confirms a compaction with ``on_session_start(boundary_reason="compression")``
@@ -91,6 +92,22 @@ def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
         return int(left), int(right)
     except ValueError:
         return None
+
+
+@dataclass(frozen=True)
+class FrozenChunk:
+    """A chunk of an unconfirmed attempt that a retry keeps (#33 D14): its members as
+    (record, the host's ``_row_id`` when it was cut), in order, and its state,
+    "summarised" or "dispatched"."""
+
+    chunk: str
+    compaction: int
+    members: tuple
+    state: str
+
+    @property
+    def records(self) -> list[str]:
+        return [record for record, _row_id in self.members]
 
 
 @dataclass
@@ -266,18 +283,8 @@ class RecordStore:
         matched by handle, never by content."""
         if not records:
             return None
-        wanted = [str(r) for r in records]
-        candidates = self._q(
-            "SELECT m.chunk FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
-            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ?",
-            (session, wanted[0]),
-        )
-        for (chunk,) in candidates:
+        for chunk, _compaction in self._chunks_with_members(session, records):
             if chunk == exclude_chunk:
-                continue
-            members = [str(r) for (r,) in self._q(
-                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
-            if members != wanted:
                 continue
             rows = self._q(
                 "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort "
@@ -292,6 +299,106 @@ class RecordStore:
                 return ChunkSummary(text=str(text), level=level, budget=budget, finish_reason=finish_reason,
                                     model=model_, provider=provider_, effort=effort_)
         return None
+
+    def _chunks_with_members(self, session: str, records: Sequence[str]) -> list[tuple[str, int]]:
+        """(chunk, compaction) of every chunk of the session with exactly these member
+        records, in this order, newest compaction first. By handle, never by content."""
+        wanted = [str(r) for r in records]
+        if not wanted:
+            return []
+        found: list[tuple[str, int]] = []
+        for chunk, compaction in self._q(
+            "SELECT m.chunk, ch.compaction FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
+            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ? ORDER BY ch.compaction DESC, ch.rowid DESC",
+            (session, wanted[0]),
+        ):
+            members = [str(r) for (r,) in self._q(
+                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
+            if members == wanted:
+                found.append((str(chunk), int(compaction)))
+        return found
+
+    def _summarised(self, chunk: str) -> bool:
+        return bool(self._q(
+            "SELECT 1 FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
+            "WHERE s.chunk = ? AND d.kind = 'summary' LIMIT 1", (chunk,)))
+
+    def _dispatched(self, chunk: str) -> bool:
+        return bool(self._q("SELECT 1 FROM chunk_dispatches WHERE chunk = ? LIMIT 1", (chunk,)))
+
+    def _failed(self, chunk: str) -> bool:
+        return bool(self._q("SELECT 1 FROM chunk_failures WHERE chunk = ? LIMIT 1", (chunk,)))
+
+    def chunk_state(self, session: str, records: Sequence[str]) -> Optional[str]:
+        """The state of a set of members over every chunk of the session that held
+        exactly them (#33 D14): "summarised" where one of them has a summary,
+        "dispatched" where a call for one of them reached the provider, else None
+        (never dispatched: its rows are cut again)."""
+        chunks = [chunk for chunk, _ in self._chunks_with_members(session, records)]
+        if any(self._summarised(chunk) for chunk in chunks):
+            return "summarised"
+        if any(self._dispatched(chunk) for chunk in chunks):
+            return "dispatched"
+        return None
+
+    def frozen_chunks(self, session: str, after: Optional[int]) -> list[FrozenChunk]:
+        """The chunks a retry keeps (#33 D14, #31): those of the session's attempts
+        after its effective compaction that the host neither confirmed, adopted nor
+        rejected, whose members were summarised or dispatched, the newest attempt's cut
+        first; a chunk that shares a record with one already taken is left out. Each
+        member carries the ``_row_id`` its row had in that attempt's list: ids hold
+        until a commit (#29 W2 step 8), so the retry recognises the chunk by identity."""
+        compactions = [int(c) for (c,) in self._q(
+            "SELECT c.compaction_id FROM compactions c WHERE c.session = ? AND c.compaction_id > ? "
+            "AND NOT EXISTS (SELECT 1 FROM confirmations f WHERE f.compaction = c.compaction_id) "
+            "AND NOT EXISTS (SELECT 1 FROM adoptions a WHERE a.compaction = c.compaction_id) "
+            "AND NOT EXISTS (SELECT 1 FROM rejections r WHERE r.compaction = c.compaction_id) "
+            "ORDER BY c.compaction_id DESC",
+            (session, after or 0),
+        )]
+        taken: set = set()
+        frozen: list[FrozenChunk] = []
+        for compaction in compactions:
+            for (chunk,) in self._q("SELECT handle FROM chunks WHERE compaction = ? ORDER BY rowid", (compaction,)):
+                members = tuple(
+                    (str(record), int(row_id) if row_id is not None else None)
+                    for record, row_id in self._q(
+                        "SELECT m.record, (SELECT i.host_row_id FROM compaction_inputs i WHERE i.compaction = ? "
+                        "AND i.record = m.record ORDER BY i.position LIMIT 1) "
+                        "FROM chunk_members m WHERE m.chunk = ? ORDER BY m.ordinal",
+                        (compaction, chunk),
+                    )
+                )
+                records = [record for record, _ in members]
+                if not records or taken.intersection(records):
+                    continue
+                state = self.chunk_state(session, records)
+                if state is None:
+                    continue
+                taken.update(records)
+                frozen.append(FrozenChunk(str(chunk), compaction, members, state))
+        return frozen
+
+    def failure_streak(self, session: str, records: Sequence[str]) -> int:
+        """In how many consecutive attempts, the newest first, a chunk of exactly these
+        members failed (#7, #33): a summary ends the streak; an attempt whose call never
+        reached an outcome (cancelled, abandoned) neither counts nor ends it."""
+        streak = 0
+        for chunk, _compaction in self._chunks_with_members(session, records):
+            if self._summarised(chunk):
+                break
+            if self._failed(chunk):
+                streak += 1
+        return streak
+
+    def chunk_dispatched(self, chunk: str) -> None:
+        with self._tx() as conn:
+            conn.execute("INSERT INTO chunk_dispatches(chunk, at) VALUES (?, ?)", (chunk, time.time()))
+
+    def chunk_failed(self, chunk: str, error: str) -> None:
+        with self._tx() as conn:
+            conn.execute("INSERT INTO chunk_failures(chunk, at, error) VALUES (?, ?, ?)",
+                         (chunk, time.time(), str(error)))
 
     def is_settled(self, compaction: int) -> bool:
         """Confirmed, adopted or rejected: the host's handling of it is known."""
