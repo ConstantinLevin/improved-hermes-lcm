@@ -60,6 +60,118 @@ class StoreRefusedError(RuntimeError):
     """
 
 
+class StoreClosedError(RuntimeError):
+    """A connection to the store was used after it was closed. A closed handle is
+    never reused or reopened in place; the message names the store and why it was
+    closed."""
+
+
+class ClosedConnection:
+    """What a store helper holds once its connection is closed. It is false, and every
+    use raises :class:`StoreClosedError`, so a closed handle is never reused."""
+
+    def __init__(self, db_path: str | Path, reason: str):
+        self._db_path = str(db_path)
+        self._reason = reason
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __getattr__(self, name: str):
+        raise StoreClosedError(
+            f"LCM's connection to the store at {self._db_path} was closed ({self._reason}); "
+            f"a closed handle is never reused"
+        )
+
+
+class FetchedCursor:
+    """The rows of one statement, fetched in full while the helper's lock was held."""
+
+    def __init__(self, rows: list, description, rowcount: int, lastrowid):
+        self._rows = rows
+        self._next = 0
+        self.description = description
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        if self._next >= len(self._rows):
+            return None
+        row = self._rows[self._next]
+        self._next += 1
+        return row
+
+    def fetchmany(self, size: int = 1) -> list:
+        rows = self._rows[self._next:self._next + size]
+        self._next += len(rows)
+        return rows
+
+    def fetchall(self) -> list:
+        rows = self._rows[self._next:]
+        self._next = len(self._rows)
+        return rows
+
+    def __iter__(self):
+        while (row := self.fetchone()) is not None:
+            yield row
+
+
+class LockedConnection:
+    """A store helper's connection as its readers use it.
+
+    Every call runs under the lock the helper's ``close()`` takes, and ``execute``
+    returns its rows fetched in full under that lock. So a close never lands between
+    a statement and its rows: it waits for the read, or the read comes after it and
+    raises :class:`StoreClosedError` (the closed connection's own error).
+    """
+
+    def __init__(self, get_conn, lock):
+        self._get_conn = get_conn
+        self._lock = lock
+
+    def __bool__(self) -> bool:
+        return bool(self._get_conn())
+
+    def execute(self, sql: str, parameters=()) -> FetchedCursor:
+        with self._lock:
+            cursor = self._get_conn().execute(sql, parameters)
+            rows = cursor.fetchall()
+            return FetchedCursor(rows, cursor.description, cursor.rowcount, cursor.lastrowid)
+
+    def __getattr__(self, name: str):
+        with self._lock:
+            value = getattr(self._get_conn(), name)
+        if not callable(value):
+            return value
+
+        def locked_call(*args, **kwargs):
+            with self._lock:
+                return getattr(self._get_conn(), name)(*args, **kwargs)
+        return locked_call
+
+
+def close_connection(conn, *, db_path: str | Path, reason: str, owner: str) -> ClosedConnection:
+    """Close one store connection and return what stands in its place.
+
+    A transaction still open on it is rolled back, and that is logged at WARNING:
+    nothing is rolled back silently. Closing an already closed connection changes
+    nothing.
+    """
+    if isinstance(conn, ClosedConnection):
+        return conn
+    if conn is not None:
+        try:
+            if conn.in_transaction:
+                logger.warning(
+                    "LCM rolled back an open transaction of %s on the store at %s while closing it (%s)",
+                    owner, db_path, reason,
+                )
+                conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+    return ClosedConnection(db_path, reason)
+
+
 def _refuse(path: str | Path, reason: str) -> StoreRefusedError:
     message = (
         f"LCM refuses the database at {path}: {reason}. Nothing in it was read or "

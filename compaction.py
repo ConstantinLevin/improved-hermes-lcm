@@ -255,6 +255,12 @@ class CompactionMixin:
                        focus_topic: Optional[str] = None,
                        force: bool = False) -> List[Dict[str, Any]]:
         attempt = _ATTEMPT.get()
+        if self._closed_reason is not None:
+            return self._abort(
+                messages,
+                f"LCM's store connections of this engine were closed ({self._closed_reason}); "
+                f"a closed engine is never reused",
+            )
         if not messages:
             return self._unchanged_return(messages, "empty message list")
         started = time.perf_counter()

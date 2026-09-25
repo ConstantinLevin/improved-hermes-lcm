@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .db_bootstrap import open_store
+from .db_bootstrap import close_connection, open_store
 from .handles import SESSION, new_handle
 
 logger = logging.getLogger(__name__)
@@ -51,25 +51,28 @@ class PluginSessions:
             self._conn = None
             raise
 
-    def close(self) -> None:
-        conn = self._conn
-        if conn is not None:
-            conn.close()
-            self._conn = None
+    def close(self, reason: str = "closed") -> None:
+        """Close the connection once a session write on another thread (a hook's) has
+        finished (the helper's lock). Later use raises."""
+        with self._lock:
+            self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the sessions")
 
     def find(self, host_session_id: str) -> Optional[str]:
-        row = self._conn.execute(
-            "SELECT handle FROM sessions WHERE host_session_id = ?",
-            (host_session_id,),
-        ).fetchone()
-        if row:
-            return str(row[0])
-        row = self._conn.execute(
-            "SELECT c.session FROM confirmations f JOIN compactions c ON c.compaction_id = f.compaction "
-            "WHERE f.host_session_after = ? ORDER BY f.compaction DESC LIMIT 1",
-            (host_session_id,),
-        ).fetchone()
-        return str(row[0]) if row else None
+        # Under the lock close() takes: a close waits for the read, or the read
+        # raises StoreClosedError.
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT handle FROM sessions WHERE host_session_id = ?",
+                (host_session_id,),
+            ).fetchone()
+            if row:
+                return str(row[0])
+            row = self._conn.execute(
+                "SELECT c.session FROM confirmations f JOIN compactions c ON c.compaction_id = f.compaction "
+                "WHERE f.host_session_after = ? ORDER BY f.compaction DESC LIMIT 1",
+                (host_session_id,),
+            ).fetchone()
+            return str(row[0]) if row else None
 
     def name_session(
         self,

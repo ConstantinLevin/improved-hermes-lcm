@@ -135,6 +135,17 @@ def register(ctx):
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
 
+    # At unload (a forced rediscovery, the plugin doctor's load) the host drops this
+    # engine and the next register() builds another; its store connections close with
+    # it. The copies the host made for its agents stay open: they belong to those
+    # agents, and a running session keeps its store (#20).
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        def _close_registered_engine() -> None:
+            engine.close("the plugin was unloaded")
+
+        on_unload(_close_registered_engine)
+
     # Ship the same recall contract through both Hermes plugin skill
     # registration (explicit qualified loads) and the installer's ordinary
     # profile skill link (normal discovery). Older hosts simply lack this
