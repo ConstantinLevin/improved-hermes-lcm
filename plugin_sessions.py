@@ -74,6 +74,15 @@ class PluginSessions:
             ).fetchone()
             return str(row[0]) if row else None
 
+    def latest_fact(self, session: str, kind: str) -> Optional[str]:
+        """The value of the newest fact of one kind about a plugin session, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM session_facts WHERE session = ? AND kind = ? ORDER BY fact_id DESC LIMIT 1",
+                (session, kind),
+            ).fetchone()
+            return str(row[0]) if row else None
+
     def name_session(
         self,
         host_session_id: str,

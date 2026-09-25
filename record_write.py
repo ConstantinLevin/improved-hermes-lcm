@@ -426,15 +426,21 @@ class RecordWriteMixin:
         budget: Optional[int],
         expand_hint: Optional[str],
         finish_reason: Optional[str] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        effort: Optional[str] = None,
     ) -> str:
         """A summary as a derivation of its chunk, in its own transaction; raises when
-        the write fails. ``finish_reason`` is the provider's, as the host reported it."""
+        the write fails. Its provenance: the model and provider that wrote it (the
+        summariser's route, which the host's ``route_info`` confirmed), the reasoning
+        effort asked for, and the provider's ``finish_reason`` as the host reported it."""
         return self._records.write_derivation(
             compaction=attempt.compaction,
             chunk=chunk,
             text=text,
-            model=self._config.summary_model or None,
-            provider=None,
+            model=model,
+            provider=provider,
+            effort=effort,
             level=level,
             budget=budget,
             est_tokens=count_tokens(text),

@@ -28,6 +28,7 @@ from .engine_registry import (
     _remove_registry_entries_for_engine,
     resolve_active_lcm_engine,  # noqa: F401  (re-exported: hosts import it from .engine)
 )
+from .escalation import configured_route_problem
 from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
@@ -138,6 +139,11 @@ class LCMEngine(
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        # A configured summariser the plugin cannot use is refused here, visibly, and
+        # every compaction aborts with the same cause (#9).
+        problem = configured_route_problem(self._config)
+        if problem is not None:
+            logger.error("LCM refuses its configured summariser: %s", problem)
         # Why this engine's store connections were closed; None while they are open.
         self._closed_reason: Optional[str] = None
 
@@ -517,6 +523,14 @@ class LCMEngine(
         for key in ("provider", "base_url", "api_key", "api_mode"):
             if key not in kwargs:
                 continue
+            if key == "api_key":
+                # Compared as the objects they are; a credential is never stringified.
+                incoming_key = kwargs.get(key) or ""
+                if ignore_empty_optional and not incoming_key:
+                    continue
+                if incoming_key != (self.api_key or ""):
+                    return False
+                continue
             incoming = str(kwargs.get(key) or "")
             if ignore_empty_optional and not incoming:
                 continue
@@ -703,9 +717,12 @@ class LCMEngine(
         if "model" in kwargs:
             self.model = str(kwargs.get("model") or "")
         route_affects_context = "model" in kwargs or "provider" in kwargs
-        for key in ("base_url", "api_key", "provider", "api_mode"):
+        for key in ("base_url", "provider", "api_mode"):
             if key in kwargs:
                 setattr(self, key, str(kwargs.get(key) or ""))
+        if "api_key" in kwargs:
+            # A credential passes through as the host gave it, never stringified.
+            self.api_key = kwargs.get("api_key") or ""
         if (
             "context_length" not in kwargs
             and route_affects_context
@@ -954,7 +971,9 @@ class LCMEngine(
                      api_mode: str = "") -> None:
         self.model = str(model or "")
         self.base_url = str(base_url or "")
-        self.api_key = str(api_key or "")
+        # The credential exactly as the host gave it: a string, or a callable the host
+        # resolves itself (key_cmd, Entra). Never stringified, never called here (#9).
+        self.api_key = api_key if api_key else ""
         self.provider = str(provider or "")
         self.api_mode = str(api_mode or "")
         self._set_context_length(context_length, source="update_model")

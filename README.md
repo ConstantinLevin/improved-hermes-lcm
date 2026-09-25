@@ -18,7 +18,10 @@ gets six tools. The store and the compaction path are the fork's: the plugin kee
 record, filled at each compaction from what the host hands over, verbatim, and the context a
 compaction returns is emitted from that record (#29, #1, #3). A summary that cannot be written
 fails the compaction: nothing is truncated in its place, the context stays as it was, the host
-shows the cause, and compaction is tried again at the next occasion (#7). The rest of its behaviour is
+shows the cause, and compaction is tried again at the next occasion (#7). The summariser is the
+model running the session, called on the route the host names for it, unless another is
+configured (`LCM_SUMMARY_MODEL` with `LCM_SUMMARY_PROVIDER`); a reply from any other model is a
+failed summary (#9). The rest of its behaviour is
 upstream's, including every loss listed below. The fork is not usable for its purpose yet; the
 work is the issues in this repository's tracker.
 
@@ -30,10 +33,6 @@ Each line was read in this tree's code.
   characters is cut to its first 2,000 and its last 800, and every tool call's arguments over 500
   characters to their first 400 (`engine.py`, `_serialize_messages`). The fork's summariser will
   read the store's originals in full (#8).
-- **Summarises with the host's auxiliary model.** The summariser calls the host's auxiliary client
-  for the task "compression"; with no `summary_model` configured, the host picks the model
-  (`escalation.py`, `config.py`). The fork's summariser will default to the model running the
-  session (#9).
 - **Sizes the fresh tail by message count.** The verbatim tail is the newest 32 messages; a token
   cap exists but is off by default (`fresh_tail.py`, `config.py`). The fork will size the tail in
   tokens, as a weight of the real window (#13).

@@ -1,4 +1,14 @@
-"""The summariser call for one chunk (#7).
+"""The summariser call for one chunk (#7, #9).
+
+The call names its whole route: provider, model, base URL, key and API mode, either
+the session's own as the host handed it to ``update_model`` or the one configured for
+the plugin (#9). It is made with no host task name (R8), so none of the host's
+``auxiliary.<task>`` settings reach it, with the reasoning effort passed through the
+host's ``reasoning_config``, and with ``route_info``, which the host fills with the
+route that answered. A reply from any other model than the summariser is a failure
+(#33 D9): the host's fallback ladder answers a timeout, a rate limit or another
+capacity error with the main agent's model or a configured fallback, and says so only
+there. When the main agent's model is the summariser, its answer is the summariser's.
 
 Two levels, each one call to the summariser with today's prompt text (#10 owns the
 texts): level 1 asks for a summary near the target budget; level 2, with today's
@@ -10,15 +20,16 @@ next occasion ("Ending in truncation"; "Lossless, precisely").
 What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 
 - the call raises (a rate limit, a timeout, a connection or provider error);
+- another model answered (``route_info`` names another provider or model);
 - the reply has no ``choices[0].message`` (malformed), or its ``content`` is empty;
 - the provider stopped the reply at its output limit (``finish_reason == "length"``);
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
 
-The budget is a target in the prompt text only. No ``max_tokens`` is passed, so the
-plugin never cuts a summary at an output limit of its own; a reply the provider cut at
-its default limit reports ``length`` and fails (#7; the output cap from the model table
-replaces this with #9). Where the host rewrites a missing finish reason to "stop" (its
+The budget is a target in the prompt text only. ``max_tokens`` is the summariser
+model's own output cap where the model table knows it (R5 b), and absent otherwise, so
+the plugin never cuts a summary at an output limit of its own; a reply stopped at the
+limit reports ``length`` and fails (#7). Where the host rewrites a missing finish reason to "stop" (its
 Codex adapter always; its streamed collector when no chunk carried one), a cut reply
 can still pass: that is the host's, and asked of Hermes (A-7.1).
 
@@ -38,9 +49,9 @@ import email.utils
 import logging
 import random
 import time
-from typing import Any, Callable, Mapping, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Mapping, Optional
 
-from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 from .tokens import count_tokens
 
@@ -59,6 +70,165 @@ _BACKOFF_CAP_S = 30.0
 _TRANSIENT_STATUS = frozenset({408, 409, 429})
 # With no host deadline: 2, 4, 8, 16, 30, 30 s, then stop (the cap reached a second time).
 _NO_DEADLINE_RETRIES = 6
+
+
+# The levels the host's reasoning setting takes (``auxiliary.<task>.reasoning_effort``).
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+
+
+@dataclass(frozen=True)
+class SummariserRoute:
+    """The summariser's whole route, explicit at every call (#9). ``source`` says where
+    it came from: ``session`` (the host's ``update_model``) or ``configured``."""
+
+    provider: str
+    model: str
+    base_url: str = ""
+    # As the host or the configuration gave it: a string, or a callable the host
+    # resolves itself (it passes such callables through uncalled, ``_normalize_api_key``,
+    # agent/auxiliary_client.py at 7b761da). Never stringified, never shown.
+    api_key: Any = field(default="", repr=False)
+    api_mode: str = ""
+    source: str = "session"
+    # A labelled fact about the endpoint, recorded with the summary's provenance:
+    # "the session's <provider> endpoint" when the session's route is called in the
+    # host's custom form, "endpoint: resolved by the host" when it is passed as given
+    # to a host branch that ignores an explicit base URL (ask A-9.2).
+    endpoint_note: str = ""
+
+    def provenance_provider(self) -> str:
+        return f"{self.provider} [{self.endpoint_note}]" if self.endpoint_note else self.provider
+
+    def call_kwargs(self) -> dict[str, Any]:
+        fields = {"provider": self.provider, "model": self.model, "base_url": self.base_url,
+                  "api_key": self.api_key, "api_mode": self.api_mode}
+        return {key: value for key, value in fields.items() if value}
+
+    def describe(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+
+# Providers whose client the host builds without an explicit base URL, read in
+# agent/auxiliary_client.py at Hermes 7b761da (``resolve_provider_client`` and its
+# branches). For these the host sends the chunk and the key to an endpoint of its own
+# choosing, whatever base URL the call names.
+_HOST_IGNORES_BASE_URL = {
+    "auto": "the host's auto branch picks a provider and endpoint itself (_resolve_auto_branch)",
+    "openrouter": "the host's OpenRouter branch uses its own OpenRouter base URL (_resolve_openrouter_branch, "
+                  "_try_openrouter)",
+    "nous": "the host's Nous branch uses the Nous portal's endpoint (_resolve_nous_branch)",
+    "openai-codex": "the host's Codex branch uses the Codex endpoint or its own override "
+                    "(_resolve_openai_codex_branch)",
+    "xai-oauth": "the host's xAI OAuth branch uses its own endpoint (_resolve_xai_oauth_branch)",
+    "anthropic": "the host sends anthropic to _try_anthropic, which takes only a key and chooses the endpoint "
+                 "itself (_resolve_api_key_branch)",
+}
+_HONOURING_FORM = ("provider custom with LCM_SUMMARY_API_MODE set to the endpoint's wire "
+                   "(chat_completions, anthropic_messages or codex_responses) and this base URL; "
+                   "the host's custom branch sends to exactly that URL (_resolve_custom_branch)")
+
+
+def _host_provider(provider: str) -> Optional[str]:
+    """The provider as the host's resolver dispatches on it (``_normalize_aux_provider``,
+    agent/auxiliary_client.py at 7b761da), or None when the host cannot be read."""
+    try:
+        from agent.auxiliary_client import _normalize_aux_provider  # type: ignore
+        return str(_normalize_aux_provider(provider))
+    except Exception:
+        return None
+
+
+def host_ignores_base_url(provider: str) -> Optional[str]:
+    """How the host treats an explicit base URL for ``provider``: None where it honours
+    it, else what it does instead."""
+    dispatched = _host_provider(provider)
+    if dispatched is None:
+        return "the host's provider resolution could not be read, so where it sends the call is not known"
+    if dispatched in _HOST_IGNORES_BASE_URL:
+        return _HOST_IGNORES_BASE_URL[dispatched]
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY  # type: ignore
+        pconfig = PROVIDER_REGISTRY.get(dispatched)
+    except Exception:
+        pconfig = None
+    auth_type = getattr(pconfig, "auth_type", None)
+    if pconfig is not None and auth_type != "api_key":
+        return (f"the host builds {dispatched}'s client from its own {auth_type} credentials and endpoint "
+                f"(_resolve_registry_branch)")
+    return None
+
+
+# The wires the host's custom branch speaks to an explicit base URL
+# (``resolve_provider_client``: api_mode forces codex_responses, chat_completions or
+# anthropic_messages; agent/auxiliary_client.py at 7b761da).
+_CUSTOM_WIRES = frozenset({"chat_completions", "codex_responses", "anthropic_messages"})
+
+
+def _host_api_mode(api_mode: str) -> str:
+    """The session's API mode as the host names its wire (``_canonical_api_mode``,
+    hermes_cli/config_providers.py at 7b761da)."""
+    try:
+        from hermes_cli.config_providers import _canonical_api_mode  # type: ignore
+        return str(_canonical_api_mode(str(api_mode or ""))).lower()
+    except Exception:
+        return str(api_mode or "").strip().lower()
+
+
+def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mode: str) -> SummariserRoute:
+    """The session's own route as the summariser's (the orchestrator's ruling on #54).
+
+    The summariser is the session's model on the endpoint the session itself uses,
+    which the host named in ``update_model``. Where the host's branch for the provider
+    would ignore that base URL, the route is called in the form the host honours:
+    provider custom, the session's base URL, its wire, and the same key object. Where
+    it cannot be expressed that way (no key the plugin holds, or a wire the custom
+    branch does not speak), it is passed as given, and the summary's provenance says
+    the host resolved the endpoint."""
+    route = SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
+                            api_mode=api_mode, source="session")
+    if not base_url or host_ignores_base_url(provider) is None:
+        return route
+    wire = _host_api_mode(api_mode)
+    has_key = callable(api_key) or (isinstance(api_key, str) and bool(api_key.strip()))
+    if has_key and wire in _CUSTOM_WIRES:
+        return SummariserRoute(provider="custom", model=model, base_url=base_url, api_key=api_key,
+                               api_mode=wire, source="session",
+                               endpoint_note=f"the session's {provider} endpoint")
+    return SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
+                           api_mode=api_mode, source="session", endpoint_note="endpoint: resolved by the host")
+
+
+def _control_characters(value: str) -> bool:
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def configured_route_problem(config: Any) -> Optional[str]:
+    """Why the plugin's configured summariser cannot be used, or None (#9). Checked when
+    the configuration is loaded; every compaction then aborts with this cause."""
+    model = str(getattr(config, "summary_model", "") or "").strip()
+    provider = str(getattr(config, "summary_provider", "") or "").strip()
+    base_url = str(getattr(config, "summary_base_url", "") or "").strip()
+    api_key = getattr(config, "summary_api_key", "") or ""
+    effort = str(getattr(config, "summary_reasoning_effort", "") or "").strip().lower()
+    if effort not in REASONING_EFFORTS:
+        return (f"LCM_SUMMARY_REASONING_EFFORT {effort!r} is not one of the host's levels "
+                f"({', '.join(sorted(REASONING_EFFORTS))})")
+    if isinstance(api_key, str) and _control_characters(api_key):
+        return "LCM_SUMMARY_API_KEY contains a newline or another control character"
+    if not (model or provider or base_url or api_key):
+        return None
+    if not (model and provider):
+        return ("the configured summariser is incomplete: LCM_SUMMARY_MODEL and LCM_SUMMARY_PROVIDER are "
+                "set together or not at all")
+    if _host_provider(provider) == "custom" and not base_url:
+        return ("the configured summariser names provider custom without LCM_SUMMARY_BASE_URL: the host would "
+                "borrow an endpoint of its own (the session's), which the configuration did not name")
+    if base_url:
+        ignored = host_ignores_base_url(provider)
+        if ignored is not None:
+            return (f"the configured summariser names provider {provider} with LCM_SUMMARY_BASE_URL, and the host "
+                    f"does not honour an explicit base URL there: {ignored}. The form that does: {_HONOURING_FORM}")
+    return None
 
 
 class SummaryFailure(Exception):
@@ -134,26 +304,115 @@ def _default_wait(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _call_once(messages: list[dict[str, Any]], *, model: str, timeout: Optional[float]) -> tuple[str, str]:
+@dataclass(frozen=True)
+class CallSettings:
+    """Everything one summariser call is made with, the same at both levels."""
+
+    route: SummariserRoute
+    effort: str
+    max_tokens: Optional[int] = None
+    timeout: Optional[float] = None
+    # Every secret the plugin knows by value (the route's key when it is a string, the
+    # configured key): removed from any text that is logged, stored or shown.
+    secrets: tuple = field(default=(), repr=False)
+
+    def scrub(self, text: str) -> str:
+        return scrub(text, self.secrets)
+
+
+def scrub(text: str, secrets: Iterable[Any]) -> str:
+    """``text`` with every known secret removed by its exact value. A callable
+    credential has no value the plugin knows (it never calls it); the host's
+    RedactingFormatter stays the net for what reaches its logs."""
+    for secret in secrets:
+        if isinstance(secret, str) and secret:
+            text = text.replace(secret, "[secret removed]")
+    return text
+
+
+def failure_text(exc: BaseException, secrets: Iterable[Any]) -> str:
+    """An exception as one line to log, store or show: its class and its message with
+    every known secret removed. Never a traceback, which could carry request headers."""
+    return scrub(f"{type(exc).__name__}: {exc}", secrets)
+
+
+class _RouteRecord(dict):
+    """``route_info`` that keeps every route the host writes into it (#33 D9): the host
+    records the route it resolved for this call before the request, and records each
+    fallback candidate again (``_record_route_info``, agent/auxiliary_client.py at
+    7b761da). The first is the host's own resolution of the summariser's route; the last
+    is the route that answered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.routes: list[tuple[str, str]] = []
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        super().__setitem__(key, value)
+        if key == "model":
+            self.routes.append((str(self.get("provider") or "").strip(), str(value or "").strip()))
+
+
+def _host_model_forms(model: str, provider: str) -> set[str]:
+    """The model id as asked for, and as the host normalises it for the provider that
+    receives it (``_normalize_resolved_model``, agent/auxiliary_client.py at 7b761da)."""
+    forms = {model.strip()}
+    try:
+        from agent.auxiliary_client import _normalize_resolved_model  # type: ignore
+        normalised = _normalize_resolved_model(model, provider)
+        if isinstance(normalised, str) and normalised.strip():
+            forms.add(normalised.strip())
+    except Exception:
+        pass
+    return forms
+
+
+def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[str, str]:
     """One call through the host. Returns (content, finish_reason); raises on any
-    failure of the call or the reply's shape."""
+    failure of the call, a reply from another model, or a reply of the wrong shape."""
     from agent.auxiliary_client import call_llm
 
+    route = settings.route
+    route_info = _RouteRecord()
     call_kwargs: dict[str, Any] = {
-        "task": "compression",
+        "task": None,
         "messages": messages,
         "temperature": 0.3,
+        "reasoning_config": {"enabled": settings.effort != "none", "effort": settings.effort},
+        "route_info": route_info,
+        **route.call_kwargs(),
     }
-    apply_lcm_model_route(call_kwargs, model)
-    if timeout is not None:
-        call_kwargs["timeout"] = timeout
+    if settings.max_tokens:
+        call_kwargs["max_tokens"] = settings.max_tokens
+    if settings.timeout is not None:
+        call_kwargs["timeout"] = settings.timeout
     response = call_llm(**call_kwargs)
+    # D9, by the host's own resolution of this route, never by an alias table of the
+    # plugin's: the host's label for a provider is not its normalised name (an explicit
+    # "openai" route with a base URL is recorded as "custom", "x-ai" as "x-ai").
+    if not route_info.routes:
+        raise SummaryFailure("reply on an unknown route", transient=False,
+                             detail="the host recorded no route in route_info (#33 D9)")
+    resolved, answered = route_info.routes[0], route_info.routes[-1]
+    if resolved[1] not in _host_model_forms(route.model, resolved[0]):
+        raise SummaryFailure(
+            "the host resolved the summariser's route to another model", transient=False,
+            detail=f"route_info names {resolved[0] or '?'}/{resolved[1] or '?'} for the summariser "
+                   f"{route.describe()} (#33 D9)",
+        )
+    if answered != resolved:
+        raise SummaryFailure(
+            "reply from another model", transient=False,
+            detail=f"the host's route_info names {answered[0] or '?'}/{answered[1] or '?'} as the route that "
+                   f"answered, the summariser is {route.describe()}, which the host resolved as "
+                   f"{resolved[0]}/{resolved[1]} (#33 D9)",
+        )
     try:
         choice = response.choices[0]
         message = choice.message
     except Exception as exc:
         raise SummaryFailure("malformed reply", transient=False,
-                             detail=f"no choices[0].message ({type(exc).__name__})") from exc
+                             detail=f"no choices[0].message ({type(exc).__name__})") from None
     finish_reason = getattr(choice, "finish_reason", None)
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
@@ -169,8 +428,7 @@ def _call_with_retries(
     messages: list[dict[str, Any]],
     *,
     source_tokens: int,
-    model: str,
-    timeout: Optional[float],
+    settings: CallSettings,
     wait: Callable[[float], None],
 ) -> tuple[str, str]:
     """One level: transient failures retried while the deadline allows; a reply that
@@ -179,13 +437,15 @@ def _call_with_retries(
     retries = 0
     while True:
         try:
-            content, finish_reason = _call_once(messages, model=model, timeout=timeout)
+            content, finish_reason = _call_once(messages, settings)
         except SummaryFailure:
             raise
         except Exception as exc:
+            # The exception is never logged or chained on: its request can carry the key.
+            # What leaves here is its class and message, with every known secret removed.
+            text = failure_text(exc, settings.secrets)
             if not _is_transient(exc):
-                raise SummaryFailure("summariser call failed", transient=False,
-                                     detail=f"{type(exc).__name__}: {exc}") from exc
+                raise SummaryFailure("summariser call failed", transient=False, detail=text) from None
             retry_after = _retry_after_seconds(exc)
             # The growing backoff always applies: a provider's Retry-After can only make
             # the wait longer, so a zero or expired one never makes a hot loop.
@@ -193,13 +453,11 @@ def _call_with_retries(
             deadline = _deadline()
             if deadline is not None and time.monotonic() + delay >= deadline:
                 raise SummaryFailure("summariser call failed, no time left before the host's deadline",
-                                     transient=True, detail=f"{type(exc).__name__}: {exc}",
-                                     retry_after=retry_after) from exc
+                                     transient=True, detail=text, retry_after=retry_after) from None
             if deadline is None and retries >= _NO_DEADLINE_RETRIES:
                 raise SummaryFailure("summariser call kept failing", transient=True,
-                                     detail=f"{type(exc).__name__}: {exc}", retry_after=retry_after) from exc
-            logger.warning("LCM summariser call failed transiently (%s: %s); retrying in %.1fs",
-                           type(exc).__name__, exc, delay)
+                                     detail=text, retry_after=retry_after) from None
+            logger.warning("LCM summariser call failed transiently (%s); retrying in %.1fs", text, delay)
             wait(delay)
             retries += 1
             backoff = min(_BACKOFF_CAP_S, backoff * 2)
@@ -216,9 +474,8 @@ def summarize_chunk(
     token_budget: int,
     *,
     source_tokens: int,
+    settings: CallSettings,
     depth: int = 0,
-    model: str = "",
-    timeout: Optional[float] = None,
     focus_topic: str = "",
     custom_instructions: str = "",
     source_provenance: Mapping[str, Any] | None = None,
@@ -243,7 +500,7 @@ def summarize_chunk(
     )
     try:
         content, finish_reason = _call_with_retries(
-            l1, source_tokens=source_tokens, model=model, timeout=timeout, wait=wait)
+            l1, source_tokens=source_tokens, settings=settings, wait=wait)
         return content, 1, finish_reason
     except SummaryFailure as first:
         if first.transient:
@@ -259,7 +516,7 @@ def summarize_chunk(
         )
         try:
             content, finish_reason = _call_with_retries(
-                l2, source_tokens=source_tokens, model=model, timeout=timeout, wait=wait)
+                l2, source_tokens=source_tokens, settings=settings, wait=wait)
         except SummaryFailure as second:
             raise SummaryFailure(
                 f"level 1: {first}; level 2: {second.reason}",
