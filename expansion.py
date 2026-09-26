@@ -687,10 +687,15 @@ class ImageRoom:
     reserved: tuple = (0, 0)        # (blocks, bytes) the host reserves
     share: int = 1
     note: str = ""
+    limit: Optional[int] = None     # the host's OUTBOUND_IMAGE_LIMIT
+    budget: Optional[int] = None    # the host's OUTBOUND_IMAGE_BUDGET_BYTES
+
+    def _retired(self, carriers: list) -> int:
+        return self.retire([b for b, _s in carriers], self.reserved[0],
+                           carrier_bytes_newest_first=[s for _b, s in carriers], reserved_bytes=self.reserved[1])
 
     def baseline(self) -> int:
-        return self.retire([b for b, _s in self.older], self.reserved[0],
-                           carrier_bytes_newest_first=[s for _b, s in self.older], reserved_bytes=self.reserved[1])
+        return self._retired(list(self.older))
 
     def admits(self, images: list) -> bool:
         if not images:
@@ -698,18 +703,44 @@ class ImageRoom:
         if self.retire is None or self.measure is None:
             return len(images) <= 1
         blocks, size = self.measure({"role": "tool", "content": list(images)})
-        carriers = [(blocks, size)] * self.share + list(self.older)
-        retired = self.retire([b for b, _s in carriers], self.reserved[0],
-                              carrier_bytes_newest_first=[s for _b, s in carriers], reserved_bytes=self.reserved[1])
-        return retired <= self.baseline()
+        return self._retired([(blocks, size)] * self.share + list(self.older)) <= self.baseline()
 
-    def why_not(self) -> str:
-        shared = (f", shared with {self.share - 1} more {'call' if self.share == 2 else 'calls'} of this tool in "
-                  f"this message") if self.share > 1 else ""
-        reserved, older = self.reserved[0], sum(b for b, _s in self.older)
-        return (f"not shown: the host's send path has no room for it in this request without retiring earlier "
-                f"images ({reserved} {'image' if reserved == 1 else 'images'} it reserves and {older} in earlier "
-                f"results stand in it{shared}); it stays in the store under this handle")
+    def why_not(self, image: dict, handle: str, media: str) -> str:
+        """Why an image that no page can carry now is held: what the host's own function
+        would do with the page added (ruling on the pre-review of 0771477, B)."""
+        blocks, size = self.measure({"role": "tool", "content": [image]})
+        if self.budget is not None and size > self.budget:
+            # The host strips it whatever else the request holds.
+            return (f"not shown: this image is {size} bytes as the host measures it, over the host's budget of "
+                    f"{self.budget} bytes for the images of one request, so the host's send path would strip it "
+                    f"from any page; no page can carry this image in this host. The store still holds it: {media}, "
+                    f"{size} bytes, in message {handle}")
+        if self._retired([(blocks, size)]) > 0:
+            # With no earlier carrier at all the host would still retire the page: the images
+            # it reserves (uploads, which it never retires) fill the ceiling.
+            count, taken = self.reserved
+            if self.limit is not None and count + blocks > self.limit:
+                return (f"not shown: the {count} images the host reserves in this request (uploads, which it never "
+                        f"retires) fill its ceiling of {self.limit} images, so the host would retire this page; the "
+                        f"image shows once those uploads leave the context")
+            return (f"not shown: the images the host reserves in this request (uploads, which it never retires) take "
+                    f"{taken} bytes of its budget of {self.budget}, which leaves no room for this image's {size} "
+                    f"bytes, so the host would retire this page; the image shows once those uploads leave the context")
+        carriers = [(blocks, size)] * self.share + list(self.older)
+        retired, base = self._retired(carriers), self.baseline()
+        # The host retires the oldest carriers first; the list is newest first, so the ones
+        # this page adds to the retirement are those just before the ones retired anyway.
+        extra = range(len(carriers) - retired, len(carriers) - base)
+        if any(i >= self.share for i in extra):
+            shared = (f", shared with {self.share - 1} more {'call' if self.share == 2 else 'calls'} of this tool "
+                      f"in this message") if self.share > 1 else ""
+            reserved, older = self.reserved[0], sum(b for b, _s in self.older)
+            return (f"not shown: the host's send path has no room for it in this request without retiring earlier "
+                    f"images ({reserved} {'image' if reserved == 1 else 'images'} it reserves and {older} in earlier "
+                    f"results stand in it{shared}); it stays in the store under this handle")
+        return (f"not shown: the {self.share} calls of this tool in this message share the room left in this "
+                f"request, and this image does not fit this call's share; the host would retire one of these "
+                f"pages; it stays in the store under this handle")
 
 
 _OTHER_CALLS_NOTE = ("the host may retire this page's images if other results of this turn carry images; expand "
@@ -720,7 +751,11 @@ def host_image_room(messages: Any, tool_name: str) -> ImageRoom:
     """The ``ImageRoom`` of this call, from the live list and the host's own functions."""
     try:
         from agent.context_compressor import _image_payload  # type: ignore
-        from agent.image_eviction_policy import outbound_image_retire_count  # type: ignore
+        from agent.image_eviction_policy import (  # type: ignore
+            OUTBOUND_IMAGE_BUDGET_BYTES,
+            OUTBOUND_IMAGE_LIMIT,
+            outbound_image_retire_count,
+        )
         call_variants, result_variants, _coalesce = host_pairing.host_alias_helpers()
         if not isinstance(messages, list):
             raise ValueError("no message list")
@@ -749,7 +784,8 @@ def host_image_room(messages: Any, tool_name: str) -> ImageRoom:
         ours = sum(1 for call in pending if _call_parts(call)[0] == tool_name)
         others = len(pending) - ours
         return ImageRoom(outbound_image_retire_count, _image_payload, tuple(older), tuple(reserved),
-                         max(1, ours), _OTHER_CALLS_NOTE if others else "")
+                         max(1, ours), _OTHER_CALLS_NOTE if others else "", int(OUTBOUND_IMAGE_LIMIT),
+                         int(OUTBOUND_IMAGE_BUDGET_BYTES))
     except Exception as exc:
         return ImageRoom(None, None, note=f"the host's send-path image ceiling cannot be read ({type(exc).__name__}: "
                                           f"{exc}), so this page carries at most one image")
@@ -853,7 +889,8 @@ class PageBuilder:
                     if not self._room_alone(piece):
                         # The request has no room for it even alone: marked, never sent
                         # to be retired unseen (``ImageRoom``).
-                        piece["held"] = self.image_room.why_not()
+                        piece["held"] = self.image_room.why_not(canonical_image_part(value)[0], str(item.get("handle")),
+                                                                image_media_type(value))
                         if not self.fits(page_items + [piece], page) and page_items:
                             break
                     # An image larger than a page, or one no rule counts, stands alone.

@@ -3,7 +3,8 @@
 A store is a database this plugin created. It carries one ``store_identity`` row
 written at creation. A database without that row, or with another format, was not
 written by this plugin and is refused: nothing in it is read or changed. There are no
-migrations; a change of format means the store is begun again.
+migrations; a change of format means the store is begun again, in a file of its own
+(``store_path``): the store of another format is left beside it as it was.
 
 The whole schema is created once per database, in one transaction, when the plugin
 creates the store. Opening an existing store runs no DDL; it only checks the identity
@@ -40,8 +41,8 @@ logger = logging.getLogger(__name__)
 # frozen cut reads inside the planning transaction. Formats 7 to 9 were written only
 # by unmerged commits of #61 (7 and 8 with a ``chunk_dispatches`` table, 9 without
 # that index); opening runs no DDL, so each layout has its own name and is refused.
-# A store of an earlier format is refused and begun again (#29 W8: a change of format
-# wipes the store). Format 11 adds ``derivations.withheld_reasoning``: the encrypted
+# A store of another format is begun again in its own file (#29 W8; ``store_path``); a
+# database of another format at this format's file is refused. Format 11 adds ``derivations.withheld_reasoning``: the encrypted
 # reasoning withheld from the summariser's input, named in the summary's provenance (#8);
 # and drops ``derivations.expand_hint``, a text a pattern took from the summary (#9).
 # Format 12 stores no pairing of a result with its call: ``tool_calls.result_record``
@@ -49,8 +50,45 @@ logger = logging.getLogger(__name__)
 # never inherited (#18, round 5 of #71); which result answers which call is read at the
 # time of the question, by the host's own rule.
 STORE_FORMAT = "ihl-store/12"
-# The default file name under the host-given Hermes home.
-STORE_FILENAME = "lcm-record.db"
+# The store's file carries its format: ``<base stem>-<N><base suffix>`` (ruling C on the
+# pre-review of 0771477). A change of format begins a new file beside the old one, which is
+# never opened, moved or changed (nor its -wal and -shm files): #29's "begun again" without
+# destroying anything of the user's, and without a rename another process could race.
+FORMAT_NUMBER = STORE_FORMAT.rsplit("/", 1)[1]
+# The base the file name is formed from under the host-given Hermes home; the file itself
+# is ``store_path(base)``, ``lcm-record-12.db``.
+STORE_BASENAME = "lcm-record.db"
+# Upstream hermes-lcm's store under the same home: never opened, named when left beside.
+UPSTREAM_FILENAME = "lcm.db"
+
+
+def store_path(base: str | Path) -> Path:
+    """The file of this format's store for a base path (the default base, or the path
+    LCM_DATABASE_PATH names): ``/x/lcm-record.db`` gives ``/x/lcm-record-12.db``."""
+    base = Path(base)
+    return base.with_name(f"{base.stem}-{FORMAT_NUMBER}{base.suffix}")
+
+
+def stores_left_beside(base: str | Path, *, upstream: bool) -> list[Path]:
+    """The other stores beside this format's file, found by name only: none is opened, so
+    no -wal or -shm file is created or read. They are the base file itself (the name
+    builds before the format was in the name wrote), ``<stem>-<n><suffix>`` of any other
+    format, and, where ``upstream``, upstream's ``lcm.db``."""
+    base = Path(base)
+    current = store_path(base)
+    pattern = re.compile(re.escape(base.stem) + r"-(\d+)" + re.escape(base.suffix))
+    found: list[Path] = []
+    try:
+        names = sorted(os.listdir(base.parent))
+    except OSError:
+        return found
+    for name in names:
+        path = base.parent / name
+        if path == current:
+            continue
+        if name == base.name or pattern.fullmatch(name) or (upstream and name == UPSTREAM_FILENAME):
+            found.append(path)
+    return found
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 REQUIRED_CORE_TABLES = (
     "store_identity",

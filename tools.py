@@ -1914,6 +1914,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "quick_check": quick_check_row[0] if quick_check_row else "unknown",
                 "database_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
                 "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+                "stores_left_beside": [str(p) for p in engine._stores_left_beside(db_path)],
             },
         })
     except Exception as e:

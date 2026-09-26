@@ -362,7 +362,10 @@ class LCMConfig:
     expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
-    database_path: str = ""       # empty = <host-given Hermes home>/lcm-record.db; LCM_DATABASE_PATH may override
+    # The base the store's file is formed from (db_bootstrap.store_path: the file carries the
+    # format, lcm-record.db -> lcm-record-12.db). Empty = <host-given Hermes home>/lcm-record.db;
+    # LCM_DATABASE_PATH may name another base.
+    database_path: str = ""
 
     # -- Diagnostics ---
     # Field-level provenance for values loaded through from_env(). Manual

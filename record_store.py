@@ -779,15 +779,18 @@ class RecordStore:
     def inactive_cause(self, record: str, session: str, cover: Optional["Cover"]) -> dict:
         """The cause, as the store records it, of a record not being on the active record
         (the orchestrator's ruling on round 5 of #71: no text claims a cause the store did
-        not record). The first that holds:
+        not record). A cause tells the record's history on the active path, not who wrote it
+        (ruling on the pre-review of 0771477, A): a record a retry reused stood where the
+        effective list held it. The first that holds:
 
         - "revised": a record revising it (transitively, ``revision_lineage``) stands on the
           active record: that record, the compaction that wrote it, the revisions between,
           and the other records a merge took in with it;
-        - "rejected" / "unconfirmed": the compaction that wrote it was rejected by the host,
-          or is neither confirmed, adopted nor rejected;
-        - "left": an effective compaction's list held it (k), and a later effective
-          compaction's list (n) held neither it nor a revision of it;
+        - "left": an effective compaction's list held it (k), written there or reused, and
+          a later effective compaction's list (n) held neither it nor a revision of it;
+        - "rejected" / "unconfirmed", only for a record no effective list ever held: the
+          compaction that wrote it was rejected by the host, or is neither confirmed,
+          adopted nor rejected;
         - "none": the store records nothing that says why."""
         if cover is not None:
             parent: dict[str, Optional[str]] = {record: None}
@@ -820,24 +823,25 @@ class RecordStore:
                 written_by = self._q("SELECT compaction FROM records WHERE handle = ?", (found,))[0][0]
                 return {"kind": "revised", "active": found, "compaction": int(written_by),
                         "via": path[1:-1], "together": together}
+        effective = [int(c) for (c,) in self._q(
+            "SELECT compaction_id FROM effective_compactions WHERE session = ? ORDER BY compaction_id", (session,))]
+        held_self = {int(c) for (c,) in self._q(
+            "SELECT DISTINCT compaction FROM compaction_inputs WHERE record = ?", (record,))}
+        stood = [c for c in effective if c in held_self]
+        if stood:
+            forms = {record} | set(self.revision_lineage(record))
+            holders = {int(c) for (c,) in self._q(
+                f"SELECT DISTINCT compaction FROM compaction_inputs WHERE record IN ({','.join('?' * len(forms))})",
+                list(forms))}
+            later = [c for c in effective if c > stood[-1] and c not in holders]
+            if later:
+                return {"kind": "left", "stood": stood[-1], "gone": later[0]}
+            return {"kind": "none"}
         own = self._q("SELECT compaction FROM records WHERE handle = ?", (record,))
         if own:
             cause = self._compaction_cause(int(own[0][0]), session)
             if cause is not None:
                 return cause
-        effective = [int(c) for (c,) in self._q(
-            "SELECT compaction_id FROM effective_compactions WHERE session = ? ORDER BY compaction_id", (session,))]
-        forms = {record} | set(self.revision_lineage(record, upward=False))
-        holders = {int(c) for (c,) in self._q(
-            f"SELECT DISTINCT compaction FROM compaction_inputs WHERE record IN ({','.join('?' * len(forms))})",
-            list(forms))}
-        held_self = {int(c) for (c,) in self._q(
-            "SELECT DISTINCT compaction FROM compaction_inputs WHERE record = ?", (record,))}
-        stood = [c for c in effective if c in held_self]
-        if stood:
-            later = [c for c in effective if c > stood[-1] and c not in holders]
-            if later:
-                return {"kind": "left", "stood": stood[-1], "gone": later[0]}
         return {"kind": "none"}
 
     def _record_active(self, record: str, cover: "Cover") -> bool:
@@ -893,18 +897,16 @@ class RecordStore:
 
     # --- Revisions ----------------------------------------------------------------------
 
-    def revision_lineage(self, record: str, *, upward: bool) -> list[str]:
-        """A record's revisions, transitively: ``upward`` its sources (the records it
-        revises, and theirs), else its revisions (the records that revise it, and theirs),
+    def revision_lineage(self, record: str) -> list[str]:
+        """A record's revisions, transitively (the records that revise it, and theirs),
         nearest first, the record itself excluded. It names causes (``inactive_cause``);
         no handle is carried along it."""
-        column, other = ("revision", "source_record") if upward else ("source_record", "revision")
         found: list[str] = []
         frontier = [record]
         while frontier:
             current, frontier = frontier[0], frontier[1:]
-            for (step,) in self._q(f"SELECT {other} FROM revision_sources WHERE {column} = ? AND {other} IS NOT NULL "
-                                   f"ORDER BY ordinal", (current,)):
+            for (step,) in self._q("SELECT revision FROM revision_sources WHERE source_record = ? "
+                                   "ORDER BY ordinal", (current,)):
                 if str(step) != record and str(step) not in found:
                     found.append(str(step))
                     frontier.append(str(step))
@@ -914,7 +916,7 @@ class RecordStore:
         """The active record in its order, as units: each chunk under the cover's summaries,
         its members in order, then the stored tail. A tool call and its results never lie
         in two units (the cut never separates them), but pairing reads across a boundary
-        anyway (``expansion._unit_pairing``)."""
+        anyway (``pairing.window``)."""
         units: list[list[str]] = []
         if cover.chunks:
             members: dict[str, list[str]] = {}
@@ -925,20 +927,6 @@ class RecordStore:
             units.extend(members.get(chunk, []) for chunk in cover.chunks)
         units.append(list(cover.tail))
         return units
-
-    def record_kind(self, record: str) -> Optional[str]:
-        rows = self._q("SELECT kind FROM records WHERE handle = ?", (record,))
-        return str(rows[0][0]) if rows else None
-
-    def tool_call(self, handle: str) -> Optional[tuple[str, int, Optional[str]]]:
-        """(the assistant record, the call's position in it, the host's id there) of a call
-        handle. A call handle is minted with its record and never inherited: a rewrite of
-        the message has calls of its own."""
-        rows = self._q("SELECT record, position, tool_call_id FROM tool_calls WHERE handle = ?", (handle,))
-        if not rows:
-            return None
-        record, position, call_id = rows[0]
-        return str(record), int(position), (str(call_id) if call_id is not None else None)
 
     def record_roles(self, records: Sequence[str]) -> dict[str, Optional[str]]:
         """record -> the role its message has, as written beside it."""

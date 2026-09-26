@@ -19,7 +19,15 @@ from .codex_routing import _codex_oauth_context_cap
 from .config import LCMConfig, _host_native_compaction_configured
 from .geometry import Geometry, geometry
 from .dag import SummaryDAG
-from .db_bootstrap import STORE_FILENAME, StoreClosedError, StoreRefusedError
+from .db_bootstrap import (
+    FORMAT_NUMBER,
+    STORE_BASENAME,
+    STORE_FORMAT,
+    StoreClosedError,
+    StoreRefusedError,
+    store_path,
+    stores_left_beside,
+)
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
     _ACTIVE_ENGINES_BY_CONVERSATION_ID,
@@ -266,20 +274,28 @@ class LCMEngine(
         return clone
 
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
-        """Resolve the store's path: ``LCM_DATABASE_PATH``, else the host-given home.
+        """Resolve the store's path: this format's file (``store_path``) of the base
+        ``LCM_DATABASE_PATH`` names, else of ``lcm-record.db`` under the host-given home.
 
         With neither, the location is not known, and the plugin does not guess one.
         """
         if self._config.database_path:
-            return Path(self._config.database_path)
+            return store_path(self._config.database_path)
         if hermes_home:
-            return Path(hermes_home) / STORE_FILENAME
+            return store_path(Path(hermes_home) / STORE_BASENAME)
         message = (
             "LCM has no store location: the host gave no Hermes home and "
             "LCM_DATABASE_PATH is not set."
         )
         logger.error(message)
         raise StoreRefusedError(message)
+
+    def _stores_left_beside(self, db_path: str | Path) -> list[Path]:
+        """The stores of other formats beside this one, by name only (``stores_left_beside``)."""
+        db_path = Path(db_path)
+        stem = db_path.stem[:-len(f"-{FORMAT_NUMBER}")] if db_path.stem.endswith(f"-{FORMAT_NUMBER}") else db_path.stem
+        return stores_left_beside(db_path.with_name(stem + db_path.suffix),
+                                  upstream=not self._config.database_path)
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind the store's helpers to one SQLite database: the record and its
@@ -290,6 +306,8 @@ class LCMEngine(
         copy no teardown call (#20). The finalizer holds the helpers, never the engine.
         """
         helpers = []
+        # Whether this process begins the store's file (ruling C on the pre-review of 0771477).
+        begun = not Path(db_path).exists()
         try:
             for build in (
                 lambda: MessageStore(db_path, hermes_home=hermes_home),
@@ -302,6 +320,15 @@ class LCMEngine(
             _close_helpers(tuple(helpers), f"an engine on {db_path}", ["its store could not be opened"])
             raise
         self._store, self._dag, self._sessions, self._records = helpers
+        if begun:
+            left = self._stores_left_beside(db_path)
+            if left:
+                logger.warning(
+                    "LCM began a new store at %s (format %s). The store(s) at %s were left as they were: not "
+                    "opened, moved or changed, their -wal and -shm files included; their handles are unknown in "
+                    "the new store.",
+                    db_path, STORE_FORMAT, ", ".join(str(path) for path in left),
+                )
         self._close_box: list = [None]
         # The store's daily backup (#6); it holds the record helper, never the engine.
         self._backup = DailyBackup(db_path, self._records)
@@ -1079,6 +1106,9 @@ class LCMEngine(
             "hermes_home": str(self._hermes_home or ""),
             "database_path": str(self._store.db_path),
             "database_path_source": self._database_path_source(),
+            # Stores of other formats beside this one, by name only, never opened: what a
+            # change of format left (ruling C on the pre-review of 0771477).
+            "stores_left_beside": [str(path) for path in self._stores_left_beside(self._store.db_path)],
             "session_id": session_id,
             "host_session_id": self._session_id,
             "session_platform": self.current_session_platform,
