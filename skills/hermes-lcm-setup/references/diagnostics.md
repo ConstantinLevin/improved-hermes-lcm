@@ -1,6 +1,6 @@
 # Diagnostics
 
-Use read-only product tools before changing configuration or running an apply path.
+Use read-only product tools before changing configuration or restoring a store.
 
 ## Fast path
 
@@ -8,18 +8,13 @@ Use read-only product tools before changing configuration or running an apply pa
 2. Send one normal message if the session has not been bound since restart.
 3. `lcm_status`: inspect runtime identity, database path, context pressure, summary/store counts, and filters.
 4. `lcm_inspect`: inspect current-session lineage, the stored fresh tail, and skip/no-op reasons without retrieving content.
-5. `lcm_doctor`: run database, FTS, configuration, and context-pressure diagnostics, check the record's invariant (every record on the branch is in the returned tail or under exactly one summary of the latest compaction), list the store's identity and its recent events (what the plugin could not do), and show the daily backup slot and its age.
+5. `lcm_doctor`: run database, configuration, and context-pressure diagnostics, check the record's invariant (every record on the branch is in the returned tail or under exactly one summary of the latest compaction), list the store's identity and its recent events (what the plugin could not do), and show the daily backup slot and its age.
 
 If optional slash commands are enabled, `/lcm status` and `/lcm doctor` expose the corresponding operator views.
 
-## Safe mutation order
+## No repair command
 
-For repair (the only one is rebuilding a full-text index, `/lcm doctor repair apply`, which rebuilds derived data from the insert-only record):
-
-1. run the read-only preview (`/lcm doctor repair`);
-2. inspect exact candidates and paths;
-3. obtain user authorization for the specific apply operation;
-4. run one bounded apply and verify integrity afterward.
+The plugin offers no repair: the store is the insert-only record and keeps no index derived from it. A store SQLite finds damaged (`sqlite_integrity` or `quick_check` not `ok` in the doctor) is restored from the daily backup, by hand (Restore below).
 
 ## The daily backup
 

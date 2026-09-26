@@ -11,11 +11,7 @@ from typing import Any, Dict, TYPE_CHECKING
 from . import expansion
 from . import grep as grep_tool
 from .diagnostics import doctor_guidance_for_checks
-from .db_bootstrap import (
-    GREP_INDEX_SPEC,
-    check_external_content_fts_integrity,
-    inspect_lcm_schema_health,
-)
+from .db_bootstrap import inspect_lcm_schema_health
 from .message_content import content_parts, is_image_part
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
@@ -1414,38 +1410,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "schema_core_tables",
-            "status": "fail",
-            "detail": str(e),
-        })
-
-    # 1b. grep's index (#18 D2): its structure, FTS5's deep integrity-check, and every
-    # record of the session held by it. The deep check is the one place that sees damage
-    # grep's own per-call check cannot (the index's postings); where it fails, the index is
-    # rebuilt at once, as the owner decided, and checked again.
-    try:
-        conn = engine._store.connection
-        fts_integrity = check_external_content_fts_integrity(conn, GREP_INDEX_SPEC)
-        unindexed = int(conn.execute(
-            "SELECT count(*) FROM records r LEFT JOIN grep_index_docsize d ON d.id = r.record_id "
-            "WHERE r.session = ? AND d.id IS NULL", (session_id,)).fetchone()[0]) if session_id else 0
-        detail: dict[str, Any] = {"integrity": fts_integrity, "session_records_not_indexed": unindexed}
-        status = "pass" if fts_integrity["status"] == "pass" and not unindexed else fts_integrity["status"]
-        if fts_integrity["status"] == "fail" or unindexed:
-            detail["rebuild"] = engine._records.rebuild_grep_index(
-                session=session_id or None, found="doctor: " + ("integrity-check failed"
-                                                               if fts_integrity["status"] == "fail"
-                                                               else f"{unindexed} records not indexed"))
-            again = check_external_content_fts_integrity(conn, GREP_INDEX_SPEC)
-            detail["after_rebuild"] = again
-            status = "fail" if again["status"] != "pass" else "warn"
-        checks.append({
-            "check": "grep_index_integrity",
-            "status": "warn" if status == "unchecked" else status,
-            "detail": detail,
-        })
-    except Exception as e:
-        checks.append({
-            "check": "grep_index_integrity",
             "status": "fail",
             "detail": str(e),
         })

@@ -1,5 +1,5 @@
 """Readers over a message's content: its images, found by structure, and the text
-the full-text index reads.
+grep searches.
 
 Hermes/OpenAI-format messages carry ``content`` as a string or as a list of parts
 (text parts, image parts). An image is a part of type ``image_url`` (Chat
@@ -223,8 +223,8 @@ def readable_reasoning(raw: dict) -> str | None:
 
 
 # What separates the strings of ``grep_text``; a term holding it is refused (``grep``), so a
-# match never spans two strings. A NUL, where SQLite's text functions and FTS5 tokenizer
-# stop, is written as this too: a term never holds a NUL either.
+# match never spans two strings. A NUL, where SQLite's text functions stop, is written as
+# this too: a term never holds a NUL either.
 GREP_SEPARATOR = "\x1f"
 
 

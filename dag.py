@@ -61,9 +61,9 @@ class SummaryDAG:
         :meth:`close` takes, and ``execute`` returns its rows already fetched. Once
         closed, every use raises ``StoreClosedError``.
 
-        Exposed for read-oriented diagnostics and inspection -- FTS sync counts,
-        integrity checks, latest-node lookups -- that need ad-hoc queries the DAG
-        does not wrap in a purpose-built method. Callers must treat it as
+        Exposed for read-oriented diagnostics and inspection -- integrity checks,
+        latest-node lookups -- that need ad-hoc queries the DAG does not wrap in a
+        purpose-built method. Callers must treat it as
         read-only: the tables behind it are the record's, written only by
         ``RecordStore``.
         """

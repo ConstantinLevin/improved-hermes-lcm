@@ -1,4 +1,4 @@
-"""The plugin's SQLite store: identity, creation, connection settings, and FTS health.
+"""The plugin's SQLite store: identity, creation and connection settings.
 
 A store is a database this plugin created. It carries one ``store_identity`` row
 written at creation. A database without that row, or with another format, was not
@@ -7,8 +7,7 @@ migrations; a change of format means the store is begun again, in a file of its 
 (``store_path``): the store of another format is left beside it as it was.
 
 The whole schema is created once per database, in one transaction, when the plugin
-creates the store. Opening an existing store runs no DDL; it only checks the identity
-and the health of the full-text indexes, and repairs an index only when it is damaged.
+creates the store. Opening an existing store runs no DDL; it only checks the identity.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import sqlite3
 import sys
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -50,10 +48,10 @@ logger = logging.getLogger(__name__)
 # never inherited (#18, round 5 of #71); which result answers which call is read at the
 # time of the question, by the host's own rule.
 # Format 13 is grep's (#18 D2): ``records.text`` holds the strings the agent's past shows as
-# the message's own (``message_content.grep_text``), and one full-text index over it,
-# ``grep_index``, a trigram index with detail=none that only chooses candidates; the hit is
-# decided by exact containment. The summaries' index (``nodes_fts``) and ``messages_fts`` go:
-# summaries are never searched.
+# the message's own (``message_content.grep_text``), and grep reads that column of the
+# scope's records; a hit is exact containment. The store keeps no full-text index: the
+# summaries' index (``nodes_fts``) and ``messages_fts`` go, summaries are never searched, and
+# no second copy of ``records.text`` exists that could disagree with it.
 STORE_FORMAT = "ihl-store/13"
 # The store's file carries its format: ``<base stem>-<N><base suffix>`` (ruling C on the
 # pre-review of 0771477). A change of format begins a new file beside the old one, which is
@@ -106,11 +104,7 @@ REQUIRED_CORE_TABLES = (
     "derivations",
     "derivation_sources",
     "compaction_returns",
-    "grep_index",
 )
-
-# The trigram tokenizer and its case_sensitive option came with SQLite 3.34.0.
-MIN_SQLITE_FOR_GREP = (3, 34, 0)
 
 
 class StoreRefusedError(RuntimeError):
@@ -241,52 +235,6 @@ def _refuse(path: str | Path, reason: str) -> StoreRefusedError:
     )
     logger.error(message)
     return StoreRefusedError(message)
-
-
-class ExternalContentFtsSpec:
-    def __init__(
-        self,
-        *,
-        table_name: str,
-        content_table: str,
-        content_rowid: str,
-        indexed_column: str,
-        trigger_sqls: Sequence[str],
-        options: Sequence[tuple[str, str]] = (),
-    ) -> None:
-        self.table_name = table_name
-        self.content_table = content_table
-        self.content_rowid = content_rowid
-        self.indexed_column = indexed_column
-        self.trigger_sqls = tuple(trigger_sqls)
-        # FTS5 options beside content/content_rowid, as (name, SQL literal), in order.
-        self.options = tuple(options)
-
-
-# grep's index (#18 D2) is derived from the record and only grows with it (#29 W1): one
-# trigram index over ``records.text``. ``records`` is insert-only, so an insert trigger is
-# all it needs. detail=none keeps no positions: the index chooses the records that hold
-# every trigram of a term, and exact containment decides (``grep``); a phrase query, which
-# detail=full would allow, is quadratic on repetitive terms. case_sensitive 1: the trigrams
-# are the codepoints as stored, no folding table.
-GREP_INDEX_SPEC = ExternalContentFtsSpec(
-    table_name="grep_index",
-    content_table="records",
-    content_rowid="record_id",
-    indexed_column="text",
-    trigger_sqls=(
-        """
-        CREATE TRIGGER IF NOT EXISTS records_grep_insert
-            AFTER INSERT ON records BEGIN
-            INSERT INTO grep_index(rowid, text)
-                VALUES (new.record_id, new.text);
-        END;
-        """,
-    ),
-    options=(("tokenize", "'trigram case_sensitive 1'"), ("detail", "none")),
-)
-
-FTS_SPECS = (GREP_INDEX_SPEC,)
 
 
 # The tables of the plugin's own record. Each is insert-only: triggers raise on any
@@ -662,32 +610,6 @@ JOIN chunks ch ON ch.handle = s.chunk;
 _SCHEMA_SQL = _RECORD_SQL + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + "\n" + _VIEWS_SQL
 
 
-def _is_sqlite_lock_error(exc: BaseException) -> bool:
-    """Return True when an exception chain represents SQLite lock contention."""
-    lock_codes = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
-    lock_messages = (
-        "database is locked",
-        "database table is locked",
-        "database schema is locked",
-        "database is busy",
-        "database table is busy",
-        "database schema is busy",
-    )
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, sqlite3.Error):
-            error_code = getattr(current, "sqlite_errorcode", None)
-            if isinstance(error_code, int) and (error_code & 0xFF) in lock_codes:
-                return True
-            detail = str(current).lower()
-            if any(message in detail for message in lock_messages):
-                return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
 # --- Journal mode -------------------------------------------------------------
 #
 # The store runs with a rollback journal (journal_mode=DELETE), in every process
@@ -824,11 +746,8 @@ def _create_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
     """Create the whole schema and the identity row in one transaction.
 
     Several processes and engine copies can reach an empty database at once; the
-    identity is checked again under the write lock, and only one creates. A SQLite without
-    FTS5's trigram tokenizer cannot hold grep's index: nothing is created, and the store is
-    refused with the version it has.
+    identity is checked again under the write lock, and only one creates.
     """
-    _require_trigram(conn, db_path)
     conn.execute("BEGIN IMMEDIATE")
     try:
         if _identity_state(conn, db_path) == "store":
@@ -836,10 +755,6 @@ def _create_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
             return
         for statement in _split_sql(_SCHEMA_SQL):
             conn.execute(statement)
-        for spec in FTS_SPECS:
-            _create_fts_table(conn, spec)
-            for trigger_sql in spec.trigger_sqls:
-                conn.execute(trigger_sql)
         conn.execute(
             "INSERT INTO store_identity(format, store_uuid, created_at) VALUES (?, ?, ?)",
             (STORE_FORMAT, uuid.uuid4().hex, time.time()),
@@ -851,33 +766,11 @@ def _create_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
     logger.info("LCM created a new store at %s (format %s)", db_path, STORE_FORMAT)
 
 
-def _require_trigram(conn: sqlite3.Connection, db_path: str | Path) -> None:
-    """Refuse, before anything is created, a SQLite older than 3.34 or without FTS5's
-    trigram tokenizer: grep's index needs it (#18 D2)."""
-    version = sqlite3.sqlite_version
-    why = None
-    if sqlite3.sqlite_version_info < MIN_SQLITE_FOR_GREP:
-        why = "it is older than 3.34"
-    else:
-        try:
-            conn.execute("CREATE VIRTUAL TABLE temp.lcm_trigram_check USING fts5(x, "
-                         "tokenize='trigram case_sensitive 1', detail=none)")
-            conn.execute("DROP TABLE temp.lcm_trigram_check")
-        except sqlite3.Error as exc:
-            why = f"it refuses the tokenizer ({exc})"
-    if why is not None:
-        message = (f"LCM needs SQLite 3.34 or newer with FTS5's trigram tokenizer for its search index; this "
-                   f"Python links SQLite {version}, and {why}. Nothing was created at {db_path}.")
-        logger.error(message)
-        raise StoreRefusedError(message)
-
-
-def open_store(conn: sqlite3.Connection, db_path: str | Path, *, check_fts: bool = False) -> None:
+def open_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
     """Bind a fresh connection to the store at ``db_path``.
 
     Refuses a database this plugin did not write; creates the store in an empty
-    database; configures the connection. With ``check_fts`` the full-text indexes
-    are checked and repaired only when damaged.
+    database; configures the connection.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     state = _identity_state(conn, db_path)
@@ -886,17 +779,6 @@ def open_store(conn: sqlite3.Connection, db_path: str | Path, *, check_fts: bool
     configure_connection(conn, db_path)
     if state == "empty":
         _create_store(conn, db_path)
-    if check_fts:
-        for spec in FTS_SPECS:
-            repaired = ensure_fts_intact(conn, spec)
-            if repaired["rebuilt"] or repaired["triggers_recreated"]:
-                logger.warning(
-                    "LCM repaired the full-text index %s at %s: triggers_recreated=%s; "
-                    "the index was rebuilt from the stored rows",
-                    spec.table_name,
-                    db_path,
-                    repaired["triggers_recreated"],
-                )
 
 
 def _refuse_foreign_empty_file(db_path: str | Path) -> None:
@@ -919,18 +801,6 @@ def _refuse_foreign_empty_file(db_path: str | Path) -> None:
 
 
 # --- Diagnostics --------------------------------------------------------------
-
-def get_existing_table_names(conn: sqlite3.Connection, names: Iterable[str]) -> set[str]:
-    existing: set[str] = set()
-    for name in names:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
-            (name,),
-        ).fetchone()
-        if row and row[0]:
-            existing.add(row[0])
-    return existing
-
 
 def _database_path_for_connection(conn: sqlite3.Connection | None, fallback: str = "") -> str:
     if conn is None:
@@ -983,273 +853,3 @@ def inspect_lcm_schema_health(
     detail["existing_tables"] = existing
     detail["missing_tables"] = missing
     return detail
-
-
-# --- Full-text indexes --------------------------------------------------------
-
-def get_fts_shadow_table_names(table_name: str) -> list[str]:
-    return [
-        f"{table_name}_data",
-        f"{table_name}_idx",
-        f"{table_name}_docsize",
-        f"{table_name}_config",
-    ]
-
-
-def quote_sql_identifier(identifier: str) -> str:
-    if not identifier or not identifier.replace("_", "a").isalnum() or identifier[0].isdigit():
-        raise ValueError(f"invalid SQL identifier: {identifier}")
-    return f'"{identifier}"'
-
-
-def _fts_option_sql(spec: ExternalContentFtsSpec) -> list[str]:
-    return [f"{name}={value}" for name, value in spec.options]
-
-
-def _create_fts_table(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
-    options = "".join(f",\n            {option}" for option in _fts_option_sql(spec))
-    conn.execute(
-        f"""
-        CREATE VIRTUAL TABLE {quote_sql_identifier(spec.table_name)} USING fts5(
-            {quote_sql_identifier(spec.indexed_column)},
-            content={quote_sql_identifier(spec.content_table)},
-            content_rowid={quote_sql_identifier(spec.content_rowid)}{options}
-        )
-        """
-    )
-
-
-def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
-    shadow_tables = get_fts_shadow_table_names(spec.table_name)
-    existing_tables = get_existing_table_names(conn, [spec.table_name, *shadow_tables])
-    if spec.table_name not in existing_tables:
-        return True
-    if any(name not in existing_tables for name in shadow_tables):
-        return True
-
-    try:
-        info = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
-            (spec.table_name,),
-        ).fetchone()
-        sql = (info[0] if info else "") or ""
-        normalized = sql.lower()
-        if "virtual table" not in normalized or "using fts5" not in normalized:
-            return True
-        # The table's options as the spec writes them (tokenizer, detail): another form
-        # is not this index and is created again.
-        compact = "".join(normalized.split())
-        if any("".join(option.lower().split()) not in compact for option in _fts_option_sql(spec)):
-            return True
-
-        columns = conn.execute(
-            f"PRAGMA table_info({quote_sql_identifier(spec.table_name)})"
-        ).fetchall()
-        column_names = {row[1] for row in columns if len(row) > 1}
-        if spec.indexed_column not in column_names:
-            return True
-
-        content_count = conn.execute(
-            f"SELECT COUNT(*) FROM {quote_sql_identifier(spec.content_table)}"
-        ).fetchone()[0]
-        # For an external-content FTS5 table, ``COUNT(*) FROM <fts>`` reads
-        # through to the content table; the ``<fts>_docsize`` shadow table holds
-        # the true indexed-document count.
-        docsize_table = f"{spec.table_name}_docsize"
-        fts_count = conn.execute(
-            f"SELECT COUNT(*) FROM {quote_sql_identifier(docsize_table)}"
-        ).fetchone()[0]
-        if int(content_count or 0) != int(fts_count or 0):
-            return True
-    except sqlite3.DatabaseError as exc:
-        # A busy/locked snapshot is an availability problem, not FTS corruption.
-        if _is_sqlite_lock_error(exc):
-            raise
-        return True
-
-    return False
-
-
-# SQLite/FTS5 error substrings that denote genuine corruption or index drift.
-# Everything else a writable integrity-check can raise (locks, timeouts) is
-# transient and classifies as ``unchecked``, never ``fail``.
-_FTS_CORRUPTION_SIGNATURES = (
-    "malformed",
-    "disk image",
-    "not a database",
-    "corrupt",
-    "checksum mismatch",
-)
-
-
-def _is_fts_corruption_error(detail: str) -> bool:
-    lowered = detail.lower()
-    return any(signature in lowered for signature in _FTS_CORRUPTION_SIGNATURES)
-
-
-def check_external_content_fts_integrity(
-    conn: sqlite3.Connection,
-    spec: ExternalContentFtsSpec,
-) -> dict[str, str]:
-    """Run SQLite's FTS5 integrity-check for an external-content table.
-
-    FTS5 exposes this as a special INSERT command. It is wrapped in a savepoint
-    and rolled back so the check leaves no state behind on the connection.
-    """
-
-    if _fts_needs_rebuild_structural(conn, spec):
-        return {"status": "fail", "detail": "structural repair needed"}
-
-    savepoint = f"lcm_fts_integrity_{spec.table_name}"
-    savepoint_sql = quote_sql_identifier(savepoint)
-    try:
-        conn.execute(f"SAVEPOINT {savepoint_sql}")
-        conn.execute(
-            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
-        )
-    except sqlite3.DatabaseError as exc:
-        try:
-            conn.execute(f"ROLLBACK TO {savepoint_sql}")
-            conn.execute(f"RELEASE {savepoint_sql}")
-        except sqlite3.DatabaseError:
-            pass
-        detail = str(exc)
-        lowered = detail.lower()
-        if "readonly" in lowered or "read-only" in lowered:
-            return {"status": "unchecked", "detail": detail}
-        if _is_fts_corruption_error(detail):
-            return {"status": "fail", "detail": detail}
-        return {"status": "unchecked", "detail": detail}
-
-    try:
-        conn.execute(f"ROLLBACK TO {savepoint_sql}")
-        conn.execute(f"RELEASE {savepoint_sql}")
-    except sqlite3.DatabaseError as exc:
-        return {"status": "fail", "detail": str(exc)}
-
-    return {"status": "pass", "detail": "ok"}
-
-
-def _drop_fts_table(conn: sqlite3.Connection, table_name: str) -> None:
-    conn.execute(f"DROP TABLE IF EXISTS {quote_sql_identifier(table_name)}")
-    for shadow_name in get_fts_shadow_table_names(table_name):
-        conn.execute(f"DROP TABLE IF EXISTS {quote_sql_identifier(shadow_name)}")
-
-
-def _extract_trigger_name(trigger_sql: str) -> str | None:
-    match = re.search(
-        r"CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))",
-        trigger_sql,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        return None
-    return match.group(1) or match.group(2)
-
-
-def _normalize_trigger_sql(sql: str) -> str:
-    """Normalise trigger SQL for comparison with what SQLite keeps in sqlite_master.
-
-    Case, whitespace, ``IF NOT EXISTS`` and a trailing semicolon are not
-    significant.
-    """
-    text = re.sub(r"\bif\s+not\s+exists\b", " ", sql, flags=re.IGNORECASE)
-    return " ".join(text.split()).strip().rstrip(";").strip().lower()
-
-
-def _fts_stale_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> list[str]:
-    """Names of the spec's triggers that are missing or whose SQL differs from the spec."""
-    stale: list[str] = []
-    for trigger_sql in spec.trigger_sqls:
-        name = _extract_trigger_name(trigger_sql)
-        if not name:
-            continue
-        row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?",
-            (name,),
-        ).fetchone()
-        if not row or _normalize_trigger_sql(row[0] or "") != _normalize_trigger_sql(trigger_sql):
-            stale.append(name)
-    return stale
-
-
-def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
-    return _fts_needs_rebuild_structural(conn, spec) or bool(_fts_stale_triggers(conn, spec))
-
-
-@contextmanager
-def _fts_repair_ownership(conn: sqlite3.Connection):
-    """Own the short FTS repair transaction.
-
-    ``BEGIN IMMEDIATE`` serialises the recheck and the repair across processes.
-    A caller that already owns a transaction gets a savepoint instead.
-    """
-    if conn.in_transaction:
-        savepoint = quote_sql_identifier("lcm_fts_repair_ownership")
-        conn.execute(f"SAVEPOINT {savepoint}")
-        try:
-            yield
-        except BaseException:
-            try:
-                conn.execute(f"ROLLBACK TO {savepoint}")
-            finally:
-                conn.execute(f"RELEASE {savepoint}")
-            raise
-        else:
-            conn.execute(f"RELEASE {savepoint}")
-        return
-
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield
-    except BaseException:
-        conn.rollback()
-        raise
-    else:
-        conn.commit()
-
-
-def _repair_fts(
-    conn: sqlite3.Connection,
-    spec: ExternalContentFtsSpec,
-    *,
-    force_rebuild: bool = False,
-) -> dict[str, bool]:
-    """Recreate stale triggers and rebuild the index, under the write lock.
-
-    A trigger that drifted may already have indexed text other than the stored
-    rows, so recreating triggers always rebuilds the index from the content table
-    in the same transaction. A structurally damaged index is dropped and created
-    again first. Another process may have repaired it while this one waited, so
-    the state is checked again once the write lock is held.
-    """
-    rebuilt = False
-    table = quote_sql_identifier(spec.table_name)
-    with _fts_repair_ownership(conn):
-        structural = force_rebuild or _fts_needs_rebuild_structural(conn, spec)
-        stale = _fts_stale_triggers(conn, spec)
-        if structural:
-            _drop_fts_table(conn, spec.table_name)
-            _create_fts_table(conn, spec)
-        for trigger_sql in spec.trigger_sqls:
-            name = _extract_trigger_name(trigger_sql)
-            if name in stale:
-                conn.execute(f"DROP TRIGGER IF EXISTS {quote_sql_identifier(name)}")
-                conn.execute(trigger_sql)
-        if structural or stale:
-            conn.execute(f"INSERT INTO {table}({table}) VALUES('rebuild')")
-            rebuilt = True
-    return {"rebuilt": rebuilt, "degraded": False, "triggers_recreated": bool(stale)}
-
-
-def ensure_fts_intact(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> dict[str, bool]:
-    """Cheap startup check: repair only a structurally damaged index or stale triggers."""
-    if not external_content_fts_needs_repair(conn, spec):
-        return {"rebuilt": False, "degraded": False, "triggers_recreated": False}
-    return _repair_fts(conn, spec)
-
-
-def repair_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> dict[str, bool]:
-    """Explicit repair: also rebuild when the deep FTS5 integrity-check fails."""
-    deep = check_external_content_fts_integrity(conn, spec)
-    return _repair_fts(conn, spec, force_rebuild=deep.get("status") == "fail")

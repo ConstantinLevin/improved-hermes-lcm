@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from .db_bootstrap import GREP_INDEX_SPEC, _repair_fts, close_connection, open_store
+from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .inflight import ChunkSummary
 from .message_content import base64_like_strings, describe_image_part, grep_text, image_parts
@@ -1061,83 +1061,32 @@ class RecordStore:
             members[str(chunk)].append(str(record))
         return members
 
-    def grep_unindexed(self, records: Sequence[str]) -> int:
-        """How many of these records have no row in grep's index (its ``_docsize``): a record
-        the index does not hold can never be a candidate."""
-        rows = self._q(
-            "SELECT count(*) FROM records r LEFT JOIN grep_index_docsize d ON d.id = r.record_id "
-            "WHERE r.handle IN (SELECT value FROM json_each(?)) AND d.id IS NULL",
-            (json.dumps(list(records)),))
-        return int(rows[0][0])
+    def grep_hits(self, session: str, records: Sequence[str], term: str, *, whole_session: bool) -> set[str]:
+        """The records among ``records`` (the scope, records of ``session``) whose ``text``
+        contains ``term`` exactly (Python ``in``): every record of the scope is read, and the
+        column read is the one the hit is decided by, so nothing else can disagree with it.
 
-    def grep_unanswered(self, records: Sequence[str]) -> list[str]:
-        """Of up to three records of the scope (its first, middle and last with a trigram of
-        text), those the index does not return for a trigram of their own text. An index that
-        lost its structure or postings raises nothing and answers nothing (cell O-X2), which
-        coverage cannot see; a record that holds a trigram and is not returned for it shows it."""
-        picks = list(dict.fromkeys([records[0], records[len(records) // 2], records[-1]])) if records else []
-        missing: list[str] = []
-        for handle, record_id, text in self._q(
-                "SELECT handle, record_id, text FROM records WHERE handle IN (SELECT value FROM json_each(?))",
-                (json.dumps(picks),)):
-            gram = next((text[i:i + 3] for i in range(len(text or "") - 2) if "\x1f" not in text[i:i + 3]), None)
-            if gram is None:
-                continue
-            found = self._q("SELECT 1 FROM grep_index WHERE grep_index MATCH ? AND rowid = ?",
-                            ('"' + gram.replace('"', '""') + '"', record_id))
-            if not found:
-                missing.append(str(handle))
-        return missing
-
-    def grep_hits(self, session: str, records: Sequence[str], term: str, match: Optional[str]) -> set[str]:
-        """The records among ``records`` whose searchable text contains ``term`` exactly (Python
-        ``in``). ``match`` is a MATCH expression for grep's index that every hit satisfies
-        (the term's trigrams); None scans every record given. Rows are read from an iterated
-        cursor under the helper's lock, never fetched into a list: a scan of a whole scope
-        keeps only the hits' handles. Raises what SQLite raises."""
-        sql = ("SELECT r.handle, r.text FROM records r WHERE r.session = ? "
-               "AND r.handle IN (SELECT value FROM json_each(?))")
-        args: list[Any] = [session, json.dumps(list(records))]
-        if match is not None:
-            sql += " AND r.record_id IN (SELECT rowid FROM grep_index WHERE grep_index MATCH ?)"
-            args.append(match)
+        A scope of the whole session (``whole_session``) is read as the session's records by
+        their index and tested against the scope's set of handles; the scope behind one handle
+        is read by its handles. Rows come from an iterated cursor under the helper's lock,
+        never fetched into a list: a scan keeps only the hits' handles. Raises what SQLite
+        raises; a store that cannot be read is never "no hits"."""
+        scope = set(records)
+        if whole_session:
+            sql, args = "SELECT handle, text FROM records WHERE session = ?", [session]
+        else:
+            sql = "SELECT handle, text FROM records WHERE session = ? AND handle IN (SELECT value FROM json_each(?))"
+            args = [session, json.dumps(list(scope))]
         hits: set[str] = set()
         with self._lock:
             cursor = self._conn.execute(sql, args)
             try:
                 for handle, text in cursor:
-                    if isinstance(text, str) and term in text:
+                    if handle in scope and term in text:
                         hits.add(str(handle))
             finally:
                 cursor.close()
         return hits
-
-    def rebuild_grep_index(self, *, session: Optional[str], found: str) -> dict[str, Any]:
-        """Rebuild grep's index from ``records.text`` under the store's write lock, where its
-        deep check still fails there: a process that finds it repaired by another rebuilds
-        nothing (``_repair_fts`` checks again under the lock). Records what it did, or why it
-        could not, as a store event; raises when the rebuild fails."""
-        from .db_bootstrap import check_external_content_fts_integrity
-
-        started = time.monotonic()
-        try:
-            with self._tx() as conn:
-                check = check_external_content_fts_integrity(conn, GREP_INDEX_SPEC)
-                if check["status"] == "pass":
-                    outcome = {"rebuilt": False, "why": "the index passed its check under the write lock"}
-                else:
-                    _repair_fts(conn, GREP_INDEX_SPEC, force_rebuild=True)
-                    outcome = {"rebuilt": True, "check": check}
-                outcome["records"] = int(conn.execute("SELECT count(*) FROM records").fetchone()[0])
-        except Exception as exc:
-            self.event("grep_index_rebuild_failed", session=session,
-                       detail={"found": found, "error": f"{type(exc).__name__}: {exc}"})
-            raise
-        outcome["seconds"] = round(time.monotonic() - started, 3)
-        outcome["found"] = found
-        self.event("grep_index_rebuilt" if outcome["rebuilt"] else "grep_index_found_repaired",
-                   session=session, detail=outcome)
-        return outcome
 
     def _chunks_of(self, derivation: str) -> list[str]:
         """The chunks a derivation covers: its sources when they are chunks, and the

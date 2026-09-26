@@ -144,9 +144,9 @@ class MessageStore:
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         try:
-            # Refuses a database this plugin did not write, creates the store in an
-            # empty one, and repairs a damaged full-text index. No DDL otherwise.
-            open_store(self._conn, self.db_path, check_fts=True)
+            # Refuses a database this plugin did not write and creates the store in an
+            # empty one. No DDL otherwise.
+            open_store(self._conn, self.db_path)
         except BaseException:
             self._conn.close()
             self._conn = None
@@ -277,7 +277,7 @@ class MessageStore:
         closed, every use raises ``StoreClosedError``.
 
         Exposed for read-oriented diagnostics and inspection -- integrity /
-        quick checks, FTS sync counts, schema health -- that need ad-hoc
+        quick checks, schema health -- that need ad-hoc
         queries the store does not wrap in a purpose-built method. Callers must
         treat it as read-only: the tables behind it are the record's, written
         only by ``RecordStore``.

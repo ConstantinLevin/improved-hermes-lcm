@@ -12,11 +12,11 @@ count, unless all of them are asked for (``all``).
 agent's past shows as the message's own words and actions, each by itself: its content as
 the host sends it, its tool calls' names and arguments, its readable reasoning. Never a
 summary, an image, an encrypted item. A hit means "this shown string contains the term",
-exactly: codepoints as stored, case-sensitive, no normalisation, no folding table. The
-trigram index (``grep_index``) only chooses candidates, the records holding every trigram of
-the term (a sample of at most ``TRIGRAM_LIMIT`` of them); Python's ``in`` on each candidate
-decides. A term shorter than three characters has no trigram: every record of the scope is
-a candidate. What came after the last compaction is not in the store: the result says what
+exactly: codepoints as stored, case-sensitive, no normalisation, no folding table. Every
+record of the scope is read and tested with Python's ``in``, in one snapshot of the store.
+There is no index: the column read is the one the hit is decided by, so no second copy of it
+exists that could disagree (measured on #76: about 0.1 s for a scope of 39 M characters, 0.6 s
+for 230 M). What came after the last compaction is not in the store: the result says what
 it searched and when that was stored.
 
 **What a result holds**, never the term itself (the host classifies a result as failed when
@@ -32,19 +32,13 @@ at Hermes cdcd53c2cd; the page token carries the term):
   time they were stored (the tail is no chunk; whether the context still holds them the
   store learns only at the next compaction), in count-only mode too.
 
-A search that fails is an error, never "no hits". The index is checked on every call for
-records of the scope it does not hold, and for three of them (the first, middle and last)
-that it must return for a trigram of their own text (an index whose structure was lost
-raises nothing and answers nothing); SQLite's corruption errors on the query are caught.
-Any of these records an event, rebuilds the index under the store's write lock and retries
-the search once. Damage to other records' postings that raises nothing is found by the
-doctor's deep check, which rebuilds too.
+A search that fails is an error, never "no hits": whatever reading the store raises (a
+damaged page, a lock held past the busy timeout) is the tool's error.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -62,15 +56,9 @@ TOOL = "lcm_grep"
 # is about how ambiguous a term is, not about the window, and is not scaled.
 GREP_COUNT_ONLY_AT = 3
 
-# At most this many distinct trigrams of the term go to the index; any subset of a term's
-# trigrams is held by every record that holds the term, so the number moves only how many
-# candidates are verified, never the result.
-TRIGRAM_LIMIT = 64
-
 _ARGUMENTS = ("term", "scope", "all", "raw", "page")
 _REMOVED = ("query", "limit", "sort", "role", "time_from", "time_to", "mode", "session_scope", "session_id",
             "source", "conversation_id", "content_scope", "externalized_refs")
-_CORRUPTION = ("malformed", "disk image", "not a database", "corrupt", "checksum mismatch")
 
 NOTHING_STORED = ("nothing of this session is stored yet: the store is filled at a compaction, and until the first "
                   "one everything of the session is in your context")
@@ -78,13 +66,6 @@ COUNT_ONLY = ("the term lies in this many chunks, too many to return; narrow the
               "with all=true for every one of them")
 TAIL_NOTE = ("records of the fresh tail stored at the last compaction hold the term; your context held them "
              "verbatim then")
-
-
-class _IndexDamaged(Exception):
-    def __init__(self, found: str, detail: Any):
-        super().__init__(found)
-        self.found = found
-        self.detail = detail
 
 
 @dataclass
@@ -101,7 +82,10 @@ class _Found:
 
 
 def check_term(term: Any) -> str:
-    """The term, or a refusal naming what is wrong with it."""
+    """The term, or a refusal naming what is wrong with it. NUL and U+001F are refused: the
+    stored text writes a NUL as U+001F and separates its strings by it, so a term holding
+    either would be answered wrongly. A lone surrogate is not refused: stored text cannot
+    hold one, so the true answer, no chunk, is what the scan gives."""
     if not isinstance(term, str):
         raise ExpansionError("term must be a string: the text to search for")
     if not term:
@@ -111,24 +95,7 @@ def check_term(term: Any) -> str:
     if GREP_SEPARATOR in term:
         raise ExpansionError("term holds U+001F (unit separator), which separates the searched strings and is "
                              "never searched for")
-    try:
-        term.encode("utf-8")
-    except UnicodeEncodeError:
-        raise ExpansionError("term holds a lone surrogate, which is not text and cannot be searched for") from None
     return term
-
-
-def trigram_match(term: str) -> Optional[str]:
-    """The MATCH expression for grep's index: the AND of at most ``TRIGRAM_LIMIT`` distinct
-    trigrams of the term, sampled evenly in the order first seen, each quoted as a string
-    (every character literal); None for a term shorter than three characters."""
-    grams = list(dict.fromkeys(term[i:i + 3] for i in range(len(term) - 2)))
-    if not grams:
-        return None
-    if len(grams) > TRIGRAM_LIMIT:
-        step = len(grams) / TRIGRAM_LIMIT
-        grams = [grams[int(k * step)] for k in range(TRIGRAM_LIMIT)]
-    return " AND ".join('"' + gram.replace('"', '""') + '"' for gram in grams)
 
 
 def _stored_at(records: RecordStore, compaction: int) -> Optional[str]:
@@ -168,41 +135,8 @@ def _search(records: RecordStore, session: str, term: str, scope: str) -> _Found
             found.tail = list(cover.tail)
         found.members = records.chunk_member_lists(found.chunks)
         scope_records = [r for chunk in found.chunks for r in found.members.get(chunk, [])] + found.tail
-        unindexed = records.grep_unindexed(scope_records)
-        if unindexed:
-            raise _IndexDamaged("coverage", {"records_not_indexed": unindexed})
-        try:
-            unanswered = records.grep_unanswered(scope_records)
-            if unanswered:
-                raise _IndexDamaged("unanswered", {"records_the_index_does_not_return": unanswered})
-            found.hits = records.grep_hits(session, scope_records, term, trigram_match(term))
-        except sqlite3.DatabaseError as exc:
-            if any(signature in str(exc).lower() for signature in _CORRUPTION):
-                raise _IndexDamaged("query_error", f"{type(exc).__name__}: {exc}") from exc
-            raise
+        found.hits = records.grep_hits(session, scope_records, term, whole_session=found.session_scope)
     return found
-
-
-def _search_with_repair(records: RecordStore, session: str, term: str, scope: str) -> _Found:
-    """``_search``; where the index is damaged, an event, a rebuild under the write lock, and
-    one more search. Damage that shows again, or a rebuild that fails, is an error."""
-    try:
-        return _search(records, session, term, scope)
-    except _IndexDamaged as damage:
-        records.event("grep_index_damaged", session=session, detail={"found": damage.found, "detail": damage.detail})
-        try:
-            records.rebuild_grep_index(session=session, found=damage.found)
-        except Exception as exc:
-            raise ExpansionError(f"grep's index is damaged ({damage.found}) and could not be rebuilt "
-                                 f"({type(exc).__name__}: {exc}); the store events grep_index_damaged and "
-                                 f"grep_index_rebuild_failed record it. Nothing was searched.") from None
-    try:
-        return _search(records, session, term, scope)
-    except _IndexDamaged as again:
-        records.event("grep_index_damaged", session=session,
-                      detail={"found": again.found, "detail": again.detail, "after_rebuild": True})
-        raise ExpansionError(f"grep's index is still damaged ({again.found}) after it was rebuilt; the store event "
-                             f"grep_index_damaged records it. Nothing was searched.") from None
 
 
 def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, everything: bool, raw: bool) -> Target:
@@ -284,7 +218,7 @@ def grep(engine: Any, args: dict, *, messages: Any = None) -> Any:
     check_term(term)
     limit = expansion.host_page_limits(engine, TOOL, messages)
     records: RecordStore = engine._records
-    found = _search_with_repair(records, session, term, scope)
+    found = _search(records, session, term, scope)
     target = _target(records, engine, found, scope=scope, everything=everything, raw=raw)
     identity = expansion.target_identity(target)
     if state is not None:
