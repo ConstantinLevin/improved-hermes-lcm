@@ -32,9 +32,13 @@ def _has_token_count(value: Any) -> bool:
 
 
 def is_envelope(value: Any) -> bool:
-    """The host's multimodal tool result (``_is_multimodal_tool_result``,
-    agent/tool_dispatch_helpers.py:305 at Hermes d0288be5b3)."""
-    return isinstance(value, dict) and value.get("_multimodal") is True and isinstance(value.get("content"), list)
+    """The host's multimodal tool result, by the host's own test (``_is_multimodal_tool_result``,
+    agent/tool_dispatch_helpers.py:305 at Hermes d0288be5b3), called, never copied (the plan
+    of #71, §5.4). Where the host's test cannot be read this raises, and the tool's call
+    answers with that error (``LCMEngine.handle_tool_call``)."""
+    from agent.tool_dispatch_helpers import _is_multimodal_tool_result  # type: ignore
+
+    return bool(_is_multimodal_tool_result(value))
 
 
 def final_result(result: Any) -> Any:

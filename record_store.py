@@ -916,7 +916,7 @@ class RecordStore:
         """The active record in its order, as units: each chunk under the cover's summaries,
         its members in order, then the stored tail. A tool call and its results never lie
         in two units (the cut never separates them), but pairing reads across a boundary
-        anyway (``pairing.window``)."""
+        anyway (``pairing.blocks_span``)."""
         units: list[list[str]] = []
         if cover.chunks:
             members: dict[str, list[str]] = {}

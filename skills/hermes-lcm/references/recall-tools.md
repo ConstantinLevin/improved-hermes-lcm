@@ -38,9 +38,9 @@ Recommended current-session escalation:
 Use as low-level drill-down after a known handle (`handle`):
 
 - a summary's (`s…`) or a chunk's (`c…`) handle returns that stretch: the messages verbatim, the readable reasoning beside them, each tool call with its handle (`t…`), name and arguments, without its result; `raw=true` puts the results inline;
-- a tool call's handle returns its result, the one that follows it in the conversation; a message's handle (`m…`) returns that message;
+- a tool call's handle returns its result, the one the host sent with the call; where the host sent none, or its own stand-in, or did not send the call, a note says so; a message's handle (`m…`) returns that message;
 - a handle whose message the host has since rewritten is refused with the handle that stands for it now; expand that one;
-- a result longer than one page carries `next_page`; pass it as `page` for the rest.
+- a result longer than one page carries `next_page`; pass it as `page` for the rest; if what the handle opens into changed since the first page, the page is refused and you start again from the handle.
 
 Do not use it as broad first-step discovery.
 
