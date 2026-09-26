@@ -3,17 +3,28 @@
 The summariser reads the chunk's records as the messages they were, between its
 instructions (today's text) and a closing request; ``summariser_input`` builds that.
 
-The call names its whole route: provider, model, base URL, key and API mode, either
-the session's own as the host handed it to ``update_model`` or the one configured for
-the plugin (#9). It is made with no host task name (R8), so none of the host's
-``auxiliary.<task>`` settings reach it, with the reasoning effort passed through the
-host's ``reasoning_config``, and with ``route_info``, which the host fills with the
-route that answered. A reply from any other model than the summariser is a failure
-(#33 D9): the host's fallback ladder answers a timeout, a rate limit or another
-capacity error with the main agent's model or a configured fallback, and says so only
-there. After a fallback, only the session route's own provider and model are accepted,
-and only a provider that names its endpoint, since ``route_info`` carries no base URL
-(the orchestrator's ruling on D9).
+The call names its whole route (#9), one of two:
+
+- the one configured for the plugin (model, base URL, wire and key, all four named) is
+  called through the plugin's own client (``summariser_client``; the orchestrator's
+  ruling on the Codex review of c2efe0e): exactly what the configuration names is
+  sent, and nothing of the host's provider resolution (its config entries, extra
+  headers, credential pools, wire detection, fallback ladder) reaches the call. The
+  reasoning effort is sent only in the request field the model table documents for
+  that model and wire (its ``effort`` column); where there is none, no effort is sent,
+  and the summary's provenance says so (``effort_sent``). The reply's text, finish
+  reason and reasoning are the provider's own stream's.
+- the session's own, as the host handed it to ``update_model``, is called through the
+  host's ``call_llm`` as its ``main_runtime``, which the host resolves the way it
+  resolves the main agent's route. It is made with no host task name (R8), so none of
+  the host's ``auxiliary.<task>`` settings reach it, with the reasoning effort passed
+  through the host's ``reasoning_config``, and with ``route_info``, which the host
+  fills with the route that answered. A reply from any other model than the
+  summariser is a failure (#33 D9): the host's fallback ladder answers a timeout, a
+  rate limit or another capacity error with the main agent's model or a configured
+  fallback, and says so only there. After a fallback, only the session route's own
+  provider and model are accepted, and only a provider that names its endpoint, since
+  ``route_info`` carries no base URL (the orchestrator's ruling on D9).
 
 Two levels, each one call to the summariser with today's prompt text (#10 owns the
 texts): level 1 asks for a summary near the target budget; level 2, with today's
@@ -26,7 +37,8 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 
 - the call raises (a rate limit, a timeout, a connection or provider error);
 - another model answered (``route_info`` names another provider or model);
-- the reply has no ``choices[0].message`` (malformed), or its ``content`` is empty;
+- the reply has no ``choices[0].message`` (malformed; the own client: its stream ends
+  without the event that completes a reply), or its text is empty;
 - the provider stopped the reply at its output limit (``finish_reason == "length"``);
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
@@ -46,9 +58,10 @@ attribute guessed per provider.
 The budget is a target in the prompt text only. ``max_tokens`` is the summariser
 model's own output cap where the model table knows it (R5 b), and absent otherwise, so
 the plugin never cuts a summary at an output limit of its own; a reply stopped at the
-limit reports ``length`` and fails (#7). Where the host rewrites a missing finish reason to "stop" (its
-Codex adapter always; its streamed collector when no chunk carried one), a cut reply
-can still pass: that is the host's, and asked of Hermes (A-7.1).
+limit reports ``length`` and fails (#7). On the session's route, where the host rewrites a missing
+finish reason to "stop" (its Codex adapter always; its streamed collector when no chunk
+carried one), a cut reply can still pass: that is the host's, and asked of Hermes
+(A-7.1). The own client reads the provider's finish itself.
 
 Transient failures (HTTP 408/409/429/5xx, connection errors, timeouts) are retried at
 the same level after the longer of the provider's ``Retry-After`` and 2 s doubling to 30 s
@@ -99,7 +112,9 @@ REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhig
 @dataclass(frozen=True)
 class SummariserRoute:
     """The summariser's whole route, explicit at every call (#9). ``source`` says where
-    it came from: ``session`` (the host's ``update_model``) or ``configured``."""
+    it came from: ``session`` (the host's ``update_model``, called through the host as
+    its ``main_runtime``) or ``configured`` (called through the plugin's own client,
+    ``summariser_client``)."""
 
     provider: str
     model: str
@@ -110,13 +125,8 @@ class SummariserRoute:
     api_key: Any = field(default="", repr=False)
     api_mode: str = ""
     source: str = "session"
-    # A labelled fact about the endpoint, recorded with the summary's provenance:
-    # "the session's <provider> endpoint" when the session's route is called in the
-    # host's custom form, "endpoint: resolved by the host" when it is passed as given
-    # to a host branch that ignores an explicit base URL (ask A-9.2).
-    endpoint_note: str = ""
-    # The provider as the host (``update_model``) or the configuration named it, kept
-    # where the call is made in the custom form: the model table is keyed on it (9.6).
+    # The provider as the host (``update_model``) or the configuration named it: the
+    # model table is keyed on it (9.6). For a configured route it is only a label.
     named_provider: str = ""
 
     def table_provider(self) -> str:
@@ -124,35 +134,18 @@ class SummariserRoute:
         return self.named_provider or self.provider
 
     def provenance_provider(self) -> str:
-        return f"{self.provider} [{self.endpoint_note}]" if self.endpoint_note else self.provider
+        if self.source == "configured":
+            return f"{self.provider or 'configured'} [{self.base_url}, {self.api_mode}, the plugin's own client]"
+        return self.provider
 
-    def call_kwargs(self) -> dict[str, Any]:
+    def main_runtime(self) -> dict[str, Any]:
+        """The session's route as the host's ``main_runtime``."""
         fields = {"provider": self.provider, "model": self.model, "base_url": self.base_url,
                   "api_key": self.api_key, "api_mode": self.api_mode}
         return {key: value for key, value in fields.items() if value}
 
     def describe(self) -> str:
-        return f"{self.provider}/{self.model}"
-
-
-# Providers whose client the host builds without an explicit base URL, read in
-# agent/auxiliary_client.py at Hermes 7b761da (``resolve_provider_client`` and its
-# branches). For these the host sends the chunk and the key to an endpoint of its own
-# choosing, whatever base URL the call names.
-_HOST_IGNORES_BASE_URL = {
-    "auto": "the host's auto branch picks a provider and endpoint itself (_resolve_auto_branch)",
-    "openrouter": "the host's OpenRouter branch uses its own OpenRouter base URL (_resolve_openrouter_branch, "
-                  "_try_openrouter)",
-    "nous": "the host's Nous branch uses the Nous portal's endpoint (_resolve_nous_branch)",
-    "openai-codex": "the host's Codex branch uses the Codex endpoint or its own override "
-                    "(_resolve_openai_codex_branch)",
-    "xai-oauth": "the host's xAI OAuth branch uses its own endpoint (_resolve_xai_oauth_branch)",
-    "anthropic": "the host sends anthropic to _try_anthropic, which takes only a key and chooses the endpoint "
-                 "itself (_resolve_api_key_branch)",
-}
-_HONOURING_FORM = ("provider custom with LCM_SUMMARY_BASE_URL, LCM_SUMMARY_API_KEY, and LCM_SUMMARY_API_MODE set "
-                   "to the endpoint's wire (chat_completions, anthropic_messages or codex_responses); the host's "
-                   "custom branch sends to exactly that URL with exactly that key and wire (_resolve_custom_branch)")
+        return f"{self.provider or 'configured'}/{self.model}"
 
 
 def _host_provider(provider: str) -> Optional[str]:
@@ -165,65 +158,14 @@ def _host_provider(provider: str) -> Optional[str]:
         return None
 
 
-def host_ignores_base_url(provider: str) -> Optional[str]:
-    """How the host treats an explicit base URL for ``provider``: None where it honours
-    it, else what it does instead."""
-    dispatched = _host_provider(provider)
-    if dispatched is None:
-        return "the host's provider resolution could not be read, so where it sends the call is not known"
-    if dispatched in _HOST_IGNORES_BASE_URL:
-        return _HOST_IGNORES_BASE_URL[dispatched]
-    try:
-        from hermes_cli.auth import PROVIDER_REGISTRY  # type: ignore
-        pconfig = PROVIDER_REGISTRY.get(dispatched)
-    except Exception:
-        pconfig = None
-    auth_type = getattr(pconfig, "auth_type", None)
-    if pconfig is not None and auth_type != "api_key":
-        return (f"the host builds {dispatched}'s client from its own {auth_type} credentials and endpoint "
-                f"(_resolve_registry_branch)")
-    return None
-
-
-# The wires the host's custom branch speaks to an explicit base URL
-# (``resolve_provider_client``: api_mode forces codex_responses, chat_completions or
-# anthropic_messages; agent/auxiliary_client.py at 7b761da).
-_CUSTOM_WIRES = frozenset({"chat_completions", "codex_responses", "anthropic_messages"})
-
-
-def _host_api_mode(api_mode: str) -> str:
-    """The session's API mode as the host names its wire (``_canonical_api_mode``,
-    hermes_cli/config_providers.py at 7b761da)."""
-    try:
-        from hermes_cli.config_providers import _canonical_api_mode  # type: ignore
-        return str(_canonical_api_mode(str(api_mode or ""))).lower()
-    except Exception:
-        return str(api_mode or "").strip().lower()
-
-
 def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mode: str) -> SummariserRoute:
-    """The session's own route as the summariser's (the orchestrator's ruling on #54).
-
-    The summariser is the session's model on the endpoint the session itself uses,
-    which the host named in ``update_model``. Where the host's branch for the provider
-    would ignore that base URL, the route is called in the form the host honours:
-    provider custom, the session's base URL, its wire, and the same key object. Where
-    it cannot be expressed that way (no key the plugin holds, or a wire the custom
-    branch does not speak), it is passed as given, and the summary's provenance says
-    the host resolved the endpoint."""
-    route = SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
-                            api_mode=api_mode, source="session", named_provider=provider)
-    if not base_url or host_ignores_base_url(provider) is None:
-        return route
-    wire = _host_api_mode(api_mode)
-    has_key = callable(api_key) or (isinstance(api_key, str) and bool(api_key.strip()))
-    if has_key and wire in _CUSTOM_WIRES:
-        return SummariserRoute(provider="custom", model=model, base_url=base_url, api_key=api_key,
-                               api_mode=wire, source="session",
-                               endpoint_note=f"the session's {provider} endpoint", named_provider=provider)
+    """The session's own route as the summariser's (the orchestrator's ruling on #54):
+    the session's model on the route the host named in ``update_model``, handed to the
+    host's ``call_llm`` as its ``main_runtime``, which the host resolves the way it
+    resolves the main agent's own route (``_resolve_auto_route``, agent/auxiliary_client.py
+    at Hermes 9fc7f17906)."""
     return SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
-                           api_mode=api_mode, source="session", endpoint_note="endpoint: resolved by the host",
-                           named_provider=provider)
+                           api_mode=api_mode, source="session", named_provider=provider)
 
 
 def _control_characters(value: str) -> bool:
@@ -231,10 +173,10 @@ def _control_characters(value: str) -> bool:
 
 
 def _host_local_server_aliases() -> Optional[frozenset]:
-    """The host's local-server provider names (ollama, vllm, llama.cpp …), whose explicit
-    base URL is taken with the configured key or the placeholder, never a borrowed one
-    (``_LOCAL_SERVER_ALIASES`` and ``_resolve_custom_branch``, agent/auxiliary_client.py
-    at Hermes 916e1688ba), or None when the host cannot be read."""
+    """The host's local-server provider names (ollama, vllm, llama.cpp …), labels that
+    name no endpoint in ``route_info`` (``_LOCAL_SERVER_ALIASES``,
+    agent/auxiliary_client.py at Hermes 9fc7f17906), or None when the host cannot be
+    read."""
     try:
         from agent.auxiliary_client import _LOCAL_SERVER_ALIASES  # type: ignore
         return frozenset(str(name).strip().lower() for name in _LOCAL_SERVER_ALIASES)
@@ -242,40 +184,22 @@ def _host_local_server_aliases() -> Optional[frozenset]:
         return None
 
 
-def _host_named_custom_entry(alias: str) -> Optional[str]:
-    """The name under which config.yaml holds a ``providers`` (or legacy
-    ``custom_providers``) entry the host would compose for a local-server alias: the alias
-    itself, then "custom" (``_resolve_named_custom_branch``); "" where there is none;
-    None where the host's lookup cannot be read."""
-    try:
-        from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
-        for name in (alias, "custom"):
-            if _get_named_custom_provider(name):
-                return name
-    except Exception:
-        return None
-    return ""
-
-
 def configured_route_problem(config: Any) -> Optional[str]:
     """Why the plugin's configured summariser cannot be used, or None (#9). Checked when
     the configuration is loaded; every compaction then aborts with this cause.
 
-    A configured route is accepted only when every part the host uses for the call is
-    one the configuration named: nothing is borrowed and nothing is detected from the
-    shape of a URL or a model name ("Known, or nothing"; 9.2). Read at Hermes 916e1688ba
-    (agent/auxiliary_client.py, ``resolve_provider_client`` and its branches), that is
-    the host's custom branch with the provider literally ``custom`` or one of its
-    local-server aliases, a base URL, and one of the three wires it forces
-    (``_wrap_transport`` otherwise picks the wire from the URL and the model name). The
-    key is required: without one the custom branch sends OPENAI_API_KEY, or the main
-    key where the host matches, to the configured URL; only a local-server alias never
-    borrows, and sends the placeholder. For an alias the host first composes a
-    ``providers`` entry of the same name from config.yaml, whose headers may join the
-    call; the base URL, key and wire named here win over it. Every other provider (a
-    hosted or OAuth one, an API-key provider of the host's registry, a named custom
-    entry, an unknown name) resolves its endpoint, credentials or wire itself, so it is
-    refused; it stays reachable as the session's own route."""
+    A configured summariser is called through the plugin's own client with exactly what
+    the configuration names (``summariser_client``; the orchestrator's ruling on the
+    Codex review of c2efe0e): nothing of the host's provider resolution, config entries or
+    fallback ladder is involved. So all four must be named: the model, the base URL, the
+    wire (``chat_completions``, ``codex_responses`` or ``anthropic_messages``) and the key,
+    which may be ``none`` to send no authentication (a placeholder is never invented).
+    ``LCM_SUMMARY_PROVIDER`` is optional: a label for the provenance and the model
+    table's route rows. A wire whose client is not installed in the host's environment
+    (the ``anthropic`` SDK is an optional extra of Hermes) is refused; nothing is ever
+    installed lazily."""
+    from .summariser_client import WIRES, sdk_missing
+
     model = str(getattr(config, "summary_model", "") or "").strip()
     provider = str(getattr(config, "summary_provider", "") or "").strip()
     base_url = str(getattr(config, "summary_base_url", "") or "").strip()
@@ -289,47 +213,24 @@ def configured_route_problem(config: Any) -> Optional[str]:
         return "LCM_SUMMARY_API_KEY contains a newline or another control character"
     if not (model or provider or base_url or api_key or api_mode):
         return None
-    if not (model and provider):
-        return ("the configured summariser is incomplete: LCM_SUMMARY_MODEL and LCM_SUMMARY_PROVIDER are "
-                "set together or not at all")
-    named = provider.lower()
-    aliases = _host_local_server_aliases()
-    if aliases is None or _host_provider(provider) is None:
-        return ("the host's provider resolution could not be read, so what it would do with the configured "
-                "summariser is not known")
-    local = named in aliases
-    if named != "custom" and not local:
-        return (f"the configured summariser names provider {provider}: the host would choose its endpoint, "
-                f"credentials or wire itself, which the configuration did not name. The form it honours: "
-                f"{_HONOURING_FORM}")
-    if not base_url:
-        return (f"the configured summariser names provider {provider} without LCM_SUMMARY_BASE_URL: the host "
-                f"would borrow an endpoint of its own, which the configuration did not name")
-    wire = _host_api_mode(api_mode)
-    if wire not in _CUSTOM_WIRES:
-        return (f"the configured summariser names no wire the host's custom branch speaks (LCM_SUMMARY_API_MODE "
-                f"is {api_mode!r}): the host would pick one from the URL and the model name. Name one of "
-                f"{', '.join(sorted(_CUSTOM_WIRES))}")
-    has_key = isinstance(api_key, str) and bool(api_key.strip())
-    if local and not has_key:
-        # For a local-server alias the host first composes a config.yaml ``providers``
-        # entry of the same name (``resolve_provider_client`` → ``_resolve_named_custom_
-        # branch``, agent/auxiliary_client.py at Hermes 9fc7f17906), looked up by the
-        # alias and then by "custom", and that entry supplies the key the configuration
-        # left out: its api_key, key_env or key_cmd, or a credential pool keyed by URL.
-        # The ruling on the pre-review of 6a6a7f8: refused, unless LCM names the key.
-        entry = _host_named_custom_entry(named)
-        if entry is None:
-            return ("the host's config.yaml providers entries could not be read, so whether one of the name "
-                    f"{provider} would supply a key is not known; set LCM_SUMMARY_API_KEY")
-        if entry:
-            return (f"config.yaml has a providers entry named {entry}, which the host composes into the "
-                    f"configured summariser and which would supply a key LCM did not name; set "
-                    f"LCM_SUMMARY_API_KEY")
-    if not has_key and not local:
-        return ("the configured summariser names no LCM_SUMMARY_API_KEY: the host would send OPENAI_API_KEY, or "
-                "the main key, to the configured URL. A server that needs no key is named by the host's "
-                f"local-server provider name ({', '.join(sorted(aliases))}), which never borrows one")
+    missing = [name for name, value in (("LCM_SUMMARY_MODEL", model), ("LCM_SUMMARY_BASE_URL", base_url),
+                                        ("LCM_SUMMARY_API_MODE", api_mode),
+                                        ("LCM_SUMMARY_API_KEY", str(api_key).strip()))
+               if not value]
+    if missing:
+        return (f"the configured summariser does not name {', '.join(missing)}: the plugin's own client sends "
+                f"exactly the model, base URL, wire and key the configuration names, so all four are required "
+                f"(the key may be 'none' to send no authentication)")
+    if api_mode not in WIRES:
+        return f"LCM_SUMMARY_API_MODE {api_mode!r} is not one of {', '.join(WIRES)}"
+    if api_mode == "anthropic_messages" and base_url.rstrip("/").lower().endswith("/v1"):
+        # The Anthropic SDK appends /v1/messages to the base URL; the URL is sent as named,
+        # never rewritten, so one that ends in /v1 would reach .../v1/v1/messages.
+        return (f"LCM_SUMMARY_BASE_URL {base_url!r} ends in /v1: on anthropic_messages the client appends "
+                f"/v1/messages to the base URL, so name it without the /v1")
+    problem = sdk_missing(api_mode)
+    if problem is not None:
+        return f"the configured summariser's wire cannot be used: {problem}"
     return None
 
 
@@ -475,6 +376,10 @@ class CallSettings:
     # Every secret the plugin knows by value (the route's key when it is a string, the
     # configured key): removed from any text that is logged, stored or shown.
     secrets: tuple = field(default=(), repr=False)
+    # For a configured route: the request fields that carry the effort, from the model
+    # table's ``effort`` column ({} sends none), and what the provenance says was sent.
+    effort_param: dict = field(default_factory=dict)
+    effort_sent: str = ""
 
     def scrub(self, text: str) -> str:
         return scrub(text, self.secrets)
@@ -529,13 +434,10 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
 
 def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -> bool:
     """After a fallback, whether the route that answered is the session route's own
-    provider and model (the orchestrator's ruling on D9): the host's last rung, the main
-    agent's model, is labelled with the main agent's provider, while the plugin may call
-    the session's route in the custom form (``session_route``), so the labels differ for
-    the same model on the same provider. Only a provider that names its endpoint counts:
-    ``route_info`` carries no base URL, so a custom or local-server label, which names
-    none, is never taken for the session's route. A configured summariser is never
-    accepted after a fallback, for the same reason."""
+    provider and model (the orchestrator's ruling on D9; D9 applies to the session route
+    only, since a configured route never passes the host's ladder). Only a provider that
+    names its endpoint counts: ``route_info`` carries no base URL, so a custom or
+    local-server label, which names none, is never taken for the session's route."""
     if route.source != "session" or not route.named_provider:
         return False
     named = _host_provider(route.named_provider)
@@ -548,13 +450,40 @@ def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -
     return answered[1] in _host_model_forms(route.model, answered[0])
 
 
+def _own_client_once(messages: list[dict[str, Any]], settings: CallSettings,
+                     timeout: Optional[float]) -> tuple[str, str]:
+    """One call of a configured route through the plugin's own client
+    (``summariser_client``). The SDK's errors are raised as they are, and read by their
+    HTTP status like the host's; a stream that ends without its terminal event is the
+    endpoint's failure, a deadline that passes while it streams is transient."""
+    from . import summariser_client
+
+    try:
+        content, finish_reason, _reasoning = summariser_client.call(
+            settings.route, messages, timeout=timeout, max_tokens=settings.max_tokens, effort=settings.effort_param)
+    except summariser_client.StreamEnded as exc:
+        raise SummaryFailure("the summariser's stream ended unfinished", transient=exc.deadline, kind="endpoint",
+                             detail=str(exc)) from None
+    if not content.strip():
+        raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
+                             detail=f"no text, finish_reason {finish_reason!r}")
+    if finish_reason == "length":
+        raise SummaryFailure("reply cut at the output limit", transient=False, kind="reply",
+                             detail="finish_reason 'length'")
+    return content, finish_reason
+
+
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
                timeout: Optional[float] = None) -> tuple[str, str]:
-    """One call through the host. Returns (content, finish_reason); raises on any
-    failure of the call, a reply from another model, or a reply of the wrong shape.
-    ``timeout`` is what is left of the host's deadline at dispatch; with no host
-    deadline none is passed, and the host's own applies (#33: no per-call timeout of
-    the plugin's own)."""
+    """One call. A configured route goes through the plugin's own client; the session's
+    route through the host's ``call_llm``, as its ``main_runtime``. Returns (content,
+    finish_reason); raises on any failure of the call, a reply from another model, or a
+    reply of the wrong shape. ``timeout`` is what is left of the host's deadline at
+    dispatch; with no host deadline none is passed, and the host's own applies on the
+    session's route, the SDK's own on the own client (#33: no per-call timeout of the
+    plugin's own)."""
+    if settings.route.source == "configured":
+        return _own_client_once(messages, settings, timeout)
     from agent.auxiliary_client import call_llm
 
     route = settings.route
@@ -565,7 +494,7 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         "temperature": 0.3,
         "reasoning_config": {"enabled": settings.effort != "none", "effort": settings.effort},
         "route_info": route_info,
-        **route.call_kwargs(),
+        "main_runtime": route.main_runtime(),
     }
     if settings.max_tokens:
         call_kwargs["max_tokens"] = settings.max_tokens

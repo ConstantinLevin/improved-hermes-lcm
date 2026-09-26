@@ -476,12 +476,14 @@ class RecordWriteMixin:
         provider: Optional[str] = None,
         effort: Optional[str] = None,
         withheld_reasoning: Optional[str] = None,
+        effort_sent: Optional[str] = None,
     ) -> str:
         """A summary as a derivation of its chunk, in its own transaction; raises when
         the write fails. Its provenance: the model and provider that wrote it (the
         summariser's route, which the host's ``route_info`` confirmed), the reasoning
-        effort asked for, the provider's ``finish_reason`` as the host reported it, and the
-        encrypted reasoning withheld from its input (#8)."""
+        effort asked for and the effort field the call carried (or why none was sent), the
+        provider's ``finish_reason``, and the encrypted reasoning withheld from its input
+        (#8, #9)."""
         return self._records.write_derivation(
             compaction=attempt.compaction,
             chunk=chunk,
@@ -494,6 +496,7 @@ class RecordWriteMixin:
             est_tokens=count_tokens(text),
             finish_reason=finish_reason,
             withheld_reasoning=withheld_reasoning,
+            effort_sent=effort_sent,
         )
 
     def _write_return(

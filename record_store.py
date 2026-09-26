@@ -336,16 +336,17 @@ class RecordStore:
             args = (chunk,) if any_route else (chunk, model or None, provider or None, effort or None)
             rows = self._q(
                 "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort, "
-                "d.withheld_reasoning "
+                "d.withheld_reasoning, d.effort_sent "
                 "FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
                 "WHERE s.chunk = ? AND s.ordinal = 0 AND d.kind = 'summary' "
                 + route_clause + "ORDER BY d.derivation_id DESC LIMIT 1",
                 args,
             )
             if rows:
-                text, level, budget, finish_reason, model_, provider_, effort_, withheld = rows[0]
+                text, level, budget, finish_reason, model_, provider_, effort_, withheld, sent = rows[0]
                 return ChunkSummary(text=str(text), level=level, budget=budget, finish_reason=finish_reason,
-                                    model=model_, provider=provider_, effort=effort_, withheld=withheld)
+                                    model=model_, provider=provider_, effort=effort_, withheld=withheld,
+                                    effort_sent=sent)
         return None
 
     def _chunks_with_members(self, session: str, records: Sequence[str]) -> list[tuple[str, int]]:
@@ -1078,16 +1079,17 @@ class RecordStore:
         finish_reason: Optional[str] = None,
         effort: Optional[str] = None,
         withheld_reasoning: Optional[str] = None,
+        effort_sent: Optional[str] = None,
     ) -> str:
         with self._tx() as conn:
             handle = self._insert_with_handle(
                 conn,
                 DERIVATION,
-                "INSERT INTO derivations(handle, kind, text, compaction, model, provider, effort, prompt, "
-                "budget, finish_reason, level, est_tokens, withheld_reasoning, created_at) "
-                "VALUES (?, 'summary', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
-                (text, compaction, model or None, provider or None, effort or None, budget, finish_reason or None,
-                 level, est_tokens, withheld_reasoning, time.time()),
+                "INSERT INTO derivations(handle, kind, text, compaction, model, provider, effort, effort_sent, "
+                "prompt, budget, finish_reason, level, est_tokens, withheld_reasoning, created_at) "
+                "VALUES (?, 'summary', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                (text, compaction, model or None, provider or None, effort or None, effort_sent or None, budget,
+                 finish_reason or None, level, est_tokens, withheld_reasoning, time.time()),
             )
             conn.execute(
                 "INSERT INTO derivation_sources(derivation, ordinal, chunk, source_derivation) VALUES (?, 0, ?, NULL)",

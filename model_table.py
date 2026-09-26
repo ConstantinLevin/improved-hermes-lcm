@@ -33,6 +33,12 @@ Columns, each ``None`` where not established:
   what it may be given waits for the producer's stamp (A-P, R3). Where the item was
   produced matters too: the source of each row says what is known about that.
 
+- ``effort``: how a request on this route carries the reasoning effort (``EffortRule``),
+  from the provider's own documentation, cited with its date. Read only for a
+  configured route, which the plugin's own client calls; where it is None no effort is
+  sent and the summary's provenance says so. The session's route takes the effort
+  through the host's ``reasoning_config``.
+
 A reasoning-summaries column is not built: readable reasoning reaches every summariser as
 text (R2), so nothing would read it (the orchestrator's ruling on 9.6).
 """
@@ -93,8 +99,56 @@ class ModelFacts:
     # Every id the route names the model by.
     ids: tuple[str, ...] = ()
     encrypted_reasoning: frozenset = field(default_factory=frozenset)
+    # How a request on this route carries the reasoning effort, from the provider's own
+    # documentation (``EffortRule``); None where it is not documented or not read, and
+    # then no effort is sent to a configured route and its provenance says so.
+    effort: Optional["EffortRule"] = None
     # How a lookup found this row (set by ``lookup``).
     basis: str = ""
+
+
+@dataclass(frozen=True)
+class EffortRule:
+    """The request fields that carry a reasoning effort on one wire, the levels the
+    provider documents, and where that is written. ``form`` is "openrouter_reasoning"
+    (``reasoning: {effort}`` in the body) or "anthropic_output_config" (``thinking`` and
+    ``output_config.effort``)."""
+
+    wire: str
+    form: str
+    levels: tuple[str, ...]
+    source: str
+
+    def fields(self, level: str) -> Optional[dict]:
+        """The request fields for ``level``, or None where the level is not documented."""
+        if level not in self.levels:
+            return None
+        if self.form == "openrouter_reasoning":
+            return {"extra_body": {"reasoning": {"effort": level}}}
+        if self.form == "anthropic_output_config":
+            if level == "none":
+                return {"thinking": {"type": "disabled"}}
+            return {"thinking": {"type": "adaptive"}, "output_config": {"effort": level}}
+        return None
+
+
+# OpenRouter's unified reasoning parameter ("Reasoning Tokens", "Reasoning Effort Level",
+# openrouter.ai/docs/use-cases/reasoning-tokens, read 2026-09-26): max, xhigh, high,
+# medium, low, minimal, none; each table model lists "reasoning" among its
+# supported_parameters in the models API (read 2026-09-26).
+_OPENROUTER_EFFORT = EffortRule(
+    wire="chat_completions", form="openrouter_reasoning",
+    levels=("max", "xhigh", "high", "medium", "low", "minimal", "none"),
+    source="OpenRouter, Reasoning Tokens, Reasoning Effort Level (read 2026-09-26); models API supported_parameters "
+           "'reasoning' (read 2026-09-26)")
+# Claude Opus 5 (the claude-api reference, cached 2026-06-24, "Thinking & Effort"): adaptive
+# thinking with output_config.effort low to max; {type: "disabled"} accepted at effort high
+# or below.
+_OPUS_5_EFFORT = EffortRule(
+    wire="anthropic_messages", form="anthropic_output_config",
+    levels=("low", "medium", "high", "xhigh", "max", "none"),
+    source="Anthropic, the claude-api reference (cached 2026-06-24), Thinking & Effort: Claude Opus 5, "
+           "output_config.effort low-max, adaptive thinking, disabled accepted")
 
 
 # Anthropic's own models (the claude-api reference, cached 2026-06-24: models.md for the
@@ -111,7 +165,8 @@ _ANTHROPIC_THINKING = ("thinking blocks: the claude-api reference (model-migrati
 # model", agent/codex_responses_adapter.py _replay_reasoning_items at Hermes 916e1688ba).
 # OpenAI's own documentation was not read.
 _OPENAI_ITEMS = ("reasoning items: the host's reading (_replay_reasoning_items: sealed to issuer and model); "
-                 "OpenAI's documentation not read")
+                 "OpenAI's documentation not read; effort: not established, OpenAI's documentation cannot be "
+                 "reached from where this was written (network limited to gh, git and OpenRouter)")
 # OpenRouter's reasoning_details are passed back unmodified, for Anthropic and OpenAI
 # models alike ("Preserving Reasoning", openrouter.ai/docs/use-cases/reasoning-tokens,
 # read 2026-09-26); the host keeps reasoning_details on OpenRouter's wire only.
@@ -139,13 +194,14 @@ ROWS: tuple[ModelFacts, ...] = (
         source="window and output: the claude-api reference, cached 2026-06-24 (#31); images: Anthropic docs "
                "2026-09-24, high-resolution tier (#9, #35), no constant measured on this route; " + _ANTHROPIC_THINKING,
         image_rule=_OPUS_5_IMAGES, ids=("claude-opus-5", "anthropic/claude-opus-5"),
-        encrypted_reasoning=frozenset({"anthropic_content_blocks"}),
+        encrypted_reasoning=frozenset({"anthropic_content_blocks"}), effort=_OPUS_5_EFFORT,
     ),
     ModelFacts(
         "anthropic", "claude-haiku-4.5", reads_images=True, output_cap=64_000, context_window=200_000,
         source="window and output: the claude-api reference (models.md: 200K, 64K), cached 2026-06-24; images: "
                "Anthropic docs 2026-09-24, standard tier (#9, #35), no constant measured on this route; "
-               + _ANTHROPIC_THINKING,
+               + _ANTHROPIC_THINKING + "; effort: none on Haiku 4.5 (the claude-api reference, Thinking & Effort: "
+               "effort errors on Haiku 4.5, thinking takes budget_tokens, which no effort level names)",
         image_rule=_HAIKU_45_IMAGES,
         ids=("claude-haiku-4-5", "anthropic/claude-haiku-4-5", "claude-haiku-4.5", "anthropic/claude-haiku-4.5"),
         encrypted_reasoning=frozenset({"anthropic_content_blocks"}),
@@ -180,7 +236,7 @@ ROWS: tuple[ModelFacts, ...] = (
         source=f"{_OPENROUTER_API}; images: Anthropic's rule, measured via OpenRouter as rule + 3 on eight "
                f"images (#9, #35); {_OPENROUTER_DETAILS}",
         image_rule=replace(_OPUS_5_IMAGES, measured_constant=3), route="openrouter",
-        ids=("anthropic/claude-opus-5",), encrypted_reasoning=frozenset({"reasoning_details"}),
+        ids=("anthropic/claude-opus-5",), encrypted_reasoning=frozenset({"reasoning_details"}), effort=_OPENROUTER_EFFORT,
     ),
     ModelFacts(
         "anthropic", "claude-haiku-4.5", reads_images=True, output_cap=64_000, context_window=200_000,
@@ -188,25 +244,27 @@ ROWS: tuple[ModelFacts, ...] = (
                f"{_OPENROUTER_DETAILS}",
         image_rule=replace(_HAIKU_45_IMAGES, measured_constant=4), route="openrouter",
         ids=("anthropic/claude-haiku-4.5",), encrypted_reasoning=frozenset({"reasoning_details"}),
+        effort=_OPENROUTER_EFFORT,
     ),
     ModelFacts(
         "openai", "gpt-6-astra", reads_images=True, output_cap=128_000, context_window=1_050_000,
         source=f"{_OPENROUTER_API}; images: OpenAI's rule, measured via OpenRouter = rule (#35); "
                f"{_OPENROUTER_DETAILS}",
         image_rule=_GPT_6_ASTRA_IMAGES, route="openrouter",
-        ids=("openai/gpt-6-astra",), encrypted_reasoning=frozenset({"reasoning_details"}),
+        ids=("openai/gpt-6-astra",), encrypted_reasoning=frozenset({"reasoning_details"}), effort=_OPENROUTER_EFFORT,
     ),
     ModelFacts(
         "openai", "gpt-5.4-mini", reads_images=True, output_cap=128_000, context_window=400_000,
         source=f"{_OPENROUTER_API}; images: OpenAI's rule, measured via OpenRouter = rule (#35); "
                f"{_OPENROUTER_DETAILS}",
         image_rule=_GPT_54_MINI_IMAGES, route="openrouter",
-        ids=("openai/gpt-5.4-mini",), encrypted_reasoning=frozenset({"reasoning_details"}),
+        ids=("openai/gpt-5.4-mini",), encrypted_reasoning=frozenset({"reasoning_details"}), effort=_OPENROUTER_EFFORT,
     ),
     ModelFacts(
         "openai", "gpt-5-nano", reads_images=True, output_cap=128_000, context_window=400_000,
         source=f"{_OPENROUTER_API}; images: sizing not documented, uncounted (#35); {_OPENROUTER_DETAILS}",
         route="openrouter", ids=("openai/gpt-5-nano",), encrypted_reasoning=frozenset({"reasoning_details"}),
+        effort=_OPENROUTER_EFFORT,
     ),
     ModelFacts(
         "openai", "gpt-6-astra", reads_images=True, output_cap=None, context_window=272_000,

@@ -335,9 +335,10 @@ class LCMConfig:
 
     # -- Models ---
     # The summariser (#9). Empty summary_model: the model running the session, on the
-    # route the host hands update_model. Set: that model, on the provider named in
-    # summary_provider (required with it), with the optional base URL, key and API mode;
-    # a model id only, never "provider/model".
+    # route the host hands update_model. Set: that model, called by the plugin's own
+    # client with the base URL, key ("none": no authentication) and API mode, all
+    # required with it (escalation.configured_route_problem); summary_provider is an
+    # optional label.
     summary_model: str = ""
     summary_provider: str = ""
     summary_base_url: str = ""
