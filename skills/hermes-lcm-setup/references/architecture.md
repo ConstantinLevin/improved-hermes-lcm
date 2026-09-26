@@ -1,6 +1,6 @@
 # Architecture
 
-Hermes-LCM keeps what the host hands it at each compaction in one profile-local SQLite store, `lcm-record.db`, and replaces the older part of the context with summaries of it.
+Hermes-LCM keeps what the host hands it at each compaction in one profile-local SQLite store, `lcm-record-12.db` (the file carries the store's format), and replaces the older part of the context with summaries of it.
 
 ## Core flow
 

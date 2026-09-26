@@ -5,9 +5,8 @@ LCM_GREP = {
     "description": (
         "Full-text search over the current session's past conversation content in the LCM database, "
         "which stores it at each compaction. "
-        "Returns both raw messages and summary nodes across all depths. "
-        "Use lcm_expand(store_id=...) on a message hit or lcm_expand(node_id=...) on a summary hit "
-        "to drill into its full content."
+        "Returns both raw messages and summaries, each with its handle. "
+        "Use lcm_expand(handle=...) on a hit to read behind it."
     ),
     "parameters": {
         "type": "object",
@@ -67,48 +66,28 @@ LCM_GREP = {
 LCM_EXPAND = {
     "name": "lcm_expand",
     "description": (
-        "Recover the original detail behind a summary node or a stored message. "
-        "Mode selection (exactly one): node_id (current session only) returns the source messages "
-        "that were summarised into a summary node; store_id returns a single stored message, as it "
-        "was stored, by store_id, suitable for drilling into lcm_grep message hits. "
-        "Output is bounded by max_tokens; raw recovery is pageable via content_offset "
-        "(and source_offset/source_limit for node_id mode)."
+        "Look behind a handle and read what it stands for, as it was. A summary's handle (s…) or a chunk's "
+        "(c…) returns that stretch of the session: every user and assistant message verbatim, the readable "
+        "reasoning beside it, and each tool call with its handle (t…), name and arguments but without its "
+        "result; raw=true puts every result inline. A tool call's handle returns its result; a message's "
+        "handle (m…) returns that message. A result longer than one page carries next_page: call again "
+        "with page=next_page for the rest. Images come back as images."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "node_id": {
-                "type": "integer",
-                "description": (
-                    "Summary node ID to expand. Current-session only — cross-session DAG expansion "
-                    "is not supported in this version."
-                ),
+            "handle": {
+                "type": "string",
+                "description": "The handle to look behind: s… a summary, c… a chunk, t… a tool call, m… a message.",
             },
-            "store_id": {
-                "type": "integer",
-                "description": (
-                    "Raw message store_id to fetch, as surfaced by an lcm_grep message hit. Returns the "
-                    "message's content paged by content_offset."
-                ),
+            "raw": {
+                "type": "boolean",
+                "description": "For a summary or chunk: put every tool result inline instead of leaving it behind its call's handle.",
+                "default": False,
             },
-            "max_tokens": {
-                "type": "integer",
-                "description": "Token budget for returned content (default 4000)",
-                "default": 4000,
-            },
-            "source_offset": {
-                "type": "integer",
-                "description": "Zero-based pagination offset into the node's immediate source list (node_id mode only).",
-                "default": 0,
-            },
-            "source_limit": {
-                "type": "integer",
-                "description": "Maximum number of immediate sources to return from source_offset (node_id mode only). Output still respects max_tokens.",
-            },
-            "content_offset": {
-                "type": "integer",
-                "description": "Character offset used to continue an oversized raw message or store_id-mode message. Use next_content_offset from the previous response.",
-                "default": 0,
+            "page": {
+                "type": "string",
+                "description": "The next_page token of an earlier result, to read the next page of the same expansion.",
             },
         },
         "required": [],
@@ -171,7 +150,7 @@ LCM_EXPAND_QUERY = {
     "name": "lcm_expand_query",
     "description": (
         "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt, and either "
-        "query matching summaries/raw messages to expand or explicit node_ids to inspect. Uses the expansion path "
+        "query matching summaries/raw messages to expand or the handles (s…) of summaries to inspect. Uses the expansion path "
         "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
         "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
         "Prefer this for questions about the active conversation after compaction."
@@ -187,10 +166,10 @@ LCM_EXPAND_QUERY = {
                 "type": "string",
                 "description": "Optional search query used to find candidate summaries before expansion",
             },
-            "node_ids": {
+            "handles": {
                 "type": "array",
-                "items": {"type": "integer"},
-                "description": "Optional explicit summary node IDs to expand instead of searching",
+                "items": {"type": "string"},
+                "description": "Optional summary handles (s…) to expand instead of searching",
             },
             "max_results": {
                 "type": "integer",

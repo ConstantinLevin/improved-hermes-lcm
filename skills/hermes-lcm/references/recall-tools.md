@@ -15,7 +15,7 @@ Use for discovery across current-session stored messages and summaries.
 - Keep `sort='recency'` for recent events, use `sort='relevance'` for the strongest older match, and use `sort='hybrid'` when both matter.
 - Exact role/time filters apply before limiting where supported. `time_from`/`time_to` compare the time a message was stored, which is the time of the compaction that stored it, not the time it was said.
 - `sort='recency'` follows the conversation's order, newest first.
-- A message hit with `revises_node_id` is a summary row as the host rewrote it in the context (for example with the task list folded in); `lcm_expand(node_id=…)` on that id opens the summary's sources.
+- Each hit carries its `handle`. A message hit with `revises` is a summary row as the host rewrote it in the context (for example with the task list folded in); `lcm_expand(handle=…)` on the handle in `revises` opens the summary's stretch.
 
 Do not treat a short search snippet as sufficient evidence for a detail-heavy answer.
 
@@ -24,7 +24,7 @@ Do not treat a short search snippet as sufficient evidence for a detail-heavy an
 Use when current-session compacted material must be expanded and synthesized into a precise bounded answer.
 
 - Always provide `prompt`.
-- Provide either a small `query` or explicit `node_ids` when known.
+- Provide either a small `query` or the summaries' `handles` when known.
 - `query` follows the same narrow FTS construction rules as `lcm_grep`.
 - The expansion path is model-backed and bounded by answer/context token limits.
 
@@ -35,10 +35,12 @@ Recommended current-session escalation:
 
 ### `lcm_expand`
 
-Use as low-level drill-down after a known handle:
+Use as low-level drill-down after a known handle (`handle`):
 
-- `node_id` expands a current-session summary with source pagination;
-- `store_id` recovers one stored message as the host handed it over, with content pagination.
+- a summary's (`s…`) or a chunk's (`c…`) handle returns that stretch: the messages verbatim, the readable reasoning beside them, each tool call with its handle (`t…`), name and arguments, without its result; `raw=true` puts the results inline;
+- a tool call's handle returns its result: the stored result that carries the call's id, before the next user or agent message; where none does, a note says so; where calls of one message share an id, every result of that id is returned and a note says the store cannot tell which answered which call; a message's handle (`m…`) returns that message;
+- a handle whose message the host has since rewritten is refused with the handle that stands for it now; expand that one;
+- a result longer than one page carries `next_page`; pass it as `page` for the rest; if what the handle opens into changed since the first page, the page is refused and you start again from the handle. A page never leaves anything out: where one part cannot fit even on a page by itself, the call is refused, naming that part, its size and the page's limit, which is larger when `lcm_expand` is the only call in its message.
 
 Do not use it as broad first-step discovery.
 

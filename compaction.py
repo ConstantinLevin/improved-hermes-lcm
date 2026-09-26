@@ -143,10 +143,11 @@ from .tokens import Estimator, count_message_tokens, count_messages_tokens
 logger = logging.getLogger(__name__)
 
 # The words around a summary row (Decision 8, until #10 writes them). The wrapper carries
-# what the plugin knows, the summary's node id, which lcm_expand takes; nothing in it is
-# read out of the summary's text (#9, Decided: nothing in a reply is recognised by pattern).
-_SUMMARY_HEADER = "[Recent Summary (d0, node {node_id})]"
-_SUMMARY_FOOTER = "[Expand for details: node {node_id}]"
+# what the plugin knows, the summary's handle, which the tools take (#29 W5, #18); nothing
+# in it is read out of the summary's text (#9, Decided: nothing in a reply is recognised by
+# pattern).
+_SUMMARY_HEADER = "[Recent Summary ({handle})]"
+_SUMMARY_FOOTER = "[Expand for details: {handle}]"
 
 # How often the compress() thread, waiting for its chunks, asks the attempt's captured check.
 _WAIT_SLICE_S = 0.25
@@ -2438,11 +2439,11 @@ class CompactionMixin:
         if 0 in mechanism and messages[0].get("role") == "system":
             result.append(messages[0])  # the host's system row, in place, not recorded
         for derivation in cover:
-            node_id, text = texts[derivation]
+            _derivation_id, text = texts[derivation]
             row = {
                 "role": "user",
-                "content": "\n".join((_SUMMARY_HEADER.format(node_id=node_id), text,
-                                      _SUMMARY_FOOTER.format(node_id=node_id))),
+                "content": "\n".join((_SUMMARY_HEADER.format(handle=derivation), text,
+                                      _SUMMARY_FOOTER.format(handle=derivation))),
                 "_compressed_summary": True,
             }
             returns.append((len(result), "summary", None, derivation, raw_json(row)))
