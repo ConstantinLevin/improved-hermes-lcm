@@ -42,9 +42,12 @@ keeps inline: its spill threshold, computed by the host's own function
 computes it for this result, and compared with the exact string the engine returns
 (``results.final_result``). Paging is not a cap: nothing is left out, and a record
 larger than a page is split over pages by character offset, each piece saying where it
-lies. Every page is measured as it will be returned, with the real ``next_page`` of the
-place it ends at, or null (``PageBuilder.measure``). What cannot be split (an item without
-fields, an image's mark, an empty field, the annotations every piece carries, the header
+lies (a structural path, rendered as a JSON Pointer, ``render_path``). An item's plugin
+side (``lcm``) and its stored message (``message``) are two objects (``Item``), so no
+stored key can shadow the plugin's and none of the plugin's can shadow a stored key. Every
+page is measured as it will be returned, with the real ``next_page`` of the place it ends
+at, or null (``PageBuilder.measure``). What cannot be split (an item without fields, an
+image's mark, an empty field, the annotations every piece carries, the header
 every page carries) stands alone on the next page if it fits there; where it does not fit
 even alone, the page is refused, naming it (or the header, where the header alone does not
 fit), its size and the page's limit. Nothing is skipped.
@@ -80,7 +83,9 @@ from .summariser_input import (
 # 3: an item is the message as the host sent it and a piece carries all of its item's
 # annotations (the plan of #71, §5), so fields and offsets moved; a token of an earlier
 # version is refused with its own text.
-TOKEN_VERSION = 3
+# 4: an item's plugin side and host side are two objects (``lcm``, ``message``), a path is a
+# tuple of structural steps (PR P): the fields and the pages moved.
+TOKEN_VERSION = 4
 
 # What each status of ``RecordStore.resolve`` tells the agent; "inactive" is told by its
 # cause (``_inactive_text``).
@@ -377,19 +382,32 @@ def _call_parts(call: Any) -> tuple[Any, Any]:
 
 @dataclass
 class Item:
-    """One item of what a handle opens into, as a pair (the plan of #71, §5.2): its
-    ``annotations``, what the plugin says of it (``handle``, ``role``, ``result_of``,
-    ``note``, ``content_chars``, ``chunk``, ``summary``, ``summaries``), which every piece of it
-    carries; and
-    its ``fields``, the message's own keys (§5.1), each of which becomes a piece when the
-    item does not fit on a page by itself. A piece is its item by complement, never a
-    hand-picked list."""
+    """One item of what a handle opens into (the plan of #71, §5.2), in two namespaces that
+    are disjoint by construction (PR P):
+
+    - the plugin's side, rendered under the one key ``lcm``: ``annotations``, what the plugin
+      says of the item (``handle``, ``role``, ``result_of``, ``note``, ``content_chars``,
+      ``chunk``, ``under``, ``summary``, ``summaries``, ``tail``, ``stored_at``), which every
+      piece of it carries; and ``plugin``, the plugin's own fields that can be split over
+      pages (the readable ``reasoning``, each tool call's handle and notes by position under
+      ``calls``, a summary's ``text``, grep's ``results_holding_term`` and ``messages``); a
+      piece of a tool call carries that call's entry of ``calls`` as ``call``;
+    - the host's side, rendered under the one key ``message``: ``fields``, the stored
+      message's own keys as the host's rules leave them (§5.1), never a key of the plugin's.
+
+    No stored key can shadow an annotation and no annotation can shadow a stored key: each
+    lives in its own object. Each field becomes a piece when the item does not fit on a page
+    by itself; a piece is its item by complement, never a hand-picked list."""
 
     annotations: dict
     fields: dict = field(default_factory=dict)
+    plugin: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
-        return {**self.annotations, **self.fields}
+        out: dict = {"lcm": {**self.annotations, **self.plugin}}
+        if self.fields:
+            out["message"] = dict(self.fields)
+        return out
 
 
 # Host keys an item leaves out, with the reason (the plan of #71, §5.1). What is not named
@@ -399,23 +417,18 @@ _NATIVE_CARRIERS = ("anthropic_content_blocks", "bedrock_content_blocks",
                     "codex_message_items")                  # re-encodings of the message: carried in raw form only
 
 
-def _call_entry(handle: Optional[str], call: Any) -> dict:
-    """A tool call as an item shows it: its handle, its name and arguments, and every other
-    key of the call except the host's ids and a withheld signature (the provider's thought
-    signature, encrypted, as the Reasoning paragraph says)."""
-    entry: dict = {"handle": handle}
+def _call_shown(call: Any) -> Any:
+    """A tool call as the item's ``message`` shows it: the host's own call, every key of it
+    in the host's own shape, except the host's ids and a withheld signature (the provider's
+    thought signature, encrypted, as the Reasoning paragraph says). What the plugin says of
+    the call (its handle, where its result is, its notes) is on the plugin's side
+    (``lcm.calls``), never a key of the call: a host call key named like any plugin key is
+    the host's and survives (PR P)."""
     if not isinstance(call, dict):
-        entry["call"] = call                                  # a shape other than the host's: as stored
-        return entry
+        return call                                            # a shape other than the host's: as stored
+    entry: dict = {}
     for key, value in call.items():
         if key in _ID_KEYS:
-            continue
-        if key == "function" and isinstance(value, dict):
-            entry["name"] = value.get("name")
-            entry["arguments"] = value.get("arguments")
-            for other, said in value.items():
-                if other not in ("name", "arguments"):
-                    entry[f"function.{other}"] = said
             continue
         if key == "extra_content" and isinstance(value, dict):
             # The host writes {"google": {"thought_signature"}} (agent/gemini_native_adapter.py:557)
@@ -490,26 +503,29 @@ def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
 
 def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pairing.Pairing, route: "Route", *,
                   inline: set, raw_form: bool) -> Item:
-    """One user or agent message by the host's rules (``_as_sent``), its readable
-    reasoning first, each tool call as ``_call_entry`` with what the store's pairing says of
-    it; in raw form also where its result is when this stretch does not hold it, and for a
-    call of a group the store cannot pair, every result of the group."""
+    """One user or agent message by the host's rules (``_as_sent``). The plugin's side: its
+    readable reasoning, and per tool call (``lcm.calls``, by position) its handle and what the
+    store's pairing says of it; in raw form also where its result is when this stretch does
+    not hold it, and for a call of a group the store cannot pair, every result of the group.
+    The host's side: the message's own keys, each tool call in the host's shape
+    (``_call_shown``)."""
     message, fill_note = _as_sent(raw, route, raw_form=raw_form)
     _mark_images(message, handle)
     annotations = {"handle": handle, "role": message.pop("role", raw.get("role"))}
     if fill_note is not None:
         annotations["note"] = fill_note
-    fields: dict = {}
+    plugin: dict = {}
     if raw.get("role") == "assistant":
         reasoning = readable_reasoning(raw)
         if reasoning is not None:
-            fields["reasoning"] = reasoning
-    fields["content"] = message.pop("content", None)
+            plugin["reasoning"] = reasoning
+    fields: dict = {"content": message.pop("content", None)}
+    stored_calls = "tool_calls" in message
     tool_calls = message.pop("tool_calls", None)
     if isinstance(tool_calls, list) and tool_calls:
-        shown = []
+        said = []
         for position, call in enumerate(tool_calls):
-            entry = _call_entry(calls.get(position), call)
+            entry: dict = {"handle": calls.get(position)}
             notes = _call_notes(found, handle, position)
             key = (handle, position)
             if key in found.group:
@@ -521,11 +537,17 @@ def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pai
                     entry["result_in"] = found.answer[key]
             if notes:
                 entry["note"] = "; ".join(notes)
-            shown.append(entry)
-        fields["tool_calls"] = shown
+            said.append(entry)
+        plugin["calls"] = said
+        fields["tool_calls"] = [_call_shown(call) for call in tool_calls]
+    elif stored_calls and not (annotations["role"] == "assistant" and (tool_calls is None or tool_calls == [])):
+        # Any other value is the host's own, as stored (PR P; staging dropped it). An
+        # assistant's empty or null ``tool_calls`` is left out as the host's chat transport
+        # leaves it out (agent/transports/chat_completions.py:415 at Hermes 97bacbbce5).
+        fields["tool_calls"] = tool_calls
     message.pop("tool_call_id", None)
     fields.update(message)
-    return Item(annotations, fields)
+    return Item(annotations, fields, plugin)
 
 
 def _result_item(handle: str, raw: dict, call: Optional[str], route: "Route", *, inline: bool, notes: list,
@@ -633,7 +655,7 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
                 items.append(Item({"summary": derivation,
                                    "note": "a summary: a description of what happened, not what happened; expand "
                                            "its handle to read behind it"},
-                                  {"text": store.derivation_text(derivation)}))
+                                  plugin={"text": store.derivation_text(derivation)}))
             else:
                 items.append(Item({"chunk": chunk}))
         return Target(header, items)
@@ -682,54 +704,84 @@ def _all_summaries(store: RecordStore, chunks: list[str]) -> list[tuple[str, str
 
 # --- Fields and pieces ------------------------------------------------------------------------
 
-def fields_of(item: Item) -> list[tuple[str, Any]]:
+# A field's path is a tuple of structural steps into the item, never a string (PR P): its
+# first step names the side ("lcm", the plugin's fields; "message", the host's), then each
+# step is a dict key taken literally at its own level (a ``str``) or a list index (an
+# ``int``). A host key is a literal at its level, so a key named "content[0]" is the path
+# ("message", "content[0]"), which can never equal the structural ("message", "content", 0).
+# ``render_path`` shows a path to a reader; its output is never parsed back.
+Path = tuple
+
+
+def render_path(path: Path) -> str:
+    """A path as a reader sees it: a JSON Pointer (RFC 6901) into the rendered item, each
+    step escaped ("~" as "~0", "/" as "~1"). Shown only, never parsed back."""
+    return "".join("/" + str(step).replace("~", "~0").replace("/", "~1") for step in path)
+
+
+def fields_of(item: Item) -> list[tuple[Path, Any]]:
     """The fields an item is split into when it does not fit on a page by itself: every
-    key of its ``fields``, in order; content by part (a list, or each part and key of an
-    envelope), and each tool call by its arguments. Deterministic, so a cursor naming a
-    field and an offset finds the same place on every call."""
-    fields: list[tuple[str, Any]] = []
+    field of the plugin's side, in order, then every key of the host's side, in order;
+    content by part (a list, or each part and key of an envelope), and each tool call by
+    its arguments. Deterministic, so a cursor naming a field and an offset finds the same
+    place on every call."""
+    out: list[tuple[Path, Any]] = [(("lcm", key), value) for key, value in item.plugin.items()]
     for key, value in item.fields.items():
         if key == "content" and isinstance(value, list):
-            fields.extend((f"content[{i}]", part) for i, part in enumerate(value))
+            out.extend((("message", "content", i), part) for i, part in enumerate(value))
         elif key == "content" and isinstance(value, dict) and isinstance(value.get("content"), list):
             for inner, said in value.items():
                 if inner == "content":
-                    fields.extend((f"content.content[{i}]", part) for i, part in enumerate(said))
+                    out.extend((("message", "content", "content", i), part) for i, part in enumerate(said))
                 else:
-                    fields.append((f"content.{inner}", said))
+                    out.append((("message", "content", inner), said))
         elif key == "tool_calls" and isinstance(value, list):
             for index, call in enumerate(value):
-                if isinstance(call, dict) and "arguments" in call:
-                    fields.append((f"tool_calls[{index}].arguments", call["arguments"]))
-                elif isinstance(call, dict) and "call" in call:
-                    fields.append((f"tool_calls[{index}].call", call["call"]))
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict) and "arguments" in function:
+                    out.append((("message", "tool_calls", index, "function", "arguments"), function["arguments"]))
                 else:
-                    fields.append((f"tool_calls[{index}]", call))
+                    out.append((("message", "tool_calls", index), call))
         else:
-            fields.append((key, value))
-    return fields
+            out.append((("message", key), value))
+    return out
 
 
-def _piece(item: Item, path: str, *, value: Any = None, text: Optional[str] = None, offset: int = 0,
-           total: int = 0, json_text: bool = False) -> dict:
-    """One field of an item that does not fit on a page by itself: every annotation of
-    the item, by complement, then the field and its slice. A tool call's piece also carries
-    every key of the call's entry but the one it slices."""
-    piece: dict = dict(item.annotations)
-    piece["field"] = path
-    if path.startswith("tool_calls[") and path.endswith((".arguments", ".call")):
-        index = int(path[len("tool_calls["):path.index("]")])
-        call = (item.fields.get("tool_calls") or [])[index]
-        sliced = path.rsplit(".", 1)[1]
-        piece["tool_call"] = {key: said for key, said in call.items() if key != sliced}
+class Piece(dict):
+    """One piece of an item as it is rendered (a plain dict to JSON), with its field's
+    structural ``path`` beside it, never rendered."""
+
+    path: Path = ()
+
+
+def _piece(item: Item, path: Path, *, value: Any = None, text: Optional[str] = None, offset: int = 0,
+           total: int = 0, json_text: bool = False) -> Piece:
+    """One field of an item that does not fit on a page by itself: on the plugin's side
+    (``lcm``) every annotation of the item, by complement, the field's path as a reader sees
+    it and the slice's place; beside it the host's value or text. A tool call's piece also
+    carries what the plugin says of the call (``lcm.call``) and, for its arguments, the rest
+    of the host's call (``tool_call``)."""
+    said: dict = dict(item.annotations)
+    said["field"] = render_path(path)
+    piece = Piece()
+    if len(path) >= 3 and path[:2] == ("message", "tool_calls") and isinstance(path[2], int):
+        calls = item.plugin.get("calls") or []
+        if 0 <= path[2] < len(calls):
+            said["call"] = calls[path[2]]
+        if path[3:] == ("function", "arguments"):
+            call = item.fields["tool_calls"][path[2]]
+            piece["tool_call"] = {**call, "function": {k: v for k, v in call["function"].items() if k != "arguments"}}
+    if text is not None:
+        said["offset"] = offset
+        said["chars"] = total
+        if json_text:
+            said["json"] = True          # the field's value as JSON text, split by offset
+    piece["lcm"] = said
     if text is None:
         piece["value"] = value
     else:
-        piece["offset"] = offset
-        piece["chars"] = total
         piece["text"] = text
-        if json_text:
-            piece["json"] = True          # the field's value as JSON text, split by offset
+    piece.path = path
     return piece
 
 
@@ -776,10 +828,12 @@ def _mark_images(message: dict, handle: str) -> None:
         message["content"] = marked
 
 
-def is_mark(path: str, value: Any) -> bool:
-    """A content part that is an image's mark: it is never split."""
-    return (path.startswith("content[") or path.startswith("content.content[")) and \
-        isinstance(value, dict) and value.get("not_shown") == IMAGE_MARK
+def is_mark(path: Path, value: Any) -> bool:
+    """A content part that is an image's mark: it is never split. The path is structural (a
+    part of the message's content, or of its envelope's), never a key that reads like one."""
+    part = (len(path) == 3 and path[:2] == ("message", "content") and isinstance(path[2], int)) or \
+        (len(path) == 4 and path[:3] == ("message", "content", "content") and isinstance(path[3], int))
+    return part and isinstance(value, dict) and value.get("not_shown") == IMAGE_MARK
 
 
 @dataclass(frozen=True)
@@ -990,7 +1044,7 @@ class PageBuilder:
         next_page = self.token_at(page, (i, f, o))
         return self.render(page_items, page, next_page), (Cursor(*end) if end is not None else None)
 
-    def _longest_slice(self, page_items: list, item: Item, path: str, text: str, offset: int, page: int,
+    def _longest_slice(self, page_items: list, item: Item, path: Path, text: str, offset: int, page: int,
                        json_text: bool, i: int, f: int) -> int:
         """The longest slice short of the field's end that fits, each measured ending where it
         ends (the whole rest was tried first)."""
@@ -1020,10 +1074,10 @@ def _identity(item: Item, piece: Any) -> str:
         name = f"result {said.get('handle')}" + (" as a pointer" if "content_chars" in said else "")
     else:
         name = f"message {said.get('handle')}"
-    path = piece.get("field") if isinstance(piece, dict) and piece is not item else None
-    if path is None:
+    if not isinstance(piece, Piece):
         return name
-    return f"{path} of {name}" + (", an image's mark" if is_mark(path, piece.get("value")) else "")
+    return f"{render_path(piece.path)} of {name}" + (", an image's mark" if is_mark(piece.path, piece.get("value"))
+                                                     else "")
 
 
 def target_identity(target: Target) -> str:
