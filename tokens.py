@@ -42,9 +42,18 @@ ESTIMATE_LABEL = "an estimate: characters / 4, images by the model table's rule"
 class Estimate:
     tokens: int
     uncounted_images: int = 0
+    # The part of ``tokens`` counted by images' rules: provider tokens already, so a
+    # conversion of the estimate into provider tokens applies only to the rest.
+    image_tokens: int = 0
 
     def __add__(self, other: "Estimate") -> "Estimate":
-        return Estimate(self.tokens + other.tokens, self.uncounted_images + other.uncounted_images)
+        return Estimate(self.tokens + other.tokens, self.uncounted_images + other.uncounted_images,
+                        self.image_tokens + other.image_tokens)
+
+    def in_provider_tokens(self, ratio: float) -> int:
+        """The estimate converted into provider tokens: its characters / 4 part times
+        ``ratio``, its images as their rule counted them."""
+        return math.ceil((self.tokens - self.image_tokens) * ratio) + self.image_tokens
 
     def label(self) -> str:
         """The estimate's label, as it is shown."""
@@ -153,18 +162,20 @@ def image_detail(part: dict) -> str:
 @dataclass(frozen=True)
 class Estimator:
     """The estimate for one model's context: ``image_model`` names whose image rule
-    counts images; ``reasoning_sent`` whether that provider receives
+    counts images, on the route ``image_provider`` names (the model table is keyed on
+    both, 9.6); ``reasoning_sent`` whether that provider receives
     ``reasoning_content``."""
 
     image_model: str = ""
     reasoning_sent: bool = False
+    image_provider: str = ""
 
     def image(self, part: dict) -> Optional[int]:
         """One image's tokens by the model's rule, or None (uncounted)."""
         from .image_size import image_dimensions
         from .model_table import AnthropicImageRule, OpenAIImageRule, lookup
 
-        facts = lookup(self.image_model)
+        facts = lookup(self.image_model, self.image_provider)
         rule = facts.image_rule if facts is not None else None
         if rule is None:
             return None
@@ -223,7 +234,7 @@ class Estimator:
         reasoning = message.get("reasoning_content")
         if self.reasoning_sent and isinstance(reasoning, str):
             chars += len(reasoning)
-        return Estimate(math.ceil(chars / CHARS_PER_TOKEN) + image_tokens, uncounted)
+        return Estimate(math.ceil(chars / CHARS_PER_TOKEN) + image_tokens, uncounted, image_tokens)
 
     def messages(self, messages: Iterable[Dict[str, Any]]) -> Estimate:
         total = Estimate(0)

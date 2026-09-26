@@ -714,7 +714,7 @@ class LCMEngine(
             echo = bool(needs_reasoning_echo(self.provider, self.model, self.base_url))
         except Exception:
             echo = False
-        return Estimator(image_model=self.model, reasoning_sent=echo)
+        return Estimator(image_model=self.model, reasoning_sent=echo, image_provider=self.provider)
 
     def _fixed_prefix_fact(self) -> Optional[Dict[str, Any]]:
         """The session's latest ``fixed_prefix`` fact: {"F", "list_estimate",
