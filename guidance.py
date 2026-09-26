@@ -205,18 +205,25 @@ class DeliveryCheck:
             return True
 
     def check(self, host_session_id: str, system_prompt: Any, request_messages: Any) -> None:
-        """Look for the section in one request's system-level prompt, as it was sent."""
+        """Look for the section in one request's system-level prompt, as it was sent.
+
+        A prompt is marked seen only once the check applies to it: the section is not in
+        it, and this load's home names ``lcm`` (or its config cannot be read). A prompt
+        carrying the section, or one seen while the home names another engine, is not
+        marked, so a later request with the same prompt after the home switched to ``lcm``
+        is checked (the host caches its config read, ``hermes_cli/config.py``
+        ``load_config_readonly``)."""
         prompt = sent_system_prompt(system_prompt, request_messages)
-        key = (hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest() if prompt is not None
-               else f"no system-level prompt {host_session_id}")
-        if not self._first_sight(key):
-            return
         framed = self.host.frame(SECTION_ID, self.text) if self.host is not None and self.text else None
         if prompt is not None and framed is not None and framed in prompt:
             return
         configured = configured_context_engine(self.hermes_home)
         if configured is not None and configured != "lcm":
             return  # the section is given only where this home's context engine is LCM
+        key = (hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest() if prompt is not None
+               else f"no system-level prompt {host_session_id}")
+        if not self._first_sight(key):
+            return
         where = (f"; the context.engine of {self.hermes_home or 'this load’s home'} cannot be read"
                  if configured is None else "")
         if prompt is None:
