@@ -242,6 +242,21 @@ def _host_local_server_aliases() -> Optional[frozenset]:
         return None
 
 
+def _host_named_custom_entry(alias: str) -> Optional[str]:
+    """The name under which config.yaml holds a ``providers`` (or legacy
+    ``custom_providers``) entry the host would compose for a local-server alias: the alias
+    itself, then "custom" (``_resolve_named_custom_branch``); "" where there is none;
+    None where the host's lookup cannot be read."""
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
+        for name in (alias, "custom"):
+            if _get_named_custom_provider(name):
+                return name
+    except Exception:
+        return None
+    return ""
+
+
 def configured_route_problem(config: Any) -> Optional[str]:
     """Why the plugin's configured summariser cannot be used, or None (#9). Checked when
     the configuration is loaded; every compaction then aborts with this cause.
@@ -296,6 +311,21 @@ def configured_route_problem(config: Any) -> Optional[str]:
                 f"is {api_mode!r}): the host would pick one from the URL and the model name. Name one of "
                 f"{', '.join(sorted(_CUSTOM_WIRES))}")
     has_key = isinstance(api_key, str) and bool(api_key.strip())
+    if local and not has_key:
+        # For a local-server alias the host first composes a config.yaml ``providers``
+        # entry of the same name (``resolve_provider_client`` → ``_resolve_named_custom_
+        # branch``, agent/auxiliary_client.py at Hermes 9fc7f17906), looked up by the
+        # alias and then by "custom", and that entry supplies the key the configuration
+        # left out: its api_key, key_env or key_cmd, or a credential pool keyed by URL.
+        # The ruling on the pre-review of 6a6a7f8: refused, unless LCM names the key.
+        entry = _host_named_custom_entry(named)
+        if entry is None:
+            return ("the host's config.yaml providers entries could not be read, so whether one of the name "
+                    f"{provider} would supply a key is not known; set LCM_SUMMARY_API_KEY")
+        if entry:
+            return (f"config.yaml has a providers entry named {entry}, which the host composes into the "
+                    f"configured summariser and which would supply a key LCM did not name; set "
+                    f"LCM_SUMMARY_API_KEY")
     if not has_key and not local:
         return ("the configured summariser names no LCM_SUMMARY_API_KEY: the host would send OPENAI_API_KEY, or "
                 "the main key, to the configured URL. A server that needs no key is named by the host's "
@@ -710,21 +740,25 @@ def summarize_chunk(
     focus_topic: str = "",
     custom_instructions: str = "",
     path: CallPath = CallPath(),
+    level_one: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, int, str]:
     """Summarise one chunk: (summary, level, finish_reason), or ``SummaryFailure``.
 
     ``records`` are the chunk's records as (handle, the host's dict as stored); the
     summariser reads them as the messages they were (#8, ``summariser_input``).
     ``source`` is their estimate, what the summary replaces in the context; a reply
-    must come in below it, by the same counter (R6).
+    must come in below it, by the same counter (R6). ``level_one`` is the level-1
+    input where the caller built it already (``level_one_input``, the input its window
+    check estimated).
 
     Level 1; after a non-transient failure of level 1, level 2 once (today's texts,
     until #10). A transient failure that outlasts the deadline is not retried at
     level 2: the next level would meet the same provider with no time left.
     """
     request = _summary_request(focus_topic=focus_topic, custom_instructions=custom_instructions)
-    l1 = level_one_input(records, token_budget, facts=facts, depth=depth, focus_topic=focus_topic,
-                         custom_instructions=custom_instructions)
+    l1 = level_one if level_one is not None else level_one_input(
+        records, token_budget, facts=facts, depth=depth, focus_topic=focus_topic,
+        custom_instructions=custom_instructions)
     try:
         content, finish_reason = _call_with_retries(
             l1, source=source, settings=settings, path=path)

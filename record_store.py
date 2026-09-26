@@ -296,18 +296,18 @@ class RecordStore:
         rows = self._q("SELECT COUNT(*) FROM effective_compactions WHERE session = ?", (session,))
         return int(rows[0][0]) if rows else 0
 
-    def derivations(self, handles: Iterable[str]) -> dict[str, tuple[int, str, Optional[str]]]:
-        """handle -> (derivation id, text, expand hint)."""
+    def derivations(self, handles: Iterable[str]) -> dict[str, tuple[int, str]]:
+        """handle -> (derivation id, text)."""
         wanted = [h for h in set(handles) if h]
-        found: dict[str, tuple[int, str, Optional[str]]] = {}
+        found: dict[str, tuple[int, str]] = {}
         for start in range(0, len(wanted), 500):
             chunk = wanted[start:start + 500]
             rows = self._q(
-                "SELECT handle, derivation_id, text, expand_hint FROM derivations "
+                "SELECT handle, derivation_id, text FROM derivations "
                 f"WHERE handle IN ({','.join('?' * len(chunk))})",
                 chunk,
             )
-            found.update({str(h): (int(i), str(t), e) for h, i, t, e in rows})
+            found.update({str(h): (int(i), str(t)) for h, i, t in rows})
         return found
 
     def summary_of_records(
@@ -1075,7 +1075,6 @@ class RecordStore:
         level: Optional[int],
         budget: Optional[int],
         est_tokens: Optional[int],
-        expand_hint: Optional[str] = None,
         finish_reason: Optional[str] = None,
         effort: Optional[str] = None,
         withheld_reasoning: Optional[str] = None,
@@ -1085,10 +1084,10 @@ class RecordStore:
                 conn,
                 DERIVATION,
                 "INSERT INTO derivations(handle, kind, text, compaction, model, provider, effort, prompt, "
-                "budget, finish_reason, level, est_tokens, expand_hint, withheld_reasoning, created_at) "
-                "VALUES (?, 'summary', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+                "budget, finish_reason, level, est_tokens, withheld_reasoning, created_at) "
+                "VALUES (?, 'summary', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
                 (text, compaction, model or None, provider or None, effort or None, budget, finish_reason or None,
-                 level, est_tokens, expand_hint, withheld_reasoning, time.time()),
+                 level, est_tokens, withheld_reasoning, time.time()),
             )
             conn.execute(
                 "INSERT INTO derivation_sources(derivation, ordinal, chunk, source_derivation) VALUES (?, 0, ?, NULL)",

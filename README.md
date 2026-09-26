@@ -39,7 +39,8 @@ history, or host scaffolding the host never persists) cannot be found again by a
 cuts it again and names those rows (the ask to Hermes: A1). Compaction runs
 at a threshold derived from the model's window, raised by a margin while a turn runs, and
 brings the context down to a target G (#11, #31, #32); the material outside the tail is split
-into equal chunks of 50k provider tokens (#12), and the tail takes what the target leaves,
+into equal chunks of 50k provider tokens, smaller where the summariser reads less in one call
+(#12, #34 D4), and the tail takes what the target leaves,
 sized in tokens, in whole tool groups (#13). The plugin counts by its own estimate, characters
 divided by four, converted to provider tokens by a measured ratio and labelled as an estimate
 wherever it is shown (#21). The plugin tells the agent what its summaries are in a section of

@@ -126,9 +126,6 @@ class SummaryNode:
     created_at: float = 0.0
     earliest_at: float | None = None
     latest_at: float | None = None
-    # No longer written (#9: nothing in a reply is recognised by pattern); rows written
-    # before carry the text a pattern took from the summary. Its tool fields go with #18.
-    expand_hint: str = ""
     search_rank: float | None = None
     search_directness: float = 0.0
     # Transcript order of the summary in the session's cover (the view's ``seq``).
@@ -454,9 +451,8 @@ class SummaryDAG:
             created_at=row[9],
             earliest_at=row[10],
             latest_at=row[11],
-            expand_hint=row[12] or "",
-            seq=int(row[13] or 0) if len(row) > 13 else 0,
-            search_rank=row[14] if len(row) > 14 else None,
+            seq=int(row[12] or 0) if len(row) > 12 else 0,
+            search_rank=row[13] if len(row) > 13 else None,
         )
 
     def close(self, reason: str = "closed") -> None:

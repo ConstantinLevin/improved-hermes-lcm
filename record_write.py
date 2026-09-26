@@ -471,7 +471,6 @@ class RecordWriteMixin:
         text: str,
         level: Optional[int],
         budget: Optional[int],
-        expand_hint: Optional[str],
         finish_reason: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
@@ -493,7 +492,6 @@ class RecordWriteMixin:
             level=level,
             budget=budget,
             est_tokens=count_tokens(text),
-            expand_hint=expand_hint,
             finish_reason=finish_reason,
             withheld_reasoning=withheld_reasoning,
         )
