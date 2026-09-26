@@ -49,14 +49,19 @@ logger = logging.getLogger(__name__)
 # and the ``tool_results`` table go, and a tool call's handle is minted with its record,
 # never inherited (#18, round 5 of #71); which result answers which call is read at the
 # time of the question, by the host's own rule.
-STORE_FORMAT = "ihl-store/12"
+# Format 13 is grep's (#18 D2): ``records.text`` holds the strings the agent's past shows as
+# the message's own (``message_content.grep_text``), and one full-text index over it,
+# ``grep_index``, a trigram index with detail=none that only chooses candidates; the hit is
+# decided by exact containment. The summaries' index (``nodes_fts``) and ``messages_fts`` go:
+# summaries are never searched.
+STORE_FORMAT = "ihl-store/13"
 # The store's file carries its format: ``<base stem>-<N><base suffix>`` (ruling C on the
 # pre-review of 0771477). A change of format begins a new file beside the old one, which is
 # never opened, moved or changed (nor its -wal and -shm files): #29's "begun again" without
 # destroying anything of the user's, and without a rename another process could race.
 FORMAT_NUMBER = STORE_FORMAT.rsplit("/", 1)[1]
 # The base the file name is formed from under the host-given Hermes home; the file itself
-# is ``store_path(base)``, ``lcm-record-12.db``.
+# is ``store_path(base)``, ``lcm-record-13.db``.
 STORE_BASENAME = "lcm-record.db"
 # Upstream hermes-lcm's store under the same home: never opened, named when left beside.
 UPSTREAM_FILENAME = "lcm.db"
@@ -101,9 +106,11 @@ REQUIRED_CORE_TABLES = (
     "derivations",
     "derivation_sources",
     "compaction_returns",
-    "messages_fts",
-    "nodes_fts",
+    "grep_index",
 )
+
+# The trigram tokenizer and its case_sensitive option came with SQLite 3.34.0.
+MIN_SQLITE_FOR_GREP = (3, 34, 0)
 
 
 class StoreRefusedError(RuntimeError):
@@ -245,51 +252,41 @@ class ExternalContentFtsSpec:
         content_rowid: str,
         indexed_column: str,
         trigger_sqls: Sequence[str],
+        options: Sequence[tuple[str, str]] = (),
     ) -> None:
         self.table_name = table_name
         self.content_table = content_table
         self.content_rowid = content_rowid
         self.indexed_column = indexed_column
         self.trigger_sqls = tuple(trigger_sqls)
+        # FTS5 options beside content/content_rowid, as (name, SQL literal), in order.
+        self.options = tuple(options)
 
 
-# The full-text indexes are derived from the record and only grow with it (#29 W1):
-# one over the records' text, one over the derivations' text. Both tables are
-# insert-only, so an insert trigger is all an index needs. The tools join them to
-# the ``messages`` and ``summary_nodes`` views by id, which scope what is visible.
-MESSAGES_FTS_SPEC = ExternalContentFtsSpec(
-    table_name="messages_fts",
+# grep's index (#18 D2) is derived from the record and only grows with it (#29 W1): one
+# trigram index over ``records.text``. ``records`` is insert-only, so an insert trigger is
+# all it needs. detail=none keeps no positions: the index chooses the records that hold
+# every trigram of a term, and exact containment decides (``grep``); a phrase query, which
+# detail=full would allow, is quadratic on repetitive terms. case_sensitive 1: the trigrams
+# are the codepoints as stored, no folding table.
+GREP_INDEX_SPEC = ExternalContentFtsSpec(
+    table_name="grep_index",
     content_table="records",
     content_rowid="record_id",
     indexed_column="text",
     trigger_sqls=(
         """
-        CREATE TRIGGER IF NOT EXISTS records_fts_insert
+        CREATE TRIGGER IF NOT EXISTS records_grep_insert
             AFTER INSERT ON records BEGIN
-            INSERT INTO messages_fts(rowid, text)
+            INSERT INTO grep_index(rowid, text)
                 VALUES (new.record_id, new.text);
         END;
         """,
     ),
+    options=(("tokenize", "'trigram case_sensitive 1'"), ("detail", "none")),
 )
 
-NODES_FTS_SPEC = ExternalContentFtsSpec(
-    table_name="nodes_fts",
-    content_table="derivations",
-    content_rowid="derivation_id",
-    indexed_column="text",
-    trigger_sqls=(
-        """
-        CREATE TRIGGER IF NOT EXISTS derivations_fts_insert
-            AFTER INSERT ON derivations BEGIN
-            INSERT INTO nodes_fts(rowid, text)
-                VALUES (new.derivation_id, new.text);
-        END;
-        """,
-    ),
-)
-
-FTS_SPECS = (MESSAGES_FTS_SPEC, NODES_FTS_SPEC)
+FTS_SPECS = (GREP_INDEX_SPEC,)
 
 
 # The tables of the plugin's own record. Each is insert-only: triggers raise on any
@@ -372,7 +369,8 @@ CREATE TABLE records (
     raw TEXT NOT NULL,
     role TEXT,
     tool_call_id TEXT,
-    text TEXT,
+    -- What grep searches (message_content.grep_text); "" for a record without strings.
+    text TEXT NOT NULL,
     est_tokens INTEGER,
     est_uncounted_images INTEGER NOT NULL DEFAULT 0
 );
@@ -826,8 +824,11 @@ def _create_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
     """Create the whole schema and the identity row in one transaction.
 
     Several processes and engine copies can reach an empty database at once; the
-    identity is checked again under the write lock, and only one creates.
+    identity is checked again under the write lock, and only one creates. A SQLite without
+    FTS5's trigram tokenizer cannot hold grep's index: nothing is created, and the store is
+    refused with the version it has.
     """
+    _require_trigram(conn, db_path)
     conn.execute("BEGIN IMMEDIATE")
     try:
         if _identity_state(conn, db_path) == "store":
@@ -848,6 +849,27 @@ def _create_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
         conn.execute("ROLLBACK")
         raise
     logger.info("LCM created a new store at %s (format %s)", db_path, STORE_FORMAT)
+
+
+def _require_trigram(conn: sqlite3.Connection, db_path: str | Path) -> None:
+    """Refuse, before anything is created, a SQLite older than 3.34 or without FTS5's
+    trigram tokenizer: grep's index needs it (#18 D2)."""
+    version = sqlite3.sqlite_version
+    why = None
+    if sqlite3.sqlite_version_info < MIN_SQLITE_FOR_GREP:
+        why = "it is older than 3.34"
+    else:
+        try:
+            conn.execute("CREATE VIRTUAL TABLE temp.lcm_trigram_check USING fts5(x, "
+                         "tokenize='trigram case_sensitive 1', detail=none)")
+            conn.execute("DROP TABLE temp.lcm_trigram_check")
+        except sqlite3.Error as exc:
+            why = f"it refuses the tokenizer ({exc})"
+    if why is not None:
+        message = (f"LCM needs SQLite 3.34 or newer with FTS5's trigram tokenizer for its search index; this "
+                   f"Python links SQLite {version}, and {why}. Nothing was created at {db_path}.")
+        logger.error(message)
+        raise StoreRefusedError(message)
 
 
 def open_store(conn: sqlite3.Connection, db_path: str | Path, *, check_fts: bool = False) -> None:
@@ -980,13 +1002,18 @@ def quote_sql_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
+def _fts_option_sql(spec: ExternalContentFtsSpec) -> list[str]:
+    return [f"{name}={value}" for name, value in spec.options]
+
+
 def _create_fts_table(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
+    options = "".join(f",\n            {option}" for option in _fts_option_sql(spec))
     conn.execute(
         f"""
         CREATE VIRTUAL TABLE {quote_sql_identifier(spec.table_name)} USING fts5(
             {quote_sql_identifier(spec.indexed_column)},
             content={quote_sql_identifier(spec.content_table)},
-            content_rowid={quote_sql_identifier(spec.content_rowid)}
+            content_rowid={quote_sql_identifier(spec.content_rowid)}{options}
         )
         """
     )
@@ -1008,6 +1035,11 @@ def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalConten
         sql = (info[0] if info else "") or ""
         normalized = sql.lower()
         if "virtual table" not in normalized or "using fts5" not in normalized:
+            return True
+        # The table's options as the spec writes them (tokenizer, detail): another form
+        # is not this index and is created again.
+        compact = "".join(normalized.split())
+        if any("".join(option.lower().split()) not in compact for option in _fts_option_sql(spec)):
             return True
 
         columns = conn.execute(

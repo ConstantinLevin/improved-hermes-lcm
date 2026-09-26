@@ -5,23 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
 from . import expansion
+from . import grep as grep_tool
 from .diagnostics import doctor_guidance_for_checks
-from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
+    GREP_INDEX_SPEC,
     check_external_content_fts_integrity,
     inspect_lcm_schema_health,
 )
 from .message_content import content_parts, is_image_part
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
-from .search_query import AGE_DECAY_RATE, normalize_search_sort
-from .store import build_message_fts_spec
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
@@ -29,47 +26,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
-    """Recency is the transcript order (``_sort_seq``); the time only ages a hit for
-    the hybrid blend."""
-    sort_timestamp = float(result.get("_sort_ts") or 0.0)
-    sort_order = float(result.get("_sort_seq") or 0.0)
-    rank = result.get("_sort_rank")
-    rank_value = float(rank) if rank is not None else float("inf")
-    directness = float(result.get("_sort_directness") or 0.0)
-    type_bias = 0 if result.get("type") == "message" else 1
-    role = result.get("role")
-    if role == "user":
-        role_bias = 0
-    elif role == "assistant":
-        role_bias = 1
-    elif role == "tool":
-        role_bias = 2
-    else:
-        role_bias = 1
-
-    effective_directness = directness if result.get("type") == "message" else (directness * 0.8)
-
-    if sort == "relevance":
-        return (rank_value, -effective_directness, role_bias, -sort_order, type_bias)
-
-    if sort == "hybrid":
-        age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
-        blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
-        summary_override = int(result.get("_hybrid_summary_override") or 0)
-        return (
-            -summary_override,
-            blended,
-            -effective_directness,
-            role_bias,
-            -sort_order,
-            type_bias,
-        )
-
-    if result.get("type") == "message":
-        return (-sort_order, type_bias, role_bias, rank_value, 0.0, float("inf"))
-    return (-sort_order, type_bias, 0, rank_value, 0.0, role_bias)
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
     engine = kwargs.get("engine")
@@ -106,50 +62,6 @@ def _truncate_text_to_token_budget(text: str, max_tokens: int) -> tuple[str, boo
     return best, True
 
 
-def _parse_int_value(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _parse_optional_timestamp(value: Any, name: str) -> tuple[float | None, str | None]:
-    if value is None:
-        return None, None
-    if isinstance(value, bool):
-        return None, f"{name} must be a Unix timestamp or timezone-aware ISO 8601 string"
-    if isinstance(value, (int, float)):
-        try:
-            return float(value), None
-        except (TypeError, ValueError, OverflowError):
-            return None, f"{name} must be a Unix timestamp or timezone-aware ISO 8601 string"
-    text = str(value).strip()
-    if not text:
-        return None, f"{name} must not be empty"
-    try:
-        return float(text), None
-    except (TypeError, ValueError, OverflowError):
-        pass
-    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
-    try:
-        parsed = datetime.fromisoformat(iso_text)
-    except ValueError:
-        return None, f"{name} must be a Unix timestamp or timezone-aware ISO 8601 string"
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None, f"{name} ISO timestamp must include a timezone offset or Z"
-    return parsed.timestamp(), None
-
-
-def _parse_grep_role(value: Any) -> tuple[str | None, str | None]:
-    if value is None:
-        return None, None
-    role = str(value or "").strip()
-    valid_roles = {"system", "user", "assistant", "tool", "unknown"}
-    if role not in valid_roles:
-        return None, "role must be one of: system, user, assistant, tool, unknown"
-    return role, None
-
-
 def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
     try:
         if isinstance(value, bool):
@@ -159,7 +71,6 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
         return None, f"{name} must be an integer"
 
 
-_LCM_GREP_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_MAX_RESPONSE_CHARS = 20_000
@@ -334,53 +245,6 @@ def _slice_content_for_response(
         "next_content_offset": next_content_offset if has_more else 0,
         "has_more": has_more,
     }
-
-
-def _query_terms_for_match_window(query: str | None) -> list[str]:
-    if not query:
-        return []
-    terms: list[str] = []
-    normalized_query = " ".join(re.findall(r"\w+", query))
-    if normalized_query:
-        terms.append(normalized_query)
-
-    def add_term(term: str) -> None:
-        term = term.strip()
-        if not term:
-            return
-        terms.append(term)
-        parts = [part for part in re.split(r"[^\w]+", term) if part]
-        if len(parts) > 1:
-            terms.append(" ".join(parts))
-        terms.extend(part for part in parts if len(part) >= 2)
-
-    for quoted in re.findall(r'"([^"]+)"', query):
-        add_term(quoted)
-    for token in re.findall(r"[\w][\w:-]*\*?", query):
-        token = token.rstrip("*").strip()
-        if not token or token.upper() in {"AND", "OR", "NOT", "NEAR"}:
-            continue
-        if ":" in token:
-            token = token.rsplit(":", 1)[-1]
-        if len(token) >= 2:
-            add_term(token)
-    seen: set[str] = set()
-    unique: list[str] = []
-    for term in sorted(terms, key=len, reverse=True):
-        key = term.casefold()
-        if key not in seen:
-            seen.add(key)
-            unique.append(term)
-    return unique
-
-
-def _content_offset_for_query_match(content: str, query: str | None) -> int:
-    folded = content.casefold()
-    for term in _query_terms_for_match_window(query):
-        index = folded.find(term.casefold())
-        if index >= 0:
-            return index
-    return 0
 
 
 def _pagination_payload(
@@ -732,95 +596,6 @@ def _collect_context_blocks_for_node(
     return blocks
 
 
-def _collect_raw_match_context_block(
-    engine: "LCMEngine",
-    rows: list[dict[str, Any]],
-    max_tokens: int,
-    *,
-    query: str | None = None,
-    exclude_store_ids: set[int] | None = None,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    from .tokens import count_tokens
-
-    exclude_store_ids = exclude_store_ids or set()
-    messages: list[dict[str, Any]] = []
-    matches: list[dict[str, Any]] = []
-    budget_used = 0
-    has_more = False
-    next_store_id: int | None = None
-    for row in rows:
-        store_id = row.get("store_id")
-        if store_id in exclude_store_ids:
-            continue
-        remaining_tokens = max(0, max_tokens - budget_used)
-        if remaining_tokens <= 0:
-            has_more = True
-            next_store_id = store_id if isinstance(store_id, int) else None
-            break
-        content, image_spans = _stored_content_text(row)
-        match_offset = _content_offset_for_query_match(content, query)
-        content_slice = _slice_content_for_response(content, remaining_tokens, content_offset=match_offset,
-                                                    image_spans=image_spans)
-        content = content_slice["content"]
-        item = {
-            "store_id": store_id,
-            "session_id": row.get("session_id") or "",
-            "source": row.get("source") or "",
-            "role": row.get("role"),
-            "timestamp": row.get("timestamp", 0),
-            **content_slice,
-            "content_source": "raw_search_hit",
-            "search_rank": row.get("search_rank"),
-        }
-        if row.get("tool_call_id"):
-            item["tool_call_id"] = row.get("tool_call_id")
-        if match_offset:
-            item["match_window_offset"] = match_offset
-        if row.get("tool_calls"):
-            item["tool_calls_omitted"] = True
-        if row.get("tool_name"):
-            item["tool_name"] = row.get("tool_name")
-        messages.append(item)
-        matches.append(
-            {
-                "store_id": store_id,
-                "role": row.get("role"),
-                "snippet": row.get("snippet") or content[:300],
-                "search_rank": row.get("search_rank"),
-            }
-        )
-        budget_used += count_tokens(content)
-        if content_slice["has_more"]:
-            has_more = True
-            break
-
-    if not messages and not has_more:
-        return None, matches
-    block = {
-        "type": "raw_messages",
-        "messages": messages,
-        "pagination": {
-            "has_more": has_more,
-            "returned_sources": len(messages),
-            "total_sources": len(rows),
-            "next_store_id": next_store_id,
-        },
-    }
-    return block, matches
-
-
-def _collect_store_ids_from_context_blocks(blocks: list[dict[str, Any]]) -> set[int]:
-    store_ids: set[int] = set()
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        for message in block.get("messages", []) or []:
-            store_id = message.get("store_id")
-            if isinstance(store_id, int):
-                store_ids.add(store_id)
-    return store_ids
-
-
 def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
     from .tokens import count_tokens
 
@@ -902,208 +677,22 @@ _QUERY_THINK_BLOCK_RE = re.compile(
 )
 
 
-def _shape_message_hit(
-    hit: Dict[str, Any],
-    *,
-    current_session_id: str | None,
-    has_current_session: bool,
-) -> dict[str, Any]:
-    """Shape a raw MessageStore hit into an lcm_grep result row."""
-    timestamp_value = hit.get("timestamp", 0) or 0
-    return {
-        "type": "message",
-        "depth": "raw",
-        "store_id": hit["store_id"],
-        "session_id": hit["session_id"],
-        "source": hit.get("source") or "",
-        "conversation_id": hit.get("conversation_id") or "",
-        "role": hit["role"],
-        "timestamp": timestamp_value,
-        "snippet": hit.get("snippet", hit.get("content", "")[:200]),
-        "from_current_session": has_current_session
-        and hit["session_id"] == current_session_id,
-        **({"revises_node_id": hit["revises_node_id"]} if hit.get("revises_node_id") is not None else {}),
-        "_sort_ts": timestamp_value,
-        "_sort_seq": hit.get("seq") or 0,
-        "_sort_rank": hit.get("search_rank"),
-        "_sort_directness": hit.get("_directness_score") or 0.0,
-    }
-
-
-def _shape_summary_hit(node: Any) -> dict[str, Any]:
-    """Shape a SummaryDAG node hit into an lcm_grep result row."""
-    return {
-        "type": "summary",
-        "depth": f"d{node.depth}",
-        "node_id": node.node_id,
-        "session_id": node.session_id,
-        "snippet": node.summary[:300],
-        "token_count": node.token_count,
-        "earliest_at": node.earliest_at,
-        "latest_at": node.latest_at,
-        "from_current_session": True,
-        "_sort_ts": node.latest_at or node.created_at,
-        "_sort_seq": getattr(node, "seq", 0) or 0,
-        "_sort_rank": node.search_rank,
-        "_sort_directness": node.search_directness or 0.0,
-    }
-
-
-_LCM_GREP_REMOVED_ARGUMENTS = (
-    "mode",
-    "session_scope",
-    "session_id",
-    "source",
-    "conversation_id",
-    "content_scope",
-    "externalized_refs",
-)
-
-
-def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
-    """Full-text search over raw messages and summaries of the current session.
-
-    ``limit`` is clamped to ``_LCM_GREP_HARD_LIMIT_CAP`` regardless of input.
-    """
+def lcm_grep(args: Dict[str, Any], **kwargs) -> Any:
+    """Search what the session's agent said and did for a term, and return the chunks it
+    lies in (``grep``, #18 D2). The result is the final string, at most the host's spill
+    threshold."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
-
-    removed = [name for name in _LCM_GREP_REMOVED_ARGUMENTS if name in args]
-    if removed:
-        return json.dumps({
-            "error": (
-                "lcm_grep no longer accepts: " + ", ".join(removed)
-                + ". It searches the current session by full text only."
-            ),
-        })
-
-    query = args.get("query", "").strip()
-    if not query:
-        return json.dumps({"error": "No query provided"})
-
-    raw_limit_arg = args.get("limit", 10)
-    parsed_limit = _parse_int_value(raw_limit_arg, 10)
-    if parsed_limit <= 0:
-        return json.dumps({"error": "limit must be a positive integer"})
-    requested_limit = parsed_limit
-    limit_cap = _LCM_GREP_HARD_LIMIT_CAP
-    limit = min(requested_limit, limit_cap)
-    sort = normalize_search_sort(args.get("sort"))
-    source_limit = max(limit * 4, limit, 20)
-
-    role, role_error = _parse_grep_role(args.get("role"))
-    if role_error:
-        return json.dumps({"error": role_error})
-    time_from, time_from_error = _parse_optional_timestamp(args.get("time_from"), "time_from")
-    if time_from_error:
-        return json.dumps({"error": time_from_error})
-    time_to, time_to_error = _parse_optional_timestamp(args.get("time_to"), "time_to")
-    if time_to_error:
-        return json.dumps({"error": time_to_error})
-    if time_from is not None and time_to is not None and time_to < time_from:
-        return json.dumps({"error": "time_to must be greater than or equal to time_from"})
-    raw_message_filter_active = (
-        role is not None
-        or time_from is not None
-        or time_to is not None
-    )
-
-    # MessageStore.search and SummaryDAG.search treat session_id="" as a
-    # literal scoped filter, so an unbound engine returns zero results rather
-    # than matches from other sessions. Read current_session_id (the
-    # foreground view) so a side channel that briefly owns engine._session_id
-    # does not redirect the search away from the operator's conversation.
-    search_session_id: str = engine.current_session_id
-
-    current_session_id = engine.current_session_id
-    has_current_session = bool(current_session_id)
-    results: list[Dict[str, Any]] = []
-
     try:
-        msg_hits = engine._store.search(
-            query,
-            session_id=search_session_id,
-            limit=source_limit,
-            sort=sort,
-            role=role,
-            time_from=time_from,
-            time_to=time_to,
-        )
-        for hit in msg_hits:
-            results.append(
-                _shape_message_hit(
-                    hit,
-                    current_session_id=current_session_id,
-                    has_current_session=has_current_session,
-                )
-            )
+        return grep_tool.grep(engine, args, messages=kwargs.get("messages"))
+    except expansion.ExpansionError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
     except Exception as exc:
-        logger.warning("Message search failed: %s", exc)
-
-    if not raw_message_filter_active:
-        try:
-            node_hits = engine._dag.search(
-                query,
-                session_id=search_session_id,
-                limit=source_limit,
-                sort=sort,
-            )
-            for node in node_hits:
-                results.append(_shape_summary_hit(node))
-        except Exception as exc:
-            logger.warning("Node search failed: %s", exc)
-
-    if sort == "hybrid":
-        max_message_directness = max(
-            (float(result.get("_sort_directness") or 0.0) for result in results if result.get("type") == "message"),
-            default=0.0,
-        )
-        for result in results:
-            if result.get("type") == "summary":
-                result["_hybrid_summary_override"] = 1 if float(result.get("_sort_directness") or 0.0) >= (max_message_directness + 8.0) else 0
-
-    results.sort(key=lambda result: _combined_result_sort_key(result, sort))
-    for result in results:
-        result.pop("_sort_ts", None)
-        result.pop("_sort_seq", None)
-        result.pop("_sort_rank", None)
-        result.pop("_sort_directness", None)
-        result.pop("_hybrid_summary_override", None)
-
-    # The tools take handles (#29 W5): a hit names its record or summary by its handle.
-    shown = results[:limit]
-    record_handles = engine._records.handles_of_records(
-        r["store_id"] for r in shown if r.get("store_id") is not None)
-    derivation_handles = engine._records.handles_of_derivations(
-        [r["node_id"] for r in shown if r.get("node_id") is not None]
-        + [r["revises_node_id"] for r in shown if r.get("revises_node_id") is not None])
-    for result in shown:
-        if "store_id" in result:
-            result["handle"] = record_handles.get(result.pop("store_id"))
-        if "node_id" in result:
-            result["handle"] = derivation_handles.get(result.pop("node_id"))
-        if "revises_node_id" in result:
-            result["revises"] = derivation_handles.get(result.pop("revises_node_id"))
-
-    response: Dict[str, Any] = {
-        "query": query,
-        "sort": sort,
-        "limit": limit,
-        "total_results": len(results),
-        "results": shown,
-    }
-    if role is not None:
-        response["role"] = role
-    if time_from is not None:
-        response["time_from"] = time_from
-    if time_to is not None:
-        response["time_to"] = time_to
-    if raw_message_filter_active:
-        response["summary_results_omitted"] = True
-    if requested_limit > limit_cap:
-        response["limit_clamped_from"] = requested_limit
-    return json.dumps(response)
+        # A store that cannot be read is said, never shown as "no hits".
+        logger.warning("lcm_grep failed", exc_info=True)
+        return json.dumps({"error": f"lcm_grep could not read the store ({type(exc).__name__}: {exc}); nothing was "
+                                    f"searched"}, ensure_ascii=False)
 
 
 _LCM_EXPAND_REMOVED_ARGUMENTS = (
@@ -1192,6 +781,12 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if "node_ids" in args:
         return json.dumps({"error": "lcm_expand_query no longer accepts node_ids; give the summaries' handles "
                                     "as handles"})
+    # The query looks behind handles the agent holds (manifesto, "Looking behind a handle");
+    # finding a stretch by a term is lcm_grep's (#18 D2; the query is rebuilt in #19).
+    removed = [name for name in ("query", "max_results") if name in args]
+    if removed:
+        return json.dumps({"error": "lcm_expand_query no longer accepts " + ", ".join(removed) + ": it reads the "
+                                    "summaries whose handles you give. To find where a term lies, use lcm_grep."})
     handles = args.get("handles")
     inner = {key: value for key, value in args.items() if key != "handles"}
     if handles is not None:
@@ -1247,16 +842,9 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
         return json.dumps({"error": context_max_tokens_error})
     context_max_tokens = max(1, context_max_tokens)
 
-    max_results, max_results_error = _parse_int_arg("max_results", 5)
-    if max_results_error:
-        return json.dumps({"error": max_results_error})
-    max_results = max(1, int(max_results or 5))
-
-    query = str(args.get("query") or "").strip()
     raw_node_ids = args.get("node_ids") or []
 
     nodes = []
-    raw_results: list[dict[str, Any]] = []
     if raw_node_ids:
         for node_id in raw_node_ids:
             try:
@@ -1266,27 +854,15 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
             node = _get_session_node(engine, parsed_node_id)
             if node is not None:
                 nodes.append(node)
-    elif query:
-        nodes = engine._dag.search(query, session_id=engine.current_session_id, limit=max_results)
-        raw_results = engine._store.search(query, session_id=engine.current_session_id, limit=max_results)
     else:
-        return json.dumps({"error": "Provide either query or handles"})
+        return json.dumps({"error": "handles is required: the handles (s…) of the summaries to read"})
 
-    if not nodes and not raw_results:
-        return json.dumps(
-            {
-                "prompt": prompt,
-                "query": query,
-                "answer": "No matching summaries or raw messages found in the current session.",
-                "node_ids": [],
-                "matches": [],
-                "raw_matches": [],
-            }
-        )
+    if not nodes:
+        return json.dumps({"error": "none of the handles given stands for a summary this session holds"})
 
     context_blocks = []
     context_budget_used = 0
-    for node in nodes[:max_results]:
+    for node in nodes:
         remaining_context_tokens = max(0, context_max_tokens - context_budget_used)
         node_blocks = _collect_context_blocks_for_node(
             engine,
@@ -1295,21 +871,6 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
         )
         context_blocks.extend(node_blocks)
         context_budget_used += _context_content_token_count(node_blocks)
-
-    raw_matches: list[dict[str, Any]] = []
-    if raw_results:
-        seen_store_ids = _collect_store_ids_from_context_blocks(context_blocks)
-        remaining_context_tokens = max(0, context_max_tokens - context_budget_used)
-        raw_block, raw_matches = _collect_raw_match_context_block(
-            engine,
-            raw_results,
-            max_tokens=remaining_context_tokens,
-            query=query,
-            exclude_store_ids=seen_store_ids,
-        )
-        if raw_block is not None:
-            context_blocks.append(raw_block)
-            context_budget_used += _context_content_token_count([raw_block])
 
     context_pagination = []
     for block in context_blocks:
@@ -1370,21 +931,6 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
                     "source_offset": pagination.get("next_source_offset") or 0,
                     "content_offset": pagination.get("next_content_offset") or 0,
                 }
-        elif block_type == "raw_messages":
-            truncated_message = next(
-                (message for message in block.get("messages", []) if message.get("content_truncated")),
-                None,
-            )
-            if truncated_message:
-                item["store_id"] = truncated_message.get("store_id")
-                item["content_source"] = truncated_message.get("content_source")
-                item["expand_args"] = {
-                    "store_id": truncated_message.get("store_id"),
-                    "content_offset": truncated_message.get("next_content_offset") or 0,
-                }
-            elif pagination.get("next_store_id"):
-                item["store_id"] = pagination.get("next_store_id")
-                item["expand_args"] = {"store_id": pagination.get("next_store_id")}
         elif block_type in {"child_nodes", "descendant_child_nodes"}:
             item["expand_args"] = {
                 "node_id": block.get("node_id"),
@@ -1397,7 +943,7 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
         for item in context_pagination
     )
 
-    selected_nodes = nodes[:max_results]
+    selected_nodes = nodes
     matches = [
         {
             "node_id": node.node_id,
@@ -1411,7 +957,6 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
     def _degraded_payload(reason: str, *, include_timeout: bool = False) -> str:
         payload: Dict[str, Any] = {
             "prompt": prompt,
-            "query": query,
             "error": reason,
             "degraded": True,
             "model": model,
@@ -1421,7 +966,6 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
             "context_pagination": context_pagination,
             "node_ids": node_ids,
             "matches": matches,
-            "raw_matches": raw_matches,
         }
         if include_timeout:
             payload["timeout_seconds"] = timeout
@@ -1452,7 +996,6 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
     return json.dumps(
         {
             "prompt": prompt,
-            "query": query,
             "answer": answer,
             "model": model,
             "max_tokens": max_tokens,
@@ -1461,7 +1004,6 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
             "context_pagination": context_pagination,
             "node_ids": node_ids,
             "matches": matches,
-            "raw_matches": raw_matches,
         }
     )
 
@@ -1876,26 +1418,37 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
-    # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
-    # inverted indexes point at the exact table and repair path.
-    for check_name, conn, spec in (
-        ("messages_fts_integrity", engine._store.connection, build_message_fts_spec()),
-        ("nodes_fts_integrity", engine._dag.connection, build_nodes_fts_spec()),
-    ):
-        try:
-            fts_integrity = check_external_content_fts_integrity(conn, spec)
-            status = fts_integrity["status"]
-            checks.append({
-                "check": check_name,
-                "status": "warn" if status == "unchecked" else status,
-                "detail": fts_integrity if status == "unchecked" else fts_integrity["detail"],
-            })
-        except Exception as e:
-            checks.append({
-                "check": check_name,
-                "status": "fail",
-                "detail": str(e),
-            })
+    # 1b. grep's index (#18 D2): its structure, FTS5's deep integrity-check, and every
+    # record of the session held by it. The deep check is the one place that sees damage
+    # grep's own per-call check cannot (the index's postings); where it fails, the index is
+    # rebuilt at once, as the owner decided, and checked again.
+    try:
+        conn = engine._store.connection
+        fts_integrity = check_external_content_fts_integrity(conn, GREP_INDEX_SPEC)
+        unindexed = int(conn.execute(
+            "SELECT count(*) FROM records r LEFT JOIN grep_index_docsize d ON d.id = r.record_id "
+            "WHERE r.session = ? AND d.id IS NULL", (session_id,)).fetchone()[0]) if session_id else 0
+        detail: dict[str, Any] = {"integrity": fts_integrity, "session_records_not_indexed": unindexed}
+        status = "pass" if fts_integrity["status"] == "pass" and not unindexed else fts_integrity["status"]
+        if fts_integrity["status"] == "fail" or unindexed:
+            detail["rebuild"] = engine._records.rebuild_grep_index(
+                session=session_id or None, found="doctor: " + ("integrity-check failed"
+                                                               if fts_integrity["status"] == "fail"
+                                                               else f"{unindexed} records not indexed"))
+            again = check_external_content_fts_integrity(conn, GREP_INDEX_SPEC)
+            detail["after_rebuild"] = again
+            status = "fail" if again["status"] != "pass" else "warn"
+        checks.append({
+            "check": "grep_index_integrity",
+            "status": "warn" if status == "unchecked" else status,
+            "detail": detail,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "grep_index_integrity",
+            "status": "fail",
+            "detail": str(e),
+        })
 
     # 2. SQLite storage posture
     try:
@@ -1919,32 +1472,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "sqlite_storage",
-            "status": "fail",
-            "detail": str(e),
-        })
-
-    # 3. FTS index sync
-    try:
-        msg_count = engine._store.connection.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
-        ).fetchone()[0]
-        fts_count = engine._store.connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM messages_fts
-            JOIN messages ON messages_fts.rowid = messages.store_id
-            WHERE messages.session_id = ?
-            """,
-            (session_id,),
-        ).fetchone()[0]
-        checks.append({
-            "check": "fts_index_sync",
-            "status": "pass" if fts_count >= msg_count else "warn",
-            "detail": f"{fts_count} session FTS rows, {msg_count} session messages",
-        })
-    except Exception as e:
-        checks.append({
-            "check": "fts_index_sync",
             "status": "fail",
             "detail": str(e),
         })

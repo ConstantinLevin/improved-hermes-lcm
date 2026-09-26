@@ -33,8 +33,9 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
                    "daily backup slot by hand (skill reference: diagnostics, Restore)")
     elif name == "schema_core_tables":
         command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before repair or restore"
-    elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:
-        if status == "warn" and isinstance(detail, dict) and detail.get("status") == "unchecked":
+    elif name == "grep_index_integrity":
+        deep = detail.get("integrity", detail) if isinstance(detail, dict) else {}
+        if status == "warn" and isinstance(deep, dict) and deep.get("status") == "unchecked":
             action = DOCTOR_ACTION_INSPECT
             command = "rerun the doctor with read-write SQLite access if a deep FTS integrity result is needed"
             warning_only = True
