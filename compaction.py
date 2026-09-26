@@ -749,9 +749,11 @@ class CompactionMixin:
         reaches the floor is never cut: it stays whole in the tail this time (``held``),
         and the tail begins at it. A candidate without a summary below c/4 by today's
         estimate (the same records give the same estimate, so only where c or the
-        estimate's ratio changed since it was cut) is not kept: no chunk below c/4 is
-        ever sent, however it arises (ruling on #61, 1), so its rows are cut again
-        (``recut``), the one departure from "a recorded chunk is frozen". A summarised
+        estimate's ratio changed since it was cut, or where the cut sent it alone
+        because no neighbour took it within B) is not kept: its rows are cut again
+        (``recut``; ruling on #61, 1), and the cut sends a part below c/4 only where no
+        neighbour takes it within B (``_cut_chunks``). This is one departure from "a
+        recorded chunk is frozen"; a multi-group one above B is the other. A summarised
         one is kept whatever its size: it is not sent again, its summary is reused."""
         check_tool_pairing(messages)
         first = max(mechanism) + 1 if mechanism else 0
@@ -959,7 +961,7 @@ class CompactionMixin:
         no effort is sent, and the provenance says so. The session's route passes the
         effort through the host's ``reasoning_config``."""
         if route.source != "configured":
-            return {}, f"{effort} (through the host's reasoning_config, which may clamp it)"
+            return {}, f"{effort} (through the host's reasoning_config, as the host applies it)"
         rule = facts.effort if facts is not None else None
         if rule is None:
             why = "the model table has no row for this route" if facts is None else \
