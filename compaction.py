@@ -52,7 +52,9 @@ In order:
    again; the one exception is a run below c/4 standing before or between kept
    chunks, which joins one of them (D1), and goes on over contiguous neighbours until
    the chunk holds c/4, releasing a summary where it must, with an event. A chunk not
-   found again, one without a summary below c/4 by today's estimate, and one with
+   found again, one without a summary below c/4 by today's estimate that a neighbour
+   can now take within B (one no neighbour can take stays frozen), one without a
+   summary above B that holds more than one group, and one with
    rows that came without a host identity (the gateway's replayed history, host
    scaffolding never persisted; the ask to Hermes is A1) are cut again, visibly: a
    warning and a store event. When only a rest below c/4 stands outside the tail,
@@ -750,10 +752,12 @@ class CompactionMixin:
         and the tail begins at it. A candidate without a summary below c/4 by today's
         estimate (the same records give the same estimate, so only where c or the
         estimate's ratio changed since it was cut, or where the cut sent it alone
-        because no neighbour took it within B) is not kept: its rows are cut again
-        (``recut``; ruling on #61, 1), and the cut sends a part below c/4 only where no
-        neighbour takes it within B (``_cut_chunks``). This is one departure from "a
-        recorded chunk is frozen"; a multi-group one above B is the other. A summarised
+        because no neighbour took it within B) is cut again (``recut``; ruling on #61,
+        1) only where a neighbour can now take it within B (``neighbour_takes``); one no
+        neighbour can take stays frozen like every recorded chunk, so its failures count
+        and no duplicate chunk is recorded (the orchestrator's ruling on 6736c1d). This
+        is one departure from "a recorded chunk is frozen"; a multi-group one above B is
+        the other (ruled on #33). A summarised
         one is kept whatever its size: it is not sent again, its summary is reused."""
         check_tool_pairing(messages)
         first = max(mechanism) + 1 if mechanism else 0
@@ -797,9 +801,48 @@ class CompactionMixin:
         if frozen:
             # A kept chunk is weighed as the cut weighs it (``_cut_estimate``).
             cut_estimator, convert = self._cut_estimate()
-            cut_size = {i: cut_estimator.message(convert(messages[i])).tokens if isinstance(messages[i], dict) else 0
-                        for _chunk, positions in frozen for i in positions}
-        for chunk, positions in frozen:
+            cut_size: Dict[int, int] = {}
+
+            def cut_weight(indices) -> int:
+                for i in indices:
+                    if i not in cut_size:
+                        cut_size[i] = (cut_estimator.message(convert(messages[i])).tokens
+                                       if isinstance(messages[i], dict) else 0)
+                return sum(cut_size[i] for i in indices)
+
+            limit = self._chunk_limit()
+            owner = {i: which for which, (_chunk, positions) in enumerate(frozen) for i in positions}
+
+        def neighbour_takes(which: int, positions: List[int], weight: int) -> Optional[str]:
+            """Whether a neighbour can take a candidate below c/4 within B, as the cut
+            would (``_cut_chunks``), and which; None where none can (the orchestrator's
+            ruling on 6736c1d: such a chunk, sent alone, stays frozen). The neighbours
+            are the groups adjacent to it outside the mechanism's layer and before the
+            floor: another candidate is taken as one chunk of its weight, a group above
+            c as an oversized chunk, any other group as part of a run, which is split
+            again and so always takes it. Without B nothing bounds a merge."""
+            if bound is None:
+                return "any neighbour (the summariser's window is not known, so no bound applies)"
+            before = next((i for i in range(positions[0] - 1, first - 1, -1) if i not in mechanism_set), None)
+            after = next((i for i in range(positions[-1] + 1, floor) if i not in mechanism_set), None)
+            for side, index in (("following", after), ("preceding", before)):
+                if index is None or index not in group_of:
+                    continue
+                other = owner.get(index)
+                if other is not None and other != which:
+                    other_weight = cut_weight(frozen[other][1])
+                    if weight + other_weight <= bound:
+                        return f"the {side} recorded chunk ({other_weight} tokens)"
+                    continue
+                group_weight = cut_weight(group_of[index])
+                if group_weight > limit:
+                    if weight + group_weight <= bound:
+                        return f"the {side} oversized group ({group_weight} tokens)"
+                    continue
+                return f"the {side} run"
+            return None
+
+        for which, (chunk, positions) in enumerate(frozen):
             low, high = positions[0], positions[-1]
             whole = (low >= first and low in group_of and group_of[low][0] == low and high in group_of
                      and group_of[high][-1] == high
@@ -807,10 +850,14 @@ class CompactionMixin:
             if not whole or claimed.intersection(positions):
                 recut.append((chunk, "its members are no longer whole groups over consecutive entries of this list"))
                 continue
-            weight = sum(cut_size[i] for i in positions)
-            if weight < smallest and chunk.state != "summarised":
-                recut.append((chunk, f"it holds {weight} tokens by today's estimate, below c/4 = {smallest}, and "
-                                     f"has no summary: it would be sent below c/4"))
+            weight = cut_weight(positions)
+            taker = neighbour_takes(which, positions, weight) if weight < smallest else None
+            if weight < smallest and chunk.state != "summarised" and taker is not None:
+                # Below c/4 and a neighbour can now take it within B: cut again, so that it
+                # joins. One no neighbour can take within B was sent alone by the cut and
+                # stays frozen, its failures counted (the orchestrator's ruling on 6736c1d).
+                recut.append((chunk, f"it holds {weight} tokens by today's estimate, below c/4 = {smallest}, has "
+                                     f"no summary, and {taker} can take it within B"))
                 continue
             if (bound is not None and weight > bound and chunk.state != "summarised"
                     and len({tuple(group_of[i]) for i in positions}) > 1):
