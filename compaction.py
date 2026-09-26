@@ -541,16 +541,23 @@ class CompactionMixin:
     def _fixed_prefix(self) -> tuple[int, str]:
         """F, the fixed prefix in provider tokens (R10): the session's latest measurement
         (``_measure_fixed_prefix``: the one taken with the smallest list), labelled with
-        its list and error bound; until the first, the configured hypothesis (32k)."""
-        try:
-            fact = self._fixed_prefix_fact()
-        except Exception:
-            fact = None
+        its list and error bound; until the first, the configured hypothesis (32k).
+
+        A store that cannot be read is not "no measurement yet": the error is raised,
+        never replaced by the hypothesis (#7), and ``compress()`` aborts with it."""
+        fact = self._fixed_prefix_fact()
         if fact is not None:
             return int(fact["F"]), (f"F {fact['F']} (measured with a list of {fact.get('list_estimate')} by the "
                                     f"estimate; up to {fact.get('error_bound')} too high at #31's p99)")
         hypothesis = int(self._config.fixed_prefix_hypothesis_tokens)
         return hypothesis, f"F {hypothesis} (a hypothesis until a response measures it, R10)"
+
+    def _fixed_prefix_label(self) -> str:
+        """F as the status views show it; a store that cannot be read is said so."""
+        try:
+            return self._fixed_prefix()[1]
+        except Exception as exc:
+            return f"F unreadable: the store could not be read ({type(exc).__name__}: {exc})"
 
     def _frozen_candidates(self, messages: List[Dict[str, Any]],
                            records: Optional[Dict[int, str]] = None) -> FrozenCandidates:
@@ -735,6 +742,16 @@ class CompactionMixin:
         self._publish("_last_compression_made_progress", False)
         logger.warning("LCM compaction aborted: %s", cause)
         return messages
+
+    def _store_read_failed(self, attempt, messages: List[Dict[str, Any]], kind: str, what: str,
+                           exc: BaseException) -> List[Dict[str, Any]]:
+        """A store read of the compaction failed (a lock another process holds past the
+        busy timeout, an I/O error, a damaged page, a store closed meanwhile): the
+        compaction is aborted, the context untouched, and the host shows the cause (#7:
+        every failure explicit, never an exception out of ``compress()``)."""
+        logger.warning("LCM could not read %s from the store (%s: %s)", what, type(exc).__name__, exc)
+        self._record_event(attempt, kind, f"{type(exc).__name__}: {exc}")
+        return self._abort(messages, f"the store could not be read for {what} ({type(exc).__name__}: {exc})")
 
     def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
         """The summariser's route, effort and output cap, or the reason there is none
@@ -1286,7 +1303,11 @@ class CompactionMixin:
         # fixed prefix F is a fact of the session helper, read here, so that nothing inside
         # planning takes another lock or connection.
         self._settle_from_list(messages)
-        fixed = self._fixed_prefix()
+        try:
+            fixed = self._fixed_prefix()
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "fixed_prefix_unreadable",
+                                           "the session's fixed prefix F", exc)
 
         # The planning transaction (#33 D14 as revised 2026-09-25): every store read the
         # cut depends on, from the identity on, and the write of the cut, in one
@@ -1305,8 +1326,13 @@ class CompactionMixin:
             self._record_event(attempt, "planning_transaction_failed", repr(exc))
             return self._abort(messages, f"the store could not begin the compaction's planning transaction ({exc})")
 
-        # 1. Identity (#29 W3). A list that cannot be classified is not compacted.
-        entries = self._classify(attempt, messages)
+        # 1. Identity (#29 W3). A list that cannot be classified is not compacted; a store
+        # that cannot be read for it is a visible abort (#7), never an exception.
+        try:
+            entries = self._classify(attempt, messages)
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "classify_unreadable",
+                                           "the records the list is classified against", exc)
         if entries is None:
             return self._abort(messages, attempt.error[1] if attempt.error else "the list could not be classified")
         mechanism = {entry.position for entry in entries if entry.klass == "system"}
@@ -1509,7 +1535,17 @@ class CompactionMixin:
         # issued at once (#12, #33): each joins the call in flight for the same records,
         # reuses a summary of them already written, or starts on a worker of its own.
         members = [attempt.records[index] for chunk in chunks for index in chunk]
-        facts = self._records.record_facts(members)
+        try:
+            facts = self._records.record_facts(members)
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "chunk_records_unreadable",
+                                           "the chunks' records", exc)
+        missing = sorted(set(members) - set(facts))
+        if missing:
+            # The records were written in the planning transaction just committed.
+            self._record_event(attempt, "chunk_record_missing", {"records": missing})
+            return self._abort(messages, f"the store holds no record {', '.join(missing)} of the chunks it just "
+                                         f"recorded")
         route = settings.route
         endpoint = endpoint_key(route.provider, route.base_url)
         limiter, limit = limiter_for(endpoint), self._calls_in_flight_limit(endpoint)
@@ -1548,18 +1584,24 @@ class CompactionMixin:
                                                               records, unidentified),
                                     on_done=lambda number=number: finished.put(number))
             # Attempts share a call only with the same summariser route and effort, the
-            # rule a reuse applies (``summary_of_records``).
-            way = join_or_start(
-                (attempt.session, tuple(records), route.model, route.provenance_provider(), settings.effort),
-                subscriber, limiter=limiter, limit=limit,
-                reuse=lambda records=records, chunk_handle=chunk_handle, frozen_summary=(
-                    kept_state.get(tuple(chunk)) == "summarised"): self._records.summary_of_records(
-                    attempt.session, records, exclude_chunk=chunk_handle, model=route.model,
-                    provider=route.provenance_provider(), effort=settings.effort, any_route=frozen_summary),
-                run=self._chunk_run(chunk_messages, focus_topic=focus_topic, record_handles=records,
-                                    settings=settings),
-                describe=describe,
-            )
+            # rule a reuse applies (``summary_of_records``). The reuse reads the store; a
+            # read that fails aborts the compaction (#7). Calls already started for
+            # earlier chunks run on and write their summaries (#33 D13).
+            try:
+                way = join_or_start(
+                    (attempt.session, tuple(records), route.model, route.provenance_provider(), settings.effort),
+                    subscriber, limiter=limiter, limit=limit,
+                    reuse=lambda records=records, chunk_handle=chunk_handle, frozen_summary=(
+                        kept_state.get(tuple(chunk)) == "summarised"): self._records.summary_of_records(
+                        attempt.session, records, exclude_chunk=chunk_handle, model=route.model,
+                        provider=route.provenance_provider(), effort=settings.effort, any_route=frozen_summary),
+                    run=self._chunk_run(chunk_messages, focus_topic=focus_topic, record_handles=records,
+                                        settings=settings),
+                    describe=describe,
+                )
+            except Exception as exc:
+                return self._store_read_failed(attempt, messages, "summary_reuse_unreadable",
+                                               f"a summary of chunk {number} of {len(chunks)} already written", exc)
             ways[way] = ways.get(way, 0) + 1
             subscribers.append(subscriber)
         logger.info("LCM compaction issued %d chunk%s to %s (%s), at most %d calls in flight there",
@@ -1596,7 +1638,15 @@ class CompactionMixin:
         # 5. The return, emitted from the record (#34 D5).
         previous = attempt.effective_returns
         cover = [previous[p][2] for p in sorted(previous) if previous[p][0] == "summary"] + new_derivations
-        texts = self._records.derivations(cover)
+        try:
+            texts = self._records.derivations(cover)
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "cover_unreadable", "the summaries of the return", exc)
+        absent = [derivation for derivation in cover if derivation not in texts]
+        if absent:
+            # A summary the return stands on is not in the store: the chain would lose it.
+            self._record_event(attempt, "cover_derivation_missing", {"derivations": absent})
+            return self._abort(messages, f"the store holds no summary {', '.join(map(str, absent))} of the return")
         result: List[Dict[str, Any]] = []
         returns: List[tuple] = []
         if 0 in mechanism and messages[0].get("role") == "system":

@@ -1121,7 +1121,7 @@ class LCMEngine(
             "tau_raised": self._geometry.tau_raised if self._geometry is not None else None,
             "target": self._geometry.target if self._geometry is not None else None,
             "turn": self._turn_label(),
-            "fixed_prefix": self._fixed_prefix()[1],
+            "fixed_prefix": self._fixed_prefix_label(),
             "host_native_compaction": self._native_compaction_on,
             "native_compaction_refused": self._native_compaction_refusal or None,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),

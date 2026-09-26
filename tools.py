@@ -1821,7 +1821,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             },
         },
         "config": {
-            "fixed_prefix": engine._fixed_prefix()[1],
+            "fixed_prefix": engine._fixed_prefix_label(),
             "chunk_tokens": engine._config.chunk_tokens,
             "estimate_ratio": engine._config.estimate_ratio,
             "chunk": engine._chunk_label(),
