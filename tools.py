@@ -556,7 +556,6 @@ def _expand_child_nodes(
                 "token_count": child.token_count,
                 "source_token_count": child.source_token_count,
                 "source_uncounted_images": child.source_uncounted_images,
-                "expand_hint": child.expand_hint,
             }
         )
         budget_used += count_tokens(summary)
@@ -696,7 +695,6 @@ def _collect_context_blocks_for_node(
             "depth": node.depth,
             "summary": summary,
             "summary_truncated": summary_truncated,
-            "expand_hint": node.expand_hint,
             "token_count": node.token_count,
         }
     ]
@@ -948,7 +946,6 @@ def _shape_summary_hit(node: Any) -> dict[str, Any]:
         "session_id": node.session_id,
         "snippet": node.summary[:300],
         "token_count": node.token_count,
-        "expand_hint": node.expand_hint,
         "earliest_at": node.earliest_at,
         "latest_at": node.latest_at,
         "from_current_session": True,
@@ -1412,7 +1409,6 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "node_id": node.node_id,
             "depth": node.depth,
             "summary": node.summary[:300],
-            "expand_hint": node.expand_hint,
         }
         for node in selected_nodes
     ]
@@ -1663,7 +1659,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     latest_node_rows = engine._dag.connection.execute(
         """
         SELECT node_id, session_id, depth, token_count, source_token_count,
-               source_type, created_at, earliest_at, latest_at, expand_hint, source_uncounted_images
+               source_type, created_at, earliest_at, latest_at, source_uncounted_images
         FROM summary_nodes
         WHERE session_id = ?
         ORDER BY seq DESC
@@ -1678,13 +1674,11 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "depth": int(row[2]),
             "token_count": int(row[3] or 0),
             "source_token_count": int(row[4] or 0),
-            "source_uncounted_images": int(row[10] or 0),
+            "source_uncounted_images": int(row[9] or 0),
             "source_type": row[5],
             "created_at": row[6],
             "earliest_at": row[7],
             "latest_at": row[8],
-            "expand_hint_available": bool(row[9]),
-            "expand_hint_chars": len(row[9] or ""),
         }
         for row in latest_node_rows
     ]
@@ -1821,13 +1815,12 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             },
         },
         "config": {
-            "fixed_prefix": engine._fixed_prefix()[1],
+            "fixed_prefix": engine._fixed_prefix_label(),
             "chunk_tokens": engine._config.chunk_tokens,
             "estimate_ratio": engine._config.estimate_ratio,
             "chunk": engine._chunk_label(),
             "summary_model": (
-                f"{engine._config.summary_provider}/{engine._config.summary_model}"
-                if engine._config.summary_model else f"(the session's model: {engine.provider}/{engine.model})"
+                engine._summariser_route()[1] or f"(the session's model: {engine.provider}/{engine.model})"
             ),
             "summary_reasoning_effort_default": engine._config.summary_reasoning_effort,
             "summary_calls_in_flight": engine._config.summary_calls_in_flight,

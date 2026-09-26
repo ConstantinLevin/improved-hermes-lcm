@@ -514,14 +514,21 @@ class LCMEngine(
             return "between turns, by the hooks"
         after = {"tool_result": "after a tool round", "api_response": "after a response"}.get(state.last_event,
                                                                                              "before any tool round")
-        return f"in turn {state.turn_id or '?'}, {after}, by the hooks"
+        contested = ("; contested: a list since ended as a turn start does (τ until the hooks settle it)"
+                     if state.contested else "")
+        return f"in turn {state.turn_id or '?'}, {after}, by the hooks{contested}"
 
     @property
     def threshold_tokens(self) -> int:
-        """τ′ while the hook state says a turn runs for this copy's session, else τ
-        (#32 D2). The host reads it at the turn-start skip, the re-arm after a
-        compaction and the idle floor; ``should_compress`` applies τ or τ′ itself."""
-        return self._tau(raised=self._turn_state().in_turn)
+        """τ′ while the hook state says a turn runs for this copy's session and no list
+        has contested it since, else τ (#32 D1, D2): after a list showed the gap of a turn
+        start while the hooks still say a turn runs (an exit that skipped
+        ``on_turn_complete``), τ, until the hooks settle it. The host reads it at the
+        turn-start skip, the preflight passes, the gate's progress check, the re-arm
+        after a compaction and the idle floor; ``should_compress`` applies τ or τ′
+        itself. A read at a turn start before any list reaches the plugin cannot tell a
+        stale turn from a live one (ask A-32.2)."""
+        return self._tau(raised=self._turn_state().raises())
 
     @threshold_tokens.setter
     def threshold_tokens(self, value: Any) -> None:
@@ -666,6 +673,10 @@ class LCMEngine(
             # when this prompt is below threshold_tokens.
             self.awaiting_real_usage_after_compression = False
             self._verify_compaction_cleared_threshold = False
+            # A response shows the turn lives: a contest ends here, before the host reads
+            # threshold_tokens for its re-arm (#32 D1, D2; F1 of the pre-review of 6a6a7f8).
+            if not self._review_fork:
+                turn_signals.response_counted(self._session_id)
             self._measure_fixed_prefix()
 
         cache_keys = {"cache_read_tokens", "cache_write_tokens"}
@@ -714,7 +725,7 @@ class LCMEngine(
             echo = bool(needs_reasoning_echo(self.provider, self.model, self.base_url))
         except Exception:
             echo = False
-        return Estimator(image_model=self.model, reasoning_sent=echo)
+        return Estimator(image_model=self.model, reasoning_sent=echo, image_provider=self.provider)
 
     def _fixed_prefix_fact(self) -> Optional[Dict[str, Any]]:
         """The session's latest ``fixed_prefix`` fact: {"F", "list_estimate",
@@ -1121,7 +1132,7 @@ class LCMEngine(
             "tau_raised": self._geometry.tau_raised if self._geometry is not None else None,
             "target": self._geometry.target if self._geometry is not None else None,
             "turn": self._turn_label(),
-            "fixed_prefix": self._fixed_prefix()[1],
+            "fixed_prefix": self._fixed_prefix_label(),
             "host_native_compaction": self._native_compaction_on,
             "native_compaction_refused": self._native_compaction_refusal or None,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
@@ -1244,16 +1255,3 @@ class LCMEngine(
             return None
 
         return max(1, min(caps))
-
-    # -- Internal: helpers -------------------------------------------------
-
-    @staticmethod
-    def _extract_expand_hint(summary: str) -> str:
-        """Extract the 'Expand for details about:' line from a summary."""
-        marker = "Expand for details about:"
-        idx = summary.rfind(marker)
-        if idx >= 0:
-            hint = summary[idx + len(marker):].strip()
-            # Take first line only
-            return hint.split("\n")[0].strip()
-        return ""

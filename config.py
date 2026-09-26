@@ -222,6 +222,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("window_max_tokens", "LCM_WINDOW_MAX_TOKENS", int),
     _EnvFieldSpec("fixed_prefix_hypothesis_tokens", "LCM_FIXED_PREFIX_HYPOTHESIS_TOKENS", int),
     _EnvFieldSpec("estimate_ratio_p99", "LCM_ESTIMATE_RATIO_P99", float),
+    _EnvFieldSpec("estimate_ratio_max", "LCM_ESTIMATE_RATIO_MAX", float),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
@@ -258,6 +259,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "window_max_tokens",
     "fixed_prefix_hypothesis_tokens",
     "estimate_ratio_p99",
+    "estimate_ratio_max",
 })
 
 # The geometry's weights (#31, Decided; R14): field, env var, parse type, default, and
@@ -279,6 +281,8 @@ _GEOMETRY_WEIGHTS = (
      "default: a hypothesis (R10), F until a response of the session measures it"),
     ("estimate_ratio_p99", "LCM_ESTIMATE_RATIO_P99", float, 2.37,
      "default: #31 measured, p99 of the provider's count over characters / 4 on Claude"),
+    ("estimate_ratio_max", "LCM_ESTIMATE_RATIO_MAX", float, 3.44,
+     "default: #31 measured, the largest provider count over characters / 4 observed; #34 D4's worst case"),
 )
 
 
@@ -313,6 +317,10 @@ class LCMConfig:
     # The provider's count over the estimate at #31's p99: a measured F carries the error
     # bound (p99 - p50) x the list it was measured with.
     estimate_ratio_p99: float = 2.37
+    # The largest provider count over the estimate observed (#31): what the check of a
+    # chunk against the summariser's window converts the estimate by, labelled as the
+    # estimate's worst case (#34 D4: "the median error is never used").
+    estimate_ratio_max: float = 3.44
 
     # -- Assembly guardrails ---
     # Hard cap for the assembled active context (0 = disabled)
@@ -326,10 +334,10 @@ class LCMConfig:
     custom_instructions: str = ""
 
     # -- Models ---
-    # The summariser (#9). Empty summary_model: the model running the session, on the
-    # route the host hands update_model. Set: that model, on the provider named in
-    # summary_provider (required with it), with the optional base URL, key and API mode;
-    # a model id only, never "provider/model".
+    # The summariser (#9): the model running the session, on the route the host hands
+    # update_model. Any of the five summary_* route fields set is refused at load: a
+    # summariser other than the session's model is not supported in this build (#68,
+    # escalation.configured_route_problem).
     summary_model: str = ""
     summary_provider: str = ""
     summary_base_url: str = ""

@@ -83,9 +83,11 @@ _ONLY_WITHHELD_REASONING = ("[This message carried only reasoning the summariser
 
 @dataclass(frozen=True)
 class WireFacts:
-    """What the summariser's route means for its input, from the host's own rules."""
+    """What the summariser's route means for its input, from the host's own rules.
+    ``reads_images`` is None where the model table has no row for the summariser: its
+    images are then not sent either, and their placeholder says it is not known."""
 
-    reads_images: bool
+    reads_images: Optional[bool]
     needs_reasoning_echo: bool
     anthropic_converter: bool
 
@@ -115,7 +117,8 @@ def _host_fill_empty(message: dict) -> None:
     fill_empty_non_final_wire_payload(message, is_final=False)
 
 
-def wire_facts(provider: str, model: str, base_url: str, api_mode: str, reads_images: bool) -> WireFacts:
+def wire_facts(provider: str, model: str, base_url: str, api_mode: str,
+               reads_images: Optional[bool]) -> WireFacts:
     """The route's facts for the input: whether the host sends ``reasoning_content``
     to it (``needs_reasoning_echo``, agent/message_sanitization.py at 7b761da) and
     whether its wire is the host's Anthropic converter (provider anthropic, or the
@@ -182,27 +185,44 @@ def _signed_bedrock_block(block: Any) -> bool:
     return "redactedContent" in reasoning or (isinstance(text, dict) and bool(text.get("signature")))
 
 
-def _keep(message: dict, key: str, drop) -> None:
+def _keep(message: dict, key: str, drop) -> int:
+    """Drop the items of ``key`` that ``drop`` names; returns how many were dropped."""
     values = message.get(key)
-    if isinstance(values, list):
-        kept = [v for v in values if not drop(v)]
-        if kept:
-            message[key] = kept
-        else:
-            message.pop(key, None)
+    if not isinstance(values, list):
+        return 0
+    kept = [v for v in values if not drop(v)]
+    if kept:
+        message[key] = kept
+    else:
+        message.pop(key, None)
+    return len(values) - len(kept)
 
 
-def _withhold_encrypted(message: dict) -> None:
-    _keep(message, "reasoning_details", _signed_or_encrypted_detail)
-    _keep(message, "codex_reasoning_items", lambda i: isinstance(i, dict) and bool(i.get("encrypted_content")))
-    _keep(message, "anthropic_content_blocks", _signed_anthropic_block)
-    _keep(message, "_anthropic_content_blocks", _signed_anthropic_block)
-    _keep(message, "bedrock_content_blocks", _signed_bedrock_block)
+# The kinds of encrypted reasoning, by the host field that carries them; the model
+# table's ``encrypted_reasoning`` column names the same kinds (#8, 9.6).
+ENCRYPTED_KINDS = ("reasoning_details", "codex_reasoning_items", "anthropic_content_blocks", "bedrock_content_blocks")
+
+
+def _withhold_encrypted(message: dict) -> dict[str, int]:
+    """Withhold the encrypted items (R3), and say how many of each kind: the loss is named
+    where it happens (#8, "Reasoning": never brushed over)."""
+    counts = {
+        "reasoning_details": _keep(message, "reasoning_details", _signed_or_encrypted_detail),
+        "codex_reasoning_items": _keep(message, "codex_reasoning_items",
+                                       lambda i: isinstance(i, dict) and bool(i.get("encrypted_content"))),
+        "anthropic_content_blocks": _keep(message, "anthropic_content_blocks", _signed_anthropic_block)
+        + _keep(message, "_anthropic_content_blocks", _signed_anthropic_block),
+        "bedrock_content_blocks": _keep(message, "bedrock_content_blocks", _signed_bedrock_block),
+    }
+    return {kind: count for kind, count in counts.items() if count}
 
 
 # --- Images ----------------------------------------------------------------------------------
 
 _NOT_READ = "not shown to this summariser, which does not read images"
+# The orchestrator's ruling on #8b: a summariser the model table has no row for is not
+# said not to read images; its images are not sent, and it is said that it is not known.
+_NOT_KNOWN = "image not sent: whether this summariser reads images is unknown"
 _EVICTED = "left out of this call: the host's Anthropic converter drops it for its per-request image limit"
 
 
@@ -231,6 +251,36 @@ def _image_count(message: dict) -> int:
     if not count and isinstance(stashed, list):
         count = sum(1 for p in stashed if is_image_part(p))
     return count
+
+
+def image_count(message: dict) -> int:
+    """The images one message as the summariser receives it carries (placeholders are
+    text and do not count)."""
+    return _image_count(message)
+
+
+def wire_image_limit(facts: WireFacts) -> Optional[int]:
+    """The most images one summariser request may carry before the host's converter for
+    the summariser's wire retires some of them unseen, or None where none does.
+
+    Retiring is a loss (#8: the summariser never sees those images; the orchestrator's
+    ruling on the Codex review of 6f4a351), so the cut keeps every chunk within this
+    limit, as it keeps it within B. Read at Hermes origin/main d0288be5b3:
+    - the Anthropic Messages converter (``_evict_old_screenshots``,
+      agent/anthropic_message_convert.py:605) retires tool-result images once a request
+      carries more than ``OUTBOUND_IMAGE_LIMIT`` (20, agent/image_eviction_policy.py),
+      every image counted, uploads included; it runs on the auxiliary path too;
+    - the Chat Completions and Responses paths of ``call_llm`` retire none:
+      ``evict_stale_outbound_tool_images`` runs only on the main agent's send path
+      (agent/chat_completion_helpers.py:2247, agent/turn_request_assembly.py:153);
+    - where the summariser is sent no images (it does not read them, or that is not
+      known), there is nothing to retire.
+    Raises where the host's limit cannot be read."""
+    if not (facts.reads_images and facts.anthropic_converter):
+        return None
+    from agent.image_eviction_policy import OUTBOUND_IMAGE_LIMIT  # type: ignore
+
+    return int(OUTBOUND_IMAGE_LIMIT)
 
 
 def _evict_as_the_host_would(messages: list[dict], records: list[str]) -> None:
@@ -308,11 +358,17 @@ def _has_payload(message: dict) -> bool:
                 or (isinstance(message.get("reasoning_content"), str) and message["reasoning_content"].strip()))
 
 
-def summariser_message(raw: dict, record: str, facts: WireFacts) -> dict:
-    """One record's message as the summariser receives it (see the module docstring)."""
+def summariser_message(raw: dict, record: str, facts: WireFacts,
+                       withheld: Optional[dict[str, int]] = None) -> dict:
+    """One record's message as the summariser receives it (see the module docstring).
+    The encrypted items withheld from it are added to ``withheld`` by kind."""
     message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
-    _withhold_encrypted(message)
-    if not facts.reads_images:
+    for kind, count in _withhold_encrypted(message).items():
+        if withheld is not None:
+            withheld[kind] = withheld.get(kind, 0) + count
+    if facts.reads_images is None:
+        _replace_images_in_message(message, record, _NOT_KNOWN)
+    elif not facts.reads_images:
         _replace_images_in_message(message, record, _NOT_READ)
     if message.get("role") == "assistant":
         readable = _readable_reasoning(raw)
@@ -329,12 +385,14 @@ def summariser_messages(
     instructions: str,
     request: dict,
     facts: WireFacts,
+    withheld: Optional[dict[str, int]] = None,
 ) -> list[dict]:
     """The whole input of one summariser call: the instructions, the chunk's records
     as messages, and the closing request with its fields (focus topic, custom
-    instructions) where there are any."""
+    instructions) where there are any. ``withheld`` receives the count of encrypted
+    items withheld, by kind."""
     pairs = list(records)
-    body = [summariser_message(raw, record, facts) for record, raw in pairs]
+    body = [summariser_message(raw, record, facts, withheld) for record, raw in pairs]
     if facts.reads_images and facts.anthropic_converter:
         _evict_as_the_host_would(body, [record for record, _raw in pairs])
     closing = CLOSING_REQUEST

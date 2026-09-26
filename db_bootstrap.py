@@ -41,8 +41,10 @@ logger = logging.getLogger(__name__)
 # by unmerged commits of #61 (7 and 8 with a ``chunk_dispatches`` table, 9 without
 # that index); opening runs no DDL, so each layout has its own name and is refused.
 # A store of an earlier format is refused and begun again (#29 W8: a change of format
-# wipes the store).
-STORE_FORMAT = "ihl-store/10"
+# wipes the store). Format 11 adds ``derivations.withheld_reasoning``: the encrypted
+# reasoning withheld from the summariser's input, named in the summary's provenance (#8);
+# and drops ``derivations.expand_hint``, a text a pattern took from the summary (#9).
+STORE_FORMAT = "ihl-store/11"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -406,7 +408,7 @@ CREATE TABLE derivations (
     finish_reason TEXT,
     level INTEGER,
     est_tokens INTEGER,
-    expand_hint TEXT,
+    withheld_reasoning TEXT,
     created_at REAL NOT NULL
 );
 
@@ -618,7 +620,6 @@ SELECT d.derivation_id AS node_id,
                         THEN json_extract(r.raw, '$.timestamp') END)
         FROM chunk_members m JOIN records r ON r.handle = m.record
         WHERE m.chunk = ch.handle) AS latest_at,
-       d.expand_hint AS expand_hint,
        l.seq + {_SEQ_POSITION - 1} AS seq
 FROM derivations d
 JOIN latest_returns l ON l.kind = 'summary' AND l.derivation = d.handle

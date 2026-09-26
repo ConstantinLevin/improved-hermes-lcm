@@ -19,14 +19,16 @@ record, filled at each compaction from what the host hands over, verbatim, and t
 compaction returns is emitted from that record (#29, #1, #3). A summary that cannot be written
 fails the compaction: nothing is truncated in its place, the context stays as it was, the host
 shows the cause, and compaction is tried again at the next occasion (#7). The summariser is the
-model running the session, called on the route the host names for it, unless another is
-configured (`LCM_SUMMARY_MODEL` with `LCM_SUMMARY_PROVIDER`); a reply from any other model is a
-failed summary (#9). The summariser reads a chunk's stored records as the messages they were, in
+model running the session, called through the host on the route the host names for it. A
+summariser other than the session's model (`LCM_SUMMARY_MODEL`, `_PROVIDER`, `_BASE_URL`,
+`_API_KEY`, `_API_MODE`) is not supported in this build and is refused at load (#68). A reply
+from any other model is a failed summary (#9). The summariser reads a chunk's stored records as the messages they were, in
 full: tool calls and results whole, readable reasoning marked, images only where it reads them;
 encrypted reasoning is withheld until the plugin knows which provider produced it (#8). A
 compaction's summariser calls, one per chunk, run at once, through one limiter per endpoint
-(#33). No chunk below a quarter of the chunk size is ever sent: such a rest joins a neighbouring
-chunk or stays raw before the tail. Every chunk is recorded before any of its calls starts, and a
+(#33). A rest below a quarter of the chunk size joins a neighbouring chunk or stays raw before the
+tail; no chunk exceeds what the summariser reads in one call, so a rest no neighbour can take
+within that bound is sent alone, with a warning. Every chunk is recorded before any of its calls starts, and a
 retry, in any process, keeps every recorded chunk of the earlier attempts: a summarised one keeps
 its summary, any other is retried as the same chunk, and only what is new is cut. A chunk of the
 same messages failing by its own fault
@@ -37,7 +39,8 @@ history, or host scaffolding the host never persists) cannot be found again by a
 cuts it again and names those rows (the ask to Hermes: A1). Compaction runs
 at a threshold derived from the model's window, raised by a margin while a turn runs, and
 brings the context down to a target G (#11, #31, #32); the material outside the tail is split
-into equal chunks of 50k provider tokens (#12), and the tail takes what the target leaves,
+into equal chunks of 50k provider tokens, smaller where the summariser reads less in one call
+(#12, #34 D4), and the tail takes what the target leaves,
 sized in tokens, in whole tool groups (#13). The plugin counts by its own estimate, characters
 divided by four, converted to provider tokens by a measured ratio and labelled as an estimate
 wherever it is shown (#21). The plugin tells the agent what its summaries are in a section of

@@ -23,23 +23,26 @@ In order:
    alone is left, the compaction aborts visibly: the chain and the newest turn fill
    the context.
 3. The material is cut into chunks of the size c (#31, #12), in list order and only
-   between groups: a tool call and its results stay in one chunk. A group larger than
-   c is a chunk of its own; between such groups, each run of material B is split
-   equally into ceil(B / c) chunks, cut at the group boundaries nearest k·B/n. No
-   chunk below c/4 is ever cut (ruling on #61, 1): a part of the split that small
-   merges into its smaller neighbour, which then exceeds c by the small parts it
-   absorbs. c is a value that flexes by the small parts a chunk absorbs: a part of
-   the split stays under 1.5c, a D1 join into a kept chunk can add up to c/4 more
-   (about 1.75c), and an oversized group is a chunk of its own whatever its size. The
-   one hard bound is the summariser's input: after the cut, every chunk, kept and
-   joined ones included, is checked against what the summariser can read in one
-   call where the model table knows its window, and one it cannot read aborts the
-   compaction visibly (D4); where the table does not know it, the provider's own
-   refusal is a failure of kind ``request``, visible and counted; a run
-   below c/4 joins the chunk of an adjacent oversized group, or, at the end of the
-   material, stays raw and the tail begins at it. c is 50k provider tokens, cut in
-   the plugin's estimate (characters / 4) as 50k / 1.51, #31's p50 of the provider's
-   count over that estimate (``_chunk_limit``). A chunk is frozen once its cut is
+   between groups: a tool call and its results stay in one chunk. Each row is sized
+   as the summariser receives it (``_cut_estimate``). A group larger than c is a chunk
+   of its own; between such groups, each run of material W is split equally into
+   ceil(W / c) chunks, cut at the group boundaries nearest k·W/n. No chunk below c/4
+   is cut where a merge avoids it (ruling on #61, 1): a part of the split that small
+   merges into its smaller neighbour, which then exceeds c by the small part it
+   absorbs. c flexes by the small parts a chunk absorbs, never above B, the most the
+   summariser reads in one call where the model table knows its window
+   (``_summariser_bound``): c itself is at most B, and no merge or join makes a chunk
+   above B; a part no neighbour takes within B is sent alone, below c/4, with an
+   event. An oversized group is a chunk of its own whatever its size. After the cut,
+   every chunk, kept and joined ones included, is checked against what the summariser
+   can read in one call, and one it cannot read (an indivisible group, a chunk an
+   earlier attempt cut) aborts the compaction visibly (D4); where the table does not
+   know the window, the provider's own refusal is a failure of kind ``request``,
+   visible and counted; a run below c/4 joins the chunk of an adjacent oversized
+   group within B, or, at the end of the material, stays raw and the tail begins at
+   it. c is 50k provider tokens, cut in the plugin's estimate (characters / 4) as
+   50k / 1.51, #31's p50 of the provider's count over that estimate (``_chunk_limit``),
+   and at most B. A chunk is frozen once its cut is
    recorded (#33 D14 as revised 2026-09-25, #31): a retry, in any process, keeps every
    recorded chunk of the session's unsettled attempts, found by its members'
    ``_row_id``s, whether or not its call was ever sent: a summarised one with its
@@ -49,7 +52,9 @@ In order:
    again; the one exception is a run below c/4 standing before or between kept
    chunks, which joins one of them (D1), and goes on over contiguous neighbours until
    the chunk holds c/4, releasing a summary where it must, with an event. A chunk not
-   found again, one without a summary below c/4 by today's estimate, and one with
+   found again, one without a summary below c/4 by today's estimate that a neighbour
+   can now take within B (one no neighbour can take stays frozen), one without a
+   summary above B that holds more than one group, and one with
    rows that came without a host identity (the gateway's replayed history, host
    scaffolding never persisted; the ask to Hermes is A1) are cut again, visibly: a
    warning and a store event. When only a rest below c/4 stands outside the tail,
@@ -88,6 +93,8 @@ There is no condensation in this path: the cover grows by one summary per chunk 
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import math
@@ -96,6 +103,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from . import turn_signals
 from .escalation import (
     OWN_FAILURE_KINDS,
     REASONING_EFFORTS,
@@ -106,11 +114,14 @@ from .escalation import (
     _host_provider,
     configured_route_problem,
     failure_text,
+    level_one_input,
+    prompt_inputs,
     session_route,
     summarize_chunk,
 )
 from .model_table import lookup as lookup_model
-from .summariser_input import wire_facts
+from .handles import MESSAGE
+from .summariser_input import image_count, summariser_message, wire_facts, wire_image_limit
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .fresh_tail import ToolPairingError, check_tool_pairing
@@ -131,9 +142,11 @@ from .tokens import Estimator, count_message_tokens, count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
-# The words around a summary row (Decision 8, until #10 writes them).
+# The words around a summary row (Decision 8, until #10 writes them). The wrapper carries
+# what the plugin knows, the summary's node id, which lcm_expand takes; nothing in it is
+# read out of the summary's text (#9, Decided: nothing in a reply is recognised by pattern).
 _SUMMARY_HEADER = "[Recent Summary (d0, node {node_id})]"
-_SUMMARY_FOOTER = "[Expand for details: {hint}]"
+_SUMMARY_FOOTER = "[Expand for details: node {node_id}]"
 
 # How often the compress() thread, waiting for its chunks, asks the attempt's captured check.
 _WAIT_SLICE_S = 0.25
@@ -146,10 +159,19 @@ _SMALLEST_STANDALONE_RUN = 0.25
 # The share of its source a summary's budget asks for (today's prompt, until #10):
 # min(max(2000, 0.20 × source), 12000). ρ in the tail's sizing (R9).
 _SUMMARY_BUDGET_SHARE = 0.20
+_SUMMARY_BUDGET_MIN = 2000
+_SUMMARY_BUDGET_MAX = 12000
 
 # "Keeps failing": a chunk of the same members failing in this many consecutive
 # attempts is a visible error and a store event naming it (#33, Decided; #7).
 _KEEPS_FAILING_ATTEMPTS = 3
+
+# The record handle a row is sized with before it has one (``_cut_estimate``): a
+# handle's fixed length, the kind letter and eight characters (``handles``).
+_SIZING_HANDLE = MESSAGE + "a" * 8
+
+# The summariser's route resolved once for a scope (``_route_scope``): (engine, (route, why)).
+_ROUTE_SCOPE: contextvars.ContextVar = contextvars.ContextVar("lcm_summariser_route", default=None)
 
 
 try:  # the host's own test for its ephemeral recovery scaffolding (the nudge flags)
@@ -176,17 +198,84 @@ class Occasion:
 
 
 @dataclass
+class ChunkInput:
+    """One chunk as the summariser receives it, built once (``_chunk_input``)."""
+
+    records: List[tuple]
+    source: Any
+    budget: int
+    facts: Any
+    wire: Any
+    level_one: List[Dict[str, Any]]
+    withheld: Optional[dict]
+
+
+class _StageError(Exception):
+    """A failure of one stage of ``_tail_and_cut``, with the stage's name."""
+
+    def __init__(self, where: str, exc: BaseException) -> None:
+        super().__init__(f"{where}: {type(exc).__name__}: {exc}")
+        self.where, self.exc = where, exc
+
+
+@dataclass
+class _Step:
+    """The step of the planning phase under way, for the cause of a failure the
+    boundary catches (``_compress_impl``)."""
+
+    at: str
+
+
+@dataclass
+class _Planned:
+    """What the planning phase hands the dispatch: the recorded cut, each chunk's input,
+    and the endpoint's limiter, progress hook and deadline."""
+
+    route: Any
+    chunks: List[List[int]]
+    kept_state: Dict[tuple, str]
+    mechanism: set
+    tail_start: int
+    endpoint: str
+    limiter: Any
+    limit: int
+    still_wanted: Any
+    describe: Any
+    finished: Any
+    # Per chunk: (number, chunk handle, positions, records, subscriber, the worker's run).
+    calls: List[tuple]
+
+
+def _passes_the_boundary(exc: BaseException) -> bool:
+    """The exceptions the planning boundary lets through, to their current path: the
+    attempt's own cancellation (``compress()`` returns its input), the host's explicit
+    cancellation of an auxiliary attempt (``AuxiliaryExplicitCancellation``,
+    agent/auxiliary_client.py:212 at origin/main d0288be5b3), and the interpreter's
+    stops (KeyboardInterrupt, SystemExit, GeneratorExit)."""
+    if isinstance(exc, (AttemptCancelled, KeyboardInterrupt, SystemExit, GeneratorExit)):
+        return True
+    try:
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation  # type: ignore
+    except Exception:
+        return False
+    return isinstance(exc, AuxiliaryExplicitCancellation)
+
+
+@dataclass
 class TailPlan:
     """Where the tail begins and how it was sized (``_tail_plan``); with the chunks of
     an earlier attempt the cut keeps (``kept``) and those that reach the floor and stay
     whole in the tail (``held``), each as (``FrozenChunk``, positions); and those it
-    does not keep after all (``recut``), each as (``FrozenChunk``, why)."""
+    does not keep after all (``recut``), each as (``FrozenChunk``, why); of those, the
+    ones released below c/4 for a neighbour to take (``released``, as (``FrozenChunk``,
+    positions)), which ``compress()`` keeps after all where the cut does not join them."""
 
     start: int
     label: str
     kept: List[tuple] = field(default_factory=list)
     held: List[tuple] = field(default_factory=list)
     recut: List[tuple] = field(default_factory=list)
+    released: List[tuple] = field(default_factory=list)
 
 
 @dataclass
@@ -260,15 +349,20 @@ def _pairs_crossing(messages: List[Dict[str, Any]], boundary: int) -> Optional[t
     return None
 
 
-def _fewest_chunks(sizes: List[int], limit: int) -> int:
-    """The fewest chunks of at most ``limit`` that cover ``sizes`` in order, every
-    size at most ``limit``: filling each chunk as far as it goes is optimal."""
-    count, used = 0, 0
-    for size in sizes:
-        if count == 0 or used + size > limit:
-            count, used = count + 1, size
+def _fewest_chunks(sizes: List[int], limit: int, images: Optional[List[int]] = None,
+                   image_limit: Optional[int] = None) -> int:
+    """The fewest chunks of at most ``limit`` tokens, and of at most ``image_limit``
+    images where one is given, that cover ``sizes`` in order, every group within both:
+    filling each chunk as far as it goes is optimal (a shorter piece of a chunk that fits
+    fits too)."""
+    images = images or [0] * len(sizes)
+    count, used, pictured = 0, 0, 0
+    for size, pictures in zip(sizes, images):
+        if count == 0 or used + size > limit or (image_limit is not None and pictured + pictures > image_limit):
+            count, used, pictured = count + 1, size, pictures
         else:
             used += size
+            pictured += pictures
     return count
 
 
@@ -279,53 +373,80 @@ def _smallest_for(limit: int) -> int:
     return max(1, math.ceil(limit * _SMALLEST_STANDALONE_RUN))
 
 
-def _split_run(sizes: List[int], limit: int) -> List[int]:
+def _split_run(sizes: List[int], limit: int, bound: Optional[int] = None,
+               alone: Optional[List[tuple]] = None, images: Optional[List[int]] = None,
+               image_limit: Optional[int] = None) -> List[int]:
     """The equal split of one run of groups, each at most ``limit`` (#31): n chunks,
-    n = ceil(B / limit), or more where the groups cannot be packed into that many
-    without a chunk above ``limit``; each cut at the group boundary nearest k·B/n
-    that keeps every chunk within ``limit`` and leaves a rest the remaining chunks
-    can hold. Returns the group index at which each chunk after the first begins.
+    n = ceil(W / limit) for the run's weight W, or more where the groups cannot be
+    packed into that many without a chunk above ``limit``; each cut at the group
+    boundary nearest k·W/n that keeps every chunk within ``limit`` and leaves a rest the
+    remaining chunks can hold. Returns the group index at which each chunk after the
+    first begins.
 
     No part is below c/4 (ruling on #61, 1): a chunk that small cannot have a shorter
     summary and fails on every attempt. Where the groups leave no other way, as
     [c, 1, c], such a part merges into its smaller neighbour (the following one on a
-    tie). That chunk is above ``limit`` by the small parts it absorbs, each below
-    c/4, one on either side at most, as [c/4 − 1, c, c/4 − 1] shows: so a part of the
-    split stays under 1.5c. c flexes by the small parts a chunk absorbs (orchestrator
-    ruling on #61; it amends #12's "never above c"); the hard bound is the check
-    against the summariser's input after the cut (D4). The equal cut always finds a
-    boundary: n is at least the fewest chunks that cover the run, and every group of
-    a run is at most ``limit``."""
-    cuts = _equal_cuts(sizes, limit)
+    tie), or the other where the smaller one would make a chunk above ``bound``, the
+    most the summariser reads in one call (B, ``_summariser_bound``; the orchestrator's
+    ruling on the Codex review of c2efe0e: every merge is bounded by B). c flexes by
+    the small parts a chunk absorbs (orchestrator ruling on #61; it amends #12's "never
+    above c"), never above B. Where neither neighbour takes it within B, the part
+    stands alone, below c/4, and is named in ``alone`` as (first group, end group,
+    weight): the caller records it. The equal cut always finds a boundary: n is at
+    least the fewest chunks that cover the run, and every group of a run is at most
+    ``limit``.
+
+    ``images`` (per group) and ``image_limit`` (``wire_image_limit``) bound each chunk's
+    images the same way (the orchestrator's ruling on the Codex review of 6f4a351): n is
+    at least ceil(images / image_limit) and the fewest chunks within both bounds, every
+    cut keeps its chunk within both, and no merge makes a chunk above ``image_limit``.
+    Every group of a run is within ``image_limit``."""
+    images = images or [0] * len(sizes)
+    cuts = _equal_cuts(sizes, limit, images, image_limit)
     if not cuts:
         return cuts
     smallest = _smallest_for(limit)
     starts = [0] + cuts + [len(sizes)]
+    standing: set = set()   # the first group of each part that stands alone
     while len(starts) > 2:
         weights = [sum(sizes[a:b]) for a, b in zip(starts, starts[1:])]
-        small = next((i for i, weight in enumerate(weights) if weight < smallest), None)
+        pictures = [sum(images[a:b]) for a, b in zip(starts, starts[1:])]
+        small = next((i for i, weight in enumerate(weights) if weight < smallest and starts[i] not in standing),
+                     None)
         if small is None:
             break
-        if small == 0:
-            merge_with = 1
-        elif small == len(weights) - 1:
-            merge_with = small - 1
-        else:
-            merge_with = small + 1 if weights[small + 1] <= weights[small - 1] else small - 1
+        sides = sorted((side for side in (small - 1, small + 1) if 0 <= side < len(weights)),
+                       key=lambda side: (weights[side], 0 if side > small else 1))
+        fitting = [side for side in sides
+                   if (bound is None or weights[side] + weights[small] <= bound)
+                   and (image_limit is None or pictures[side] + pictures[small] <= image_limit)]
+        if not fitting:
+            standing.add(starts[small])
+            continue
         # Removing the boundary between the part and its neighbour merges them.
-        del starts[max(small, merge_with)]
+        del starts[max(small, fitting[0])]
+    if alone is not None:
+        for a, b in zip(starts, starts[1:]):
+            if sum(sizes[a:b]) < smallest:
+                alone.append((a, b, sum(sizes[a:b])))
     return starts[1:-1]
 
 
-def _equal_cuts(sizes: List[int], limit: int) -> List[int]:
-    total = sum(sizes)
-    if total <= limit:
+def _equal_cuts(sizes: List[int], limit: int, images: Optional[List[int]] = None,
+                image_limit: Optional[int] = None) -> List[int]:
+    images = images or [0] * len(sizes)
+    total, pictured = sum(sizes), sum(images)
+    within_images = image_limit is None or pictured <= image_limit
+    if total <= limit and within_images:
         return []
-    n = max(-(-total // limit), _fewest_chunks(sizes, limit))
-    prefix = [0]
-    for size in sizes:
+    n = max(-(-total // limit), _fewest_chunks(sizes, limit, images, image_limit))
+    if image_limit is not None:
+        n = max(n, -(-pictured // image_limit))
+    prefix, image_prefix = [0], [0]
+    for size, count in zip(sizes, images):
         prefix.append(prefix[-1] + size)
-    fewest_from = [_fewest_chunks(sizes[j:], limit) for j in range(len(sizes))]
+        image_prefix.append(image_prefix[-1] + count)
+    fewest_from = [_fewest_chunks(sizes[j:], limit, images[j:], image_limit) for j in range(len(sizes))]
     cuts: List[int] = []
     previous = 0
     for k in range(1, n):
@@ -333,6 +454,8 @@ def _equal_cuts(sizes: List[int], limit: int) -> List[int]:
         best, best_distance = None, None
         for j in range(previous + 1, len(sizes)):
             if prefix[j] - prefix[previous] > limit:
+                break
+            if image_limit is not None and image_prefix[j] - image_prefix[previous] > image_limit:
                 break
             if fewest_from[j] > n - k:
                 continue
@@ -370,12 +493,19 @@ class CompactionMixin:
                                        f"p50 of the provider's count over it, = {int(estimate * ratio)} provider tokens")
 
     def should_compress_preflight(self, messages):
+        """See ``_should_compress_preflight``; one summariser route for all of it."""
+        with self._route_scope():
+            return self._should_compress_preflight(messages)
+
+    def _should_compress_preflight(self, messages):
         """Before a request, at turn start (the host asks it only there, after
         ``should_compress`` declined): settle and bind what the list shows, then ask
         for a compaction when the prompt reaches the occasion's threshold and the
         material outside the tail holds a run that stands alone (c/4). No count of the
         host's exists here, so the plugin's estimate decides, converted into provider
-        tokens by #31's ratio and labelled. Nothing else is written."""
+        tokens by #31's ratio and labelled. Written to the store: only the settling and
+        binding. Changed in memory besides: the hook state of the session's turn, which
+        the occasion's classification marks contested at a gap (#32 D1)."""
         self._bind_from_list(messages)
         if self._geometry is None:
             return False
@@ -390,6 +520,11 @@ class CompactionMixin:
                 material = self._material_outside_tail(messages, occasion)
             except ToolPairingError:
                 # compress() records the error and shows it; the preflight asks for it.
+                return self._mark_preflight_compression_requested()
+            except Exception:
+                # Sizing failed (``_sizing_failed``): compress() aborts with the cause and
+                # shows it; the preflight asks for it rather than raise into the host.
+                logger.warning("LCM preflight could not size the material outside the tail", exc_info=True)
                 return self._mark_preflight_compression_requested()
             smallest = self._smallest_run()
             if material.tokens >= smallest:
@@ -407,12 +542,20 @@ class CompactionMixin:
 
     def _material_outside_tail(self, messages: List[Dict[str, Any]], occasion: Occasion):
         """The estimate of what stands outside the fresh tail and the mechanism's layer,
-        with the frozen cut, found by id only; nothing is written."""
+        with the frozen cut, found by id only; nothing is written. Counted in the cut's
+        unit (``_cut_estimate``), since it is compared with c/4 as the cut compares it."""
         mechanism = self._mechanism_positions(messages)
         tail_start = self._tail_start(messages, mechanism, occasion)
-        return self._estimator().messages([messages[index] for index in range(tail_start) if index not in mechanism])
+        estimator, convert = self._cut_estimate()
+        return estimator.messages([convert(messages[index]) for index in range(tail_start)
+                                   if index not in mechanism])
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        """See ``_has_content_to_compress``; one summariser route for all of it."""
+        with self._route_scope():
+            return self._has_content_to_compress(messages)
+
+    def _has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         """The host's probe before the gateway's /compress (``ContextEngine``,
         agent/context_engine.py 176; asked only on ``skip_without_window``,
         agent/conversation_compression_manual.py 104-106): False makes the host say
@@ -453,6 +596,17 @@ class CompactionMixin:
                                                      "turn's opening row")
         if _ends_with_tool_results(messages):
             return Occasion("running", True, False, "in a running turn: the list ends with tool results")
+        # A gap while the hooks say a turn runs: the turn is contested until the hooks
+        # settle it, so that what the plugin publishes without a list (threshold_tokens,
+        # should_compress) is τ too, as D1 wants at the gap. The review fork, which runs
+        # under its parent's id, never marks the parent's turn. Only the current attempt
+        # writes the turn's state (#33 D12; the Codex review of c2efe0e): an attempt the
+        # host cancelled, or one a newer attempt replaced, whose worker resumes after the
+        # next turn started would otherwise contest that turn. The preflight runs on the
+        # host's thread with no attempt, and writes.
+        attempt = _ATTEMPT.get()
+        if not getattr(self, "_review_fork", False) and self._live_write_allowed(attempt):
+            turn_signals.turn_start_seen(self._session_id, state.turn_id)
         if _is_next_user_message(last):
             return Occasion("gap", False, True, "a gap: a turn start while the hooks still say a turn runs (an "
                                                 "exit that skipped on_turn_complete)")
@@ -485,7 +639,7 @@ class CompactionMixin:
                 positions.add(index)
         return positions
 
-    def _chunk_limit(self) -> int:
+    def _chunk_limit(self, focus_topic: str = "") -> int:
         """c in the unit the plugin cuts in, its estimate (characters / 4, #21).
 
         #31 decides c = 50k provider tokens (``chunk_tokens``). The plugin cannot count
@@ -494,20 +648,121 @@ class CompactionMixin:
         n = 201; ``estimate_ratio``). #12 states the chunk accordingly: "50k provider
         tokens is about 33k by the estimate". So c is cut at 50,000 / 1.51 = 33,112 by
         the estimate: a chunk of typical text is then about 50k to the provider, and
-        one at the p99 error about 78k, within every summariser window in the model
-        table (the check against the summariser's window follows the cut)."""
-        config = self._config
-        return max(1, int(config.chunk_tokens / config.estimate_ratio))
+        one at the p99 error about 78k.
 
-    def _smallest_run(self) -> int:
+        Only the summariser bounds the chunk (#12): where the model table knows the
+        summariser's window, c is at most what it can read in one call, by the
+        estimate's worst case (#34 D4), ``_summariser_bound``; the cut uses that
+        effective c everywhere it uses c (the split, c/4, the joins). ``focus_topic`` is
+        the attempt's focus text, which the summariser's prompt carries (B)."""
+        return self._chunk_size(focus_topic)[0]
+
+    def _chunk_size(self, focus_topic: str = "") -> tuple[int, str]:
+        """The effective c by the estimate and its label (the orchestrator's rulings on
+        D4, in the pre-review of 6a6a7f8 and on the Codex review of c2efe0e):
+        c_eff = min(c, B), B the summariser's room in the estimate's unit
+        (``_summariser_bound``). Every chunk the cut makes of divisible material is at
+        most B: a part of the split is at most c_eff, and a part or run below c/4 merges
+        only where the merge stays within B (``_split_run``, ``_cut_chunks``). Only an
+        indivisible group larger than the room aborts, the ruling's other clause. Where
+        the table does not know the window, c stays as #31 decides."""
+        config = self._config
+        c = max(1, int(config.chunk_tokens / config.estimate_ratio))
+        label = (f"c = {c} tokens by the plugin's estimate: {config.chunk_tokens} provider tokens / "
+                 f"{config.estimate_ratio}, #31's p50 of the provider's count over characters / 4")
+        bound, bound_label = self._summariser_bound(focus_topic)
+        if bound is None:
+            unknown = self._window_unknown()
+            return c, (f"{label}; {unknown}" if unknown else label)
+        if bound >= c:
+            return c, label
+        return bound, f"c = {bound} tokens by the plugin's estimate, below #31's {c}: B, {bound_label}"
+
+    def _cut_estimate(self) -> tuple[Estimator, Callable[[Any], Any]]:
+        """The unit the cut sizes material in (the orchestrator's ruling on the Codex
+        review of c2efe0e): each row as the summariser receives it, by
+        ``summariser_message`` for the summariser's route (readable reasoning as the text
+        part it becomes, the reasoning field its provider is sent, an image it is not
+        sent as its placeholder, the record's handle at its fixed length), counted by the
+        summariser's estimate. c, c/4 and B are then in the unit the check against the
+        summariser's window counts in (D4), so a chunk the cut bounds by B fits. The tail
+        and G stay on the session's estimate: they are the session's context. Returns the
+        estimator and the conversion of one row. Where there is no summariser route, the
+        session's estimate of the row as it stands: ``compress()`` aborts then and says
+        why. The host's per-request image eviction on the Anthropic converter, which only
+        lowers a chunk's input, is not counted."""
+        route, _why = self._summariser_route()
+        if route is None:
+            return self._estimator(), lambda message: message
+        _facts, wire = self._summariser_wire(route)
+        estimator = Estimator(image_model=route.target_model, image_provider=route.target_provider,
+                              reasoning_sent=wire.needs_reasoning_echo)
+
+        def convert(message: Any) -> Any:
+            return summariser_message(message, _SIZING_HANDLE, wire) if isinstance(message, dict) else message
+        return estimator, convert
+
+    def _summariser_bound(self, focus_topic: str = "") -> tuple[Optional[int], str]:
+        """B, the most one chunk may hold by the plugin's estimate so that the summariser
+        can read it in one call: its window less its output cap and less its prompt,
+        divided by the estimate's worst case observed (#34 D4); None where the model table
+        does not know the window or there is no summariser route. The prompt is the
+        largest a call of this attempt can carry (the ruling on the Codex review of
+        188fb8b): the larger of the two levels' inputs without records, at the largest
+        budget, with the custom instructions and the attempt's focus text at their actual
+        length (none where the attempt has none: the preflight and the host's automatic
+        compaction pass none). Reads nothing of the store."""
+        route, _why = self._summariser_route()
+        if route is None:
+            return None, ""
+        facts, wire = self._summariser_wire(route)
+        if facts is None or not facts.context_window:
+            return None, ""
+        worst = float(self._config.estimate_ratio_max)
+        room = facts.context_window - (facts.output_cap or 0)
+        estimator = Estimator(image_model=route.target_model, image_provider=route.target_provider,
+                              reasoning_sent=wire.needs_reasoning_echo)
+        prompt = max((estimator.messages(inputs) for inputs in prompt_inputs(
+            _SUMMARY_BUDGET_MAX, facts=wire, focus_topic=focus_topic or "",
+            custom_instructions=self._config.custom_instructions)), key=lambda estimate: estimate.tokens)
+        bound = int((room - prompt.in_provider_tokens(worst)) / worst)
+        if bound <= 0:
+            return None, ""
+        return bound, (f"the summariser {route.describe()} reads {room} provider tokens ({facts.context_window} "
+                       f"window less {facts.output_cap or 0} output; {facts.basis}), less its prompt of "
+                       f"{prompt.tokens}{' with the focus text' if focus_topic else ''}, over {worst}, the "
+                       f"estimate's worst case (#34 D4): {bound} by the estimate")
+
+    def _window_unknown(self) -> str:
+        """Where the model table has no row, or no window, for the summariser's target: no
+        B exists and the window is not checked, and that is said (the orchestrator's
+        ruling on the Codex review of e229fd0: unknown is never unlimited, and never
+        silent). "" where the window is known or there is no route."""
+        route, _why = self._summariser_route()
+        if route is None:
+            return ""
+        facts = self._summariser_wire(route)[0]
+        if facts is not None and facts.context_window:
+            return ""
+        return (f"the summariser's window is not known (the model table has no {'window' if facts else 'row'} for "
+                f"{route.target_provider}/{route.target_model}): no B, the chunks are not checked against its "
+                f"window, and a refusal of the provider's is the only bound")
+
+    def _image_limit(self) -> Optional[int]:
+        """The most images one chunk may carry to the summariser (``wire_image_limit``),
+        or None: none where there is no summariser route (``compress()`` aborts then)."""
+        route, _why = self._summariser_route()
+        if route is None:
+            return None
+        return wire_image_limit(self._summariser_wire(route)[1])
+
+    def _smallest_run(self, focus_topic: str = "") -> int:
         """c/4 in the estimate's unit: the smallest run that stands alone (#31), the
         same value the cut uses (``_smallest_for``)."""
-        return _smallest_for(self._chunk_limit())
+        return _smallest_for(self._chunk_limit(focus_topic))
 
-    def _chunk_label(self) -> str:
-        config = self._config
-        return (f"c = {self._chunk_limit()} tokens by the plugin's estimate: {config.chunk_tokens} provider tokens "
-                f"/ {config.estimate_ratio}, #31's p50 of the provider's count over characters / 4")
+    def _chunk_label(self, focus_topic: str = "") -> str:
+        return self._chunk_size(focus_topic)[1]
 
     @staticmethod
     def _tail_floor(messages: List[Dict[str, Any]], mechanism: set, groups: List[List[int]],
@@ -541,16 +796,23 @@ class CompactionMixin:
     def _fixed_prefix(self) -> tuple[int, str]:
         """F, the fixed prefix in provider tokens (R10): the session's latest measurement
         (``_measure_fixed_prefix``: the one taken with the smallest list), labelled with
-        its list and error bound; until the first, the configured hypothesis (32k)."""
-        try:
-            fact = self._fixed_prefix_fact()
-        except Exception:
-            fact = None
+        its list and error bound; until the first, the configured hypothesis (32k).
+
+        A store that cannot be read is not "no measurement yet": the error is raised,
+        never replaced by the hypothesis (#7), and ``compress()`` aborts with it."""
+        fact = self._fixed_prefix_fact()
         if fact is not None:
             return int(fact["F"]), (f"F {fact['F']} (measured with a list of {fact.get('list_estimate')} by the "
                                     f"estimate; up to {fact.get('error_bound')} too high at #31's p99)")
         hypothesis = int(self._config.fixed_prefix_hypothesis_tokens)
         return hypothesis, f"F {hypothesis} (a hypothesis until a response measures it, R10)"
+
+    def _fixed_prefix_label(self) -> str:
+        """F as the status views show it; a store that cannot be read is said so."""
+        try:
+            return self._fixed_prefix()[1]
+        except Exception as exc:
+            return f"F unreadable: the store could not be read ({type(exc).__name__}: {exc})"
 
     def _frozen_candidates(self, messages: List[Dict[str, Any]],
                            records: Optional[Dict[int, str]] = None) -> FrozenCandidates:
@@ -594,8 +856,12 @@ class CompactionMixin:
 
     def _tail_plan(self, messages: List[Dict[str, Any]], mechanism: set,
                    occasion: Optional[Occasion] = None, frozen: Sequence[tuple] = (),
-                   fixed: Optional[tuple] = None) -> "TailPlan":
-        """Where the tail begins, and how it was sized (#13, #31).
+                   fixed: Optional[tuple] = None, focus_topic: str = "",
+                   keep: Optional[set] = None) -> "TailPlan":
+        """Where the tail begins, and how it was sized (#13, #31). ``focus_topic`` is the
+        attempt's focus text, which B counts (``_summariser_bound``). ``keep`` names frozen
+        chunks below c/4 not to release: ``compress()`` found that the cut would not join
+        them.
 
         The tail takes what the target leaves: after the compaction the context is
         F + S + (the new summaries) + t + R_in, and it should come to G. In the plugin's
@@ -624,9 +890,13 @@ class CompactionMixin:
         reaches the floor is never cut: it stays whole in the tail this time (``held``),
         and the tail begins at it. A candidate without a summary below c/4 by today's
         estimate (the same records give the same estimate, so only where c or the
-        estimate's ratio changed since it was cut) is not kept: no chunk below c/4 is
-        ever sent, however it arises (ruling on #61, 1), so its rows are cut again
-        (``recut``), the one departure from "a recorded chunk is frozen". A summarised
+        estimate's ratio changed since it was cut, or where the cut sent it alone
+        because no neighbour took it within B) is cut again (``recut``; ruling on #61,
+        1) only where a neighbour can now take it within B (``neighbour_takes``); one no
+        neighbour can take stays frozen like every recorded chunk, so its failures count
+        and no duplicate chunk is recorded (the orchestrator's ruling on 6736c1d). This
+        is one departure from "a recorded chunk is frozen"; a multi-group one above B is
+        the other (ruled on #33). A summarised
         one is kept whatever its size: it is not sent again, its summary is reused."""
         check_tool_pairing(messages)
         first = max(mechanism) + 1 if mechanism else 0
@@ -664,9 +934,75 @@ class CompactionMixin:
         kept: List[tuple] = []
         held: List[tuple] = []
         recut: List[tuple] = []
+        released: List[tuple] = []
         claimed: set = set()
-        smallest = self._smallest_run()
-        for chunk, positions in frozen:
+        smallest = self._smallest_run(focus_topic)
+        bound = self._summariser_bound(focus_topic)[0] if frozen else None
+        if frozen:
+            # A kept chunk is weighed as the cut weighs it (``_cut_estimate``).
+            cut_estimator, convert = self._cut_estimate()
+            cut_size: Dict[int, int] = {}
+
+            def cut_weight(indices) -> int:
+                for i in indices:
+                    if i not in cut_size:
+                        cut_size[i] = (cut_estimator.message(convert(messages[i])).tokens
+                                       if isinstance(messages[i], dict) else 0)
+                return sum(cut_size[i] for i in indices)
+
+            cut_picture: Dict[int, int] = {}
+
+            def cut_images(indices) -> int:
+                for i in indices:
+                    if i not in cut_picture:
+                        cut_picture[i] = image_count(convert(messages[i])) if isinstance(messages[i], dict) else 0
+                return sum(cut_picture[i] for i in indices)
+
+            limit = self._chunk_limit(focus_topic)
+            image_limit = self._image_limit()
+            owner = {i: which for which, (_chunk, positions) in enumerate(frozen) for i in positions}
+        # Only what takes part in the cut can take a released chunk (the orchestrator's
+        # ruling on the Codex review of 5b74bbc): the entries before the tail, which begins
+        # at the sized start or after the last candidate below the floor, whichever is
+        # later. Rows in the tail are no neighbour.
+        cut_end = min(floor, max([sized] + [positions[-1] + 1 for _chunk, positions in frozen
+                                            if positions and positions[-1] < floor]))
+
+        def within(tokens: int, images: int) -> bool:
+            return (bound is None or tokens <= bound) and (image_limit is None or images <= image_limit)
+
+        def neighbour_takes(which: int, positions: List[int], weight: int) -> Optional[str]:
+            """Whether a neighbour can take a candidate below c/4 within B and the wire's
+            image limit, as the cut would (``_cut_chunks``), and which; None where none
+            can (the orchestrator's ruling on 6736c1d: such a chunk, sent alone, stays
+            frozen). The neighbours are the groups adjacent to it outside the mechanism's
+            layer and before the tail (``cut_end``): another candidate is taken as one chunk of its
+            weight, a group above c or above the image limit as an oversized chunk, any
+            other group as part of a run, which is split again and so always takes it.
+            Without B and an image limit nothing bounds a merge."""
+            if bound is None and image_limit is None:
+                return "any neighbour (the summariser's window is not known, so no bound applies)"
+            pictured = cut_images(positions)
+            before = next((i for i in range(positions[0] - 1, first - 1, -1) if i not in mechanism_set), None)
+            after = next((i for i in range(positions[-1] + 1, cut_end) if i not in mechanism_set), None)
+            for side, index in (("following", after), ("preceding", before)):
+                if index is None or index not in group_of:
+                    continue
+                other = owner.get(index)
+                if other is not None and other != which:
+                    other_weight = cut_weight(frozen[other][1])
+                    if within(weight + other_weight, pictured + cut_images(frozen[other][1])):
+                        return f"the {side} recorded chunk ({other_weight} tokens)"
+                    continue
+                group_weight, group_images = cut_weight(group_of[index]), cut_images(group_of[index])
+                if group_weight > limit or (image_limit is not None and group_images > image_limit):
+                    if within(weight + group_weight, pictured + group_images):
+                        return f"the {side} oversized group ({group_weight} tokens)"
+                    continue
+                return f"the {side} run"
+            return None
+
+        for which, (chunk, positions) in enumerate(frozen):
             low, high = positions[0], positions[-1]
             whole = (low >= first and low in group_of and group_of[low][0] == low and high in group_of
                      and group_of[high][-1] == high
@@ -674,10 +1010,34 @@ class CompactionMixin:
             if not whole or claimed.intersection(positions):
                 recut.append((chunk, "its members are no longer whole groups over consecutive entries of this list"))
                 continue
-            weight = sum(sizes[i] for i in positions)
-            if weight < smallest and chunk.state != "summarised":
-                recut.append((chunk, f"it holds {weight} tokens by today's estimate, below c/4 = {smallest}, and "
-                                     f"has no summary: it would be sent below c/4"))
+            weight = cut_weight(positions)
+            taker = (neighbour_takes(which, positions, weight)
+                     if weight < smallest and chunk.chunk not in (keep or ()) else None)
+            if weight < smallest and chunk.state != "summarised" and taker is not None:
+                # Below c/4 and a neighbour can now take it within B: cut again, so that it
+                # joins. One no neighbour can take within B was sent alone by the cut and
+                # stays frozen, its failures counted (the orchestrator's ruling on 6736c1d);
+                # so does one the cut would not join after all (``keep``, from compress()).
+                recut.append((chunk, f"it holds {weight} tokens by today's estimate, below c/4 = {smallest}, has "
+                                     f"no summary, and {taker} can take it within B"))
+                released.append((chunk, positions))
+                continue
+            if (bound is not None and weight > bound and chunk.state != "summarised"
+                    and len({tuple(group_of[i]) for i in positions}) > 1):
+                # Cut before the summariser's bound applied (another summariser, another
+                # c): kept, it would be refused on every attempt; its groups can be cut
+                # smaller, so it is cut again, as a chunk below c/4 is.
+                recut.append((chunk, f"it holds {weight} tokens by today's estimate, more than the summariser "
+                                     f"reads ({bound}), has no summary, and its groups can be cut smaller"))
+                continue
+            if (image_limit is not None and chunk.state != "summarised"
+                    and len({tuple(group_of[i]) for i in positions}) > 1
+                    and cut_images(positions) > image_limit):
+                # Its images pass what the wire's converter keeps; its groups can be cut
+                # within it, as within B (the ruling on the Codex review of 6f4a351).
+                recut.append((chunk, f"it carries {cut_images(positions)} images, more than the {image_limit} the "
+                                     f"summariser's wire keeps in one request, has no summary, and its groups can "
+                                     f"be cut within it"))
                 continue
             claimed.update(positions)
             (kept if high < floor else held).append((chunk, positions))
@@ -695,7 +1055,7 @@ class CompactionMixin:
         if held:
             label += (f"; {len(held)} kept chunk{'' if len(held) == 1 else 's'} reach{'es' if len(held) == 1 else ''} "
                       f"the floor at {floor} and stay whole in the tail")
-        return TailPlan(start, label, kept=kept, held=held, recut=recut)
+        return TailPlan(start, label, kept=kept, held=held, recut=recut, released=released)
 
     def _tail_start(self, messages: List[Dict[str, Any]], mechanism: set,
                     occasion: Optional[Occasion] = None) -> int:
@@ -736,30 +1096,93 @@ class CompactionMixin:
         logger.warning("LCM compaction aborted: %s", cause)
         return messages
 
-    def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
-        """The summariser's route, effort and output cap, or the reason there is none
-        (#9). No part of the route is guessed: the session's route is what the host
-        handed ``update_model``; a configured one must name its provider."""
+    @staticmethod
+    def _rollback_planning(attempt, why: BaseException) -> None:
+        """Roll the planning transaction back: an abort after the cut was written but
+        before it is committed leaves nothing of this attempt in the store."""
+        try:
+            attempt.end_planning(why)
+        except Exception:
+            logger.warning("LCM could not roll back the planning transaction", exc_info=True)
+        # The compaction's id was rolled back with it and may be issued again: events of
+        # this attempt name no compaction.
+        attempt.compaction = None
+
+    def _sizing_failed(self, attempt, messages: List[Dict[str, Any]], what: str,
+                       exc: BaseException) -> List[Dict[str, Any]]:
+        """Sizing the material failed (a row the summariser's form or the estimate cannot
+        take: a ``RecursionError`` from deeply nested tool arguments, any other exception):
+        the compaction is aborted with the true cause and an event, never an exception out
+        of ``compress()`` (the orchestrator's ruling on the Codex review of 40eda93; #7)."""
+        logger.warning("LCM could not size the material while %s (%s: %s)", what, type(exc).__name__, exc)
+        self._record_event(attempt, "cut_sizing_failed", {"while": what, "error": f"{type(exc).__name__}: {exc}"})
+        return self._abort(messages, f"the material could not be sized while {what} ({type(exc).__name__}: {exc})")
+
+    def _store_read_failed(self, attempt, messages: List[Dict[str, Any]], kind: str, what: str,
+                           exc: BaseException) -> List[Dict[str, Any]]:
+        """A store read of the compaction failed (a lock another process holds past the
+        busy timeout, an I/O error, a damaged page, a store closed meanwhile): the
+        compaction is aborted, the context untouched, and the host shows the cause (#7:
+        every failure explicit, never an exception out of ``compress()``)."""
+        logger.warning("LCM could not read %s from the store (%s: %s)", what, type(exc).__name__, exc)
+        self._record_event(attempt, kind, f"{type(exc).__name__}: {exc}")
+        return self._abort(messages, f"the store could not be read for {what} ({type(exc).__name__}: {exc})")
+
+    def _summariser_route(self) -> tuple[Optional[SummariserRoute], str]:
+        """The summariser's whole route, or why there is none (#9), with its target
+        resolved by the host once (``session_route``). Inside a route scope
+        (``_route_scope``: a compaction attempt, the preflight, the gateway's probe) the
+        one route resolved for it is returned, so everything the scope decides (the model
+        table's row, the input, the window, B, the image limit, the limiter's endpoint, the
+        provenance, D9) reads one resolved pair (the orchestrator's ruling on the Codex
+        review of 080f5a3). Reads nothing of the store."""
+        scoped = _ROUTE_SCOPE.get()
+        if scoped is not None and scoped[0] is self:
+            return scoped[1]
+        return self._resolve_summariser_route()
+
+    @contextlib.contextmanager
+    def _route_scope(self):
+        """Resolve the summariser's route once for everything inside (see
+        ``_summariser_route``); nested scopes keep the outer one."""
+        scoped = _ROUTE_SCOPE.get()
+        if scoped is not None and scoped[0] is self:
+            yield
+            return
+        token = _ROUTE_SCOPE.set((self, self._resolve_summariser_route()))
+        try:
+            yield
+        finally:
+            _ROUTE_SCOPE.reset(token)
+
+    def _resolve_summariser_route(self) -> tuple[Optional[SummariserRoute], str]:
         config = self._config
         problem = configured_route_problem(config)
         if problem is not None:
-            # Refused when the configuration was loaded, and every compaction says why.
+            # Refused when the configuration was loaded (a summariser other than the
+            # session's model, #68), and every compaction says why.
             return None, problem
-        secrets = tuple(s for s in (config.summary_api_key, self.api_key) if isinstance(s, str) and s)
-        if config.summary_model:
-            route = SummariserRoute(
-                provider=config.summary_provider.strip(), model=config.summary_model.strip(),
-                base_url=config.summary_base_url.strip(), api_key=config.summary_api_key,
-                api_mode=config.summary_api_mode.strip(), source="configured",
-            )
-        else:
-            if not (self.model and self.provider):
-                return None, ("the session's model is not known: the host has not named its route "
-                              "through update_model, and no summariser is configured")
-            if not self.base_url and _host_provider(self.provider) == "custom":
-                return None, ("the session's route names provider custom without a base URL: the host "
-                              "would borrow an endpoint of its own, which the session did not name")
-            route = session_route(self.provider, self.model, self.base_url, self.api_key, self.api_mode)
+        if not (self.model and self.provider):
+            return None, ("the session's model is not known: the host has not named its route "
+                          "through update_model")
+        if not self.base_url and _host_provider(self.provider) == "custom":
+            return None, ("the session's route names provider custom without a base URL: the host "
+                          "would borrow an endpoint of its own, which the session did not name")
+        route = session_route(self.provider, self.model, self.base_url, self.api_key, self.api_mode)
+        if not route.target_provider:
+            return None, (f"the route the host takes for the session's {self.provider}/{self.model} is not known: "
+                          f"{route.target_problem}")
+        return route, ""
+
+    def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
+        """The summariser's route, effort and output cap, or the reason there is none
+        (#9). No part of the route is guessed: it is what the host handed
+        ``update_model``."""
+        config = self._config
+        route, problem = self._summariser_route()
+        if route is None:
+            return None, problem
+        secrets = tuple(s for s in (self.api_key,) if isinstance(s, str) and s)
         effort = None
         if self._plugin_session:
             try:
@@ -770,7 +1193,7 @@ class CompactionMixin:
         if effort not in REASONING_EFFORTS:
             return None, (f"the summariser's reasoning effort {effort!r} is not one of the host's levels "
                           f"({', '.join(sorted(REASONING_EFFORTS))})")
-        facts = lookup_model(route.model)
+        facts = lookup_model(route.target_model, route.target_provider)
         return CallSettings(
             route=route,
             effort=effort,
@@ -807,13 +1230,15 @@ class CompactionMixin:
         token = _ATTEMPT.set(attempt)
         try:
             try:
-                result = self._compress_impl(
-                    messages,
-                    current_tokens=current_tokens,
-                    focus_topic=focus_topic,
-                    force=force,
-                    provider_rejected=bool(bypass_cooldown),
-                )
+                # One summariser route, resolved once, for the whole attempt.
+                with self._route_scope():
+                    result = self._compress_impl(
+                        messages,
+                        current_tokens=current_tokens,
+                        focus_topic=focus_topic,
+                        force=force,
+                        provider_rejected=bool(bypass_cooldown),
+                    )
             except BaseException as exc:
                 # A planning transaction still open is rolled back (#33 D14 as revised).
                 try:
@@ -828,7 +1253,9 @@ class CompactionMixin:
             except Exception as exc:
                 logger.warning("LCM could not commit the planning transaction", exc_info=True)
                 self._record_event(attempt, "planning_commit_failed", repr(exc))
-                result = self._abort(messages, f"the store could not commit the compaction's planning ({exc})")
+                if not attempt.outcome.get("_last_compress_aborted"):
+                    result = self._abort(messages, f"the store could not commit the compaction's planning ({exc})")
+                # An attempt that already aborted keeps its first cause, the one the host shows.
         except AttemptCancelled:
             return messages
         except BaseException:
@@ -845,52 +1272,119 @@ class CompactionMixin:
             self._apply_attempt_outcome(attempt)
         return result
 
+    def _chunk_input(self, records: List[tuple], route: SummariserRoute, *,
+                     focus_topic: Optional[str]) -> "ChunkInput":
+        """What the summariser receives for one chunk, built once (the pre-review of
+        6a6a7f8, F4): from the chunk's records as the store holds them (#8), the level-1
+        input the window check estimates and the call sends, and the encrypted
+        reasoning withheld from it. The source is what the summary replaces in the
+        session's context, by the session's estimate (R6): the acceptance compares the
+        reply with this, by the same estimate."""
+        source = self._estimator().messages([message for _record, message in records])
+        budget = self._summary_budget(source)
+        facts, wire = self._summariser_wire(route)
+        counts: Dict[str, int] = {}
+        level_one = level_one_input(records, budget, facts=wire, focus_topic=focus_topic or "",
+                                    custom_instructions=self._config.custom_instructions, withheld=counts)
+        return ChunkInput(records=records, source=source, budget=budget, facts=facts, wire=wire,
+                          level_one=level_one, withheld=self._withheld_note(counts, facts))
+
     def _chunk_run(
         self,
-        chunk_messages: List[Dict[str, Any]],
+        prepared: "ChunkInput",
         *,
         focus_topic: Optional[str],
-        record_handles: List[str],
         settings: CallSettings,
+        chunk_handle: str = "",
     ) -> Callable[[ChunkCall], ChunkSummary]:
         """What a worker runs for one chunk: its summary, or ``SummaryFailure`` (#7),
         with the summariser's route and effort (#9). Everything the call needs is read
-        here, on the ``compress()`` thread; the worker reads nothing of the engine.
+        before, on the ``compress()`` thread; the worker reads nothing of the engine.
 
         The summariser reads the chunk's records as the messages they were, whole
         (#8, ``summariser_input``). The budget is a target in the prompt text, never an
-        output limit.
+        output limit. The encrypted reasoning withheld from the input is named where it
+        happens, when the call is admitted to its endpoint's limiter and goes out (#8,
+        "Reasoning": never brushed over): a chunk whose summary is reused, whose call
+        another attempt already makes, or whose call is abandoned before admission, sends
+        nothing and logs nothing.
         """
-        # What the summary replaces in the session's context, by the session's estimate
-        # (R6): the acceptance compares the reply with this, by the same estimate.
-        source = self._estimator().messages(chunk_messages)
-        budget = min(max(2000, int(source.tokens * _SUMMARY_BUDGET_SHARE)), 12000)
-        facts = lookup_model(settings.route.model)
         route = settings.route
-        records = list(zip(record_handles, chunk_messages))
-        # Images go in only where the model table says the summariser reads them; the
-        # reasoning field and the converter by the host's rules for the route.
-        wire = wire_facts(route.provider, route.model, route.base_url, route.api_mode,
-                          reads_images=bool(facts is not None and facts.reads_images))
+        withheld = prepared.withheld
         custom_instructions = self._config.custom_instructions
 
         def run(call: ChunkCall) -> ChunkSummary:
+            named = []
+
+            @contextlib.contextmanager
+            def dispatch():
+                # The withholding is named when the call is admitted (a limiter slot
+                # granted, an attempt still waiting), never for a call that is abandoned
+                # before it goes out (the Codex review of 6f4a351, P3); once per call.
+                with call.dispatch() as deadline:
+                    if withheld is not None and not named:
+                        named.append(True)
+                        logger.warning("LCM withholds from the summariser %s of chunk %s: %s",
+                                       withheld["items_text"], chunk_handle, withheld["text"])
+                    yield deadline
+
             text, level, finish_reason = summarize_chunk(
-                records,
-                budget,
-                source=source,
+                prepared.records,
+                prepared.budget,
+                source=prepared.source,
                 settings=settings,
-                facts=wire,
+                facts=prepared.wire,
                 depth=0,
                 focus_topic=focus_topic or "",
                 custom_instructions=custom_instructions,
-                path=CallPath(wait=call.wait, dispatch=call.dispatch, hold=call.limiter.hold,
+                path=CallPath(wait=call.wait, dispatch=dispatch, hold=call.limiter.hold,
                               deadline=call.deadline),
+                level_one=prepared.level_one,
             )
-            return ChunkSummary(text=text, level=level, budget=budget, finish_reason=finish_reason,
-                                model=route.model, provider=route.provenance_provider(), effort=settings.effort)
+            return ChunkSummary(text=text, level=level, budget=prepared.budget, finish_reason=finish_reason,
+                                model=route.target_model, provider=route.provenance_provider(), effort=settings.effort,
+                                withheld=json.dumps(withheld["record"]) if withheld is not None else None)
 
         return run
+
+    @staticmethod
+    def _summary_budget(source) -> int:
+        """The summary's target length (today's prompt, until #10)."""
+        return min(max(_SUMMARY_BUDGET_MIN, int(source.tokens * _SUMMARY_BUDGET_SHARE)), _SUMMARY_BUDGET_MAX)
+
+    @staticmethod
+    def _summariser_wire(route: SummariserRoute):
+        """The summariser's row in the model table (by its route, 9.6) and what its
+        route means for its input: images go in only where the row says it reads them,
+        and where there is no row it is not known (#8); the reasoning field and the
+        converter by the host's rules for the route. All of it from the route's target, the
+        provider, model, base URL and wire the host routes the session to (a MoA session's
+        aggregator), resolved once (``session_route``)."""
+        facts = lookup_model(route.target_model, route.target_provider)
+        wire = wire_facts(route.target_provider, route.target_model, route.target_base_url, route.target_api_mode,
+                          reads_images=facts.reads_images if facts is not None else None)
+        return facts, wire
+
+    @staticmethod
+    def _withheld_note(counts: Dict[str, int], facts) -> Optional[dict]:
+        """The named loss of the encrypted items withheld from a summariser (#8; R3 until
+        the producer is stamped, ask A-P): per kind, how many, and whether this
+        summariser's route takes that kind at all (the model table, 9.6), or that it is
+        not known. None where nothing was withheld."""
+        if not counts:
+            return None
+        takes = {}
+        for kind in counts:
+            takes[kind] = None if facts is None else (kind in facts.encrypted_reasoning)
+        words = {True: "this summariser's route takes that kind", False: "this summariser's route does not take "
+                 "that kind", None: "whether this summariser's route takes it is not known (no row)"}
+        items_text = ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items()))
+        text = ("encrypted reasoning, withheld because its producer is not known (ask A-P); "
+                + "; ".join(f"{kind}: {words[takes[kind]]}" for kind in sorted(counts)))
+        return {"items_text": items_text, "text": text,
+                "record": {"withheld": counts, "reason": "producer not known (ask A-P)",
+                           "summariser_takes": takes,
+                           "table": facts.basis if facts is not None else "no row"}}
 
     def _calls_in_flight_limit(self, endpoint: str) -> int:
         """The endpoint's limit: its own where configured, else the default (#33)."""
@@ -969,8 +1463,9 @@ class CompactionMixin:
                 try:
                     derivation = self._write_summary(
                         attempt, chunk_handle, text=summary.text, level=summary.level, budget=summary.budget,
-                        finish_reason=summary.finish_reason, expand_hint=self._extract_expand_hint(summary.text),
+                        finish_reason=summary.finish_reason,
                         model=summary.model, provider=summary.provider, effort=summary.effort,
+                        withheld_reasoning=summary.withheld,
                     )
                 except Exception as exc:
                     logger.warning("LCM could not write the summary of chunk %d of %d (%s: %s)",
@@ -1042,11 +1537,29 @@ class CompactionMixin:
     def _cut_chunks(cls, messages: List[Dict[str, Any]], material: List[int], limit: int,
                     estimator: Optional[Estimator] = None, kept: Sequence[List[int]] = (),
                     summarised: Sequence[bool] = (),
-                    joins: Optional[List[dict]] = None) -> List[List[int]]:
+                    joins: Optional[List[dict]] = None, *,
+                    convert: Optional[Callable[[Any], Any]] = None,
+                    bound: Optional[int] = None,
+                    alone: Optional[List[dict]] = None,
+                    image_limit: Optional[int] = None) -> List[List[int]]:
         """The material cut in list order into chunks, only between groups: a tool
-        call is never separated from its results (#31, #12). No chunk below c/4 is ever
-        cut (ruling on #61, 1): a summary of a chunk that small cannot be shorter than
-        its source, so it would fail on every attempt (#7, ruling on #52).
+        call is never separated from its results (#31, #12). No chunk below c/4 is cut
+        where a merge within B can avoid it (ruling on #61, 1): a summary of a chunk that
+        small cannot be shorter than its source, so it would fail on every attempt (#7,
+        ruling on #52).
+
+        Rows are sized by ``estimator`` after ``convert`` (the caller's
+        ``_cut_estimate``: each row as the summariser receives it). ``bound`` is B, the
+        most the summariser reads in one call (``_summariser_bound``), or None where the
+        model table does not know its window: no merge makes a chunk above it (the
+        orchestrator's ruling on the Codex review of c2efe0e). A part or run below c/4
+        that no neighbour takes within B stands alone and is named in ``alone``.
+
+        ``image_limit`` (``wire_image_limit``) bounds each chunk's images as B bounds its
+        tokens (the orchestrator's ruling on the Codex review of 6f4a351): images are
+        counted as the summariser receives each row; a group above it is a chunk of its
+        own (the check after the cut refuses it); a run is split within it; no merge or
+        join passes it.
 
         ``kept`` are the chunks of an earlier attempt the cut keeps (#33 D14), each as
         its positions, whole groups of the material, and ``summarised`` says of each
@@ -1055,9 +1568,9 @@ class CompactionMixin:
         #61), with the one exception below.
 
         A group larger than ``limit`` (c) is a chunk of its own: a chunk flexes by one
-        group. The groups between such groups form runs; each run of B tokens is split
-        equally (``_split_run``): ceil(B / c) chunks cut at the group boundaries nearest
-        k·B/n, none below c/4.
+        group. The groups between such groups form runs; each run of W tokens is split
+        equally (``_split_run``): ceil(W / c) chunks cut at the group boundaries nearest
+        k·W/n, none below c/4 where a merge within B avoids it.
 
         Where the whole material is below c/4, nothing is cut: it stays raw, and the
         caller makes the compaction a no-op. Otherwise a run below c/4
@@ -1082,16 +1595,20 @@ class CompactionMixin:
           a run takes the joined rows into its equal split. No kept chunk without a
           summary is ever released into a run: one below c/4 was cut again already,
           and one at c/4 or more ends the join.
-        - A join into a kept chunk that is itself up to 1.5c makes up to about 1.75c:
-          c flexes by the small parts a chunk absorbs, and the bound is the caller's
-          check of every chunk against the summariser's input (D4).
+        - No join makes a chunk above B: a neighbour it would take above B is passed
+          over (a run is not, since it is split again). A run below c/4 that no
+          neighbour takes within B stays raw at the end of the material, and elsewhere
+          stands alone, named in ``alone``; the caller records it.
         Each join is recorded in ``joins``, and the caller records an event for it. A
         joined chunk has new members, so it is summarised afresh; it is recorded with
         this attempt's cut, so a retry keeps it and the join is not made again. Never
         jumping over a chunk, so the chunks stay contiguous.
         """
         groups = cls._groups(messages, material)
-        sizes = [sum(count_message_tokens(messages[index], estimator) for index in group) for group in groups]
+        sizes = [sum(count_message_tokens(convert(messages[index]) if convert else messages[index], estimator)
+                     for index in group) for group in groups]
+        pictures = ([sum(image_count(convert(messages[index]) if convert else messages[index]) for index in group)
+                     for group in groups] if image_limit is not None else [0] * len(groups))
         kept_of: Dict[int, int] = {}   # group number -> the kept chunk it belongs to
         first_group = {group[0]: number for number, group in enumerate(groups)}
         for which, positions in enumerate(kept):
@@ -1108,7 +1625,7 @@ class CompactionMixin:
         items: List[tuple] = []
         run: List[int] = []
         for number, size in enumerate(sizes):
-            if number in kept_of or size > limit:
+            if number in kept_of or size > limit or (image_limit is not None and pictures[number] > image_limit):
                 if run:
                     items.append(("run", run))
                     run = []
@@ -1142,19 +1659,32 @@ class CompactionMixin:
         def weight(item: list) -> int:
             return sum(sizes[g] for g in item[1])
 
+        def images_of(item: list) -> int:
+            return sum(pictures[g] for g in item[1])
+
         def positions(item: list) -> List[int]:
             return [groups[item[1][0]][0], groups[item[1][-1]][-1]]
+
+        def fits(at: int, side: int) -> bool:
+            # A run takes the joined rows into its equal split, which bounds each part;
+            # every other neighbour becomes one chunk with the item, bounded by B and by
+            # the wire's image limit.
+            if work[side][0] == "run":
+                return True
+            return ((bound is None or weight(work[at]) + weight(work[side]) <= bound)
+                    and (image_limit is None or images_of(work[at]) + images_of(work[side]) <= image_limit))
 
         def target_for(at: int) -> Optional[int]:
             """Where a tiny item at ``at`` joins: an oversized neighbour, the following
             one first; a tiny run at the very end stays raw (None); else a neighbour
             without a summary, then one with a summary, then a run, the following
-            one first on a tie (D1)."""
+            one first on a tie (D1). A neighbour the join would take above B is passed
+            over; where none is left, the item stands alone (-1)."""
             item = work[at]
             following = at + 1 if at + 1 < len(work) else None
             preceding = at - 1 if at > 0 else None
             for side in (following, preceding):
-                if side is not None and work[side][0] == "oversized":
+                if side is not None and work[side][0] == "oversized" and fits(at, side):
                     return side
             if following is None and item[0] == "run":
                 return None
@@ -1165,8 +1695,9 @@ class CompactionMixin:
                 return (rank.get(neighbour[0], 3) + (1 if neighbour[0] == "kept" and neighbour[2] else 0),
                         0 if side == following else 1)
 
-            sides = [side for side in (following, preceding) if side is not None]
-            return min(sides, key=cost)
+            sides = [side for side in (following, preceding)
+                     if side is not None and work[side][0] != "oversized" and fits(at, side)]
+            return min(sides, key=cost) if sides else -1
 
         # A run below c/4 joins its neighbours until the chunk it makes holds at least
         # c/4, over as many contiguous neighbours as that takes: an oversized group
@@ -1184,6 +1715,15 @@ class CompactionMixin:
                 item[0] = "raw"   # stays raw: the tail begins at it
                 at += 1
                 continue
+            if side == -1:
+                # No neighbour takes it within B: it stands alone, below c/4, named.
+                if alone is not None:
+                    alone.append({"positions": positions(item), "tokens": weight(item), "bound": bound,
+                                  "neighbours": [{"kind": work[s][0], "tokens": weight(work[s])}
+                                                 for s in (at - 1, at + 1) if 0 <= s < len(work)]})
+                item[0] = "alone"
+                at += 1
+                continue
             neighbour = work[side]
             low, high = min(at, side), max(at, side)
             merged_groups = work[low][1] + work[high][1]
@@ -1198,6 +1738,11 @@ class CompactionMixin:
                 merged = ["run", merged_groups, False]
             else:
                 merged = ["joined", merged_groups, False]
+            # A kept chunk a join takes is released (its summary with it): its groups are
+            # no longer kept, and may be split like any other (the orchestrator's ruling on
+            # the Codex review of 722d336).
+            for g in merged_groups:
+                kept_of.pop(g, None)
             work[low:high + 1] = [merged]
             at = low
 
@@ -1205,9 +1750,20 @@ class CompactionMixin:
         for kind, members, _summary in work:
             if kind == "raw":
                 continue
-            if kind == "run":
-                starts = [0] + _split_run([sizes[g] for g in members], limit) + [len(members)]
+            # A part below c/4 left alone (a run, or a join whose kept chunks were released)
+            # is still split where its images pass the limit.
+            split_alone = (kind == "alone" and image_limit is not None
+                           and sum(pictures[g] for g in members) > image_limit
+                           and not any(g in kept_of for g in members))
+            if kind == "run" or split_alone:
+                parts: List[tuple] = []
+                starts = [0] + _split_run([sizes[g] for g in members], limit, bound, parts,
+                                          [pictures[g] for g in members], image_limit) + [len(members)]
                 chunk_groups = [members[a:b] for a, b in zip(starts, starts[1:])]
+                if alone is not None:
+                    for a, b, tokens in parts:
+                        alone.append({"positions": [groups[members[a]][0], groups[members[b - 1]][-1]],
+                                      "tokens": tokens, "bound": bound, "neighbours": "parts of the equal split"})
             else:
                 chunk_groups = [members]
             for group_numbers in chunk_groups:
@@ -1286,8 +1842,96 @@ class CompactionMixin:
         # fixed prefix F is a fact of the session helper, read here, so that nothing inside
         # planning takes another lock or connection.
         self._settle_from_list(messages)
-        fixed = self._fixed_prefix()
+        try:
+            fixed = self._fixed_prefix()
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "fixed_prefix_unreadable",
+                                           "the session's fixed prefix F", exc)
 
+        # The planning phase, from opening the planning transaction to the dispatch of the
+        # first call, inside one boundary (the orchestrator's ruling on the Codex review
+        # of a6e776e): any exception in it, but the attempt's and the host's cancellations,
+        # is a visible abort with its true cause and an event naming the step it was in
+        # (``_Step``, ``_planning_failed``). The handlers inside that give a better cause
+        # stay; the boundary catches everything else.
+        step = _Step("opening the planning transaction")
+        try:
+            planned = self._planning_phase(attempt, messages, step, occasion=occasion, fixed=fixed,
+                                           settings=settings, focus_topic=focus_topic, force=force,
+                                           force_overflow=force_overflow, provider_rejected=provider_rejected,
+                                           why_now=why_now)
+        except BaseException as exc:
+            if _passes_the_boundary(exc):
+                raise
+            return self._planning_failed(attempt, messages, step, exc)
+        if not isinstance(planned, _Planned):
+            return planned   # an abort or a no-op the planning phase returned itself
+        return self._dispatch_phase(attempt, messages, planned, settings=settings, focus_topic=focus_topic,
+                                    started=started, recovery_cap=recovery_cap)
+
+    def _tail_and_cut(self, messages: List[Dict[str, Any]], mechanism: set, occasion: Occasion,
+                      frozen: Sequence[tuple], *, fixed: tuple, focus_topic: str, limit: int,
+                      bound: Optional[int], image_limit: Optional[int], estimator: Estimator,
+                      convert: Callable[[Any], Any], step: Optional["_Step"] = None) -> tuple:
+        """The tail and the cut, planned together (the orchestrator's ruling on the Codex
+        review of 5b74bbc): a frozen chunk below c/4 is released only where the cut then
+        joins it. One the cut leaves raw, or cuts as the same chunk alone, is kept frozen
+        after all, and the plan is made again; each round keeps one more, so there are at
+        most as many rounds as frozen chunks. Returns (plan, material, chunks, joins,
+        alone); a failure is raised as ``_StageError`` naming the stage."""
+        keep: set = set()
+        while True:
+            if step is not None:
+                step.at = "placing the tail"
+            try:
+                plan = self._tail_plan(messages, mechanism, occasion, frozen, fixed=fixed, focus_topic=focus_topic,
+                                       keep=keep)
+            except Exception as exc:
+                raise _StageError("placing the tail", exc) from exc
+            material = [index for index in range(plan.start) if index not in mechanism]
+            chunks: List[List[int]] = []
+            joins: List[dict] = []
+            alone: List[dict] = []
+            if material:
+                if step is not None:
+                    step.at = "cutting the material"
+                try:
+                    chunks = self._cut_chunks(messages, material, limit, estimator,
+                                              kept=[positions for _chunk, positions in plan.kept],
+                                              summarised=[chunk.state == "summarised" for chunk, _p in plan.kept],
+                                              joins=joins, convert=convert, bound=bound, alone=alone,
+                                              image_limit=image_limit)
+                except Exception as exc:
+                    raise _StageError("cutting the material", exc) from exc
+            cut_as = {tuple(chunk) for chunk in chunks}
+            covered = {index for chunk in chunks for index in chunk}
+            idle = [chunk.chunk for chunk, positions in plan.released
+                    if tuple(positions) in cut_as or not covered.intersection(positions)]
+            if not idle:
+                return plan, material, chunks, joins, alone
+            keep.update(idle)
+
+    def _planning_failed(self, attempt, messages: List[Dict[str, Any]], step: "_Step",
+                         exc: BaseException) -> List[Dict[str, Any]]:
+        """An exception inside the planning phase that no handler there named: the
+        planning transaction, where still open, is rolled back (nothing of the attempt is
+        recorded), an event names the step, and the host shows the true cause."""
+        logger.warning("LCM compaction failed while %s", step.at, exc_info=True)
+        if attempt.planning is not None:
+            self._rollback_planning(attempt, exc)
+        try:
+            self._record_event(attempt, "planning_phase_failed",
+                               {"step": step.at, "error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            logger.warning("LCM could not record the planning failure", exc_info=True)
+        return self._abort(messages, f"the compaction failed while {step.at} ({type(exc).__name__}: {exc})")
+
+    def _planning_phase(self, attempt, messages: List[Dict[str, Any]], step: "_Step", *, occasion: Occasion,
+                        fixed: tuple, settings: CallSettings, focus_topic: Optional[str], force: bool,
+                        force_overflow: bool, provider_rejected: bool, why_now: str):
+        """Steps 1 to 3 and the dispatch's preparation, inside ``_compress_impl``'s one
+        boundary: returns a ``_Planned`` to dispatch, or the list an abort or a no-op
+        returns. ``step.at`` names the step under way."""
         # The planning transaction (#33 D14 as revised 2026-09-25): every store read the
         # cut depends on, from the identity on, and the write of the cut, in one
         # BEGIN IMMEDIATE, after the attempt's captured check is asked inside it. A
@@ -1305,8 +1949,14 @@ class CompactionMixin:
             self._record_event(attempt, "planning_transaction_failed", repr(exc))
             return self._abort(messages, f"the store could not begin the compaction's planning transaction ({exc})")
 
-        # 1. Identity (#29 W3). A list that cannot be classified is not compacted.
-        entries = self._classify(attempt, messages)
+        # 1. Identity (#29 W3). A list that cannot be classified is not compacted; a store
+        # that cannot be read for it is a visible abort (#7), never an exception.
+        step.at = "classifying the list"
+        try:
+            entries = self._classify(attempt, messages)
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "classify_unreadable",
+                                           "the records the list is classified against", exc)
         if entries is None:
             return self._abort(messages, attempt.error[1] if attempt.error else "the list could not be classified")
         mechanism = {entry.position for entry in entries if entry.klass == "system"}
@@ -1319,6 +1969,7 @@ class CompactionMixin:
         # On a retry the cut is frozen (#33 D14 as revised): every recorded chunk of the
         # unsettled attempts is found by its members' ids and records. What is cut
         # again is said visibly (ruling 3 on #61).
+        step.at = "reading the earlier attempts' chunks"
         try:
             frozen = self._frozen_candidates(
                 messages, {entry.position: entry.record for entry in entries
@@ -1341,18 +1992,36 @@ class CompactionMixin:
                                {"attempts": attempts,
                                 "chunks": [{"chunk": chunk, "attempt": compaction, "without_identity": list(rows)}
                                            for chunk, compaction, rows in frozen.unidentified]})
+        step.at = "sizing the chunks"
         try:
-            plan = self._tail_plan(messages, mechanism, occasion, frozen.found, fixed=fixed)
-        except ToolPairingError as exc:
-            self._record_event(attempt, "tool_pairing_error", str(exc))
-            return self._abort(messages, f"the tail cannot be placed: {exc}")
+            # The cut's unit: each row as the summariser receives it (``_cut_estimate``).
+            cut_estimator, convert = self._cut_estimate()
+            # c and B with the prompt this attempt's calls carry, its focus text included.
+            limit = self._chunk_limit(focus_topic or "")
+            bound = self._summariser_bound(focus_topic or "")[0]
+            # The images one chunk may carry before the wire's converter drops some unseen.
+            image_limit = self._image_limit()
+        except Exception as exc:
+            return self._sizing_failed(attempt, messages, "sizing the chunks", exc)
+        try:
+            plan, material, chunks, joins, alone = self._tail_and_cut(
+                messages, mechanism, occasion, frozen.found, fixed=fixed, focus_topic=focus_topic or "",
+                limit=limit, bound=bound, image_limit=image_limit, estimator=cut_estimator, convert=convert,
+                step=step)
+        except _StageError as failure:
+            if isinstance(failure.exc, ToolPairingError):
+                self._record_event(attempt, "tool_pairing_error", str(failure.exc))
+                what = "the tail cannot be placed" if failure.where == "placing the tail" else \
+                    "the material cannot be cut"
+                return self._abort(messages, f"{what}: {failure.exc}")
+            return self._sizing_failed(attempt, messages, failure.where, failure.exc)
+        tail_start = plan.start
         for chunk, why in frozen.recut + plan.recut:
             logger.warning("LCM cuts the %s chunk %s of attempt %d again: %s", chunk.state, chunk.chunk,
                            chunk.compaction, why)
             self._record_event(attempt, "frozen_chunk_recut",
                                {"chunk": chunk.chunk, "state": chunk.state, "attempt": chunk.compaction,
                                 "reason": why})
-        tail_start = plan.start
         logger.info("LCM tail: %s", plan.label)
         for chunk, positions in plan.held:
             # #31 holds that the floor is never inside a kept chunk; where it is (at a
@@ -1360,23 +2029,20 @@ class CompactionMixin:
             # the chunk is not cut again: it stays whole in the tail this time.
             self._record_event(attempt, "kept_chunk_reaches_floor",
                                {"chunk": chunk.chunk, "state": chunk.state, "positions": [positions[0], positions[-1]]})
-        # The cut, before the boundary is checked: a rest below c/4 at the end of the
-        # material stays raw and the tail begins at it (ruling on #61, 1).
-        material = [index for index in range(tail_start) if index not in mechanism]
-        estimator = self._estimator()
-        limit = self._chunk_limit()
-        chunks: List[List[int]] = []
+        # The cut was made before the boundary is checked: a rest below c/4 at the end of
+        # the material stays raw and the tail begins at it (ruling on #61, 1).
         waiting: List[int] = []
+        step.at = "cutting the material"
         if material:
-            joins: List[dict] = []
-            try:
-                chunks = self._cut_chunks(messages, material, limit, estimator,
-                                          kept=[positions for _chunk, positions in plan.kept],
-                                          summarised=[chunk.state == "summarised" for chunk, _p in plan.kept],
-                                          joins=joins)
-            except ToolPairingError as exc:
-                self._record_event(attempt, "tool_pairing_error", str(exc))
-                return self._abort(messages, f"the material cannot be cut: {exc}")
+            for part in alone:
+                # Every merge is bounded by B (the orchestrator's ruling on the Codex
+                # review of c2efe0e): a part below c/4 that no neighbour takes within B
+                # is sent alone, and said so.
+                logger.warning("LCM sends the rows at positions %d to %d (%d tokens) as a chunk below c/4 = %d: no "
+                               "neighbour takes them within B = %s, the most the summariser reads in one call",
+                               part["positions"][0], part["positions"][1], part["tokens"], _smallest_for(limit),
+                               bound)
+                self._record_event(attempt, "chunk_below_smallest_alone", part)
             for join in joins:
                 # The one exception to "nothing joins a kept chunk" (ruling on #61, D1),
                 # continued until the chunk holds c/4 (ruling on 60a48c9).
@@ -1414,6 +2080,7 @@ class CompactionMixin:
                 logger.info("LCM leaves %d rows below c/4 at the end of the material raw (from position %d): the "
                             "tail begins at them, and they join material at a later compaction",
                             len(waiting), tail_start)
+        step.at = "checking the tail's boundary"
         unanswered = _unanswered_calls_at(messages, tail_start)
         if unanswered:
             # The forward check: a call at the boundary whose result is not in the list
@@ -1437,11 +2104,11 @@ class CompactionMixin:
         if not material and waiting and not (force_overflow or provider_rejected):
             # Only a rest below c/4 stands outside the tail: nothing to compact yet, not a
             # failure (ruling on #61, 1), as the preflight says for the same list.
-            rest = estimator.messages([messages[index] for index in waiting])
+            rest = cut_estimator.messages([convert(messages[index]) for index in waiting])
             return self._unchanged_return(
                 messages, f"nothing to compact: what stands outside the fresh tail is below the smallest run that "
                           f"stands alone, c/4 ({rest.tokens} < {_smallest_for(limit)} tokens, {rest.label()}; "
-                          f"{self._chunk_label()}); it stays raw until more material joins it")
+                          f"{self._chunk_label(focus_topic or '')}); it stays raw until more material joins it")
         if not material:
             if force_overflow or provider_rejected:
                 self._publish("_last_overflow_recovery_failed", True)
@@ -1457,12 +2124,13 @@ class CompactionMixin:
                 f"{'tool group' if len(messages) - tail_start > 1 else 'message'} fill the context; outside them "
                 f"stands only the mechanism's layer (the system row and the summaries)",
             )
-        material_estimate = estimator.messages([messages[index] for index in material])
+        step.at = "estimating the material"
+        material_estimate = cut_estimator.messages([convert(messages[index]) for index in material])
 
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk,
         # the last step of the planning transaction.
         logger.info("LCM cut %d tokens of material into %d chunk%s (%s)", material_estimate.tokens, len(chunks),
-                    "" if len(chunks) == 1 else "s", self._chunk_label())
+                    "" if len(chunks) == 1 else "s", self._chunk_label(focus_topic or ""))
         # Kept chunks as they were, by their positions: summarised ones reuse their summary
         # whatever route wrote it; they are never summarised again (ruling on #61).
         kept_state = {tuple(positions): chunk.state for chunk, positions in plan.kept}
@@ -1471,32 +2139,158 @@ class CompactionMixin:
             logger.info("LCM keeps the cut of earlier attempts (#33 D14): %d recorded chunks as they were "
                         "(%d summarised, %d retried as the same chunk)", len(states), states.count("summarised"),
                         states.count("cut"))
-        # A chunk the summariser cannot read in one call would fail on every attempt; it
-        # is never cut (the tiny-chunk rule on #52). Only where the model table knows
-        # the window; counted by the plugin's estimate, its images by the summariser's rule.
-        model_facts = lookup_model(settings.route.model)
-        if model_facts is not None and model_facts.context_window:
-            room = model_facts.context_window - (model_facts.output_cap or 0)
-            summariser_estimate = Estimator(image_model=settings.route.model)
-            for number, chunk in enumerate(chunks, start=1):
-                estimate = summariser_estimate.messages([messages[index] for index in chunk])
-                if estimate.tokens > room:
-                    return self._abort(
-                        messages,
-                        f"chunk {number} of {len(chunks)} holds about {estimate.tokens} tokens "
-                        f"({estimate.label()}), more than the summariser {settings.route.describe()} can read "
-                        f"in one call ({model_facts.context_window} window less {model_facts.output_cap or 0} "
-                        f"output)",
-                    )
+        step.at = "writing the compaction"
         try:
             chunk_handles = self._write_compaction(attempt, entries, chunks, force=force)
         except Exception as exc:
             logger.warning("LCM could not write the compaction", exc_info=True)
             self._record_event(attempt, "compaction_write_failed", repr(exc))
             return self._abort(messages, f"the store could not write the compaction ({exc})")
+
+        # 3b. What the summariser receives for each chunk, built once from the chunk's
+        # records as just written (#8; F4 of the pre-review of 6a6a7f8), read inside the
+        # planning transaction, so that a chunk the summariser cannot read is refused
+        # before its cut is committed: nothing of this attempt is then recorded.
+        route = settings.route
+        step.at = "reading the chunks' records"
+        members = [attempt.records[index] for chunk in chunks for index in chunk]
+        try:
+            facts = self._records.record_facts(members)
+        except Exception as exc:
+            self._rollback_planning(attempt, exc)
+            return self._store_read_failed(attempt, messages, "chunk_records_unreadable",
+                                           "the chunks' records", exc)
+        missing = sorted(set(members) - set(facts))
+        if missing:
+            self._rollback_planning(attempt, RuntimeError("chunk records missing"))
+            self._record_event(attempt, "chunk_record_missing", {"records": missing})
+            return self._abort(messages, f"the store holds no record {', '.join(missing)} of the chunks it just "
+                                         f"recorded")
+        step.at = "building the summariser's input"
+        prepared: Dict[int, ChunkInput] = {}
+        for number, chunk in enumerate(chunks, start=1):
+            records = [attempt.records[index] for index in chunk]
+            try:
+                prepared[number] = self._chunk_input(
+                    [(record, json.loads(facts[record][1])) for record in records], route, focus_topic=focus_topic)
+            except Exception as exc:
+                # F2 of the pre-review: never an exception out of compress().
+                self._rollback_planning(attempt, exc)
+                logger.warning("LCM could not build the summariser's input for chunk %d of %d (%s: %s)",
+                               number, len(chunks), type(exc).__name__, exc)
+                self._record_event(attempt, "chunk_input_failed",
+                                   {"chunk": number, "error": f"{type(exc).__name__}: {exc}"})
+                return self._abort(messages, f"the summariser's input for chunk {number} of {len(chunks)} could "
+                                             f"not be built ({type(exc).__name__}: {exc})")
+        # A chunk the summariser cannot read in one call would fail on every attempt
+        # (#34 D4). The cut bounds every chunk of divisible material by B, in this check's
+        # unit (``_chunk_size``, ``_cut_estimate``), so this refuses only a group that cannot
+        # be divided, or a kept chunk cut before the summariser's bound applied. What is counted is what the
+        # summariser receives (#8b): its level-1 input, an image it is not sent as its
+        # placeholder, readable reasoning as the text part it becomes; compared like with
+        # like: the estimate's characters / 4 by the worst case observed, never the median,
+        # images by the summariser's rule. A kept chunk that has its summary is not sent,
+        # so it is not checked.
+        # A chunk carrying more images than the summariser wire's converter keeps would
+        # lose the rest unseen (#8; the orchestrator's ruling on the Codex review of
+        # 6f4a351). The cut keeps divisible material within the limit, so this refuses
+        # only a group that cannot be divided, or a chunk an earlier attempt cut: never
+        # with placeholders in their place, since a loss is a failure (see the PR).
+        step.at = "checking each chunk's images against the wire's limit"
+        if not route.target_api_mode:
+            # The wire of the client the host builds for the summariser is not one the
+            # plugin has established (``_client_wire``): whether it keeps every image is not
+            # known, so a chunk carrying one is not sent ("Known, or nothing"; the
+            # orchestrator's ruling on the Codex review of e229fd0).
+            for number, chunk in enumerate(chunks, start=1):
+                if kept_state.get(tuple(chunk)) == "summarised":
+                    continue
+                carried = sum(image_count(summariser_message(raw, record, prepared[number].wire))
+                              for record, raw in prepared[number].records)
+                if carried:
+                    self._rollback_planning(attempt, RuntimeError("images on a wire not established"))
+                    self._record_event(attempt, "images_on_unknown_wire",
+                                       {"chunk": number, "images": carried, "client": route.target_client})
+                    return self._abort(
+                        messages,
+                        f"chunk {number} of {len(chunks)} carries {carried} image{'' if carried == 1 else 's'}, and "
+                        f"the host routes the summariser {route.describe()} through a {route.target_client}, a wire "
+                        f"the plugin has not established: it cannot be shown that the summariser receives every "
+                        f"image (#8)",
+                    )
+        if image_limit is not None:
+            for number, chunk in enumerate(chunks, start=1):
+                if kept_state.get(tuple(chunk)) == "summarised":
+                    continue
+                carried = sum(image_count(summariser_message(raw, record, prepared[number].wire))
+                              for record, raw in prepared[number].records)
+                if carried > image_limit:
+                    groups = len(self._groups(messages, chunk))
+                    what = (f"a chunk an earlier attempt cut ({groups} group{'' if groups == 1 else 's'})"
+                            if tuple(chunk) in kept_state else
+                            "one group that cannot be divided (a message, or a tool call with its results)"
+                            if groups == 1 else
+                            f"{groups} groups this attempt cut within the image limit (a defect: the cut and this "
+                            f"check disagree)")
+                    self._rollback_planning(attempt, RuntimeError("chunk over the wire's image limit"))
+                    self._record_event(attempt, "chunk_over_image_limit",
+                                       {"chunk": number, "groups": groups, "images": carried, "limit": image_limit})
+                    return self._abort(
+                        messages,
+                        f"chunk {number} of {len(chunks)}, {what}, carries {carried} images, more than the "
+                        f"{image_limit} the host's converter for the summariser {route.describe()} keeps in one "
+                        f"request (agent/image_eviction_policy.py OUTBOUND_IMAGE_LIMIT): the rest would be removed "
+                        f"unseen (#8)",
+                    )
+        step.at = "checking each chunk against the summariser's window"
+        model_facts = prepared[1].facts if prepared else None
+        if model_facts is not None and model_facts.context_window:
+            room = model_facts.context_window - (model_facts.output_cap or 0)
+            worst = float(self._config.estimate_ratio_max)
+            summariser_estimate = Estimator(image_model=route.target_model, image_provider=route.target_provider,
+                                            reasoning_sent=prepared[1].wire.needs_reasoning_echo)
+            for number, chunk in enumerate(chunks, start=1):
+                if kept_state.get(tuple(chunk)) == "summarised":
+                    continue
+                estimate = summariser_estimate.messages(prepared[number].level_one)
+                provider_tokens = estimate.in_provider_tokens(worst)
+                if provider_tokens > room:
+                    groups = len(self._groups(messages, chunk))
+                    if tuple(chunk) in kept_state:
+                        what = f"a chunk an earlier attempt cut ({groups} group{'' if groups == 1 else 's'})"
+                    elif groups == 1:
+                        what = "one group that cannot be divided (a message, or a tool call with its results)"
+                    else:
+                        # The cut bounds such a chunk by B in the same unit; reaching this
+                        # is a defect of the cut, said as what it is.
+                        what = (f"{groups} groups this attempt cut within B = {bound} by the cut's estimate (a defect: "
+                                f"the cut and this check disagree)")
+                    self._rollback_planning(attempt, RuntimeError("chunk over the summariser's window"))
+                    self._record_event(attempt, "chunk_over_summariser_window",
+                                       {"chunk": number, "groups": groups, "provider_tokens": provider_tokens,
+                                        "room": room})
+                    return self._abort(
+                        messages,
+                        f"chunk {number} of {len(chunks)}, {what}, would reach the summariser {route.describe()} as "
+                        f"about {provider_tokens} provider tokens ({estimate.tokens} by the plugin's estimate, its "
+                        f"characters / 4 times {worst}, the estimate's worst case observed, #34 D4; "
+                        f"{estimate.label()}), more than it can read in one call ({model_facts.context_window} "
+                        f"window less {model_facts.output_cap or 0} output; {model_facts.basis})",
+                    )
+        else:
+            # No window known: no B and no check, and that is said, in the log and in the
+            # compaction's record (the orchestrator's ruling on the Codex review of e229fd0).
+            unknown = self._window_unknown()
+            if unknown:
+                logger.warning("LCM compacts without a window check: %s", unknown)
+                self._record_event(attempt, "summariser_window_unknown",
+                                   {"summariser": route.describe(), "target": [route.target_provider,
+                                                                              route.target_model],
+                                    "why": unknown})
         # The cut is recorded: commit the planning transaction before any call starts. A
         # commit that fails (the busy timeout, a full disk) wrote nothing: a visible
         # abort, the context untouched (#7).
+        step.at = "committing the planning transaction"
         try:
             held_ms = attempt.end_planning()
         except Exception as exc:
@@ -1505,13 +2299,9 @@ class CompactionMixin:
             return self._abort(messages, f"the store could not commit the compaction's cut ({exc})")
         logger.info("LCM held the store's write lock for %.1f ms to plan and record the cut", held_ms or 0.0)
 
-        # 4. One summary per chunk, from the chunk's records as stored, every chunk's call
-        # issued at once (#12, #33): each joins the call in flight for the same records,
-        # reuses a summary of them already written, or starts on a worker of its own.
-        members = [attempt.records[index] for chunk in chunks for index in chunk]
-        facts = self._records.record_facts(members)
-        route = settings.route
-        endpoint = endpoint_key(route.provider, route.base_url)
+        # The dispatch's preparation, still inside the boundary: nothing is sent yet.
+        step.at = "preparing the dispatch"
+        endpoint = endpoint_key(route.target_provider, route.target_base_url)
         limiter, limit = limiter_for(endpoint), self._calls_in_flight_limit(endpoint)
         # The host's progress hook and deadline, read here on the compress() thread (D10).
         hook, deadline = host_progress_hook(), host_deadline()
@@ -1527,17 +2317,12 @@ class CompactionMixin:
             return settings.scrub(str(exc)) if isinstance(exc, SummaryFailure) \
                 else failure_text(exc, settings.secrets)
 
-        subscribers: List[Subscriber] = []
-        ways: Dict[str, int] = {}
         # Every chunk's outcome arrives here, once, after it is complete: the one place
         # the compress() thread reads outcomes from.
         finished: "queue.Queue[int]" = queue.Queue()
+        calls: List[tuple] = []
         for number, (chunk_handle, chunk) in enumerate(zip(chunk_handles, chunks), start=1):
-            # A cancelled or no longer current attempt starts no further call (#29 W2 step 2).
-            if not still_wanted():
-                raise AttemptCancelled()
             records = [attempt.records[index] for index in chunk]
-            chunk_messages = [json.loads(facts[record][1]) for record in records]
             # A member whose row has no host identity (the gateway's replayed history, or
             # host scaffolding the host never persists) is recorded anew at every attempt,
             # so this chunk's earlier failures cannot be counted (ruling 3 on #61).
@@ -1547,19 +2332,62 @@ class CompactionMixin:
                                     deliver=self._deliver_for(attempt, chunk_handle, number, len(chunks),
                                                               records, unidentified),
                                     on_done=lambda number=number: finished.put(number))
+            # What the worker runs, made before the call is looked up, so that a failure
+            # of it is named as its own and not as the reuse read's (F3 of the pre-review).
+            try:
+                run = self._chunk_run(prepared[number], focus_topic=focus_topic, settings=settings,
+                                      chunk_handle=chunk_handle)
+            except Exception as exc:
+                logger.warning("LCM could not prepare the summariser call of chunk %d of %d (%s: %s)",
+                               number, len(chunks), type(exc).__name__, exc)
+                self._record_event(attempt, "chunk_call_unprepared",
+                                   {"chunk": chunk_handle, "error": f"{type(exc).__name__}: {exc}"})
+                return self._abort(messages, f"the summariser call of chunk {number} of {len(chunks)} could not be "
+                                             f"prepared ({type(exc).__name__}: {exc})")
+            calls.append((number, chunk_handle, chunk, records, subscriber, run))
+        return _Planned(route=route, chunks=chunks, kept_state=kept_state, mechanism=mechanism,
+                        tail_start=tail_start, endpoint=endpoint, limiter=limiter, limit=limit,
+                        still_wanted=still_wanted, describe=describe, finished=finished, calls=calls)
+
+    def _dispatch_phase(self, attempt, messages: List[Dict[str, Any]], planned: "_Planned", *,
+                        settings: CallSettings, focus_topic: Optional[str], started: float,
+                        recovery_cap: Optional[int]) -> List[Dict[str, Any]]:
+        """Steps 4 and 5, after the planning boundary: from the dispatch of the first call
+        on, the calls, the wait and the return, each failure with its own handler (#7,
+        #33). Everything a call needs was prepared inside the boundary."""
+        route, chunks, kept_state = planned.route, planned.chunks, planned.kept_state
+        mechanism, tail_start = planned.mechanism, planned.tail_start
+        endpoint, limiter, limit = planned.endpoint, planned.limiter, planned.limit
+        still_wanted, describe, finished = planned.still_wanted, planned.describe, planned.finished
+
+        # 4. One summary per chunk, every chunk's call issued at once (#12, #33): each
+        # joins the call in flight for the same records, reuses a summary of them already
+        # written, or starts on a worker of its own.
+        subscribers: List[Subscriber] = []
+        ways: Dict[str, int] = {}
+        for number, chunk_handle, chunk, records, subscriber, run in planned.calls:
+            # A cancelled or no longer current attempt starts no further call (#29 W2 step 2).
+            if not still_wanted():
+                raise AttemptCancelled()
             # Attempts share a call only with the same summariser route and effort, the
-            # rule a reuse applies (``summary_of_records``).
-            way = join_or_start(
-                (attempt.session, tuple(records), route.model, route.provenance_provider(), settings.effort),
-                subscriber, limiter=limiter, limit=limit,
-                reuse=lambda records=records, chunk_handle=chunk_handle, frozen_summary=(
-                    kept_state.get(tuple(chunk)) == "summarised"): self._records.summary_of_records(
-                    attempt.session, records, exclude_chunk=chunk_handle, model=route.model,
-                    provider=route.provenance_provider(), effort=settings.effort, any_route=frozen_summary),
-                run=self._chunk_run(chunk_messages, focus_topic=focus_topic, record_handles=records,
-                                    settings=settings),
-                describe=describe,
-            )
+            # rule a reuse applies (``summary_of_records``). The reuse reads the store; a
+            # read that fails aborts the compaction (#7). Calls already started for
+            # earlier chunks run on and write their summaries (#33 D13).
+            try:
+                way = join_or_start(
+                    (attempt.session, tuple(records), route.target_model, route.provenance_provider(),
+                     settings.effort),
+                    subscriber, limiter=limiter, limit=limit,
+                    reuse=lambda records=records, chunk_handle=chunk_handle, frozen_summary=(
+                        kept_state.get(tuple(chunk)) == "summarised"): self._records.summary_of_records(
+                        attempt.session, records, exclude_chunk=chunk_handle, model=route.target_model,
+                        provider=route.provenance_provider(), effort=settings.effort, any_route=frozen_summary),
+                    run=run,
+                    describe=describe,
+                )
+            except Exception as exc:
+                return self._store_read_failed(attempt, messages, "summary_reuse_unreadable",
+                                               f"a summary of chunk {number} of {len(chunks)} already written", exc)
             ways[way] = ways.get(way, 0) + 1
             subscribers.append(subscriber)
         logger.info("LCM compaction issued %d chunk%s to %s (%s), at most %d calls in flight there",
@@ -1596,17 +2424,25 @@ class CompactionMixin:
         # 5. The return, emitted from the record (#34 D5).
         previous = attempt.effective_returns
         cover = [previous[p][2] for p in sorted(previous) if previous[p][0] == "summary"] + new_derivations
-        texts = self._records.derivations(cover)
+        try:
+            texts = self._records.derivations(cover)
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "cover_unreadable", "the summaries of the return", exc)
+        absent = [derivation for derivation in cover if derivation not in texts]
+        if absent:
+            # A summary the return stands on is not in the store: the chain would lose it.
+            self._record_event(attempt, "cover_derivation_missing", {"derivations": absent})
+            return self._abort(messages, f"the store holds no summary {', '.join(map(str, absent))} of the return")
         result: List[Dict[str, Any]] = []
         returns: List[tuple] = []
         if 0 in mechanism and messages[0].get("role") == "system":
             result.append(messages[0])  # the host's system row, in place, not recorded
         for derivation in cover:
-            node_id, text, hint = texts[derivation]
+            node_id, text = texts[derivation]
             row = {
                 "role": "user",
                 "content": "\n".join((_SUMMARY_HEADER.format(node_id=node_id), text,
-                                      _SUMMARY_FOOTER.format(hint=hint or ""))),
+                                      _SUMMARY_FOOTER.format(node_id=node_id))),
                 "_compressed_summary": True,
             }
             returns.append((len(result), "summary", None, derivation, raw_json(row)))
@@ -1619,7 +2455,8 @@ class CompactionMixin:
             returns.append((len(result), "record", record, None, None))
             result.append(messages[index])
 
-        # The return fence on the captured check (#29 W2 steps 2 and 6).
+        # The return fence on the captured check (#29 W2 steps 2 and 6): asked here, and
+        # inside the return's transaction once its write lock is granted (_write_return).
         self._require_live_write()
         try:
             self._write_return(attempt, result, returns)
@@ -1637,7 +2474,10 @@ class CompactionMixin:
         # The host sets its re-arm flag from this after the commit, and re-arms its
         # per-turn count when the next prompt is below threshold_tokens (#32 §9).
         self._publish("_last_compression_made_progress", True)
-        before, after = estimator.messages(messages), estimator.messages(result)
+        # The session's context, by the session's estimate, as the recovery cap is
+        # computed (``_overflow_recovery_assembly_cap``), never the summariser's.
+        session_estimator = self._estimator()
+        before, after = session_estimator.messages(messages), session_estimator.messages(result)
         over_cap = recovery_cap is not None and after.tokens > recovery_cap
         self._publish("_last_overflow_recovery_failed", over_cap)
         if over_cap:

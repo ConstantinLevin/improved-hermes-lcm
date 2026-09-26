@@ -31,7 +31,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
@@ -296,18 +296,18 @@ class RecordStore:
         rows = self._q("SELECT COUNT(*) FROM effective_compactions WHERE session = ?", (session,))
         return int(rows[0][0]) if rows else 0
 
-    def derivations(self, handles: Iterable[str]) -> dict[str, tuple[int, str, Optional[str]]]:
-        """handle -> (derivation id, text, expand hint)."""
+    def derivations(self, handles: Iterable[str]) -> dict[str, tuple[int, str]]:
+        """handle -> (derivation id, text)."""
         wanted = [h for h in set(handles) if h]
-        found: dict[str, tuple[int, str, Optional[str]]] = {}
+        found: dict[str, tuple[int, str]] = {}
         for start in range(0, len(wanted), 500):
             chunk = wanted[start:start + 500]
             rows = self._q(
-                "SELECT handle, derivation_id, text, expand_hint FROM derivations "
+                "SELECT handle, derivation_id, text FROM derivations "
                 f"WHERE handle IN ({','.join('?' * len(chunk))})",
                 chunk,
             )
-            found.update({str(h): (int(i), str(t), e) for h, i, t, e in rows})
+            found.update({str(h): (int(i), str(t)) for h, i, t in rows})
         return found
 
     def summary_of_records(
@@ -335,16 +335,17 @@ class RecordStore:
             route_clause = "" if any_route else "AND d.model IS ? AND d.provider IS ? AND d.effort IS ? "
             args = (chunk,) if any_route else (chunk, model or None, provider or None, effort or None)
             rows = self._q(
-                "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort "
+                "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort, "
+                "d.withheld_reasoning "
                 "FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
                 "WHERE s.chunk = ? AND s.ordinal = 0 AND d.kind = 'summary' "
                 + route_clause + "ORDER BY d.derivation_id DESC LIMIT 1",
                 args,
             )
             if rows:
-                text, level, budget, finish_reason, model_, provider_, effort_ = rows[0]
+                text, level, budget, finish_reason, model_, provider_, effort_, withheld = rows[0]
                 return ChunkSummary(text=str(text), level=level, budget=budget, finish_reason=finish_reason,
-                                    model=model_, provider=provider_, effort=effort_)
+                                    model=model_, provider=provider_, effort=effort_, withheld=withheld)
         return None
 
     def _chunks_with_members(self, session: str, records: Sequence[str]) -> list[tuple[str, int]]:
@@ -1074,19 +1075,19 @@ class RecordStore:
         level: Optional[int],
         budget: Optional[int],
         est_tokens: Optional[int],
-        expand_hint: Optional[str] = None,
         finish_reason: Optional[str] = None,
         effort: Optional[str] = None,
+        withheld_reasoning: Optional[str] = None,
     ) -> str:
         with self._tx() as conn:
             handle = self._insert_with_handle(
                 conn,
                 DERIVATION,
                 "INSERT INTO derivations(handle, kind, text, compaction, model, provider, effort, prompt, "
-                "budget, finish_reason, level, est_tokens, expand_hint, created_at) "
+                "budget, finish_reason, level, est_tokens, withheld_reasoning, created_at) "
                 "VALUES (?, 'summary', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
                 (text, compaction, model or None, provider or None, effort or None, budget, finish_reason or None,
-                 level, est_tokens, expand_hint, time.time()),
+                 level, est_tokens, withheld_reasoning, time.time()),
             )
             conn.execute(
                 "INSERT INTO derivation_sources(derivation, ordinal, chunk, source_derivation) VALUES (?, 0, ?, NULL)",
@@ -1098,16 +1099,28 @@ class RecordStore:
         self,
         compaction: int,
         entries: Iterable[tuple[int, str, Optional[str], Optional[str], Optional[str]]],
+        *,
+        fence: Optional[Callable[[], None]] = None,
     ) -> None:
         """(position, kind, record, derivation, raw): a returned summary names the
         derivation it was emitted from and keeps its dict as returned, verbatim, since
-        it is what the agent's context held."""
+        it is what the agent's context held.
+
+        ``fence`` is asked inside the transaction, once the write lock is granted (the
+        wait for it can last the busy timeout) and again just before COMMIT; where it
+        raises, the transaction is rolled back and nothing of the return is written
+        (#7, #33 D12). What it cannot close is a cancellation during COMMIT itself."""
+        rows = [(compaction, pos, kind, record, derivation, raw) for pos, kind, record, derivation, raw in entries]
         with self._tx() as conn:
+            if fence is not None:
+                fence()
             conn.executemany(
                 "INSERT INTO compaction_returns(compaction, position, kind, record, derivation, raw) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                [(compaction, pos, kind, record, derivation, raw) for pos, kind, record, derivation, raw in entries],
+                rows,
             )
+            if fence is not None:
+                fence()
 
     def confirm(
         self,

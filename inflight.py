@@ -184,6 +184,8 @@ class ChunkSummary:
     model: Optional[str]
     provider: Optional[str]
     effort: Optional[str]
+    # The encrypted reasoning withheld from the summariser's input, as JSON (#8), or None.
+    withheld: Optional[str] = None
 
 
 @dataclass

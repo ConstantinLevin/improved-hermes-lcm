@@ -471,16 +471,17 @@ class RecordWriteMixin:
         text: str,
         level: Optional[int],
         budget: Optional[int],
-        expand_hint: Optional[str],
         finish_reason: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
         effort: Optional[str] = None,
+        withheld_reasoning: Optional[str] = None,
     ) -> str:
         """A summary as a derivation of its chunk, in its own transaction; raises when
         the write fails. Its provenance: the model and provider that wrote it (the
         summariser's route, which the host's ``route_info`` confirmed), the reasoning
-        effort asked for, and the provider's ``finish_reason`` as the host reported it."""
+        effort asked for, the provider's ``finish_reason`` as the host reported it, and the
+        encrypted reasoning withheld from its input (#8)."""
         return self._records.write_derivation(
             compaction=attempt.compaction,
             chunk=chunk,
@@ -491,8 +492,8 @@ class RecordWriteMixin:
             level=level,
             budget=budget,
             est_tokens=count_tokens(text),
-            expand_hint=expand_hint,
             finish_reason=finish_reason,
+            withheld_reasoning=withheld_reasoning,
         )
 
     def _write_return(
@@ -502,9 +503,18 @@ class RecordWriteMixin:
         entries: List[tuple],
     ) -> None:
         """Write the return, (position, kind, record, derivation, raw) per recorded
-        entry, and key the returned dicts. The caller has asked the attempt's captured
-        check just before; raises when the write fails."""
-        self._records.write_returns(attempt.compaction, entries)
+        entry, and key the returned dicts; raises when the write fails.
+
+        The return is fenced on the attempt's captured check inside its transaction,
+        once the write lock is granted and again before COMMIT (#7, #33 D12): a check
+        asked before the write left the wait for the lock, up to the busy timeout,
+        unfenced. After COMMIT the check is asked once more before anything outside the
+        store changes: the host's own dicts are keyed, and the attempt is registered for
+        confirmation and rejection, only for an attempt that is still live. A
+        cancellation during COMMIT leaves return rows that no key and no attempt refers
+        to, as a return the host rejected does. ``AttemptCancelled`` is raised for it."""
+        self._records.write_returns(attempt.compaction, entries, fence=self._require_live_write)
+        self._require_live_write()
         for position, kind, _record, _derivation, _raw in entries:
             message = result[position]
             message[RET_KEY] = f"{attempt.compaction}:{position}"
