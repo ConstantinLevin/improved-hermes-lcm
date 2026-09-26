@@ -131,9 +131,11 @@ from .tokens import Estimator, count_message_tokens, count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
-# The words around a summary row (Decision 8, until #10 writes them).
+# The words around a summary row (Decision 8, until #10 writes them). The wrapper carries
+# what the plugin knows, the summary's node id, which lcm_expand takes; nothing in it is
+# read out of the summary's text (#9, Decided: nothing in a reply is recognised by pattern).
 _SUMMARY_HEADER = "[Recent Summary (d0, node {node_id})]"
-_SUMMARY_FOOTER = "[Expand for details: {hint}]"
+_SUMMARY_FOOTER = "[Expand for details: node {node_id}]"
 
 # How often the compress() thread, waiting for its chunks, asks the attempt's captured check.
 _WAIT_SLICE_S = 0.25
@@ -986,7 +988,7 @@ class CompactionMixin:
                 try:
                     derivation = self._write_summary(
                         attempt, chunk_handle, text=summary.text, level=summary.level, budget=summary.budget,
-                        finish_reason=summary.finish_reason, expand_hint=self._extract_expand_hint(summary.text),
+                        finish_reason=summary.finish_reason, expand_hint=None,
                         model=summary.model, provider=summary.provider, effort=summary.effort,
                     )
                 except Exception as exc:
@@ -1652,11 +1654,11 @@ class CompactionMixin:
         if 0 in mechanism and messages[0].get("role") == "system":
             result.append(messages[0])  # the host's system row, in place, not recorded
         for derivation in cover:
-            node_id, text, hint = texts[derivation]
+            node_id, text, _hint = texts[derivation]
             row = {
                 "role": "user",
                 "content": "\n".join((_SUMMARY_HEADER.format(node_id=node_id), text,
-                                      _SUMMARY_FOOTER.format(hint=hint or ""))),
+                                      _SUMMARY_FOOTER.format(node_id=node_id))),
                 "_compressed_summary": True,
             }
             returns.append((len(result), "summary", None, derivation, raw_json(row)))

@@ -1244,16 +1244,3 @@ class LCMEngine(
             return None
 
         return max(1, min(caps))
-
-    # -- Internal: helpers -------------------------------------------------
-
-    @staticmethod
-    def _extract_expand_hint(summary: str) -> str:
-        """Extract the 'Expand for details about:' line from a summary."""
-        marker = "Expand for details about:"
-        idx = summary.rfind(marker)
-        if idx >= 0:
-            hint = summary[idx + len(marker):].strip()
-            # Take first line only
-            return hint.split("\n")[0].strip()
-        return ""

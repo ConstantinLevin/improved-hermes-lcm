@@ -126,7 +126,9 @@ class SummaryNode:
     created_at: float = 0.0
     earliest_at: float | None = None
     latest_at: float | None = None
-    expand_hint: str = ""  # "Expand for details about: ..."
+    # No longer written (#9: nothing in a reply is recognised by pattern); rows written
+    # before carry the text a pattern took from the summary. Its tool fields go with #18.
+    expand_hint: str = ""
     search_rank: float | None = None
     search_directness: float = 0.0
     # Transcript order of the summary in the session's cover (the view's ``seq``).
