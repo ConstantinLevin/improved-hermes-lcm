@@ -209,13 +209,6 @@ ROWS: tuple[ModelFacts, ...] = (
         route="openrouter", ids=("openai/gpt-5-nano",), encrypted_reasoning=frozenset({"reasoning_details"}),
     ),
     ModelFacts(
-        "deepseek", "deepseek-v4.1-flash", reads_images=True, output_cap=131_072, context_window=1_048_576,
-        source=f"{_OPENROUTER_API} (input_modalities: text, image); images: no documented rule, uncounted; "
-               f"{_OPENROUTER_DETAILS}",
-        route="openrouter", ids=("deepseek/deepseek-v4.1-flash",),
-        encrypted_reasoning=frozenset({"reasoning_details"}),
-    ),
-    ModelFacts(
         "openai", "gpt-6-astra", reads_images=True, output_cap=None, context_window=272_000,
         source="window: the host's Codex OAuth window for the id (agent/model_metadata.py "
                "_CODEX_OAUTH_CONTEXT_FALLBACK at Hermes 916e1688ba; the -900k variant is another id); output: not "
