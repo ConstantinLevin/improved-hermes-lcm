@@ -798,8 +798,9 @@ class RecordStore:
             found: Optional[str] = None
             while frontier and found is None:
                 current, frontier = frontier[0], frontier[1:]
-                for (step,) in self._q("SELECT revision FROM revision_sources WHERE source_record = ? "
-                                       "ORDER BY revision", (current,)):
+                # In write order (the re-plan of #71, C4), never the handles' text order.
+                for (step,) in self._q("SELECT s.revision FROM revision_sources s JOIN records r ON r.handle = "
+                                       "s.revision WHERE s.source_record = ? ORDER BY r.record_id", (current,)):
                     step = str(step)
                     if step in parent:
                         continue
@@ -873,14 +874,17 @@ class RecordStore:
         rows = self._q("SELECT text FROM derivations WHERE handle = ?", (derivation,))
         return str(rows[0][0]) if rows else None
 
-    def leaf_summaries(self, chunks: Sequence[str], among: Sequence[str]) -> dict[str, str]:
-        """chunk -> the summary among ``among`` whose only source is that chunk."""
-        found: dict[str, str] = {}
-        for derivation in among:
-            sources = self.derivation_sources(derivation)
-            if len(sources) == 1 and sources[0][0] in chunks:
-                found[str(sources[0][0])] = derivation
-        return found
+    def derivation_state(self, derivation: str) -> str:
+        """The state the store records for a derivation, from the compaction that wrote it
+        (``_compaction_cause``): "rejected", "unconfirmed", or "effective" where that
+        compaction took effect."""
+        rows = self._q("SELECT compaction FROM derivations WHERE handle = ?", (derivation,))
+        if not rows:
+            raise KeyError(f"no derivation {derivation} in this store")
+        if rows[0][0] is None:
+            return "none"             # the store records no compaction for it
+        cause = self._compaction_cause(int(rows[0][0]), "")
+        return cause["kind"] if cause is not None else "effective"
 
     def tool_calls_of(self, records: Sequence[str]) -> dict[str, dict[int, str]]:
         """record -> {position in its ``tool_calls``: the call's handle}: the handles minted

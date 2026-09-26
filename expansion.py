@@ -11,9 +11,10 @@
 - a message's handle (``m``): that message.
 
 A stretch comes back in its collapsed form by default: every user and agent message by
-the host's per-row rules (``summariser_input.message_as_sent``: the host's sidecar in place
-of ``content`` where the host sends it, its bookkeeping popped, the encrypted items
-withheld), less the host's ``_``-prefixed in-process markers, every other key carried; the
+the host's per-row rules (``summariser_input.host_row_before_fill``, then only the plugin's
+own ``item_message``: the host's sidecar in place of ``content`` where the host sends it, its
+bookkeeping popped, the encrypted items withheld), less the host's ``_``-prefixed in-process
+markers, every other key carried; the
 readable reasoning beside the agent's messages; and each tool call as its handle, its name
 and its arguments and every other key but the host's ids, without its result. The host's
 stand-ins (its fill of an empty message, its stand-in for a missing result) are quoted in
@@ -63,7 +64,14 @@ from .record_store import HANDLE_RE, Cover, RecordStore, Resolved
 from .results import final_result
 # Readable reasoning is what the summariser reads as readable, one rule (#8, #18).
 from .summariser_input import _readable_reasoning as readable_reasoning
-from .summariser_input import HostUnavailable, host_fill_text, message_as_sent
+from .summariser_input import (
+    HostUnavailable,
+    host_fill_text,
+    host_reasoning_pad,
+    host_row,
+    host_row_before_fill,
+    item_message,
+)
 from .tokens import CHARS_PER_TOKEN
 
 # 3: an item is the message as the host sent it and a piece carries all of its item's
@@ -98,6 +106,8 @@ _RESULT_NOT_SENT = {
 }
 _ROLE_NOT_SENT = "the host's pre-call sanitizer does not send a message of role {role} to the provider"
 _FILL = "the host sends this empty message to the provider with its own stand-in as content: {content}"
+_FILL_UNSURE = ("whether the host sends this empty message with its own stand-in {content} depends on its "
+                "reasoning-echo setting (model.reasoning_echo), which the plugin cannot read")
 _SHARED = ("{k} calls of this message carry the host id {id}; the pairing shown is the host's, which the id cannot "
            "confirm")
 
@@ -321,7 +331,8 @@ def _call_parts(call: Any) -> tuple[Any, Any]:
 class Item:
     """One item of what a handle opens into, as a pair (the plan of #71, §5.2): its
     ``annotations``, what the plugin says of it (``handle``, ``role``, ``result_of``,
-    ``note``, ``content_chars``, ``chunk``, ``summary``), which every piece of it carries; and
+    ``note``, ``content_chars``, ``chunk``, ``summary``, ``summaries``), which every piece of it
+    carries; and
     its ``fields``, the message's own keys (§5.1), each of which becomes a piece when the
     item does not fit on a page by itself. A piece is its item by complement, never a
     hand-picked list."""
@@ -371,16 +382,26 @@ def _call_entry(handle: Optional[str], call: Any) -> dict:
     return entry
 
 
-def _as_sent(raw: dict, *, raw_form: bool) -> tuple[dict, Optional[str]]:
-    """The message by the host's per-row rules, strictly (``summariser_input.message_as_sent``:
-    the sidecar as content where the host sends it, its bookkeeping popped, the encrypted
-    items withheld), minus the host's ``_``-prefixed in-process markers, which its own chat
-    transport strips as scaffolding (agent/transports/chat_completions.py:375-), and, in the
-    collapsed form, minus the native carriers. With it the host's own stand-in where it
-    would fill the message for being empty (a note, never content)."""
+def _as_sent(raw: dict, route: "Route", *, raw_form: bool) -> tuple[dict, Optional[str]]:
+    """The message by the host's per-row rules and what the host does with it when it is
+    empty (the re-plan of #71, C2; LEARNINGSFÜRPLÄNE A10). First the host's own row, up to
+    its fill, with the host's reasoning pad for the route (``host_row_before_fill``); the
+    host's fill is asked on that row, before anything of the plugin's. Where the pad is not
+    the host's for certain (the agent's opt-in cannot be read), the fill is asked both ways,
+    and where the answers differ the note says so. Then, on a copy, only the plugin's own
+    transformations (``item_message``), the host's ``_``-prefixed in-process markers left out
+    (its chat transport strips them as scaffolding, agent/transports/chat_completions.py:375-)
+    and, in the collapsed form, the native carriers. Returns the message and its note."""
     try:
-        message = message_as_sent(raw)
-        fill = host_fill_text(message) if raw.get("role") in ("user", "assistant") else None
+        row = host_row_before_fill(raw, pad=route.pad)
+        fill = host_fill_text(row)
+        note = _FILL.format(content=json.dumps(fill, ensure_ascii=False)) if fill is not None else None
+        if not route.pad:
+            other = host_fill_text(host_row_before_fill(raw, pad=True))
+            if other != fill:
+                note = _FILL_UNSURE.format(content=json.dumps(fill if fill is not None else other,
+                                                                ensure_ascii=False))
+        message = item_message(row)
     except HostUnavailable as exc:
         raise ExpansionError(str(exc)) from None
     for key in [key for key in message if isinstance(key, str) and key.startswith("_")]:
@@ -388,7 +409,7 @@ def _as_sent(raw: dict, *, raw_form: bool) -> tuple[dict, Optional[str]]:
     if not raw_form:
         for key in _NATIVE_CARRIERS:
             message.pop(key, None)
-    return message, fill
+    return message, note
 
 
 def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> tuple[list, bool]:
@@ -408,25 +429,25 @@ def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> tupl
     return notes, answered
 
 
-def _record_notes(found: host_pairing.Pairing, handle: str, fill: Optional[str]) -> list:
+def _record_notes(found: host_pairing.Pairing, handle: str, fill_note: Optional[str]) -> list:
     """What the host does with a record as a whole: a role it does not send; its own
     stand-in as the content of an empty message."""
     notes = []
     if handle in found.role_not_sent:
         notes.append(_ROLE_NOT_SENT.format(role=json.dumps(found.role_not_sent[handle], ensure_ascii=False)))
-    if fill is not None:
-        notes.append(_FILL.format(content=json.dumps(fill, ensure_ascii=False)))
+    if fill_note is not None:
+        notes.append(fill_note)
     return notes
 
 
-def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pairing.Pairing, *, inline: set,
-                  raw_form: bool) -> Item:
+def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pairing.Pairing, route: "Route", *,
+                  inline: set, raw_form: bool) -> Item:
     """One user or agent message by the host's rules (``_as_sent``), its readable
     reasoning first, each tool call as ``_call_entry`` with what the host's pairing says of
     it; in raw form also where its result is when this stretch does not hold it."""
-    message, fill = _as_sent(raw, raw_form=raw_form)
+    message, fill_note = _as_sent(raw, route, raw_form=raw_form)
     annotations = {"handle": handle, "role": message.pop("role", raw.get("role"))}
-    notes = _record_notes(found, handle, fill)
+    notes = _record_notes(found, handle, fill_note)
     if notes:
         annotations["note"] = "; ".join(notes)
     fields: dict = {}
@@ -455,10 +476,11 @@ def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pai
     return Item(annotations, fields)
 
 
-def _result_item(handle: str, raw: dict, call: Optional[str], *, inline: bool, notes: list, raw_form: bool) -> Item:
+def _result_item(handle: str, raw: dict, call: Optional[str], route: "Route", *, inline: bool, notes: list,
+                 raw_form: bool) -> Item:
     """A tool result by the host's rules, answering ``call``; where it stands as a pointer
     (``inline`` false) its content is replaced by its length and every other key stays."""
-    message, _fill = _as_sent(raw, raw_form=raw_form)
+    message, _fill = _as_sent(raw, route, raw_form=raw_form)
     annotations: dict = {"handle": handle, "role": message.pop("role", raw.get("role")), "result_of": call}
     message.pop("tool_call_id", None)
     content = message.pop("content", None)
@@ -490,9 +512,14 @@ class Order:
 
     def pairing(self, store: RecordStore, stretch: list[str]) -> host_pairing.Pairing:
         try:
+            # The passes get the host's own input: each record's row as the host's
+            # build_api_messages sends it (the re-plan of #71, C3).
             return host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles,
                                                store.records_raw, api_mode=self.route.api_mode,
-                                               model=self.route.model)
+                                               model=self.route.model,
+                                               row_of=lambda raw: host_row(raw, pad=self.route.pad))
+        except HostUnavailable as exc:
+            raise ExpansionError(str(exc)) from None
         except host_pairing.PairingUnavailable as exc:
             raise ExpansionError(str(exc)) from None
 
@@ -518,14 +545,17 @@ def _records_items(store: RecordStore, order: Order, records: list[tuple[str, di
                 call_id, count = found.shared[paired]
                 notes.append(_SHARED.format(k=count, id=call_id))
             if raw:
-                items.append(_result_item(handle, message, call, inline=True, notes=notes, raw_form=True))
+                items.append(_result_item(handle, message, call, order.route, inline=True, notes=notes,
+                                          raw_form=True))
             elif paired is None or paired[0] not in held:
                 if paired is not None:
                     notes.insert(0, "the result of a call this stretch does not hold; expand its own handle to "
                                     "read it")
-                items.append(_result_item(handle, message, call, inline=False, notes=notes, raw_form=False))
+                items.append(_result_item(handle, message, call, order.route, inline=False, notes=notes,
+                                          raw_form=False))
             continue
-        items.append(_message_item(handle, message, calls.get(handle, {}), found, inline=inline, raw_form=raw))
+        items.append(_message_item(handle, message, calls.get(handle, {}), found, order.route, inline=inline,
+                                   raw_form=raw))
     return items
 
 
@@ -546,11 +576,16 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
             if len(chunks) == 1:
                 return Target(header, _records_items(store, order, store.chunk_records(chunks[0]), raw=raw))
             # A summary written from the raw of several chunks (#34 D6, "raw"): all of them,
-            # each opened by a marker naming its chunk and that chunk's own summary.
-            leaves = store.leaf_summaries(chunks, _all_summaries(store, chunks))
+            # each opened by a marker naming its chunk and every leaf summary of that chunk, in
+            # write order, each with the state the store records for it from the compaction that
+            # wrote it (effective, unconfirmed, rejected). No choice is made among them.
+            leaves: dict[str, list] = {}
+            for derivation, chunk in _all_summaries(store, chunks):
+                leaves.setdefault(chunk, []).append({"summary": derivation,
+                                                     "state": store.derivation_state(derivation)})
             items: list[Item] = []
             for chunk in chunks:
-                items.append(Item({"chunk": chunk, "summary": leaves.get(chunk)}))
+                items.append(Item({"chunk": chunk, "summaries": leaves.get(chunk, [])}))
                 items.extend(_records_items(store, order, store.chunk_records(chunk), raw=raw))
             return Target(header, items)
         # A summary written from summaries (#34 D6, "summaries"): one layer down.
@@ -578,23 +613,25 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
             header["result"] = None
             return Target(header, [])
         result = found.answer[(record, position)]
-        return Target(header, [_result_item(result, store.record_raw(result) or {}, handle, inline=True, notes=[],
-                                            raw_form=True)])
+        return Target(header, [_result_item(result, store.record_raw(result) or {}, handle, order.route, inline=True,
+                                            notes=[], raw_form=True)])
     if resolved.kind == MESSAGE:
         return Target({"handle": handle, "kind": "message", "form": form},
                       _records_items(store, order, [(handle, store.record_raw(handle) or {})], raw=True))
     raise ExpansionError(f"{handle} is not a handle this tool opens")
 
 
-def _all_summaries(store: RecordStore, chunks: list[str]) -> list[str]:
-    """The summaries whose only source is one of these chunks."""
+def _all_summaries(store: RecordStore, chunks: list[str]) -> list[tuple[str, str]]:
+    """(summary, its chunk) of every summary whose only source is one of these chunks, in
+    write order."""
     if not chunks:
         return []
     marks = ",".join("?" * len(chunks))
-    return [str(d) for (d,) in store._q(
-        f"SELECT s.derivation FROM derivation_sources s WHERE s.chunk IN ({marks}) AND s.ordinal = 0 "
+    return [(str(d), str(c)) for d, c in store._q(
+        f"SELECT s.derivation, s.chunk FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
+        f"WHERE s.chunk IN ({marks}) AND s.ordinal = 0 "
         f"AND NOT EXISTS (SELECT 1 FROM derivation_sources o WHERE o.derivation = s.derivation AND o.ordinal > 0) "
-        f"ORDER BY s.rowid", chunks)]
+        f"ORDER BY d.derivation_id", chunks)]
 
 
 # --- Fields and pieces ------------------------------------------------------------------------
@@ -877,11 +914,22 @@ class Route:
     api_mode: str = ""
     model: str = ""
     base_url: str = ""
+    provider: str = ""
+    # The host's own reasoning-echo decision for this route (``host_reasoning_pad``); its
+    # opt-in, the agent's, is not visible here (the re-plan of #71, C2).
+    pad: bool = False
+    # The page's image counts by the model table's rule, from the same snapshot.
+    estimator: Any = None
 
     @classmethod
     def of(cls, engine: Any) -> "Route":
-        return cls(str(getattr(engine, "api_mode", "") or ""), str(getattr(engine, "model", "") or ""),
-                   str(getattr(engine, "base_url", "") or ""))
+        api_mode, model = str(getattr(engine, "api_mode", "") or ""), str(getattr(engine, "model", "") or "")
+        base_url, provider = str(getattr(engine, "base_url", "") or ""), str(getattr(engine, "provider", "") or "")
+        try:
+            pad = host_reasoning_pad(provider, model, base_url)
+        except HostUnavailable as exc:
+            raise ExpansionError(str(exc)) from None
+        return cls(api_mode, model, base_url, provider, pad, engine._estimator())
 
 
 def _probe_messages(tool_name: str, part: dict) -> list:
@@ -950,12 +998,20 @@ def _route_images(route: Route, tool_name: str, part: dict) -> tuple[str, int]:
 def route_image_check(route: Route, tool_name: str) -> Callable[[dict], str]:
     """Whether the session's route carries an image to the model as an image, by the
     route's own converter (the plan of #71, §1.8): "" where it does, else why not. Once per
-    image per call. No prediction of the host: where the plugin cannot read how a route
-    carries images, or its converter raises, the image is held and the page says so."""
-    seen: dict[int, str] = {}
+    image per call, an image identified by its content, never by a reference (the re-plan
+    of #71, C1; LEARNINGSFÜRPLÄNE A9): the whole of the canonical part
+    (``canonical_image_part``), its type, URL and detail. No prediction of the host: where
+    the plugin cannot read how a route carries images, or its converter raises, the image is
+    held and the page says so."""
+    seen: dict[tuple, str] = {}
 
     def check(part: dict) -> str:
-        key = id(part)
+        image_url = part.get("image_url") if isinstance(part.get("image_url"), dict) else {}
+        key = (part.get("type"), image_url.get("url"), image_url.get("detail"),
+               json.dumps({k: v for k, v in part.items() if k not in ("type", "image_url")}, sort_keys=True,
+                          ensure_ascii=False),
+               json.dumps({k: v for k, v in image_url.items() if k not in ("url", "detail")}, sort_keys=True,
+                          ensure_ascii=False))
         if key not in seen:
             try:
                 name, count = _route_images(route, tool_name, part)
@@ -1187,7 +1243,7 @@ def target_identity(target: Target) -> str:
     or a projection that changed (a reload onto other code) changes it; a compaction that
     only records new material after the stretch does not."""
     payload = [target.header, [item.as_dict() for item in target.items]]
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=False, default=repr)
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
@@ -1259,7 +1315,7 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
             if cursor.offset > length or (cursor.offset and is_content_image(path, value)):
                 raise ExpansionError("page is a garbled next_page token: its offset lies outside the field it "
                                      "names")
-    estimator = engine._estimator()
+    estimator = route.estimator                  # from the snapshot read at entry
     builder = PageBuilder(target, limit=limit, token_state=token_state, image_tokens=estimator.image,
                           image_room=host_image_room(messages, tool_name, route))
     result, _next = builder.build(cursor, page)

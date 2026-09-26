@@ -142,11 +142,15 @@ def _copy_for_passes(record: str, raw: Any) -> dict:
     return message
 
 
-def _pair_block(block: list[tuple[str, Any]], found: Pairing, *, api_mode: str, model: str) -> None:
+def _pair_block(block: list[tuple[str, Any]], found: Pairing, *, api_mode: str, model: str,
+                row_of: Callable[[dict], dict]) -> None:
     call_variants, result_variants, coalesce = host_alias_helpers()
     passes = host_sending_passes()
     scrub = host_strict_scrub(api_mode)
-    tagged = [_copy_for_passes(record, raw) for record, raw in block]
+    # The passes get the host's own input (the re-plan of #71, C3): each record's row as the
+    # host's build_api_messages sends it (``row_of``), then the host's scrub, as at
+    # agent/turn_context.py:1271-1274, then the passes as at agent_runtime_helpers.py:3039-3046.
+    tagged = [_copy_for_passes(record, row_of(raw) if isinstance(raw, dict) else raw) for record, raw in block]
     if scrub is not None:
         for message in tagged:
             try:
@@ -240,18 +244,20 @@ def _opens_block(message: Any) -> bool:
     return isinstance(message, dict) and message.get("role") in ("assistant", "user")
 
 
-def pair(sequence: list[tuple[str, Any]], *, api_mode: str, model: str = "") -> Pairing:
+def pair(sequence: list[tuple[str, Any]], *, api_mode: str, model: str = "",
+         row_of: Callable[[dict], dict]) -> Pairing:
     """What the host sends of ``sequence`` ((record, the host's dict as stored), in the
-    active order), block by block (the module docstring)."""
+    active order), block by block (the module docstring); ``row_of`` gives a stored dict's
+    row as the host sends it."""
     found = Pairing()
     block: list = []
     for record, raw in sequence:
         if _opens_block(raw) and block:
-            _pair_block(block, found, api_mode=api_mode, model=model)
+            _pair_block(block, found, api_mode=api_mode, model=model, row_of=row_of)
             block = []
         block.append((record, raw))
     if block:
-        _pair_block(block, found, api_mode=api_mode, model=model)
+        _pair_block(block, found, api_mode=api_mode, model=model, row_of=row_of)
     return found
 
 
@@ -284,7 +290,8 @@ def blocks_span(order: list[str], roles: Callable[[list[str]], dict], first: int
 
 
 def pairing_around(order: list[str], index: dict, records: list[str], roles: Callable[[list[str]], dict],
-                   raws: Callable[[list[str]], dict], *, api_mode: str, model: str = "") -> Pairing:
+                   raws: Callable[[list[str]], dict], *, api_mode: str, model: str = "",
+                   row_of: Callable[[dict], dict]) -> Pairing:
     """The pairing of ``records`` (contiguous in ``order``) through the blocks they lie in."""
     places = [index[r] for r in records if r in index]
     if not places:
@@ -292,4 +299,5 @@ def pairing_around(order: list[str], index: dict, records: list[str], roles: Cal
     start, end = blocks_span(order, roles, min(places), max(places))
     span = order[start:end]
     raw = raws(span)
-    return pair([(record, raw.get(record) or {}) for record in span], api_mode=api_mode, model=model)
+    return pair([(record, raw.get(record) or {}) for record in span], api_mode=api_mode, model=model,
+                row_of=row_of)

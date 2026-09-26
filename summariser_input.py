@@ -136,13 +136,31 @@ def _host_fill_empty(message: dict) -> None:
     fill_empty_non_final_wire_payload(message, is_final=False)
 
 
-def host_fill_text(message: dict) -> Optional[str]:
+def host_fill_text(row: dict) -> Optional[str]:
     """The host's own stand-in for an empty non-final message (``fill_empty_non_final_wire_payload``,
     agent/agent_runtime_helpers.py:2582-2590, applied at agent/turn_context.py:1264), or None
-    where the host sends the message as it is. Run on a copy; strict."""
+    where the host sends the message as it is. ``row`` must be the host's own input to the
+    fill: ``host_row_before_fill`` of the record, before any transformation of the plugin's
+    (LEARNINGSFÜRPLÄNE A10). Run on a copy; strict."""
     fill = _strict_import("empty-message fill", "agent.agent_runtime_helpers", "fill_empty_non_final_wire_payload")
-    probe = dict(message)
+    probe = dict(row)
     return str(probe.get("content")) if fill(probe, is_final=False) else None
+
+
+def host_reasoning_pad(provider: str, model: str, base_url: str) -> bool:
+    """The host's own reasoning-echo decision for a route (``_needs_thinking_reasoning_pad``,
+    agent/reasoning_params.py:163-179 at Hermes 8afaab3703), from the route the engine holds:
+    the DeepSeek, Kimi and MiMo families exactly as the host tests them. The host's opt-in
+    (``model.reasoning_echo``, the agent's ``_reasoning_echo_flag``) is the agent's and cannot
+    be read here: a caller that needs it asks both ways. Strict."""
+    mixin = _strict_import("reasoning-echo decision", "agent.reasoning_params", "ReasoningParamsMixin")
+
+    class _Route(mixin):  # the host's own methods, over the engine's route
+        pass
+
+    route = _Route()
+    route.provider, route.model, route.base_url = provider, model, base_url
+    return bool(route._needs_thinking_reasoning_pad())
 
 
 def wire_facts(provider: str, model: str, base_url: str, api_mode: str,
@@ -172,7 +190,9 @@ def wire_facts(provider: str, model: str, base_url: str, api_mode: str,
 
 # --- The host's build_api_messages, field by field (see the module docstring) -------------
 
-def _as_the_host_sends_it(raw: dict, *, needs_echo: bool, strict: bool = False, fill: bool = True) -> dict:
+def _row_before_fill(raw: dict, *, needs_echo: bool, strict: bool) -> dict:
+    """``build_api_messages``' per-row steps up to the fill (agent/turn_context.py:1221-1260):
+    the clone, the sidecar, the persistence fields, the reasoning copy, the pops."""
     message = _host_clone(raw, strict)
     persistence_only = (_strict_import("persistence fields", "agent.message_metadata",
                                        "PERSISTENCE_ONLY_MESSAGE_FIELDS") if strict else _PERSISTENCE_ONLY)
@@ -184,22 +204,46 @@ def _as_the_host_sends_it(raw: dict, *, needs_echo: bool, strict: bool = False, 
     _host_reasoning_policy(raw, message, needs_echo, strict)
     message.pop("reasoning", None)
     message.pop("finish_reason", None)
+    return message
+
+
+def _as_the_host_sends_it(raw: dict, *, needs_echo: bool, strict: bool = False, fill: bool = True) -> dict:
+    message = _row_before_fill(raw, needs_echo=needs_echo, strict=strict)
     if fill:
-        _host_fill_empty(message)
+        if strict:
+            _strict_import("empty-message fill", "agent.agent_runtime_helpers",
+                           "fill_empty_non_final_wire_payload")(message, is_final=False)
+        else:
+            _host_fill_empty(message)
     message.pop("_length_continuation_fragment", None)
     message.pop("_length_continuation_nudge", None)
     return message
 
 
-def message_as_sent(raw: dict) -> dict:
-    """A record's message by the host's per-row rules (``build_api_messages``,
-    agent/turn_context.py:1221-1268 at Hermes 8afaab3703), for expansion (the plan of #71,
-    §5.1): every host function called strictly (``HostUnavailable`` where one cannot be
-    read), no reasoning echo (the reader shows the readable reasoning beside it), and not
-    the host's fill of an empty message, which is the host's stand-in, never the message's
-    content (``host_fill_text`` gives it for a note); the encrypted items withheld (R3)."""
-    message = _as_the_host_sends_it(raw, needs_echo=False, strict=True, fill=False)
+def host_row_before_fill(raw: dict, *, pad: bool) -> dict:
+    """The record's row as the host builds it for a request up to its fill, with the host's
+    reasoning pad for the route (``host_reasoning_pad``), every host function called
+    strictly: the host's own input to ``fill_empty_non_final_wire_payload``."""
+    return _row_before_fill(raw, needs_echo=pad, strict=True)
+
+
+def host_row(raw: dict, *, pad: bool) -> dict:
+    """The record's row as the host's ``build_api_messages`` sends it (1221-1268), fill
+    included, strictly: the host's own input to its pre-call passes (``pairing``)."""
+    return _as_the_host_sends_it(raw, needs_echo=pad, strict=True, fill=True)
+
+
+def item_message(row: dict) -> dict:
+    """What expansion shows of a host row (the plan of #71, §5.1; the re-plan C2): a copy
+    of ``host_row_before_fill``, then only the plugin's own transformations, after every host
+    function has had its input: the encrypted items withheld (R3), ``reasoning_content``
+    popped (the readable reasoning is shown as a field of its own), the continuation marks
+    popped."""
+    message = copy.deepcopy(row)
     _withhold_encrypted(message)
+    message.pop("reasoning_content", None)
+    message.pop("_length_continuation_fragment", None)
+    message.pop("_length_continuation_nudge", None)
     return message
 
 
