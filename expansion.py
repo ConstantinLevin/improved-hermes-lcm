@@ -309,10 +309,12 @@ def decode_token(token: Any) -> dict:
     if state["v"] != TOKEN_VERSION:
         raise ExpansionError("page is not a next_page token of these tools")
     # Every field, by type and range: a garbled token is refused with what is wrong in it.
+    # The fields every token has, then the fields of its tool: lcm_expand's handle, and
+    # lcm_grep's term, scope and all (#18 D2).
     checks = (
         ("t", lambda v: isinstance(v, str) and bool(v), "a tool name"),
         ("s", lambda v: isinstance(v, str) and bool(v), "a store's uuid"),
-        ("h", lambda v: isinstance(v, str) and HANDLE_RE.fullmatch(v) is not None, "a handle"),
+        *(_TOOL_TOKEN_FIELDS.get(state.get("t"), _TOOL_TOKEN_FIELDS["lcm_expand"])),
         ("m", lambda v: v in ("raw", "collapsed"), "raw or collapsed"),
         ("i", lambda v: _plain_int(v) and v >= 0, "an item number of 0 or more"),
         ("f", lambda v: _plain_int(v) and v >= -1, "a field number of -1 or more"),
@@ -332,6 +334,19 @@ def decode_token(token: Any) -> dict:
 
 def _plain_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+# The fields a tool's token carries beside the common ones (``decode_token``). A token of a
+# tool not named here is checked as lcm_expand's, and refused by the tool that reads it.
+_TOOL_TOKEN_FIELDS = {
+    "lcm_expand": (("h", lambda v: isinstance(v, str) and HANDLE_RE.fullmatch(v) is not None, "a handle"),),
+    "lcm_grep": (
+        ("q", lambda v: isinstance(v, str) and bool(v), "a search term"),
+        ("p", lambda v: v == "" or (isinstance(v, str) and HANDLE_RE.fullmatch(v) is not None),
+         "the session (\"\") or a handle"),
+        ("a", lambda v: isinstance(v, bool), "true or false"),
+    ),
+}
 
 
 @dataclass(frozen=True)

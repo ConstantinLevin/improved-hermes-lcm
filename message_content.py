@@ -1,5 +1,5 @@
 """Readers over a message's content: its images, found by structure, and the text
-the full-text index reads.
+grep searches.
 
 Hermes/OpenAI-format messages carry ``content`` as a string or as a list of parts
 (text parts, image parts). An image is a part of type ``image_url`` (Chat
@@ -36,22 +36,6 @@ def _extract_text_part_value(value: Any) -> str | None:
         if isinstance(nested, str):
             return nested
     return None
-
-
-def normalize_content_value(content: Any) -> str | None:
-    """Return a stable text representation for message content.
-
-    ``None`` remains ``None``. Strings are returned unchanged. Structured content
-    is serialized deterministically for token accounting.
-    """
-    if content is None:
-        return None
-    if isinstance(content, str):
-        return content
-    try:
-        return json.dumps(content, ensure_ascii=False, sort_keys=True)
-    except (TypeError, ValueError):
-        return str(content)
 
 
 def _is_multimodal_envelope(value: Any) -> bool:
@@ -157,7 +141,16 @@ def is_image_part(part: Any) -> bool:
     return _is_image_part(part)
 
 
-def _index_parts(parts: list) -> list[str]:
+def _shown_json(value: Any) -> str:
+    """A value that is not a string as the tools' pages render it: JSON in its stored key
+    order, ``ensure_ascii`` off (``results.final_result``)."""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _parts_strings(parts: list) -> list[str]:
     pieces: list[str] = []
     for part in parts:
         if isinstance(part, str):
@@ -171,36 +164,97 @@ def _index_parts(parts: list) -> list[str]:
             if text:
                 pieces.append(text)
         else:
-            pieces.append(normalize_content_value(part) or "")
+            pieces.append(_shown_json(part))
     return pieces
 
 
-def index_text(content: Any) -> str | None:
-    """The text the full-text index reads for a message's content.
-
-    A string is itself. A list of parts gives its text parts, and any other part
-    that is not an image as JSON. The ``_multimodal`` envelope gives the same for
-    its ``content`` list and every other field it carries (``text_summary``,
-    ``meta`` with the image's path, …). Only structural image parts are left out
-    (#35); nothing else becomes unsearchable. Base64 inside a string stays in.
-    """
-    if content is None or isinstance(content, str):
-        return content
+def _content_strings(content: Any) -> list[str]:
+    """The strings a message's content shows: a string is itself; a list gives each text
+    part's text and every other part that is not an image as its JSON; the ``_multimodal``
+    envelope gives the same for its list and every other field it carries (``text_summary``,
+    ``meta`` …) as a string or its JSON. Structural image parts are left out (#35); base64
+    inside a string stays in."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [content]
     if _is_multimodal_envelope(content):
         pieces: list[str] = []
         for key, value in content.items():
             if key == "_multimodal":
                 continue
             if key == "content":
-                pieces.extend(_index_parts(value))
+                pieces.extend(_parts_strings(value))
             elif isinstance(value, str):
                 pieces.append(value)
             else:
-                pieces.append(normalize_content_value(value) or "")
-        return "\n".join(piece for piece in pieces if piece)
+                pieces.append(_shown_json(value))
+        return pieces
     if isinstance(content, list):
-        return "\n".join(piece for piece in _index_parts(content) if piece)
-    return normalize_content_value(content)
+        return _parts_strings(content)
+    return [_shown_json(content)]
+
+
+def sent_content(raw: dict) -> Any:
+    """A stored message's content as the host sends it: the ``api_content`` sidecar, where
+    it is a non-empty string on a user or assistant row, in place of ``content``; else
+    ``content``. The host's rule for a row of its history (``build_api_messages``,
+    agent/turn_context.py:1227-1252 at Hermes cdcd53c2cd); one rule for expansion
+    (``summariser_input._row_before_fill``) and for what grep searches (``grep_text``)."""
+    return raw["api_content"] if sidecar_sent(raw) else raw.get("content")
+
+
+def sidecar_sent(raw: dict) -> bool:
+    """Whether the host sends the row's ``api_content`` in place of its ``content``."""
+    sidecar = raw.get("api_content")
+    return isinstance(sidecar, str) and bool(sidecar) and raw.get("role") in ("user", "assistant")
+
+
+def readable_reasoning(raw: dict) -> str | None:
+    """The readable reasoning of a stored message, the one rule expansion, the summariser
+    and grep read (#8, #18): ``reasoning``, else a non-blank ``reasoning_content``. The
+    host's ``reasoning`` is its merged readable text (agent/agent_runtime_helpers.py:1362-1395
+    at Hermes cdcd53c2cd); a blank ``reasoning_content`` is the host's tool-call pad."""
+    for key in ("reasoning", "reasoning_content"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+# What separates the strings of ``grep_text``; a term holding it is refused (``grep``), so a
+# match never spans two strings. A NUL, where SQLite's text functions stop, is written as
+# this too: a term never holds a NUL either.
+GREP_SEPARATOR = "\x1f"
+
+
+def grep_text(raw: dict) -> str:
+    """What grep searches in a stored message (#18 D2): the strings the agent's past shows as
+    the message's own words and actions, each by itself, joined by ``GREP_SEPARATOR``: its
+    content as the host sends it (``sent_content``), then for each tool call its name and
+    its arguments (the stored string, or the JSON of another value), then, on an assistant
+    message, its readable reasoning (expansion shows it there only). Never an image, an
+    encrypted item, a native carrier, a key or the host's bookkeeping. "" for a message
+    without strings, never None."""
+    strings = list(_content_strings(sent_content(raw)))
+    calls = raw.get("tool_calls")
+    if isinstance(calls, list):
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            name, arguments = function.get("name"), function.get("arguments")
+            if isinstance(name, str):
+                strings.append(name)
+            if isinstance(arguments, str):
+                strings.append(arguments)
+            elif arguments is not None:
+                strings.append(_shown_json(arguments))
+    if raw.get("role") == "assistant":
+        reasoning = readable_reasoning(raw)
+        if reasoning is not None:
+            strings.append(reasoning)
+    return GREP_SEPARATOR.join(s.replace("\x00", GREP_SEPARATOR) for s in strings if s)
 
 
 def base64_like_strings(message: dict) -> list[str]:

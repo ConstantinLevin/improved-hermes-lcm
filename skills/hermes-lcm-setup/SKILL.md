@@ -5,13 +5,13 @@ description: Setting up the Hermes-LCM lossless context plugin, configuring it, 
 
 # Hermes-LCM: setup and health
 
-Use this skill when a task concerns Hermes-LCM setup, configuration, compaction behaviour, diagnostics or repair.
+Use this skill when a task concerns Hermes-LCM setup, configuration, compaction behaviour, diagnostics or restore.
 
 Start here:
 
 1. Confirm that the `hermes-lcm` plugin is enabled and `context.engine` is `lcm`.
-2. Use `lcm_status`, `lcm_inspect`, and `lcm_doctor` before changing configuration or attempting repair.
-3. Treat slash-command apply paths as mutations: preview first and require the user's authorization. The store's backup is automatic and daily (`references/diagnostics.md`).
+2. Use `lcm_status`, `lcm_inspect`, and `lcm_doctor` before changing configuration or restoring a store.
+3. The plugin offers no repair command; the store's backup is automatic and daily, and a restore is by hand (`references/diagnostics.md`).
 4. Load the relevant reference rather than guessing settings or behaviour.
 
 Reference map:

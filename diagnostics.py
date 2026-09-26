@@ -7,22 +7,19 @@ from typing import Any
 
 DOCTOR_ACTION_SAFE_IGNORE = "safe/ignore"
 DOCTOR_ACTION_INSPECT = "inspect"
-DOCTOR_ACTION_REBUILD = "rebuild"
 
 
 def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
     """Return operator triage guidance for one lcm_doctor check.
 
-    Guidance is deliberately conservative: most warning classes are inspect-only
-    evidence. The one mutation offered, rebuilding a full-text index, rebuilds
-    derived data from the insert-only record; the store's backup is the daily slot.
+    Guidance is deliberately conservative: every warning class is inspect-only
+    evidence, and no mutation is offered; the store's backup is the daily slot.
     """
     status = str(check.get("status") or "")
     if status not in {"warn", "fail"}:
         return None
 
     name = str(check.get("check") or "unknown")
-    detail = check.get("detail")
     action = DOCTOR_ACTION_INSPECT
     command = "inspect the reported detail and confirm the active HERMES_HOME/LCM_DATABASE_PATH"
     warning_only = False
@@ -32,17 +29,7 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = ("stop and inspect the SQLite database path; if integrity_check is not ok, restore the "
                    "daily backup slot by hand (skill reference: diagnostics, Restore)")
     elif name == "schema_core_tables":
-        command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before repair or restore"
-    elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:
-        if status == "warn" and isinstance(detail, dict) and detail.get("status") == "unchecked":
-            action = DOCTOR_ACTION_INSPECT
-            command = "rerun the doctor with read-write SQLite access if a deep FTS integrity result is needed"
-            warning_only = True
-            rationale = "the deep FTS check could not run, but this is not evidence that the index is corrupt"
-        else:
-            action = DOCTOR_ACTION_REBUILD
-            command = "rebuild the FTS index from the stored records (`/lcm doctor repair apply`)"
-            rationale = "the index is derived from the insert-only record; rebuilding it cannot lose a record"
+        command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before any restore"
     elif name == "sqlite_storage":
         command = ("inspect journal/quick_check output and database size; if SQLite reports corruption, restore "
                    "the daily backup slot by hand (skill reference: diagnostics, Restore)")

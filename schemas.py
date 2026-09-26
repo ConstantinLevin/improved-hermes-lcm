@@ -3,62 +3,45 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Full-text search over the current session's past conversation content in the LCM database, "
-        "which stores it at each compaction. "
-        "Returns both raw messages and summaries, each with its handle. "
-        "Use lcm_expand(handle=...) on a hit to read behind it."
+        "Find where a term lies in what this session's past holds as stored at its last compaction: what was "
+        "said (the messages as sent), each tool call's name and arguments, tool results and readable reasoning; "
+        "never the summaries. The term is matched exactly: case-sensitive, character for character. Returns "
+        "each chunk the term lies in, whole, as lcm_expand returns it (collapsed: calls without their results; "
+        "raw=true puts results inline), each named with the summary that covers it in your context. In the "
+        "collapsed form, results_holding_term names the results that hold the term, to open with lcm_expand. "
+        "At three or more chunks only their count comes back: narrow the term or the scope, or pass all=true. "
+        "Records of the fresh tail stored at the last compaction that hold the term are named by handle. What "
+        "came after the last compaction is in your context and not searched. A result longer than one page "
+        "carries next_page: call again with page=next_page."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {
+            "term": {
                 "type": "string",
-                "description": (
-                    "Search query (FTS5 syntax: keywords, phrases, OR/NOT). "
-                    "FTS5 defaults to AND matching, so prefer 1-3 distinctive terms or one quoted multi-word phrase. "
-                    "Wrap exact phrases in quotes. Short CJK fragments and emoji-heavy queries may use substring fallback instead of plain FTS token matching."
-                ),
+                "description": "The exact text to find (any length from one character; not a pattern or query syntax).",
             },
-            "limit": {
-                "type": "integer",
-                "description": (
-                    "Max results to return (default 10, hard upper bound 200). "
-                    "Values above the cap are clamped and reported via limit_clamped_from in the response."
-                ),
-                "default": 10,
-            },
-            "sort": {
+            "scope": {
                 "type": "string",
-                "enum": ["recency", "relevance", "hybrid"],
-                "description": (
-                    "How to order matches. 'recency' favors newer hits, 'relevance' favors strongest FTS matches, "
-                    "and 'hybrid' keeps strong older matches competitive while still boosting newer context."
-                ),
-                "default": "recency",
+                "description": "Optional: a summary's (s…) or chunk's (c…) handle, to search only what stands behind it. "
+                               "Without it, the whole session is searched.",
             },
-            "role": {
+            "all": {
+                "type": "boolean",
+                "description": "Return every matching chunk even when there are three or more.",
+                "default": False,
+            },
+            "raw": {
+                "type": "boolean",
+                "description": "Put every tool result inline in the returned chunks.",
+                "default": False,
+            },
+            "page": {
                 "type": "string",
-                "enum": ["system", "user", "assistant", "tool", "unknown"],
-                "description": "Optional raw-message role filter. When supplied, lcm_grep returns raw message hits only.",
-            },
-            "time_from": {
-                "anyOf": [{"type": "number"}, {"type": "string"}],
-                "description": (
-                    "Optional inclusive minimum time a message was stored (the time of the compaction that stored it, "
-                    "not the time it was said). Accepts Unix seconds or timezone-aware ISO 8601; "
-                    "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
-                ),
-            },
-            "time_to": {
-                "anyOf": [{"type": "number"}, {"type": "string"}],
-                "description": (
-                    "Optional inclusive maximum time a message was stored (the time of the compaction that stored it, "
-                    "not the time it was said). Accepts Unix seconds or timezone-aware ISO 8601; "
-                    "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
-                ),
+                "description": "The next_page token of an earlier result, to read the next page of the same search.",
             },
         },
-        "required": ["query"],
+        "required": [],
     },
 }
 
@@ -150,8 +133,8 @@ LCM_DOCTOR = {
 LCM_EXPAND_QUERY = {
     "name": "lcm_expand_query",
     "description": (
-        "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt, and either "
-        "query matching summaries/raw messages to expand or the handles (s…) of summaries to inspect. Uses the expansion path "
+        "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt and "
+        "the handles (s…) of the summaries to read (lcm_grep finds where a term lies). Uses the expansion path "
         "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
         "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
         "Prefer this for questions about the active conversation after compaction."
@@ -163,19 +146,10 @@ LCM_EXPAND_QUERY = {
                 "type": "string",
                 "description": "The question or task to answer from expanded LCM context",
             },
-            "query": {
-                "type": "string",
-                "description": "Optional search query used to find candidate summaries before expansion",
-            },
             "handles": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional summary handles (s…) to expand instead of searching",
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Max candidate summaries to expand when using query (default 5)",
-                "default": 5,
+                "description": "The summary handles (s…) to expand",
             },
             "max_tokens": {
                 "type": "integer",

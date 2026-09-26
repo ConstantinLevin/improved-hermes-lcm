@@ -67,7 +67,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from .message_content import content_parts, image_media_type, is_image_part
+from .message_content import content_parts, image_media_type, is_image_part, readable_reasoning, sent_content, \
+    sidecar_sent
 
 try:  # the host's own set of bookkeeping fields no provider receives
     from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS as _PERSISTENCE_ONLY  # type: ignore
@@ -196,11 +197,11 @@ def _row_before_fill(raw: dict, *, needs_echo: bool, strict: bool) -> dict:
     message = _host_clone(raw, strict)
     persistence_only = (_strict_import("persistence fields", "agent.message_metadata",
                                        "PERSISTENCE_ONLY_MESSAGE_FIELDS") if strict else _PERSISTENCE_ONLY)
-    sidecar = message.pop("api_content", None)
+    message.pop("api_content", None)
     for key in persistence_only:
         message.pop(key, None)
-    if isinstance(sidecar, str) and sidecar and raw.get("role") in ("user", "assistant"):
-        message["content"] = sidecar
+    if sidecar_sent(raw):                     # one rule with what grep searches (#18 D2)
+        message["content"] = sent_content(raw)
     _host_reasoning_policy(raw, message, needs_echo, strict)
     message.pop("reasoning", None)
     message.pop("finish_reason", None)
@@ -392,12 +393,8 @@ def _evict_as_the_host_would(messages: list[dict], records: list[str]) -> None:
 
 # --- Labelled parts ---------------------------------------------------------------------------
 
-def _readable_reasoning(raw: dict) -> Optional[str]:
-    for key in ("reasoning", "reasoning_content"):
-        value = raw.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    return None
+# The one rule for readable reasoning, shared with expansion and grep (message_content).
+_readable_reasoning = readable_reasoning
 
 
 def _malformed_argument_parts(message: dict) -> list[dict]:

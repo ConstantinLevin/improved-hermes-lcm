@@ -8,30 +8,21 @@ The tools read what the session's compactions stored. What was said since the la
 
 ### `lcm_grep`
 
-Use for discovery across current-session stored messages and summaries.
+Use to find which stretch of the stored session a term lies in, when you do not know which summary covers it.
 
-- `query` is FTS5 text by default; it is not a regex.
-- Prefer 1-3 distinctive terms or one quoted phrase because FTS5 combines extra terms with AND.
-- Keep `sort='recency'` for recent events, use `sort='relevance'` for the strongest older match, and use `sort='hybrid'` when both matter.
-- Exact role/time filters apply before limiting where supported. `time_from`/`time_to` compare the time a message was stored, which is the time of the compaction that stored it, not the time it was said.
-- `sort='recency'` follows the conversation's order, newest first.
-- Each hit carries its `handle`. A message hit with `revises` is a summary row as the host rewrote it in the context (for example with the task list folded in); `lcm_expand(handle=…)` on the handle in `revises` opens the summary's stretch.
-
-Do not treat a short search snippet as sufficient evidence for a detail-heavy answer.
+- `term` is found exactly: case-sensitive, character for character, no pattern or query syntax. It is searched in what was said (the messages as sent), each tool call's name and arguments, tool results and readable reasoning; never in summaries.
+- It returns each chunk the term lies in, whole, as `lcm_expand` returns it, named with the summary (`under`) that covers it in your context; in the collapsed form, `results_holding_term` names the tool results that hold the term, to open with `lcm_expand`. `raw=true` puts every result inline.
+- At three or more matching chunks only the count comes back: narrow the term, give `scope` (a summary's or chunk's handle), or pass `all=true`.
+- Records of the fresh tail stored at the last compaction that hold the term are named by handle; what came after the last compaction is in your context and not searched. `searched` says what was searched and when it was stored.
+- A result longer than one page carries `next_page`; pass it as `page` for the rest.
 
 ### `lcm_expand_query`
 
 Use when current-session compacted material must be expanded and synthesized into a precise bounded answer.
 
 - Always provide `prompt`.
-- Provide either a small `query` or the summaries' `handles` when known.
-- `query` follows the same narrow FTS construction rules as `lcm_grep`.
+- Provide the summaries' `handles`.
 - The expansion path is model-backed and bounded by answer/context token limits.
-
-Recommended current-session escalation:
-
-1. `lcm_grep` to locate relevant material.
-2. `lcm_expand_query` when exact detail was compressed away.
 
 ### `lcm_expand`
 

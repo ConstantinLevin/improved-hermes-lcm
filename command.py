@@ -3,18 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sqlite3
 from typing import Any
 
-from .db_bootstrap import (
-    check_external_content_fts_integrity,
-    external_content_fts_needs_repair,
-    inspect_lcm_schema_health,
-    repair_external_content_fts,
-)
+from .db_bootstrap import inspect_lcm_schema_health
 from .diagnostics import doctor_guidance_for_checks
-from .dag import build_nodes_fts_spec
-from .store import build_message_fts_spec
 
 
 def _fmt_bool(value: Any) -> str:
@@ -43,8 +35,6 @@ def _help_text(error: str | None = None) -> str:
         "LCM command help",
         "- /lcm or /lcm status: show current LCM runtime/session status",
         "- /lcm doctor: run read-only LCM health checks",
-        "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
-        "- /lcm doctor repair apply: rebuild the message and summary FTS indexes from the stored records",
         "- /lcm help: show this help",
     ])
     return "\n".join(lines)
@@ -151,103 +141,6 @@ def _status_text(engine) -> str:
     return "\n".join(lines)
 
 
-def _scan_fts_repair(engine) -> dict[str, Any]:
-    checks: dict[str, dict[str, Any]] = {}
-    specs = {
-        "messages_fts": build_message_fts_spec(),
-        "nodes_fts": build_nodes_fts_spec(),
-    }
-    conn = engine._store.connection
-    for label, spec in specs.items():
-        try:
-            structural_needs_repair = external_content_fts_needs_repair(conn, spec)
-            integrity_check = check_external_content_fts_integrity(conn, spec)
-            integrity_status = str(integrity_check.get("status") or "fail")
-            needs_repair = structural_needs_repair or integrity_status == "fail"
-            content_count = int(conn.execute(
-                f"SELECT COUNT(*) FROM {spec.content_table}"
-            ).fetchone()[0])
-            try:
-                fts_count = int(conn.execute(f"SELECT COUNT(*) FROM {spec.table_name}").fetchone()[0])
-            except sqlite3.Error:
-                fts_count = None
-            checks[label] = {
-                "ok": not needs_repair,
-                "needs_repair": needs_repair,
-                "content_rows": content_count,
-                "fts_rows": fts_count,
-                "integrity_status": integrity_status,
-                "integrity_detail": integrity_check.get("detail"),
-                "error": None,
-            }
-        except Exception as exc:  # pragma: no cover - defensive
-            checks[label] = {
-                "ok": False,
-                "needs_repair": True,
-                "content_rows": None,
-                "fts_rows": None,
-                "integrity_status": "error",
-                "integrity_detail": str(exc),
-                "error": str(exc),
-            }
-    return {
-        "checks": checks,
-        "needs_repair": any(item["needs_repair"] for item in checks.values()),
-    }
-
-
-def _doctor_repair_text(engine) -> str:
-    scan = _scan_fts_repair(engine)
-    lines = [
-        "LCM doctor repair",
-        f"status: {'repair-needed' if scan['needs_repair'] else 'ok'}",
-    ]
-    for label, item in scan["checks"].items():
-        state = "repair-needed" if item["needs_repair"] else "ok"
-        lines.append(f"{label}: {state}")
-        if item["error"]:
-            lines.append(f"{label}_error: {item['error']}")
-        else:
-            lines.append(f"{label}_content_rows: {item['content_rows']}")
-            lines.append(f"{label}_fts_rows: {item['fts_rows']}")
-            lines.append(f"{label}_integrity_status: {item['integrity_status']}")
-    lines.append("note: read-only scan only — no FTS tables were repaired")
-    if scan["needs_repair"]:
-        lines.append("note: use `/lcm doctor repair apply` to rebuild the FTS indexes from the stored records")
-    return "\n".join(lines)
-
-
-def _doctor_repair_apply_text(engine) -> str:
-    # The full-text indexes are derived from the record, which is insert-only, and are
-    # rebuilt from it; a repair cannot lose a record. The store's backup is the daily
-    # slot (#6), not a copy per command.
-    db_path = engine._store.db_path
-    conn = engine._store.connection
-    try:
-        messages_result = repair_external_content_fts(conn, build_message_fts_spec())
-        nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
-    except sqlite3.Error as exc:
-        return "\n".join([
-            "LCM doctor repair apply",
-            "status: error",
-            f"database_path: {db_path}",
-            f"error: FTS repair failed: {exc}",
-        ])
-
-    return "\n".join([
-        "LCM doctor repair apply",
-        "status: ok",
-        f"database_path: {db_path}",
-        f"messages_fts_rebuilt: {_fmt_bool(messages_result['rebuilt'])}",
-        f"messages_fts_triggers_recreated: {_fmt_bool(messages_result['triggers_recreated'])}",
-        f"messages_fts_degraded: {_fmt_bool(messages_result['degraded'])}",
-        f"nodes_fts_rebuilt: {_fmt_bool(nodes_result['rebuilt'])}",
-        f"nodes_fts_triggers_recreated: {_fmt_bool(nodes_result['triggers_recreated'])}",
-        f"nodes_fts_degraded: {_fmt_bool(nodes_result['degraded'])}",
-        "note: the indexes are rebuilt from the stored records",
-    ])
-
-
 def _backup_lines(engine) -> list[str]:
     """The daily backup slot (#6), as the doctor shows it."""
     backup = engine._backup.describe()
@@ -289,39 +182,6 @@ def _doctor_text(engine) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         integrity = f"error: {exc}"
         issues.append("sqlite_integrity")
-
-    def _fts_text_status(result: dict[str, Any]) -> str:
-        status = str(result.get("status") or "fail")
-        return "ok" if status == "pass" else status
-
-    try:
-        store_fts_count = int(store_conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0])
-        store_fts_integrity = check_external_content_fts_integrity(store_conn, build_message_fts_spec())
-        store_fts = _fts_text_status(store_fts_integrity)
-        if store_fts == "fail":
-            issues.append("messages_fts")
-        elif store_fts == "unchecked":
-            recommended_actions.append("rerun `/lcm doctor` with read-write SQLite access if a deep messages FTS check is needed")
-    except Exception as exc:  # pragma: no cover - defensive
-        store_fts_count = f"error: {exc}"
-        store_fts = f"error: {exc}"
-        store_fts_integrity = {"status": "fail", "detail": str(exc)}
-        issues.append("messages_fts")
-
-    try:
-        node_fts_count = int(dag_conn.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0])
-        node_fts_integrity = check_external_content_fts_integrity(dag_conn, build_nodes_fts_spec())
-        node_fts = _fts_text_status(node_fts_integrity)
-        if node_fts == "fail":
-            issues.append("nodes_fts")
-        elif node_fts == "unchecked":
-            recommended_actions.append("rerun `/lcm doctor` with read-write SQLite access if a deep nodes FTS check is needed")
-    except Exception as exc:  # pragma: no cover - defensive
-        node_fts_count = f"error: {exc}"
-        node_fts = f"error: {exc}"
-        node_fts_integrity = {"status": "fail", "detail": str(exc)}
-        issues.append("nodes_fts")
-
 
     total_messages = _safe_count(store_conn, "SELECT COUNT(*) FROM messages", "messages_total")
     total_message_sessions = _safe_count(
@@ -426,18 +286,6 @@ def _doctor_text(engine) -> str:
         triage_checks.append({"check": "database_integrity", "status": "fail", "detail": integrity})
     if schema_health.get("error") or schema_missing_tables:
         triage_checks.append({"check": "schema_core_tables", "status": "fail", "detail": schema_health})
-    if store_fts != "ok":
-        triage_checks.append({
-            "check": "messages_fts_integrity",
-            "status": "warn" if store_fts == "unchecked" else "fail",
-            "detail": store_fts_integrity,
-        })
-    if node_fts != "ok":
-        triage_checks.append({
-            "check": "nodes_fts_integrity",
-            "status": "warn" if node_fts == "unchecked" else "fail",
-            "detail": node_fts_integrity,
-        })
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
     if invariant_error or invariant_failing:
@@ -473,10 +321,6 @@ def _doctor_text(engine) -> str:
         f"message_sessions_total: {total_message_sessions}",
         f"summary_nodes_total: {total_nodes}",
         f"summary_node_sessions_total: {total_node_sessions}",
-        f"messages_fts: {store_fts}",
-        f"messages_fts_rows: {store_fts_count}",
-        f"nodes_fts: {node_fts}",
-        f"nodes_fts_rows: {node_fts_count}",
         f"store_format: {store_identity.get('format', '(unknown)')}",
         f"store_uuid: {store_identity.get('store_uuid', '(unknown)')}",
         "record_invariant: "
@@ -526,13 +370,9 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         return _status_text(engine)
 
     if head == "doctor":
-        if not rest:
-            return _doctor_text(engine)
-        if len(rest) == 1 and rest[0].lower() == "repair":
-            return _doctor_repair_text(engine)
-        if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
-            return _doctor_repair_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `repair` and `repair apply` as extra subcommands.")
+        if rest:
+            return _help_text("`/lcm doctor` does not accept extra arguments.")
+        return _doctor_text(engine)
 
     if head == "help":
         return _help_text()

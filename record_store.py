@@ -37,7 +37,7 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .inflight import ChunkSummary
-from .message_content import base64_like_strings, describe_image_part, image_parts, index_text
+from .message_content import base64_like_strings, describe_image_part, grep_text, image_parts
 from .tokens import Estimator
 
 logger = logging.getLogger(__name__)
@@ -1044,6 +1044,50 @@ class RecordStore:
             conn.execute("COMMIT")
         return reports
 
+    # --- grep (#18 D2) ---------------------------------------------------------------------
+
+    def compaction_began_at(self, compaction: int) -> Optional[float]:
+        rows = self._q("SELECT began_at FROM compactions WHERE compaction_id = ?", (compaction,))
+        return float(rows[0][0]) if rows else None
+
+    def chunk_member_lists(self, chunks: Sequence[str]) -> dict[str, list[str]]:
+        """chunk -> its member records, in order, for every chunk given."""
+        members: dict[str, list[str]] = {str(chunk): [] for chunk in chunks}
+        if not members:
+            return members
+        for chunk, record in self._q(
+                "SELECT chunk, record FROM chunk_members WHERE chunk IN (SELECT value FROM json_each(?)) "
+                "ORDER BY chunk, ordinal", (json.dumps(list(members)),)):
+            members[str(chunk)].append(str(record))
+        return members
+
+    def grep_hits(self, session: str, records: Sequence[str], term: str, *, whole_session: bool) -> set[str]:
+        """The records among ``records`` (the scope, records of ``session``) whose ``text``
+        contains ``term`` exactly (Python ``in``): every record of the scope is read, and the
+        column read is the one the hit is decided by, so nothing else can disagree with it.
+
+        A scope of the whole session (``whole_session``) is read as the session's records by
+        their index and tested against the scope's set of handles; the scope behind one handle
+        is read by its handles. Rows come from an iterated cursor under the helper's lock,
+        never fetched into a list: a scan keeps only the hits' handles. Raises what SQLite
+        raises; a store that cannot be read is never "no hits"."""
+        scope = set(records)
+        if whole_session:
+            sql, args = "SELECT handle, text FROM records WHERE session = ?", [session]
+        else:
+            sql = "SELECT handle, text FROM records WHERE session = ? AND handle IN (SELECT value FROM json_each(?))"
+            args = [session, json.dumps(list(scope))]
+        hits: set[str] = set()
+        with self._lock:
+            cursor = self._conn.execute(sql, args)
+            try:
+                for handle, text in cursor:
+                    if handle in scope and term in text:
+                        hits.add(str(handle))
+            finally:
+                cursor.close()
+        return hits
+
     def _chunks_of(self, derivation: str) -> list[str]:
         """The chunks a derivation covers: its sources when they are chunks, and the
         chunks of its sources, recursively, when they are derivations. The visited
@@ -1345,7 +1389,7 @@ class RecordStore:
                             raw_json(message),
                             message.get("role"),
                             message.get("tool_call_id"),
-                            index_text(message.get("content")),
+                            grep_text(message),
                             estimate.tokens,
                             estimate.uncounted_images,
                         ),
