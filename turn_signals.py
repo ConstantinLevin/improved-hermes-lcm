@@ -118,6 +118,26 @@ def turn_start_seen(session_id: str, turn_id: str) -> bool:
         return True
 
 
+def response_counted(session_id: str) -> bool:
+    """The provider answered a request of the session (the engine's
+    ``update_from_response`` with a real prompt count): a turn runs, so a contest ends.
+    The host counts the response before it reads ``threshold_tokens`` for its re-arm
+    (``record_response_usage``: ``update_from_response``, then the re-arm read,
+    agent/turn_usage.py at Hermes 9fc7f17906), and fires ``post_api_request`` only later
+    (``normalize_model_response``), so this is the earliest signal of a live turn before
+    that read. No request is sent between a skipped turn end and the next
+    ``pre_llm_call``, which opens a fresh state, so a response always belongs to the turn
+    the state names. Returns whether a contest ended."""
+    if not session_id:
+        return False
+    with _LOCK:
+        current = _STATES.get(str(session_id))
+        if current is None or not current.in_turn or not current.contested:
+            return False
+        _STATES[str(session_id)] = replace(current, contested=False)
+        return True
+
+
 def tool_ran(session_id: str, turn_id: str) -> None:
     _event(session_id, turn_id, TOOL_RESULT)
 

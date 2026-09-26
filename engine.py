@@ -673,6 +673,10 @@ class LCMEngine(
             # when this prompt is below threshold_tokens.
             self.awaiting_real_usage_after_compression = False
             self._verify_compaction_cleared_threshold = False
+            # A response shows the turn lives: a contest ends here, before the host reads
+            # threshold_tokens for its re-arm (#32 D1, D2; F1 of the pre-review of 6a6a7f8).
+            if not self._review_fork:
+                turn_signals.response_counted(self._session_id)
             self._measure_fixed_prefix()
 
         cache_keys = {"cache_read_tokens", "cache_write_tokens"}
