@@ -177,10 +177,16 @@ def decode_token(token: Any) -> dict:
         raise ExpansionError("page must be the next_page token of an earlier result")
     text = token.strip()
     try:
-        state = json.loads(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode("utf-8"))
+        # Strictly: a character outside the URL-safe alphabet is an error, never skipped
+        # (``urlsafe_b64decode`` alone discards them). A standard-alphabet character in
+        # the token ("+" or "/") is not ours either.
+        if "+" in text or "/" in text:
+            raise ValueError("not the URL-safe alphabet")
+        standard = (text + "=" * (-len(text) % 4)).replace("-", "+").replace("_", "/")
+        state = json.loads(base64.b64decode(standard, validate=True).decode("utf-8"))
     except (binascii.Error, UnicodeDecodeError, ValueError):
         raise ExpansionError("page is not a next_page token of these tools") from None
-    if not isinstance(state, dict) or state.get("v") != TOKEN_VERSION:
+    if not isinstance(state, dict) or not _plain_int(state.get("v")) or state.get("v") != TOKEN_VERSION:
         raise ExpansionError("page is not a next_page token of these tools")
     # Every field, by type and range: a garbled token is refused with what is wrong in it.
     checks = (
@@ -281,7 +287,7 @@ def _records_items(store: RecordStore, cover: Cover, records: list[tuple[str, di
     by_record_call_id: dict[str, dict[str, str]] = {}
     for handle, message in records:
         if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
-            by_call_id = store.revision_call_handles(handle) if store.record_kind(handle) == "revision" else {}
+            by_call_id = store.inherited_call_handles(handle) if store.record_kind(handle) == "revision" else {}
             by_record_call_id[handle] = by_call_id
             shown_calls.update(h for h in calls.get(handle, {}).values())
             shown_calls.update(by_call_id.values())
@@ -434,9 +440,9 @@ def _piece(item: dict, path: str, *, value: Any = None, text: Optional[str] = No
         piece["tool_call"] = call.get("handle")
         # Everything the call says beside its arguments (its name, and in a raw stretch
         # where its result is or that none is recorded) goes with each piece.
-        for key, value in call.items():
+        for key, said in call.items():
             if key not in ("handle", "arguments", "call"):
-                piece[key] = value
+                piece[key] = said
     if text is None:
         piece["value"] = value
     else:
@@ -459,10 +465,58 @@ class _Rendered:
     summary: str
 
 
+def canonical_image_part(part: dict) -> tuple[Optional[dict], str]:
+    """An image part in the host's canonical list-content form, ``{"type": "image_url",
+    "image_url": {"url": …}}``, which every converter of the host takes: the Chat
+    Completions path as it is, the Anthropic converter by ``_image_block_from_openai_url``
+    (agent/anthropic_message_convert.py:170-187 at Hermes d0288be5b3), the Responses
+    converter by ``_iter_content_parts``/``_input_image_part`` (agent/codex_responses_adapter.py
+    92, 205-247), and the send path's own image test (``_IMAGE_PART_TYPES``,
+    agent/vision_message_prep.py:24). The host has no helper for the other direction; the
+    conversion is by the shapes' own definitions: an Anthropic ``image`` block's base64
+    source becomes a data URL, its URL source that URL; a Responses ``input_image`` its
+    ``image_url``. Returns (the part, "") or (None, why) where no URL can be made (a
+    Responses ``file_id``, a source of another type): such an image is refused visibly
+    (Codex review of 9a787bd, finding 4)."""
+    kind = part.get("type")
+    detail = None
+    url: Any = None
+    if kind in ("image_url", "input_image"):
+        url = part.get("image_url")
+        if isinstance(url, dict):
+            detail = url.get("detail")
+            url = url.get("url")
+        detail = detail or part.get("detail")
+        if not isinstance(url, str) or not url:
+            return None, (f"stored as a {kind} part without an image URL"
+                          + (" (a file id only the provider holds)" if part.get("file_id") else ""))
+    elif kind == "image":
+        source = part.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64" and isinstance(source.get("data"), str):
+            url = f"data:{source.get('media_type') or 'image/jpeg'};base64,{source['data']}"
+        elif isinstance(source, dict) and source.get("type") == "url" and isinstance(source.get("url"), str):
+            url = source["url"]
+        else:
+            kind_of = source.get("type") if isinstance(source, dict) else type(source).__name__
+            return None, f"stored as an image block with a source of type {kind_of!r}, which gives no URL"
+    else:
+        return None, f"stored as a part of type {kind!r}"
+    image_url: dict = {"url": url}
+    if detail:
+        image_url["detail"] = detail
+    return {"type": "image_url", "image_url": image_url}, ""
+
+
 def _replace_images(value: Any, images: list, describe: list) -> Any:
     if isinstance(value, dict):
         if is_image_part(value):
-            images.append(value)
+            canonical, why = canonical_image_part(value)
+            if canonical is None:
+                # Refused visibly, never dropped: the page says an image stands here and why
+                # it is not shown.
+                return {"type": "image", "not_shown": f"an image ({image_media_type(value)}) {why}; "
+                                                      f"the host's converters take no such part"}
+            images.append(canonical)
             describe.append(image_media_type(value))
             return {"type": "image", "image": len(images)}
         return {key: _replace_images(item, images, describe) for key, item in value.items()}

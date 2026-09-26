@@ -799,33 +799,64 @@ class RecordStore:
                 found.setdefault(str(record), {})[int(position)] = str(handle)
         return found
 
-    def revision_call_handles(self, revision: str) -> dict[str, str]:
-        """tool_call_id -> the call handle its sources hold, for a revision record."""
-        sources = [str(s) for (s,) in self._q(
-            "SELECT source_record FROM revision_sources WHERE revision = ? AND source_record IS NOT NULL",
-            (revision,))]
-        if not sources:
-            return {}
-        return {str(call_id): str(handle) for call_id, handle in self._q(
-            f"SELECT tool_call_id, handle FROM tool_calls WHERE tool_call_id IS NOT NULL AND record IN "
-            f"({','.join('?' * len(sources))})", sources)}
+    # --- Revisions: one walk (Codex review of 9a787bd, findings 2 and 3) ---------------
+
+    def revision_lineage(self, record: str, *, upward: bool) -> list[str]:
+        """The one walk over a record's revisions, transitively: ``upward`` its sources (the
+        records it revises, and theirs), else its revisions (the records that revise it, and
+        theirs), nearest first, the record itself excluded. Every use of a revision's
+        ancestry or descendants goes through here: the active form of a record, the call
+        handles a revision inherits, the call a revised result answers."""
+        column, other = ("revision", "source_record") if upward else ("source_record", "revision")
+        found: list[str] = []
+        frontier = [record]
+        while frontier:
+            current, frontier = frontier[0], frontier[1:]
+            for (step,) in self._q(f"SELECT {other} FROM revision_sources WHERE {column} = ? AND {other} IS NOT NULL "
+                                   f"ORDER BY ordinal", (current,)):
+                if str(step) != record and str(step) not in found:
+                    found.append(str(step))
+                    frontier.append(str(step))
+        return found
+
+    def active_form(self, record: str, cover: "Cover") -> Optional[str]:
+        """The form of a record the active record holds: the record itself where it is
+        active, else the nearest of its revisions, at any depth, that is; None where
+        neither is."""
+        for candidate in [record] + self.revision_lineage(record, upward=False):
+            if self._record_active(candidate, cover):
+                return candidate
+        return None
+
+    def inherited_call_handles(self, record: str) -> dict[str, str]:
+        """tool_call_id -> the call handle a revision shows for it: the handle its nearest
+        ancestor holds for that id, at any depth (a revision keeps its sources' calls and
+        writes no new handle for them, ``begin_compaction``)."""
+        found: dict[str, str] = {}
+        for ancestor in self.revision_lineage(record, upward=True):
+            for call_id, handle in self._q(
+                    "SELECT tool_call_id, handle FROM tool_calls WHERE tool_call_id IS NOT NULL AND record = ? "
+                    "ORDER BY position", (ancestor,)):
+                found.setdefault(str(call_id), str(handle))
+        return found
 
     def record_kind(self, record: str) -> Optional[str]:
         rows = self._q("SELECT kind FROM records WHERE handle = ?", (record,))
         return str(rows[0][0]) if rows else None
 
     def call_of_result(self, records: Sequence[str]) -> dict[str, str]:
-        """result record -> the handle of the tool call it answers, where one is recorded."""
-        wanted = [r for r in dict.fromkeys(records) if r]
+        """result record -> the handle of the tool call it answers, where one is recorded:
+        for a revised result, the call its nearest ancestor answers (``revision_lineage``)."""
         found: dict[str, str] = {}
-        for start in range(0, len(wanted), 500):
-            part = wanted[start:start + 500]
-            marks = ",".join("?" * len(part))
-            for handle, result in self._q(
-                    f"SELECT handle, result_record FROM tool_calls WHERE result_record IN ({marks}) "
-                    f"UNION ALL SELECT tool_call, result_record FROM tool_results WHERE result_record IN ({marks})",
-                    part + part):
-                found.setdefault(str(result), str(handle))
+        for record in dict.fromkeys(r for r in records if r):
+            for candidate in [record] + (self.revision_lineage(record, upward=True)
+                                         if self.record_kind(record) == "revision" else []):
+                rows = self._q("SELECT handle FROM tool_calls WHERE result_record = ? UNION ALL "
+                               "SELECT tool_call FROM tool_results WHERE result_record = ? LIMIT 1",
+                               (candidate, candidate))
+                if rows:
+                    found[record] = str(rows[0][0])
+                    break
         return found
 
     def tool_call(self, handle: str) -> Optional[tuple[str, int, list[str]]]:
@@ -851,38 +882,25 @@ class RecordStore:
         if found is None or not found[2]:
             return None, None
         for result in found[2]:
-            if self._record_active(result, cover):
-                return result, None
+            active = self.active_form(result, cover)
+            if active is not None:
+                return active, None
         return None, found[2][-1]
 
-    def _revisions_of(self, record: str) -> list[str]:
-        """Every revision written of a record, and of its revisions, transitively."""
-        found: list[str] = []
-        frontier = [record]
-        while frontier:
-            current = frontier.pop()
-            for (revision,) in self._q("SELECT revision FROM revision_sources WHERE source_record = ?", (current,)):
-                if str(revision) not in found:
-                    found.append(str(revision))
-                    frontier.append(str(revision))
-        return found
-
     def active_holder(self, handle: str, cover: "Cover") -> Optional[str]:
-        """The active record that shows a call: its own assistant record, or an active
-        revision of it whose ``tool_calls`` carry the call's id; None where none is."""
+        """The active record that shows a call: the active form of its assistant record
+        (``active_form``), where that form still carries the call's id; None where none is."""
         rows = self._q("SELECT record, tool_call_id FROM tool_calls WHERE handle = ?", (handle,))
         if not rows:
             return None
         record, call_id = str(rows[0][0]), rows[0][1]
-        if self._record_active(record, cover):
-            return record
-        for revision in self._revisions_of(record):
-            if not self._record_active(revision, cover):
-                continue
-            raw = self.record_raw(revision) or {}
-            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
-            if call_id and any(isinstance(c, dict) and str(c.get("id") or "") == str(call_id) for c in calls):
-                return revision
+        active = self.active_form(record, cover)
+        if active is None or active == record:
+            return active
+        raw = self.record_raw(active) or {}
+        calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+        if call_id and any(isinstance(c, dict) and str(c.get("id") or "") == str(call_id) for c in calls):
+            return active
         return None
 
     def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
@@ -1262,17 +1280,11 @@ class RecordStore:
                                     "source_position) VALUES (?, ?, ?, ?)",
                                     (handle, ordinal, source[1], source[2]),
                                 )
-                        # Calls the sources already hold keep their handles; only the
-                        # revision's new calls are written, as for a new record.
-                        source_records = [s[1] for s in entry.sources if s[0] == "record"]
-                        known = {
-                            str(call_id)
-                            for (call_id,) in conn.execute(
-                                "SELECT tool_call_id FROM tool_calls WHERE tool_call_id IS NOT NULL AND record IN "
-                                f"({','.join('?' * len(source_records))})",
-                                source_records,
-                            ).fetchall()
-                        } if source_records else set()
+                        # Calls its ancestors already hold keep their handles, at any depth
+                        # of revision (``revision_lineage``, read inside this transaction,
+                        # which holds the sources just written); only the revision's new
+                        # calls are written, as for a new record.
+                        known = set(self.inherited_call_handles(handle))
                         written.append((handle, message, known))
                     else:
                         written.append((handle, message, set()))
