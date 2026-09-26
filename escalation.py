@@ -390,32 +390,50 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
     return forms
 
 
-def _same_provider_label(route: SummariserRoute, label: str) -> bool:
-    """Whether a ``route_info`` record's provider is the session route's own, as the host
-    labels the main provider it routes to (``_try_main_provider_route`` returns the main
-    provider; ``_record_route_info`` records it through ``_fallback_provider_from_label``,
-    agent/auxiliary_client.py:4560-4605 and 7345 at origin/main d0288be5b3): the same
-    provider after the host's own normalisation (``_normalize_aux_provider``); a
-    ``custom:<name>`` session, which the host routes and records as ``custom``, recorded
-    as ``custom``; an actual-route session (``hermes_cli.providers.is_actual_route``)
-    recorded as ``actual``. Probed: openrouter, custom, custom:foo (as custom), x-ai,
-    deepseek. Anything else is another provider."""
-    named = str(route.named_provider or route.provider or "").strip()
-    recorded = str(label or "").strip()
-    if not named or not recorded:
-        return False
-    host_named, host_recorded = _host_provider(named), _host_provider(recorded)
-    if host_named is not None and host_named == host_recorded:
-        return True
-    if named.lower().startswith("custom:") and recorded.lower() == "custom":
-        return True
-    if recorded.lower() == "actual":
+def _session_route_label(route: SummariserRoute) -> Optional[str]:
+    """The provider label the host writes into ``route_info`` when it routes the session's
+    own route, read at Hermes origin/main d0288be5b3 (agent/auxiliary_client.py):
+    - ``call_llm`` with no task and no provider resolves "auto" (``_resolve_task_provider_model``,
+      6072) and ``_resolve_auto_branch`` (4967) tags the client with the label
+      ``_resolve_auto_route`` returns (4647); ``_prepare_aux_request`` records it
+      through ``_fallback_provider_from_label`` (7345), which only strips fallback wrappers;
+    - the main runtime's provider is lower-cased (``_normalize_main_runtime``, 3100-3103),
+      and ``_try_main_provider_route`` (4560) returns it as the label unchanged for every
+      branch (openrouter, anthropic, openai-codex, nous, the API-key providers, custom, the
+      local-server aliases ollama, vllm, llamacpp, llama.cpp, llama-cpp, a named custom
+      provider with a config entry), with two exceptions:
+      - a named ``custom:<name>`` without a config entry, with a base URL, is routed on
+        the anonymous custom arm and labelled ``custom`` (4583-4587);
+      - ``moa`` is replaced by its aggregator's provider (``_main_route_target``,
+        4552-4556, ``_resolve_moa_aggregator``).
+    None where the host cannot be read for an exception it needs."""
+    named = str(route.named_provider or route.provider or "").strip().lower()
+    if not named:
+        return None
+    if named.startswith("custom:") and route.base_url:
         try:
-            from hermes_cli.providers import is_actual_route  # type: ignore
-            return bool(is_actual_route(named, route.base_url))
+            from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
+            if _get_named_custom_provider(named) is None:
+                return "custom"
         except Exception:
-            return False
-    return False
+            return None
+    if named == "moa":
+        try:
+            from agent.auxiliary_client import _resolve_moa_aggregator  # type: ignore
+            aggregator, _model = _resolve_moa_aggregator(route.model)
+            return str(aggregator).strip().lower() if aggregator else None
+        except Exception:
+            return None
+    return named
+
+
+def _same_provider_label(route: SummariserRoute, label: str) -> bool:
+    """Whether a ``route_info`` record names the session route's own provider: exactly
+    the label the host writes for it (``_session_route_label``), compared lower-cased.
+    Anything else is another provider, an alias included (an ``ollama`` session's record
+    ``custom`` is another route)."""
+    expected = _session_route_label(route)
+    return expected is not None and str(label or "").strip().lower() == expected
 
 
 def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -> bool:
@@ -493,7 +511,7 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
     # Every record names the session route's own provider, however many there are (the
     # orchestrator's ruling on the Codex review of 5b74bbc): the host can skip an
     # unhealthy main provider and pick a fallback before its first record
-    # (``_resolve_auto_route``, agent/auxiliary_client.py:4649 at origin/main d0288be5b3),
+    # (``_resolve_auto_route``, agent/auxiliary_client.py:4647 at origin/main d0288be5b3),
     # so one record naming another provider is a reply from another route.
     other = next((record for record in route_info.routes if not _same_provider_label(route, record[0])), None)
     if other is not None:
