@@ -94,6 +94,7 @@ There is no condensation in this path: the cover grows by one summary per chunk 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import logging
 import math
@@ -168,6 +169,9 @@ _KEEPS_FAILING_ATTEMPTS = 3
 # The record handle a row is sized with before it has one (``_cut_estimate``): a
 # handle's fixed length, the kind letter and eight characters (``handles``).
 _SIZING_HANDLE = MESSAGE + "a" * 8
+
+# The summariser's route resolved once for a scope (``_route_scope``): (engine, (route, why)).
+_ROUTE_SCOPE: contextvars.ContextVar = contextvars.ContextVar("lcm_summariser_route", default=None)
 
 
 try:  # the host's own test for its ephemeral recovery scaffolding (the nudge flags)
@@ -489,6 +493,11 @@ class CompactionMixin:
                                        f"p50 of the provider's count over it, = {int(estimate * ratio)} provider tokens")
 
     def should_compress_preflight(self, messages):
+        """See ``_should_compress_preflight``; one summariser route for all of it."""
+        with self._route_scope():
+            return self._should_compress_preflight(messages)
+
+    def _should_compress_preflight(self, messages):
         """Before a request, at turn start (the host asks it only there, after
         ``should_compress`` declined): settle and bind what the list shows, then ask
         for a compaction when the prompt reaches the occasion's threshold and the
@@ -542,6 +551,11 @@ class CompactionMixin:
                                    if index not in mechanism])
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        """See ``_has_content_to_compress``; one summariser route for all of it."""
+        with self._route_scope():
+            return self._has_content_to_compress(messages)
+
+    def _has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         """The host's probe before the gateway's /compress (``ContextEngine``,
         agent/context_engine.py 176; asked only on ``skip_without_window``,
         agent/conversation_compression_manual.py 104-106): False makes the host say
@@ -678,7 +692,7 @@ class CompactionMixin:
         if route is None:
             return self._estimator(), lambda message: message
         _facts, wire = self._summariser_wire(route)
-        estimator = Estimator(image_model=route.model, image_provider=route.table_provider(),
+        estimator = Estimator(image_model=route.target_model, image_provider=route.target_provider,
                               reasoning_sent=wire.needs_reasoning_echo)
 
         def convert(message: Any) -> Any:
@@ -703,7 +717,7 @@ class CompactionMixin:
             return None, ""
         worst = float(self._config.estimate_ratio_max)
         room = facts.context_window - (facts.output_cap or 0)
-        estimator = Estimator(image_model=route.model, image_provider=route.table_provider(),
+        estimator = Estimator(image_model=route.target_model, image_provider=route.target_provider,
                               reasoning_sent=wire.needs_reasoning_echo)
         prompt = max((estimator.messages(inputs) for inputs in prompt_inputs(
             _SUMMARY_BUDGET_MAX, facts=wire, focus_topic=focus_topic or "",
@@ -1097,8 +1111,33 @@ class CompactionMixin:
         return self._abort(messages, f"the store could not be read for {what} ({type(exc).__name__}: {exc})")
 
     def _summariser_route(self) -> tuple[Optional[SummariserRoute], str]:
-        """The summariser's whole route, or why there is none (#9). Reads nothing of the
-        store: the preflight and the cut's chunk size ask it too."""
+        """The summariser's whole route, or why there is none (#9), with its target
+        resolved by the host once (``session_route``). Inside a route scope
+        (``_route_scope``: a compaction attempt, the preflight, the gateway's probe) the
+        one route resolved for it is returned, so everything the scope decides (the model
+        table's row, the input, the window, B, the image limit, the limiter's endpoint, the
+        provenance, D9) reads one resolved pair (the orchestrator's ruling on the Codex
+        review of 080f5a3). Reads nothing of the store."""
+        scoped = _ROUTE_SCOPE.get()
+        if scoped is not None and scoped[0] is self:
+            return scoped[1]
+        return self._resolve_summariser_route()
+
+    @contextlib.contextmanager
+    def _route_scope(self):
+        """Resolve the summariser's route once for everything inside (see
+        ``_summariser_route``); nested scopes keep the outer one."""
+        scoped = _ROUTE_SCOPE.get()
+        if scoped is not None and scoped[0] is self:
+            yield
+            return
+        token = _ROUTE_SCOPE.set((self, self._resolve_summariser_route()))
+        try:
+            yield
+        finally:
+            _ROUTE_SCOPE.reset(token)
+
+    def _resolve_summariser_route(self) -> tuple[Optional[SummariserRoute], str]:
         config = self._config
         problem = configured_route_problem(config)
         if problem is not None:
@@ -1111,7 +1150,12 @@ class CompactionMixin:
         if not self.base_url and _host_provider(self.provider) == "custom":
             return None, ("the session's route names provider custom without a base URL: the host "
                           "would borrow an endpoint of its own, which the session did not name")
-        return session_route(self.provider, self.model, self.base_url, self.api_key, self.api_mode), ""
+        route = session_route(self.provider, self.model, self.base_url, self.api_key, self.api_mode)
+        if not route.target_provider:
+            return None, (f"the host could not resolve the route it takes for the session's "
+                          f"{self.provider}/{self.model} (its _main_route_target): the summariser's provider and "
+                          f"model are not known")
+        return route, ""
 
     def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
         """The summariser's route, effort and output cap, or the reason there is none
@@ -1132,7 +1176,7 @@ class CompactionMixin:
         if effort not in REASONING_EFFORTS:
             return None, (f"the summariser's reasoning effort {effort!r} is not one of the host's levels "
                           f"({', '.join(sorted(REASONING_EFFORTS))})")
-        facts = lookup_model(route.model, route.table_provider())
+        facts = lookup_model(route.target_model, route.target_provider)
         return CallSettings(
             route=route,
             effort=effort,
@@ -1169,13 +1213,15 @@ class CompactionMixin:
         token = _ATTEMPT.set(attempt)
         try:
             try:
-                result = self._compress_impl(
-                    messages,
-                    current_tokens=current_tokens,
-                    focus_topic=focus_topic,
-                    force=force,
-                    provider_rejected=bool(bypass_cooldown),
-                )
+                # One summariser route, resolved once, for the whole attempt.
+                with self._route_scope():
+                    result = self._compress_impl(
+                        messages,
+                        current_tokens=current_tokens,
+                        focus_topic=focus_topic,
+                        force=force,
+                        provider_rejected=bool(bypass_cooldown),
+                    )
             except BaseException as exc:
                 # A planning transaction still open is rolled back (#33 D14 as revised).
                 try:
@@ -1279,7 +1325,7 @@ class CompactionMixin:
                 level_one=prepared.level_one,
             )
             return ChunkSummary(text=text, level=level, budget=prepared.budget, finish_reason=finish_reason,
-                                model=route.model, provider=route.provenance_provider(), effort=settings.effort,
+                                model=route.target_model, provider=route.provenance_provider(), effort=settings.effort,
                                 withheld=json.dumps(withheld["record"]) if withheld is not None else None)
 
         return run
@@ -1294,9 +1340,11 @@ class CompactionMixin:
         """The summariser's row in the model table (by its route, 9.6) and what its
         route means for its input: images go in only where the row says it reads them,
         and where there is no row it is not known (#8); the reasoning field and the
-        converter by the host's rules for the route."""
-        facts = lookup_model(route.model, route.table_provider())
-        wire = wire_facts(route.provider, route.model, route.base_url, route.api_mode,
+        converter by the host's rules for the route. All of it from the route's target, the
+        provider, model, base URL and wire the host routes the session to (a MoA session's
+        aggregator), resolved once (``session_route``)."""
+        facts = lookup_model(route.target_model, route.target_provider)
+        wire = wire_facts(route.target_provider, route.target_model, route.target_base_url, route.target_api_mode,
                           reads_images=facts.reads_images if facts is not None else None)
         return facts, wire
 
@@ -2161,7 +2209,7 @@ class CompactionMixin:
         if model_facts is not None and model_facts.context_window:
             room = model_facts.context_window - (model_facts.output_cap or 0)
             worst = float(self._config.estimate_ratio_max)
-            summariser_estimate = Estimator(image_model=route.model, image_provider=route.table_provider(),
+            summariser_estimate = Estimator(image_model=route.target_model, image_provider=route.target_provider,
                                             reasoning_sent=prepared[1].wire.needs_reasoning_echo)
             for number, chunk in enumerate(chunks, start=1):
                 if kept_state.get(tuple(chunk)) == "summarised":
@@ -2205,7 +2253,7 @@ class CompactionMixin:
 
         # The dispatch's preparation, still inside the boundary: nothing is sent yet.
         step.at = "preparing the dispatch"
-        endpoint = endpoint_key(route.provider, route.base_url)
+        endpoint = endpoint_key(route.target_provider, route.target_base_url)
         limiter, limit = limiter_for(endpoint), self._calls_in_flight_limit(endpoint)
         # The host's progress hook and deadline, read here on the compress() thread (D10).
         hook, deadline = host_progress_hook(), host_deadline()
@@ -2279,11 +2327,12 @@ class CompactionMixin:
             # earlier chunks run on and write their summaries (#33 D13).
             try:
                 way = join_or_start(
-                    (attempt.session, tuple(records), route.model, route.provenance_provider(), settings.effort),
+                    (attempt.session, tuple(records), route.target_model, route.provenance_provider(),
+                     settings.effort),
                     subscriber, limiter=limiter, limit=limit,
                     reuse=lambda records=records, chunk_handle=chunk_handle, frozen_summary=(
                         kept_state.get(tuple(chunk)) == "summarised"): self._records.summary_of_records(
-                        attempt.session, records, exclude_chunk=chunk_handle, model=route.model,
+                        attempt.session, records, exclude_chunk=chunk_handle, model=route.target_model,
                         provider=route.provenance_provider(), effort=settings.effort, any_route=frozen_summary),
                     run=run,
                     describe=describe,
