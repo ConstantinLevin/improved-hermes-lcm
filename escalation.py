@@ -390,50 +390,60 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
     return forms
 
 
-def _session_route_label(route: SummariserRoute) -> Optional[str]:
-    """The provider label the host writes into ``route_info`` when it routes the session's
-    own route, read at Hermes origin/main d0288be5b3 (agent/auxiliary_client.py):
+def _session_route_target(route: SummariserRoute) -> Optional[tuple[str, str]]:
+    """The provider label and the model the host records in ``route_info`` when it routes
+    the session's own route, resolved together by the host's own functions (the
+    orchestrator's ruling on the Codex review of 8fc3750), read at Hermes origin/main
+    d0288be5b3 (agent/auxiliary_client.py):
     - ``call_llm`` with no task and no provider resolves "auto" (``_resolve_task_provider_model``,
-      6072) and ``_resolve_auto_branch`` (4967) tags the client with the label
-      ``_resolve_auto_route`` returns (4647); ``_prepare_aux_request`` records it
+      6072); ``_resolve_auto_branch`` (4967) tags the client with the label
+      ``_resolve_auto_route`` (4647) returns, and ``_prepare_aux_request`` records it
       through ``_fallback_provider_from_label`` (7345), which only strips fallback wrappers;
-    - the main runtime's provider is lower-cased (``_normalize_main_runtime``, 3100-3103),
-      and ``_try_main_provider_route`` (4560) returns it as the label unchanged for every
-      branch (openrouter, anthropic, openai-codex, nous, the API-key providers, custom, the
-      local-server aliases ollama, vllm, llamacpp, llama.cpp, llama-cpp, a named custom
-      provider with a config entry), with two exceptions:
-      - a named ``custom:<name>`` without a config entry, with a base URL, is routed on
-        the anonymous custom arm and labelled ``custom`` (4583-4587);
-      - ``moa`` is replaced by its aggregator's provider (``_main_route_target``,
-        4552-4556, ``_resolve_moa_aggregator``).
-    None where the host cannot be read for an exception it needs."""
-    named = str(route.named_provider or route.provider or "").strip().lower()
-    if not named:
+    - the target is the host's: ``_normalize_main_runtime`` (3080; the provider
+      lower-cased) and ``_main_route_target`` (4534; ``moa`` replaced by its aggregator's
+      provider and model, 4552-4556), called here, not mirrored;
+    - ``_try_main_provider_route`` (4560) returns the target's provider as the label for
+      every branch, except a named ``custom:<name>`` without a config entry and with a
+      base URL, routed on the anonymous custom arm as ``custom`` (4583-4587): no host
+      function carries that rewrite, so it is read here with the host's own entry lookup;
+    - the model recorded is the target's model, or the host's normalisation of it for the
+      provider (``_normalize_resolved_model``, through ``resolve_provider_client``):
+      ``_host_model_forms`` takes both.
+    None where the host cannot be read or names no target."""
+    try:
+        from agent.auxiliary_client import _main_route_target, _normalize_main_runtime  # type: ignore
+        provider, model, base_url, _key, _mode = _main_route_target(_normalize_main_runtime(route.main_runtime()),
+                                                                   None)
+    except Exception:
         return None
-    if named.startswith("custom:") and route.base_url:
+    provider, model = str(provider or "").strip().lower(), str(model or "").strip()
+    if not provider or provider == "auto" or not model:
+        return None
+    if provider.startswith("custom:") and base_url:
         try:
             from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
-            if _get_named_custom_provider(named) is None:
-                return "custom"
+            if _get_named_custom_provider(provider) is None:
+                provider = "custom"
         except Exception:
             return None
-    if named == "moa":
-        try:
-            from agent.auxiliary_client import _resolve_moa_aggregator  # type: ignore
-            aggregator, _model = _resolve_moa_aggregator(route.model)
-            return str(aggregator).strip().lower() if aggregator else None
-        except Exception:
-            return None
-    return named
+    return provider, model
 
 
 def _same_provider_label(route: SummariserRoute, label: str) -> bool:
     """Whether a ``route_info`` record names the session route's own provider: exactly
-    the label the host writes for it (``_session_route_label``), compared lower-cased.
+    the label the host writes for it (``_session_route_target``), compared lower-cased.
     Anything else is another provider, an alias included (an ``ollama`` session's record
     ``custom`` is another route)."""
-    expected = _session_route_label(route)
-    return expected is not None and str(label or "").strip().lower() == expected
+    target = _session_route_target(route)
+    return target is not None and str(label or "").strip().lower() == target[0]
+
+
+def _session_route_model_forms(route: SummariserRoute, provider: str) -> set[str]:
+    """The model ids a record of the session's route may carry: the host's target model
+    (``_session_route_target``; a MoA session's aggregator model, not ``default``), as
+    asked for and as the host normalises it for ``provider``."""
+    target = _session_route_target(route)
+    return _host_model_forms(target[1], provider) if target is not None else set()
 
 
 def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -> bool:
@@ -445,14 +455,13 @@ def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -
     leaves one record that reads as the session's route (ask A-33.3)."""
     if route.source != "session" or not route.named_provider:
         return False
-    named = _host_provider(route.named_provider)
-    label = _host_provider(answered[0])
-    if named is None or label is None or named != label:
+    target = _session_route_target(route)
+    if target is None or not _same_provider_label(route, answered[0]):
         return False
     aliases = _host_local_server_aliases() or frozenset()
-    if named == "custom" or route.named_provider.strip().lower() in aliases:
+    if target[0] == "custom" or target[0] in aliases:
         return False
-    return answered[1] in _host_model_forms(route.model, answered[0])
+    return answered[1] in _session_route_model_forms(route, answered[0])
 
 
 # The complete ending and every other, in the Chat Completions shape the host hands each
@@ -520,7 +529,7 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
             detail=f"route_info names {other[0] or '?'}/{other[1] or '?'}; the summariser is {route.describe()} "
                    f"(#33 D9)",
         )
-    if resolved[1] not in _host_model_forms(route.model, resolved[0]):
+    if resolved[1] not in _session_route_model_forms(route, resolved[0]):
         raise SummaryFailure(
             "the host resolved the summariser's route to another model", transient=False, kind="route",
             detail=f"route_info names {resolved[0] or '?'}/{resolved[1] or '?'} for the summariser "
