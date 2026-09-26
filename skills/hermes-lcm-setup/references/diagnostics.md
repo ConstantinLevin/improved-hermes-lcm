@@ -25,13 +25,17 @@ For repair (the only one is rebuilding a full-text index, `/lcm doctor repair ap
 
 The plugin keeps one backup of each store: `<store directory>/backups/lcm/<store name>.daily.sqlite3`. It is taken automatically, at most once a day and only when the store changed since, through SQLite's backup API. Each copy is checked (`integrity_check`, the store's identity, the record's invariant) before it replaces the slot, so the slot is always the last copy that passed. A failed backup keeps the old slot and appears in the doctor's recent events as `backup_failed`. A slot that holds another store's backup is set aside as `<store name>.daily.<uuid>.sqlite3` and never overwritten. There is no backup command.
 
+## Stores of another format
+
+The store's file carries its format: `lcm-record-12.db` holds format `ihl-store/12`. A build of another format begins its own file beside it, and leaves every other store as it was: never opened, moved or changed, its `-wal` and `-shm` files included. `/lcm status`, `/lcm doctor` and `lcm_status` list them as `stores_left_beside` (an older `lcm-record.db`, `lcm-record-<n>.db` of another format, upstream's `lcm.db`), and the plugin logs one warning when it begins a new file beside them. Their handles are unknown in the new store. Two Hermes processes of different formats on one home each write their own store, so the two diverge.
+
 ## Restore
 
 A restore is the owner's, by hand, with every Hermes process on that home stopped:
 
 1. stop Hermes (gateway, CLI, dashboard) on this home;
-2. move the live store aside, for example to `lcm-record.db.before-restore`. Never delete it: it holds everything written since the backup;
-3. write the slot into place through SQLite: `sqlite3 backups/lcm/lcm-record.daily.sqlite3 ".backup lcm-record.db"` (run in the store's directory);
+2. move the live store aside, for example `lcm-record-12.db` to `lcm-record-12.db.before-restore` (the file `database_path` in `/lcm status` names). Never delete it: it holds everything written since the backup;
+3. write the slot into place through SQLite: `sqlite3 backups/lcm/lcm-record-12.daily.sqlite3 ".backup lcm-record-12.db"` (run in the store's directory);
 4. start Hermes again.
 
 A session that was running continues from its host context, which holds summaries and rows the restored store does not have. So a running session aborts visibly at its next compaction after a restore ("Compression aborted: …", nothing changed in its context). Begin a new session with `/new`.

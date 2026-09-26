@@ -36,7 +36,7 @@ Start with:
 - compaction runs at a threshold derived from the model's context window, τ = min(W − 123k, 0.85·W) − 54.5k, raised by the 54.5k margin while a turn runs; `lcm_status` shows τ, τ′ and the target G. The weights are `LCM_ROUND_GROWTH_TOKENS`, `LCM_HYGIENE_SHARE`, `LCM_TURN_MARGIN_TOKENS` and `LCM_TARGET_SHARE`; the host's own compression threshold is not read;
 - the newest messages kept raw (the tail) are sized in tokens, not counted: what the target G leaves after the fixed prefix and the summaries, in whole tool groups; there is no tail setting. The fixed prefix is measured at the session's responses and kept where the list was smallest, with its error bound shown in `lcm_status` (`LCM_FIXED_PREFIX_HYPOTHESIS_TOKENS`, 32,000, stands in until the first);
 - `LCM_CHUNK_TOKENS`: the chunk size in provider tokens (default 50,000); the material outside the fresh tail is split equally into chunks of at most this size, cut by the plugin's estimate as this size divided by `LCM_ESTIMATE_RATIO` (default 1.51);
-- `LCM_DATABASE_PATH`: profile-local SQLite path when the default is unsuitable;
+- `LCM_DATABASE_PATH`: the base of the profile-local SQLite store when the default is unsuitable; the file carries the format, so `/x/lcm.sqlite` gives `/x/lcm-12.sqlite`;
 - summary provider settings only after confirming credentials, cost, and data handling.
 
 Optional slash commands are disabled by default with `LCM_ENABLE_SLASH_COMMAND=false`. Do not enable mutation surfaces merely to diagnose a problem.
