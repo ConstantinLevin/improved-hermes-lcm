@@ -141,9 +141,9 @@ _HOST_IGNORES_BASE_URL = {
     "anthropic": "the host sends anthropic to _try_anthropic, which takes only a key and chooses the endpoint "
                  "itself (_resolve_api_key_branch)",
 }
-_HONOURING_FORM = ("provider custom with LCM_SUMMARY_API_MODE set to the endpoint's wire "
-                   "(chat_completions, anthropic_messages or codex_responses) and this base URL; "
-                   "the host's custom branch sends to exactly that URL (_resolve_custom_branch)")
+_HONOURING_FORM = ("provider custom with LCM_SUMMARY_BASE_URL, LCM_SUMMARY_API_KEY, and LCM_SUMMARY_API_MODE set "
+                   "to the endpoint's wire (chat_completions, anthropic_messages or codex_responses); the host's "
+                   "custom branch sends to exactly that URL with exactly that key and wire (_resolve_custom_branch)")
 
 
 def _host_provider(provider: str) -> Optional[str]:
@@ -220,32 +220,76 @@ def _control_characters(value: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
 
 
+def _host_local_server_aliases() -> Optional[frozenset]:
+    """The host's local-server provider names (ollama, vllm, llama.cpp …), whose explicit
+    base URL is taken with the configured key or the placeholder, never a borrowed one
+    (``_LOCAL_SERVER_ALIASES`` and ``_resolve_custom_branch``, agent/auxiliary_client.py
+    at Hermes 916e1688ba), or None when the host cannot be read."""
+    try:
+        from agent.auxiliary_client import _LOCAL_SERVER_ALIASES  # type: ignore
+        return frozenset(str(name).strip().lower() for name in _LOCAL_SERVER_ALIASES)
+    except Exception:
+        return None
+
+
 def configured_route_problem(config: Any) -> Optional[str]:
     """Why the plugin's configured summariser cannot be used, or None (#9). Checked when
-    the configuration is loaded; every compaction then aborts with this cause."""
+    the configuration is loaded; every compaction then aborts with this cause.
+
+    A configured route is accepted only when every part the host uses for the call is
+    one the configuration named: nothing is borrowed and nothing is detected from the
+    shape of a URL or a model name ("Known, or nothing"; 9.2). Read at Hermes 916e1688ba
+    (agent/auxiliary_client.py, ``resolve_provider_client`` and its branches), that is
+    the host's custom branch with the provider literally ``custom`` or one of its
+    local-server aliases, a base URL, and one of the three wires it forces
+    (``_wrap_transport`` otherwise picks the wire from the URL and the model name). The
+    key is required: without one the custom branch sends OPENAI_API_KEY, or the main
+    key where the host matches, to the configured URL; only a local-server alias never
+    borrows, and sends the placeholder. For an alias the host first composes a
+    ``providers`` entry of the same name from config.yaml, whose headers may join the
+    call; the base URL, key and wire named here win over it. Every other provider (a
+    hosted or OAuth one, an API-key provider of the host's registry, a named custom
+    entry, an unknown name) resolves its endpoint, credentials or wire itself, so it is
+    refused; it stays reachable as the session's own route."""
     model = str(getattr(config, "summary_model", "") or "").strip()
     provider = str(getattr(config, "summary_provider", "") or "").strip()
     base_url = str(getattr(config, "summary_base_url", "") or "").strip()
     api_key = getattr(config, "summary_api_key", "") or ""
+    api_mode = str(getattr(config, "summary_api_mode", "") or "").strip()
     effort = str(getattr(config, "summary_reasoning_effort", "") or "").strip().lower()
     if effort not in REASONING_EFFORTS:
         return (f"LCM_SUMMARY_REASONING_EFFORT {effort!r} is not one of the host's levels "
                 f"({', '.join(sorted(REASONING_EFFORTS))})")
     if isinstance(api_key, str) and _control_characters(api_key):
         return "LCM_SUMMARY_API_KEY contains a newline or another control character"
-    if not (model or provider or base_url or api_key):
+    if not (model or provider or base_url or api_key or api_mode):
         return None
     if not (model and provider):
         return ("the configured summariser is incomplete: LCM_SUMMARY_MODEL and LCM_SUMMARY_PROVIDER are "
                 "set together or not at all")
-    if _host_provider(provider) == "custom" and not base_url:
-        return ("the configured summariser names provider custom without LCM_SUMMARY_BASE_URL: the host would "
-                "borrow an endpoint of its own (the session's), which the configuration did not name")
-    if base_url:
-        ignored = host_ignores_base_url(provider)
-        if ignored is not None:
-            return (f"the configured summariser names provider {provider} with LCM_SUMMARY_BASE_URL, and the host "
-                    f"does not honour an explicit base URL there: {ignored}. The form that does: {_HONOURING_FORM}")
+    named = provider.lower()
+    aliases = _host_local_server_aliases()
+    if aliases is None or _host_provider(provider) is None:
+        return ("the host's provider resolution could not be read, so what it would do with the configured "
+                "summariser is not known")
+    local = named in aliases
+    if named != "custom" and not local:
+        return (f"the configured summariser names provider {provider}: the host would choose its endpoint, "
+                f"credentials or wire itself, which the configuration did not name. The form it honours: "
+                f"{_HONOURING_FORM}")
+    if not base_url:
+        return (f"the configured summariser names provider {provider} without LCM_SUMMARY_BASE_URL: the host "
+                f"would borrow an endpoint of its own, which the configuration did not name")
+    wire = _host_api_mode(api_mode)
+    if wire not in _CUSTOM_WIRES:
+        return (f"the configured summariser names no wire the host's custom branch speaks (LCM_SUMMARY_API_MODE "
+                f"is {api_mode!r}): the host would pick one from the URL and the model name. Name one of "
+                f"{', '.join(sorted(_CUSTOM_WIRES))}")
+    has_key = isinstance(api_key, str) and bool(api_key.strip())
+    if not has_key and not local:
+        return ("the configured summariser names no LCM_SUMMARY_API_KEY: the host would send OPENAI_API_KEY, or "
+                "the main key, to the configured URL. A server that needs no key is named by the host's "
+                f"local-server provider name ({', '.join(sorted(aliases))}), which never borrows one")
     return None
 
 
