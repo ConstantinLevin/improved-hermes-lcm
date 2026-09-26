@@ -31,7 +31,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
@@ -1098,16 +1098,28 @@ class RecordStore:
         self,
         compaction: int,
         entries: Iterable[tuple[int, str, Optional[str], Optional[str], Optional[str]]],
+        *,
+        fence: Optional[Callable[[], None]] = None,
     ) -> None:
         """(position, kind, record, derivation, raw): a returned summary names the
         derivation it was emitted from and keeps its dict as returned, verbatim, since
-        it is what the agent's context held."""
+        it is what the agent's context held.
+
+        ``fence`` is asked inside the transaction, once the write lock is granted (the
+        wait for it can last the busy timeout) and again just before COMMIT; where it
+        raises, the transaction is rolled back and nothing of the return is written
+        (#7, #33 D12). What it cannot close is a cancellation during COMMIT itself."""
+        rows = [(compaction, pos, kind, record, derivation, raw) for pos, kind, record, derivation, raw in entries]
         with self._tx() as conn:
+            if fence is not None:
+                fence()
             conn.executemany(
                 "INSERT INTO compaction_returns(compaction, position, kind, record, derivation, raw) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                [(compaction, pos, kind, record, derivation, raw) for pos, kind, record, derivation, raw in entries],
+                rows,
             )
+            if fence is not None:
+                fence()
 
     def confirm(
         self,

@@ -1669,7 +1669,8 @@ class CompactionMixin:
             returns.append((len(result), "record", record, None, None))
             result.append(messages[index])
 
-        # The return fence on the captured check (#29 W2 steps 2 and 6).
+        # The return fence on the captured check (#29 W2 steps 2 and 6): asked here, and
+        # inside the return's transaction once its write lock is granted (_write_return).
         self._require_live_write()
         try:
             self._write_return(attempt, result, returns)

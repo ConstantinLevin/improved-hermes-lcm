@@ -502,9 +502,18 @@ class RecordWriteMixin:
         entries: List[tuple],
     ) -> None:
         """Write the return, (position, kind, record, derivation, raw) per recorded
-        entry, and key the returned dicts. The caller has asked the attempt's captured
-        check just before; raises when the write fails."""
-        self._records.write_returns(attempt.compaction, entries)
+        entry, and key the returned dicts; raises when the write fails.
+
+        The return is fenced on the attempt's captured check inside its transaction,
+        once the write lock is granted and again before COMMIT (#7, #33 D12): a check
+        asked before the write left the wait for the lock, up to the busy timeout,
+        unfenced. After COMMIT the check is asked once more before anything outside the
+        store changes: the host's own dicts are keyed, and the attempt is registered for
+        confirmation and rejection, only for an attempt that is still live. A
+        cancellation during COMMIT leaves return rows that no key and no attempt refers
+        to, as a return the host rejected does. ``AttemptCancelled`` is raised for it."""
+        self._records.write_returns(attempt.compaction, entries, fence=self._require_live_write)
+        self._require_live_write()
         for position, kind, _record, _derivation, _raw in entries:
             message = result[position]
             message[RET_KEY] = f"{attempt.compaction}:{position}"
