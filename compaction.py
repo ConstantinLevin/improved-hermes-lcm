@@ -93,6 +93,7 @@ There is no condensation in this path: the cover grows by one summary per chunk 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -119,7 +120,7 @@ from .escalation import (
 )
 from .model_table import lookup as lookup_model
 from .handles import MESSAGE
-from .summariser_input import summariser_message, wire_facts
+from .summariser_input import image_count, summariser_message, wire_facts, wire_image_limit
 from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .fresh_tail import ToolPairingError, check_tool_pairing
@@ -290,15 +291,20 @@ def _pairs_crossing(messages: List[Dict[str, Any]], boundary: int) -> Optional[t
     return None
 
 
-def _fewest_chunks(sizes: List[int], limit: int) -> int:
-    """The fewest chunks of at most ``limit`` that cover ``sizes`` in order, every
-    size at most ``limit``: filling each chunk as far as it goes is optimal."""
-    count, used = 0, 0
-    for size in sizes:
-        if count == 0 or used + size > limit:
-            count, used = count + 1, size
+def _fewest_chunks(sizes: List[int], limit: int, images: Optional[List[int]] = None,
+                   image_limit: Optional[int] = None) -> int:
+    """The fewest chunks of at most ``limit`` tokens, and of at most ``image_limit``
+    images where one is given, that cover ``sizes`` in order, every group within both:
+    filling each chunk as far as it goes is optimal (a shorter piece of a chunk that fits
+    fits too)."""
+    images = images or [0] * len(sizes)
+    count, used, pictured = 0, 0, 0
+    for size, pictures in zip(sizes, images):
+        if count == 0 or used + size > limit or (image_limit is not None and pictured + pictures > image_limit):
+            count, used, pictured = count + 1, size, pictures
         else:
             used += size
+            pictured += pictures
     return count
 
 
@@ -310,7 +316,8 @@ def _smallest_for(limit: int) -> int:
 
 
 def _split_run(sizes: List[int], limit: int, bound: Optional[int] = None,
-               alone: Optional[List[tuple]] = None) -> List[int]:
+               alone: Optional[List[tuple]] = None, images: Optional[List[int]] = None,
+               image_limit: Optional[int] = None) -> List[int]:
     """The equal split of one run of groups, each at most ``limit`` (#31): n chunks,
     n = ceil(W / limit) for the run's weight W, or more where the groups cannot be
     packed into that many without a chunk above ``limit``; each cut at the group
@@ -329,8 +336,15 @@ def _split_run(sizes: List[int], limit: int, bound: Optional[int] = None,
     stands alone, below c/4, and is named in ``alone`` as (first group, end group,
     weight): the caller records it. The equal cut always finds a boundary: n is at
     least the fewest chunks that cover the run, and every group of a run is at most
-    ``limit``."""
-    cuts = _equal_cuts(sizes, limit)
+    ``limit``.
+
+    ``images`` (per group) and ``image_limit`` (``wire_image_limit``) bound each chunk's
+    images the same way (the orchestrator's ruling on the Codex review of 6f4a351): n is
+    at least ceil(images / image_limit) and the fewest chunks within both bounds, every
+    cut keeps its chunk within both, and no merge makes a chunk above ``image_limit``.
+    Every group of a run is within ``image_limit``."""
+    images = images or [0] * len(sizes)
+    cuts = _equal_cuts(sizes, limit, images, image_limit)
     if not cuts:
         return cuts
     smallest = _smallest_for(limit)
@@ -338,13 +352,16 @@ def _split_run(sizes: List[int], limit: int, bound: Optional[int] = None,
     standing: set = set()   # the first group of each part that stands alone
     while len(starts) > 2:
         weights = [sum(sizes[a:b]) for a, b in zip(starts, starts[1:])]
+        pictures = [sum(images[a:b]) for a, b in zip(starts, starts[1:])]
         small = next((i for i, weight in enumerate(weights) if weight < smallest and starts[i] not in standing),
                      None)
         if small is None:
             break
         sides = sorted((side for side in (small - 1, small + 1) if 0 <= side < len(weights)),
                        key=lambda side: (weights[side], 0 if side > small else 1))
-        fitting = [side for side in sides if bound is None or weights[side] + weights[small] <= bound]
+        fitting = [side for side in sides
+                   if (bound is None or weights[side] + weights[small] <= bound)
+                   and (image_limit is None or pictures[side] + pictures[small] <= image_limit)]
         if not fitting:
             standing.add(starts[small])
             continue
@@ -357,15 +374,21 @@ def _split_run(sizes: List[int], limit: int, bound: Optional[int] = None,
     return starts[1:-1]
 
 
-def _equal_cuts(sizes: List[int], limit: int) -> List[int]:
-    total = sum(sizes)
-    if total <= limit:
+def _equal_cuts(sizes: List[int], limit: int, images: Optional[List[int]] = None,
+                image_limit: Optional[int] = None) -> List[int]:
+    images = images or [0] * len(sizes)
+    total, pictured = sum(sizes), sum(images)
+    within_images = image_limit is None or pictured <= image_limit
+    if total <= limit and within_images:
         return []
-    n = max(-(-total // limit), _fewest_chunks(sizes, limit))
-    prefix = [0]
-    for size in sizes:
+    n = max(-(-total // limit), _fewest_chunks(sizes, limit, images, image_limit))
+    if image_limit is not None:
+        n = max(n, -(-pictured // image_limit))
+    prefix, image_prefix = [0], [0]
+    for size, count in zip(sizes, images):
         prefix.append(prefix[-1] + size)
-    fewest_from = [_fewest_chunks(sizes[j:], limit) for j in range(len(sizes))]
+        image_prefix.append(image_prefix[-1] + count)
+    fewest_from = [_fewest_chunks(sizes[j:], limit, images[j:], image_limit) for j in range(len(sizes))]
     cuts: List[int] = []
     previous = 0
     for k in range(1, n):
@@ -373,6 +396,8 @@ def _equal_cuts(sizes: List[int], limit: int) -> List[int]:
         best, best_distance = None, None
         for j in range(previous + 1, len(sizes)):
             if prefix[j] - prefix[previous] > limit:
+                break
+            if image_limit is not None and image_prefix[j] - image_prefix[previous] > image_limit:
                 break
             if fewest_from[j] > n - k:
                 continue
@@ -637,6 +662,14 @@ class CompactionMixin:
                        f"{prompt.tokens}{' with the focus text' if focus_topic else ''}, over {worst}, the "
                        f"estimate's worst case (#34 D4): {bound} by the estimate")
 
+    def _image_limit(self) -> Optional[int]:
+        """The most images one chunk may carry to the summariser (``wire_image_limit``),
+        or None: none where there is no summariser route (``compress()`` aborts then)."""
+        route, _why = self._summariser_route()
+        if route is None:
+            return None
+        return wire_image_limit(self._summariser_wire(route)[1])
+
     def _smallest_run(self, focus_topic: str = "") -> int:
         """c/4 in the estimate's unit: the smallest run that stands alone (#31), the
         same value the cut uses (``_smallest_for``)."""
@@ -827,19 +860,33 @@ class CompactionMixin:
                                        if isinstance(messages[i], dict) else 0)
                 return sum(cut_size[i] for i in indices)
 
+            cut_picture: Dict[int, int] = {}
+
+            def cut_images(indices) -> int:
+                for i in indices:
+                    if i not in cut_picture:
+                        cut_picture[i] = image_count(convert(messages[i])) if isinstance(messages[i], dict) else 0
+                return sum(cut_picture[i] for i in indices)
+
             limit = self._chunk_limit(focus_topic)
+            image_limit = self._image_limit()
             owner = {i: which for which, (_chunk, positions) in enumerate(frozen) for i in positions}
 
+        def within(tokens: int, images: int) -> bool:
+            return (bound is None or tokens <= bound) and (image_limit is None or images <= image_limit)
+
         def neighbour_takes(which: int, positions: List[int], weight: int) -> Optional[str]:
-            """Whether a neighbour can take a candidate below c/4 within B, as the cut
-            would (``_cut_chunks``), and which; None where none can (the orchestrator's
-            ruling on 6736c1d: such a chunk, sent alone, stays frozen). The neighbours
-            are the groups adjacent to it outside the mechanism's layer and before the
-            floor: another candidate is taken as one chunk of its weight, a group above
-            c as an oversized chunk, any other group as part of a run, which is split
-            again and so always takes it. Without B nothing bounds a merge."""
-            if bound is None:
+            """Whether a neighbour can take a candidate below c/4 within B and the wire's
+            image limit, as the cut would (``_cut_chunks``), and which; None where none
+            can (the orchestrator's ruling on 6736c1d: such a chunk, sent alone, stays
+            frozen). The neighbours are the groups adjacent to it outside the mechanism's
+            layer and before the floor: another candidate is taken as one chunk of its
+            weight, a group above c or above the image limit as an oversized chunk, any
+            other group as part of a run, which is split again and so always takes it.
+            Without B and an image limit nothing bounds a merge."""
+            if bound is None and image_limit is None:
                 return "any neighbour (the summariser's window is not known, so no bound applies)"
+            pictured = cut_images(positions)
             before = next((i for i in range(positions[0] - 1, first - 1, -1) if i not in mechanism_set), None)
             after = next((i for i in range(positions[-1] + 1, floor) if i not in mechanism_set), None)
             for side, index in (("following", after), ("preceding", before)):
@@ -848,12 +895,12 @@ class CompactionMixin:
                 other = owner.get(index)
                 if other is not None and other != which:
                     other_weight = cut_weight(frozen[other][1])
-                    if weight + other_weight <= bound:
+                    if within(weight + other_weight, pictured + cut_images(frozen[other][1])):
                         return f"the {side} recorded chunk ({other_weight} tokens)"
                     continue
-                group_weight = cut_weight(group_of[index])
-                if group_weight > limit:
-                    if weight + group_weight <= bound:
+                group_weight, group_images = cut_weight(group_of[index]), cut_images(group_of[index])
+                if group_weight > limit or (image_limit is not None and group_images > image_limit):
+                    if within(weight + group_weight, pictured + group_images):
                         return f"the {side} oversized group ({group_weight} tokens)"
                     continue
                 return f"the {side} run"
@@ -883,6 +930,15 @@ class CompactionMixin:
                 # smaller, so it is cut again, as a chunk below c/4 is.
                 recut.append((chunk, f"it holds {weight} tokens by today's estimate, more than the summariser "
                                      f"reads ({bound}), has no summary, and its groups can be cut smaller"))
+                continue
+            if (image_limit is not None and chunk.state != "summarised"
+                    and len({tuple(group_of[i]) for i in positions}) > 1
+                    and cut_images(positions) > image_limit):
+                # Its images pass what the wire's converter keeps; its groups can be cut
+                # within it, as within B (the ruling on the Codex review of 6f4a351).
+                recut.append((chunk, f"it carries {cut_images(positions)} images, more than the {image_limit} the "
+                                     f"summariser's wire keeps in one request, has no summary, and its groups can "
+                                     f"be cut within it"))
                 continue
             claimed.update(positions)
             (kept if high < floor else held).append((chunk, positions))
@@ -1118,8 +1174,9 @@ class CompactionMixin:
         The summariser reads the chunk's records as the messages they were, whole
         (#8, ``summariser_input``). The budget is a target in the prompt text, never an
         output limit. The encrypted reasoning withheld from the input is named where it
-        happens, when the call is made (#8, "Reasoning": never brushed over): a chunk
-        whose summary is reused, or whose call another attempt already makes, sends
+        happens, when the call is admitted to its endpoint's limiter and goes out (#8,
+        "Reasoning": never brushed over): a chunk whose summary is reused, whose call
+        another attempt already makes, or whose call is abandoned before admission, sends
         nothing and logs nothing.
         """
         route = settings.route
@@ -1127,9 +1184,20 @@ class CompactionMixin:
         custom_instructions = self._config.custom_instructions
 
         def run(call: ChunkCall) -> ChunkSummary:
-            if withheld is not None:
-                logger.warning("LCM withholds from the summariser %s of chunk %s: %s", withheld["items_text"],
-                               chunk_handle, withheld["text"])
+            named = []
+
+            @contextlib.contextmanager
+            def dispatch():
+                # The withholding is named when the call is admitted (a limiter slot
+                # granted, an attempt still waiting), never for a call that is abandoned
+                # before it goes out (the Codex review of 6f4a351, P3); once per call.
+                with call.dispatch() as deadline:
+                    if withheld is not None and not named:
+                        named.append(True)
+                        logger.warning("LCM withholds from the summariser %s of chunk %s: %s",
+                                       withheld["items_text"], chunk_handle, withheld["text"])
+                    yield deadline
+
             text, level, finish_reason = summarize_chunk(
                 prepared.records,
                 prepared.budget,
@@ -1139,7 +1207,7 @@ class CompactionMixin:
                 depth=0,
                 focus_topic=focus_topic or "",
                 custom_instructions=custom_instructions,
-                path=CallPath(wait=call.wait, dispatch=call.dispatch, hold=call.limiter.hold,
+                path=CallPath(wait=call.wait, dispatch=dispatch, hold=call.limiter.hold,
                               deadline=call.deadline),
                 level_one=prepared.level_one,
             )
@@ -1340,7 +1408,8 @@ class CompactionMixin:
                     joins: Optional[List[dict]] = None, *,
                     convert: Optional[Callable[[Any], Any]] = None,
                     bound: Optional[int] = None,
-                    alone: Optional[List[dict]] = None) -> List[List[int]]:
+                    alone: Optional[List[dict]] = None,
+                    image_limit: Optional[int] = None) -> List[List[int]]:
         """The material cut in list order into chunks, only between groups: a tool
         call is never separated from its results (#31, #12). No chunk below c/4 is cut
         where a merge within B can avoid it (ruling on #61, 1): a summary of a chunk that
@@ -1353,6 +1422,12 @@ class CompactionMixin:
         model table does not know its window: no merge makes a chunk above it (the
         orchestrator's ruling on the Codex review of c2efe0e). A part or run below c/4
         that no neighbour takes within B stands alone and is named in ``alone``.
+
+        ``image_limit`` (``wire_image_limit``) bounds each chunk's images as B bounds its
+        tokens (the orchestrator's ruling on the Codex review of 6f4a351): images are
+        counted as the summariser receives each row; a group above it is a chunk of its
+        own (the check after the cut refuses it); a run is split within it; no merge or
+        join passes it.
 
         ``kept`` are the chunks of an earlier attempt the cut keeps (#33 D14), each as
         its positions, whole groups of the material, and ``summarised`` says of each
@@ -1400,6 +1475,8 @@ class CompactionMixin:
         groups = cls._groups(messages, material)
         sizes = [sum(count_message_tokens(convert(messages[index]) if convert else messages[index], estimator)
                      for index in group) for group in groups]
+        pictures = ([sum(image_count(convert(messages[index]) if convert else messages[index]) for index in group)
+                     for group in groups] if image_limit is not None else [0] * len(groups))
         kept_of: Dict[int, int] = {}   # group number -> the kept chunk it belongs to
         first_group = {group[0]: number for number, group in enumerate(groups)}
         for which, positions in enumerate(kept):
@@ -1416,7 +1493,7 @@ class CompactionMixin:
         items: List[tuple] = []
         run: List[int] = []
         for number, size in enumerate(sizes):
-            if number in kept_of or size > limit:
+            if number in kept_of or size > limit or (image_limit is not None and pictures[number] > image_limit):
                 if run:
                     items.append(("run", run))
                     run = []
@@ -1450,13 +1527,20 @@ class CompactionMixin:
         def weight(item: list) -> int:
             return sum(sizes[g] for g in item[1])
 
+        def images_of(item: list) -> int:
+            return sum(pictures[g] for g in item[1])
+
         def positions(item: list) -> List[int]:
             return [groups[item[1][0]][0], groups[item[1][-1]][-1]]
 
         def fits(at: int, side: int) -> bool:
             # A run takes the joined rows into its equal split, which bounds each part;
-            # every other neighbour becomes one chunk with the item, bounded by B.
-            return bound is None or work[side][0] == "run" or weight(work[at]) + weight(work[side]) <= bound
+            # every other neighbour becomes one chunk with the item, bounded by B and by
+            # the wire's image limit.
+            if work[side][0] == "run":
+                return True
+            return ((bound is None or weight(work[at]) + weight(work[side]) <= bound)
+                    and (image_limit is None or images_of(work[at]) + images_of(work[side]) <= image_limit))
 
         def target_for(at: int) -> Optional[int]:
             """Where a tiny item at ``at`` joins: an oversized neighbour, the following
@@ -1529,9 +1613,14 @@ class CompactionMixin:
         for kind, members, _summary in work:
             if kind == "raw":
                 continue
-            if kind == "run":
+            # A run below c/4 left alone is still split where its images pass the limit.
+            split_alone = (kind == "alone" and image_limit is not None
+                           and sum(pictures[g] for g in members) > image_limit
+                           and not any(g in kept_of for g in members))
+            if kind == "run" or split_alone:
                 parts: List[tuple] = []
-                starts = [0] + _split_run([sizes[g] for g in members], limit, bound, parts) + [len(members)]
+                starts = [0] + _split_run([sizes[g] for g in members], limit, bound, parts,
+                                          [pictures[g] for g in members], image_limit) + [len(members)]
                 chunk_groups = [members[a:b] for a, b in zip(starts, starts[1:])]
                 if alone is not None:
                     for a, b, tokens in parts:
@@ -1710,6 +1799,8 @@ class CompactionMixin:
             # c and B with the prompt this attempt's calls carry, its focus text included.
             limit = self._chunk_limit(focus_topic or "")
             bound = self._summariser_bound(focus_topic or "")[0]
+            # The images one chunk may carry before the wire's converter drops some unseen.
+            image_limit = self._image_limit()
         except Exception as exc:
             return self._sizing_failed(attempt, messages, "sizing the chunks", exc)
         chunks: List[List[int]] = []
@@ -1721,7 +1812,8 @@ class CompactionMixin:
                 chunks = self._cut_chunks(messages, material, limit, cut_estimator,
                                           kept=[positions for _chunk, positions in plan.kept],
                                           summarised=[chunk.state == "summarised" for chunk, _p in plan.kept],
-                                          joins=joins, convert=convert, bound=bound, alone=alone)
+                                          joins=joins, convert=convert, bound=bound, alone=alone,
+                                          image_limit=image_limit)
             except ToolPairingError as exc:
                 self._record_event(attempt, "tool_pairing_error", str(exc))
                 return self._abort(messages, f"the material cannot be cut: {exc}")
@@ -1879,6 +1971,35 @@ class CompactionMixin:
         # like: the estimate's characters / 4 by the worst case observed, never the median,
         # images by the summariser's rule. A kept chunk that has its summary is not sent,
         # so it is not checked.
+        # A chunk carrying more images than the summariser wire's converter keeps would
+        # lose the rest unseen (#8; the orchestrator's ruling on the Codex review of
+        # 6f4a351). The cut keeps divisible material within the limit, so this refuses
+        # only a group that cannot be divided, or a chunk an earlier attempt cut: never
+        # with placeholders in their place, since a loss is a failure (see the PR).
+        if image_limit is not None:
+            for number, chunk in enumerate(chunks, start=1):
+                if kept_state.get(tuple(chunk)) == "summarised":
+                    continue
+                carried = sum(image_count(summariser_message(raw, record, prepared[number].wire))
+                              for record, raw in prepared[number].records)
+                if carried > image_limit:
+                    groups = len(self._groups(messages, chunk))
+                    what = (f"a chunk an earlier attempt cut ({groups} group{'' if groups == 1 else 's'})"
+                            if tuple(chunk) in kept_state else
+                            "one group that cannot be divided (a message, or a tool call with its results)"
+                            if groups == 1 else
+                            f"{groups} groups this attempt cut within the image limit (a defect: the cut and this "
+                            f"check disagree)")
+                    self._rollback_planning(attempt, RuntimeError("chunk over the wire's image limit"))
+                    self._record_event(attempt, "chunk_over_image_limit",
+                                       {"chunk": number, "groups": groups, "images": carried, "limit": image_limit})
+                    return self._abort(
+                        messages,
+                        f"chunk {number} of {len(chunks)}, {what}, carries {carried} images, more than the "
+                        f"{image_limit} the host's converter for the summariser {route.describe()} keeps in one "
+                        f"request (agent/image_eviction_policy.py OUTBOUND_IMAGE_LIMIT): the rest would be removed "
+                        f"unseen (#8)",
+                    )
         model_facts = prepared[1].facts if prepared else None
         if model_facts is not None and model_facts.context_window:
             room = model_facts.context_window - (model_facts.output_cap or 0)

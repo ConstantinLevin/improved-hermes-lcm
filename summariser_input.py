@@ -253,6 +253,36 @@ def _image_count(message: dict) -> int:
     return count
 
 
+def image_count(message: dict) -> int:
+    """The images one message as the summariser receives it carries (placeholders are
+    text and do not count)."""
+    return _image_count(message)
+
+
+def wire_image_limit(facts: WireFacts) -> Optional[int]:
+    """The most images one summariser request may carry before the host's converter for
+    the summariser's wire retires some of them unseen, or None where none does.
+
+    Retiring is a loss (#8: the summariser never sees those images; the orchestrator's
+    ruling on the Codex review of 6f4a351), so the cut keeps every chunk within this
+    limit, as it keeps it within B. Read at Hermes origin/main d0288be5b3:
+    - the Anthropic Messages converter (``_evict_old_screenshots``,
+      agent/anthropic_message_convert.py:605) retires tool-result images once a request
+      carries more than ``OUTBOUND_IMAGE_LIMIT`` (20, agent/image_eviction_policy.py),
+      every image counted, uploads included; it runs on the auxiliary path too;
+    - the Chat Completions and Responses paths of ``call_llm`` retire none:
+      ``evict_stale_outbound_tool_images`` runs only on the main agent's send path
+      (agent/chat_completion_helpers.py:2247, agent/turn_request_assembly.py:153);
+    - where the summariser is sent no images (it does not read them, or that is not
+      known), there is nothing to retire.
+    Raises where the host's limit cannot be read."""
+    if not (facts.reads_images and facts.anthropic_converter):
+        return None
+    from agent.image_eviction_policy import OUTBOUND_IMAGE_LIMIT  # type: ignore
+
+    return int(OUTBOUND_IMAGE_LIMIT)
+
+
 def _evict_as_the_host_would(messages: list[dict], records: list[str]) -> None:
     """The host's Anthropic converter retires the images of the oldest image-bearing tool
     results once a request crosses its limit, counting every image, user uploads
