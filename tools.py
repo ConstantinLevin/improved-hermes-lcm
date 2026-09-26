@@ -1129,7 +1129,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> Any:
     if unknown:
         return json.dumps({"error": "lcm_expand takes handle, raw and page; not " + ", ".join(unknown)})
     try:
-        return expansion.expand(engine, args)
+        return expansion.expand(engine, args, messages=kwargs.get("messages"))
     except expansion.ExpansionError as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
     except Exception as exc:

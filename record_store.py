@@ -106,11 +106,14 @@ class Resolved:
     """What a handle names for a caller (#29 W5). ``status``: "ok"; "malformed" (not a
     handle); "unknown" (not in this store); "other_session"; "inactive" (this session's,
     but not on its active record: a reverted branch, an attempt that never took effect,
-    or a session with no effective compaction yet)."""
+    or a session with no effective compaction yet); "summary_revision" (a message handle
+    naming the host's rewrite of a summary row the plugin returned, a revision beside the
+    chain, #15: the summary is expanded, not the row; ``of`` names it)."""
 
     status: str
     kind: str
     handle: str
+    of: str = ""
 
 
 def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
@@ -733,6 +736,10 @@ class RecordStore:
         else:
             record = text if kind == MESSAGE else str(rows[0][1])
             active = self._record_active(record, cover)
+            if not active and kind == MESSAGE:
+                revised = self._q("SELECT derivation FROM summary_revisions WHERE revision = ? LIMIT 1", (text,))
+                if revised:
+                    return Resolved("summary_revision", kind, text, of=str(revised[0][0]))
         return Resolved("ok" if active else "inactive", kind, text)
 
     def _record_active(self, record: str, cover: "Cover") -> bool:

@@ -1035,7 +1035,9 @@ class LCMEngine(
         if handler:
             # The final string (or the _multimodal envelope, as it is): what a page was
             # measured as (``results.final_result``, #18).
-            return final_result(handler(args, engine=self))
+            # The live list goes with the call: a page's size depends on the tool calls of
+            # the message being answered (``expansion.host_page_limit``).
+            return final_result(handler(args, engine=self, messages=messages))
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
 
     def _database_path_source(self) -> str:

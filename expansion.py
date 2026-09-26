@@ -44,7 +44,7 @@ from typing import Any, Callable, Optional
 
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL
 from .message_content import image_media_type, is_image_part
-from .record_store import Cover, RecordStore, Resolved
+from .record_store import HANDLE_RE, Cover, RecordStore, Resolved
 from .results import final_result
 # Readable reasoning is what the summariser reads as readable, one rule (#8, #18).
 from .summariser_input import _readable_reasoning as readable_reasoning
@@ -61,6 +61,9 @@ _UNRESOLVED = {
                       "this session cannot reach another's past."),
     "inactive": ("{handle} is this session's, but not on its active record: it lies on a branch an undo or retry "
                  "left behind, or in a compaction that never took effect."),
+    "summary_revision": ("{handle} is the host's rewrite of summary {of} in your context (the row the plugin "
+                         "returned, as the host changed it, for example with its task list folded in). Expand {of} "
+                         "to read behind the summary."),
 }
 
 
@@ -70,29 +73,96 @@ class ExpansionError(Exception):
 
 
 def unresolved_message(resolved: Resolved) -> str:
-    return _UNRESOLVED[resolved.status].format(handle=resolved.handle)
+    return _UNRESOLVED[resolved.status].format(handle=resolved.handle, of=resolved.of)
 
 
 # --- The page limit -------------------------------------------------------------------------
 
-def host_page_limit(engine: Any, tool_name: str) -> int:
-    """The host's spill threshold for this tool's result, in characters: what the host
-    computes for it (``_budget_for_agent(agent).resolve_threshold(name)``,
-    agent/tool_executor.py:112-125 and 1100-1112 at Hermes d0288be5b3), from the window
-    the host reads there, ``agent.context_compressor.context_length``, which is this
-    engine's. Where the host cannot be read, the page has no known limit and the call is
-    refused (unknown is never unlimited). A threshold the host holds infinite (a pinned
-    tool) is not one of this plugin's tools; it is refused as well."""
+def calls_in_current_message(messages: Any) -> Optional[int]:
+    """How many tool calls the assistant message now being answered holds: the last
+    assistant message with tool calls in the live list the host hands the engine tool
+    (``handle_tool_call(..., messages=messages)``, agent/tool_executor.py:1655; the host
+    appends that message before running its calls and each result after it). None where
+    the list holds none."""
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            calls = message.get("tool_calls")
+            return len(calls) if isinstance(calls, list) and calls else None
+    return None
+
+
+def host_guardrail_margin(tool_name: str) -> int:
+    """The most text the host can append to this tool's result before it compares the
+    result with its spill threshold, from the host's own templates: its
+    ``_append_guardrail_observation`` (run_agent.py:1287-1312 at Hermes d0288be5b3), run by
+    ``_commit_tool_result`` before the spill (agent/tool_executor.py:1075-1112), appends up
+    to two guidance lines (``append_toolguard_guidance``, agent/tool_guardrails.py:567-572:
+    the after-call decision and the identical-streak or cycle halt) and one stall notice
+    (``_IDENTICAL_CALL_NOTICE`` or ``_IDENTICAL_CYCLE_NOTICE``, 284-296, joined by two
+    newlines). Each is measured at its longest: every decision message of
+    ``_DECISION_MESSAGES`` and the failure hint, formatted with this tool's name and counts
+    of seven digits (a count is per turn; the digits are this plugin's bound, named).
+    Where the host's templates cannot be read, no margin is known and the call is
+    refused."""
+    try:
+        from agent import tool_guardrails as guard  # type: ignore
+        big = 10 ** 6
+        fields = {"tool_name": tool_name, "count": big, "period": big, "cap": big}
+        messages = [text.format(**fields) for text in guard._DECISION_MESSAGES.values()]
+        messages.append(guard._tool_failure_recovery_hint(tool_name, big))
+        codes = list(guard._DECISION_MESSAGES) + ["same_tool_failure_warning"]
+        guidance = max(
+            len(guard.append_toolguard_guidance("", guard.ToolGuardrailDecision(
+                "halt", code, message, tool_name, big, None)))
+            for code in codes for message in messages)
+        notice = max(len(guard._IDENTICAL_CALL_NOTICE.format(ordinal=guard._ordinal(big), tool_name=tool_name)),
+                     len(guard._IDENTICAL_CYCLE_NOTICE.format(count=big, period=big, tool_name=tool_name)))
+    except Exception as exc:
+        raise ExpansionError(f"the host's guardrail texts cannot be read ({type(exc).__name__}: {exc}), so the "
+                             f"room they take beside a page is not known") from None
+    return 2 * guidance + len("\n\n") + notice
+
+
+def host_page_limit(engine: Any, tool_name: str, messages: Any) -> int:
+    """The most characters a page may hold so that the host keeps it inline, from host
+    values only (orchestrator ruling on the pre-review of 97a8483, finding 1):
+
+    - the host's threshold for one result, ``_budget_for_agent(agent).resolve_threshold(name)``
+      (agent/tool_executor.py:112-125, 1100-1112 at Hermes d0288be5b3), from the window
+      the host reads there, ``agent.context_compressor.context_length``, this engine's;
+    - the host's budget for one assistant message's results, ``turn_budget``, which
+      ``enforce_turn_budget`` applies to the last ``len(tool_calls)`` results of the batch
+      (tool_executor.py:1183-1187, 1818-1819, 1902-1904; tools/tool_result_storage.py:283-312),
+      divided by the calls of the message being answered;
+    - less the host's guardrail texts (``host_guardrail_margin``).
+
+    The host computes the budget once per batch and turns an error of it into its default
+    budget; this reads it with the host's own function when the page is built. A batch
+    whose other tools return more than their share can still push a page out: that is the
+    host's aggregate (#24), named. Where any of it cannot be read, the call is refused."""
     try:
         from agent.tool_executor import _budget_for_agent  # type: ignore
-        threshold = _budget_for_agent(SimpleNamespace(context_compressor=engine)).resolve_threshold(tool_name)
+        budget = _budget_for_agent(SimpleNamespace(context_compressor=engine))
+        threshold = budget.resolve_threshold(tool_name)
+        turn_budget = budget.turn_budget
     except Exception as exc:
         raise ExpansionError(f"the host's spill threshold for {tool_name} cannot be read "
                              f"({type(exc).__name__}: {exc}), so no page size is known") from None
-    if not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold <= 0:
-        raise ExpansionError(f"the host's spill threshold for {tool_name} is {threshold!r}, not a size a page "
-                             f"can be measured against")
-    return int(threshold)
+    for name, value in (("threshold", threshold), ("turn budget", turn_budget)):
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ExpansionError(f"the host's {name} for {tool_name} is {value!r}, not a size a page can be "
+                                 f"measured against")
+    calls = calls_in_current_message(messages)
+    if calls is None:
+        raise ExpansionError("the host handed no message list with the tool calls being answered, so the "
+                             "share of the host's per-message budget a page may take is not known")
+    limit = min(int(threshold), int(turn_budget) // calls) - host_guardrail_margin(tool_name)
+    if limit <= 0:
+        raise ExpansionError(f"{calls} tool calls in one message leave a page no room within the host's budget of "
+                             f"{int(turn_budget)} characters for the message; call {tool_name} in fewer at once")
+    return limit
 
 
 # --- Tokens ---------------------------------------------------------------------------------
@@ -112,7 +182,28 @@ def decode_token(token: Any) -> dict:
         raise ExpansionError("page is not a next_page token of these tools") from None
     if not isinstance(state, dict) or state.get("v") != TOKEN_VERSION:
         raise ExpansionError("page is not a next_page token of these tools")
+    # Every field, by type and range: a garbled token is refused with what is wrong in it.
+    checks = (
+        ("t", lambda v: isinstance(v, str) and bool(v), "a tool name"),
+        ("s", lambda v: isinstance(v, str) and bool(v), "a store's uuid"),
+        ("h", lambda v: isinstance(v, str) and HANDLE_RE.fullmatch(v) is not None, "a handle"),
+        ("m", lambda v: v in ("raw", "collapsed"), "raw or collapsed"),
+        ("i", lambda v: _plain_int(v) and v >= 0, "an item number of 0 or more"),
+        ("f", lambda v: _plain_int(v) and v >= -1, "a field number of -1 or more"),
+        ("o", lambda v: _plain_int(v) and v >= 0, "a character offset of 0 or more"),
+        ("n", lambda v: _plain_int(v) and v >= 1, "a page number of 1 or more"),
+    )
+    for key, valid, what in checks:
+        if key not in state or not valid(state[key]):
+            raise ExpansionError(f"page is a garbled next_page token: its field {key!r} is "
+                                 f"{state.get(key)!r}, not {what}")
+    if state["f"] == -1 and state["o"] != 0:
+        raise ExpansionError("page is a garbled next_page token: an offset inside a whole item")
     return state
+
+
+def _plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True)
@@ -204,6 +295,21 @@ def _records_items(store: RecordStore, records: list[tuple[str, dict]], *, raw: 
                 items.append(_result_item(handle, message, call, inline=False))
             continue
         items.append(_message_item(handle, message, calls.get(handle, {}), by_record_call_id.get(handle, {})))
+    if raw:
+        # Raw puts every result inline; a call whose result is not in this stretch says
+        # where it is, or that none is recorded, as a tool call's own expansion does.
+        inline = {h for h, r in records if r.get("role") == "tool"}
+        for item in items:
+            for entry in item.get("tool_calls") or ():
+                if not entry.get("handle"):
+                    continue
+                found = store.tool_call(entry["handle"])
+                result = found[2] if found else None
+                if result is None:
+                    entry["result"] = None
+                    entry["note"] = "no result of this call is recorded in the store"
+                elif result not in inline:
+                    entry["result_in"] = result
     return items
 
 
@@ -499,8 +605,10 @@ class PageBuilder:
         return best
 
 
-def expand(engine: Any, args: dict, *, tool_name: str = "lcm_expand") -> Any:
-    """The ``lcm_expand`` tool: one page of what a handle opens into."""
+def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "lcm_expand") -> Any:
+    """The ``lcm_expand`` tool: one page of what a handle opens into. ``messages`` is the
+    live list the host hands the engine tool; the page's size depends on it
+    (``host_page_limit``)."""
     session = engine.current_session_id          # the caller's session, read once (#20)
     if not session:
         raise ExpansionError("this engine copy is bound to no session of the plugin, so no handle resolves")
@@ -515,13 +623,17 @@ def expand(engine: Any, args: dict, *, tool_name: str = "lcm_expand") -> Any:
             raise ExpansionError("page is a token of another tool")
         if handle is not None and str(handle).strip() != state.get("h"):
             raise ExpansionError(f"page is a token of {state.get('h')}, not of {handle}")
-        if "raw" in args and bool(raw) != (state.get("m") == "raw"):
-            raise ExpansionError(f"page is a token of the {state.get('m')} form; call it without raw, or as it was")
-        handle = state.get("h")
-        raw = state.get("m") == "raw"
+        # The token decides the form. raw=false is the schema's default, sent by some
+        # callers with every call; only raw=true beside a collapsed token asks for another
+        # form than the token's (finding 5 of the pre-review of 97a8483).
+        if raw is True and state["m"] != "raw":
+            raise ExpansionError("page is a token of the collapsed form; raw=true starts a raw expansion without "
+                                 "page, from its first page")
+        handle = state["h"]
+        raw = state["m"] == "raw"
     if handle is None:
         raise ExpansionError("handle is required: the handle of a summary, chunk, tool call or message")
-    limit = host_page_limit(engine, tool_name)
+    limit = host_page_limit(engine, tool_name, messages)
     records: RecordStore = engine._records
     with records.snapshot():
         store_uuid = records.identity().get("store_uuid")
@@ -534,10 +646,19 @@ def expand(engine: Any, args: dict, *, tool_name: str = "lcm_expand") -> Any:
         target = target_for(records, cover, resolved, raw=bool(raw))
     token_state = {"v": TOKEN_VERSION, "t": tool_name, "s": store_uuid, "h": resolved.handle,
                    "m": "raw" if raw else "collapsed"}
-    cursor = Cursor(int(state.get("i", 0)), int(state.get("f", -1)), int(state.get("o", 0))) if state else Cursor()
-    page = int(state.get("n", 1)) if state else 1
-    if cursor.item > len(target.items) or cursor.item < 0:
-        raise ExpansionError("page points past the end of what this handle opens into")
+    cursor = Cursor(state["i"], state["f"], state["o"]) if state else Cursor()
+    page = state["n"] if state else 1
+    if cursor.item >= len(target.items) and not (cursor.item == 0 and not target.items):
+        raise ExpansionError("page is a garbled next_page token: it points past the end of what this handle "
+                             "opens into")
+    if cursor.field >= 0:
+        fields = fields_of(target.items[cursor.item])
+        if cursor.field >= len(fields):
+            raise ExpansionError("page is a garbled next_page token: it names a field this item does not have")
+        value = fields[cursor.field][1]
+        length = len(value) if isinstance(value, str) else len(json.dumps(value, ensure_ascii=False))
+        if cursor.offset > length or (cursor.offset and isinstance(value, dict) and is_image_part(value)):
+            raise ExpansionError("page is a garbled next_page token: its offset lies outside the field it names")
     estimator = engine._estimator()
     builder = PageBuilder(target, limit=limit, token_state=token_state, image_tokens=estimator.image)
     result, _next = builder.build(cursor, page)
