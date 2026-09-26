@@ -217,11 +217,35 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
     the model). From its result, as ``_prepare_aux_request`` records it (7343-7345): the
     label ``_fallback_provider_from_label(effective_provider or resolved_provider)``, the
     final model; and the client's ``base_url`` and class (``_client_wire``). Returns
-    (None, why) where the host cannot resolve it (no credentials, no provider)."""
+    (None, why) where the host cannot resolve it (no credentials, no provider).
+
+    A fallback never becomes the target (the orchestrator's ruling on the Codex review of
+    903281e): the final resolution must land on the session route's own provider and
+    model, the host's main-route target (``_normalize_main_runtime``, 3080, and
+    ``_main_route_target``, 4534: the provider as ``update_model`` named it, lower-cased,
+    a MoA preset's aggregator; a ``custom:<name>`` without a config entry and with a base
+    URL labelled ``custom``, 4583-4587) and its model or the host's normalisation of it
+    for the provider (``_normalize_resolved_model``). Where the host would take another
+    provider or model (its main provider unhealthy, a fallback configured), the route is
+    refused: "the session route is not available; the host would fall back to …"."""
     try:
-        from agent.auxiliary_client import _fallback_provider_from_label, _resolve_call_client  # type: ignore
+        from agent.auxiliary_client import (  # type: ignore
+            _fallback_provider_from_label, _main_route_target, _normalize_main_runtime, _resolve_call_client)
     except Exception as exc:
         return None, f"the host's client resolution cannot be read ({type(exc).__name__}: {exc})"
+    try:
+        main_provider, main_model, main_base_url, _key, _mode = _main_route_target(
+            _normalize_main_runtime(route.main_runtime()), None)
+    except Exception as exc:
+        return None, f"the host's main-route target cannot be read ({type(exc).__name__}: {exc})"
+    own_label, own_model = str(main_provider or "").strip().lower(), str(main_model or "").strip()
+    if own_label.startswith("custom:") and main_base_url:
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
+            if _get_named_custom_provider(own_label) is None:
+                own_label = "custom"
+        except Exception as exc:
+            return None, f"the host's custom-provider entries cannot be read ({type(exc).__name__}: {exc})"
     try:
         resolved = _resolve_call_client(
             None, provider=None, model=None, base_url=None, api_key=None, resolved_provider="auto",
@@ -235,6 +259,9 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
     if not label or label == "auto" or not model:
         return None, (f"the host's client resolution names no provider and model for the session's route "
                       f"({label or '?'}/{model or '?'})")
+    if label != own_label or model not in _host_model_forms(own_model, label):
+        return None, (f"the session route is not available; the host would fall back to {label}/{model} (the "
+                      f"session's route is {own_label}/{own_model})")
     return (label, model, str(getattr(client, "base_url", "") or ""), _client_wire(client),
             type(client).__name__), ""
 
@@ -561,6 +588,7 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         call_kwargs["timeout"] = timeout
     response = call_llm(**call_kwargs)
     check_route_records(route, route_info.routes)
+    check_response_model(route, response)
     try:
         choice = response.choices[0]
         message = choice.message
@@ -582,6 +610,30 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
                              detail=f"content is {type(content).__name__}, finish_reason {finish_reason!r}")
     return content, str(finish_reason)
+
+
+def check_response_model(route: SummariserRoute, response: Any) -> None:
+    """The model the response reports against the target's model forms (the orchestrator's
+    ruling on the Codex review of 903281e): the host's credential rung can retry through
+    another provider and model without a ``route_info`` record
+    (``_ladder_credential_rungs``, agent/auxiliary_client.py:7576-7633 →
+    ``_prepare_same_provider_retry``, 3738, at origin/main d0288be5b3), so the response's
+    own ``model`` field is read too, and a model not among the target's (as asked for, or
+    either side normalised by the host's ``_normalize_resolved_model`` for the target's
+    provider) is a failed call of kind ``route``. A response without a model field adds
+    nothing here; ``route_info`` stands alone then. What stays unobservable: a switch that
+    leaves no record and keeps the same model id (a host defect, filed)."""
+    reported = str(getattr(response, "model", "") or "").strip()
+    target = _session_route_target(route)
+    if not reported or target is None:
+        return
+    forms = _session_route_model_forms(route, target[0])
+    if reported in forms or (_host_model_forms(reported, target[0]) & forms):
+        return
+    raise SummaryFailure(
+        "the response reports another model", transient=False, kind="route",
+        detail=f"the response's model is {reported!r}; the summariser is {route.describe()} (#33 D9)",
+    )
 
 
 def check_route_records(route: SummariserRoute, routes: list[tuple[str, str]]) -> None:
