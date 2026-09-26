@@ -108,7 +108,9 @@ class Resolved:
     but not on its active record: a reverted branch, an attempt that never took effect,
     or a session with no effective compaction yet); "summary_revision" (a message handle
     naming the host's rewrite of a summary row the plugin returned, a revision beside the
-    chain, #15: the summary is expanded, not the row; ``of`` names it)."""
+    chain, #15: the summary is expanded, not the row; ``of`` names it); "dropped_call" (a
+    tool call whose message stands on the active record in a rewrite that no longer shows it;
+    ``of`` names the rewrite)."""
 
     status: str
     kind: str
@@ -741,6 +743,12 @@ class RecordStore:
                 # the call is active where an active revision of its record carries it
                 # (finding 4 of the Codex review of 3a4e019).
                 active = self.active_holder(text, cover) is not None
+                if not active:
+                    # Its message is on the active record in a rewritten form that no longer
+                    # shows this call (Codex review of ca0969d, finding 1): said as such.
+                    rewritten = self.active_form(record, cover)
+                    if rewritten is not None:
+                        return Resolved("dropped_call", kind, text, of=rewritten)
             if not active and kind == MESSAGE:
                 revised = self._q("SELECT derivation FROM summary_revisions WHERE revision = ? LIMIT 1", (text,))
                 if revised:
@@ -828,17 +836,33 @@ class RecordStore:
                 return candidate
         return None
 
-    def inherited_call_handles(self, record: str) -> dict[str, str]:
-        """tool_call_id -> the call handle a revision shows for it: the handle its nearest
-        ancestor holds for that id, at any depth (a revision keeps its sources' calls and
-        writes no new handle for them, ``begin_compaction``)."""
-        found: dict[str, str] = {}
-        for ancestor in self.revision_lineage(record, upward=True):
-            for call_id, handle in self._q(
-                    "SELECT tool_call_id, handle FROM tool_calls WHERE tool_call_id IS NOT NULL AND record = ? "
-                    "ORDER BY position", (ancestor,)):
-                found.setdefault(str(call_id), str(handle))
-        return found
+    def shown_call_handles(self, record: str, _memo: Optional[dict] = None) -> dict[str, str]:
+        """tool_call_id -> the handle of each call a record shows (Codex review of
+        ca0969d, finding 1): the calls written for the record itself, and, for a revision,
+        each call its ``tool_calls`` still carry that an immediate source shows, carried step
+        by step. A call is inherited only while every consecutive revision carries it: once a
+        revision drops it, a later reuse of the host's id is a new call with a new handle
+        (#29 W5: a handle never leads to other content)."""
+        memo = _memo if _memo is not None else {}
+        if record in memo:
+            return memo[record]
+        memo[record] = {}                       # a guard against a cycle in the sources
+        shown: dict[str, str] = {
+            str(call_id): str(handle) for call_id, handle in self._q(
+                "SELECT tool_call_id, handle FROM tool_calls WHERE record = ? AND tool_call_id IS NOT NULL "
+                "ORDER BY position", (record,))}
+        if self.record_kind(record) == "revision":
+            raw = self.record_raw(record) or {}
+            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+            carried = [str(c.get("id")) for c in calls if isinstance(c, dict) and c.get("id")]
+            for (source,) in self._q("SELECT source_record FROM revision_sources WHERE revision = ? "
+                                     "AND source_record IS NOT NULL ORDER BY ordinal", (record,)):
+                inherited = self.shown_call_handles(str(source), memo)
+                for call_id in carried:
+                    if call_id not in shown and call_id in inherited:
+                        shown[call_id] = inherited[call_id]
+        memo[record] = shown
+        return shown
 
     def record_kind(self, record: str) -> Optional[str]:
         rows = self._q("SELECT kind FROM records WHERE handle = ?", (record,))
@@ -889,19 +913,17 @@ class RecordStore:
 
     def active_holder(self, handle: str, cover: "Cover") -> Optional[str]:
         """The active record that shows a call: the active form of its assistant record
-        (``active_form``), where that form still carries the call's id; None where none is."""
-        rows = self._q("SELECT record, tool_call_id FROM tool_calls WHERE handle = ?", (handle,))
+        (``active_form``), where that form shows this very handle (``shown_call_handles``:
+        carried through every revision, never re-attached to a reused host id); None where
+        none is."""
+        rows = self._q("SELECT record FROM tool_calls WHERE handle = ?", (handle,))
         if not rows:
             return None
-        record, call_id = str(rows[0][0]), rows[0][1]
+        record = str(rows[0][0])
         active = self.active_form(record, cover)
         if active is None or active == record:
             return active
-        raw = self.record_raw(active) or {}
-        calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
-        if call_id and any(isinstance(c, dict) and str(c.get("id") or "") == str(call_id) for c in calls):
-            return active
-        return None
+        return active if handle in self.shown_call_handles(active).values() else None
 
     def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
         """record id (the views' store_id) -> its handle."""
@@ -1280,11 +1302,12 @@ class RecordStore:
                                     "source_position) VALUES (?, ?, ?, ?)",
                                     (handle, ordinal, source[1], source[2]),
                                 )
-                        # Calls its ancestors already hold keep their handles, at any depth
-                        # of revision (``revision_lineage``, read inside this transaction,
-                        # which holds the sources just written); only the revision's new
-                        # calls are written, as for a new record.
-                        known = set(self.inherited_call_handles(handle))
+                        # A call an immediate source shows, and this revision still carries,
+                        # keeps its handle (``shown_call_handles``, read inside this
+                        # transaction, which holds the sources just written; the revision has
+                        # no calls of its own yet); every other call is written as new, a
+                        # reused host id after a gap included.
+                        known = set(self.shown_call_handles(handle))
                         written.append((handle, message, known))
                     else:
                         written.append((handle, message, set()))

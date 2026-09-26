@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -61,6 +62,9 @@ _UNRESOLVED = {
                       "this session cannot reach another's past."),
     "inactive": ("{handle} is this session's, but not on its active record: it lies on a branch an undo or retry "
                  "left behind, or in a compaction that never took effect."),
+    "dropped_call": ("{handle} is a tool call its message no longer shows: the host rewrote that message without "
+                     "it (the rewrite is {of}), so nothing stands behind this handle on the active record. A call "
+                     "the rewrite shows under the same host id is another call, with its own handle."),
     "summary_revision": ("{handle} is the host's rewrite of summary {of} in your context (the row the plugin "
                          "returned, as the host changed it, for example with its task list folded in). Expand {of} "
                          "to read behind the summary."),
@@ -198,6 +202,8 @@ def decode_token(token: Any) -> dict:
         ("f", lambda v: _plain_int(v) and v >= -1, "a field number of -1 or more"),
         ("o", lambda v: _plain_int(v) and v >= 0, "a character offset of 0 or more"),
         ("n", lambda v: _plain_int(v) and v >= 1, "a page number of 1 or more"),
+        ("r", lambda v: isinstance(v, str) and len(v) == 16 and all(c in "0123456789abcdef" for c in v),
+         "the identity of the records paging began on"),
     )
     for key, valid, what in checks:
         if key not in state or not valid(state[key]):
@@ -287,7 +293,9 @@ def _records_items(store: RecordStore, cover: Cover, records: list[tuple[str, di
     by_record_call_id: dict[str, dict[str, str]] = {}
     for handle, message in records:
         if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
-            by_call_id = store.inherited_call_handles(handle) if store.record_kind(handle) == "revision" else {}
+            # The calls this record shows, its own and those carried to it through every
+            # revision (``shown_call_handles``).
+            by_call_id = store.shown_call_handles(handle)
             by_record_call_id[handle] = by_call_id
             shown_calls.update(h for h in calls.get(handle, {}).values())
             shown_calls.update(by_call_id.values())
@@ -507,22 +515,47 @@ def canonical_image_part(part: dict) -> tuple[Optional[dict], str]:
     return {"type": "image_url", "image_url": image_url}, ""
 
 
-def _replace_images(value: Any, images: list, describe: list) -> Any:
-    if isinstance(value, dict):
-        if is_image_part(value):
-            canonical, why = canonical_image_part(value)
-            if canonical is None:
-                # Refused visibly, never dropped: the page says an image stands here and why
-                # it is not shown.
-                return {"type": "image", "not_shown": f"an image ({image_media_type(value)}) {why}; "
-                                                      f"the host's converters take no such part"}
-            images.append(canonical)
-            describe.append(image_media_type(value))
-            return {"type": "image", "image": len(images)}
-        return {key: _replace_images(item, images, describe) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_replace_images(item, images, describe) for item in value]
-    return value
+def is_content_image(path: str, value: Any) -> bool:
+    """An image is a part of a message's content (a content list, or the ``_multimodal``
+    envelope's list), never a value elsewhere: an object in a tool call's arguments with
+    ``"type": "image"`` is arguments (Codex review of ca0969d, finding 3)."""
+    return (path.startswith("content[") or path.startswith("content.content[")) and \
+        isinstance(value, dict) and is_image_part(value)
+
+
+def _image_or_mark(part: dict, images: list, describe: list) -> dict:
+    canonical, why = canonical_image_part(part)
+    if canonical is None:
+        # Refused visibly, never dropped: the page says an image stands here and why it is
+        # not shown.
+        return {"type": "image", "not_shown": f"an image ({image_media_type(part)}) {why}; "
+                                              f"the host's converters take no such part"}
+    images.append(canonical)
+    describe.append(image_media_type(part))
+    return {"type": "image", "image": len(images)}
+
+
+def _replace_images(page_items: list, images: list, describe: list) -> list:
+    """The page's items with each image part of a message's content replaced by its mark,
+    the images collected in order. Only content parts are images (``is_content_image``):
+    an item's ``content`` list, the envelope's ``content`` list, and a piece's ``value``
+    where the piece is one of those parts."""
+    def parts(content: list) -> list:
+        return [_image_or_mark(p, images, describe) if isinstance(p, dict) and is_image_part(p) else p
+                for p in content]
+
+    replaced: list = []
+    for item in page_items:
+        item = dict(item)
+        content = item.get("content")
+        if isinstance(content, list):
+            item["content"] = parts(content)
+        elif isinstance(content, dict) and isinstance(content.get("content"), list):
+            item["content"] = dict(content, content=parts(content["content"]))
+        if "value" in item and is_content_image(str(item.get("field") or ""), item["value"]):
+            item["value"] = _image_or_mark(item["value"], images, describe)
+        replaced.append(item)
+    return replaced
 
 
 @dataclass(frozen=True)
@@ -648,7 +681,7 @@ class PageBuilder:
                 i, f, o = i + 1, -1, 0
                 continue
             path, value = fields[f]
-            if isinstance(value, dict) and is_image_part(value):
+            if is_content_image(path, value):
                 piece = _piece(item, path, value=value)
                 if self.fits(page_items + [piece], page) or not page_items:
                     # An image larger than a page, or one no rule counts, stands alone.
@@ -721,6 +754,13 @@ class PageBuilder:
         return best
 
 
+def records_identity(target: Target) -> str:
+    """The identity of what a target's items stand on, in order: each item's record handle
+    (or the chunk or summary a marker names). Sixteen hex characters of its SHA-256."""
+    names = [item.get("handle") or item.get("chunk") or item.get("summary") for item in target.items]
+    return hashlib.sha256(json.dumps(names).encode("utf-8")).hexdigest()[:16]
+
+
 def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "lcm_expand") -> Any:
     """The ``lcm_expand`` tool: one page of what a handle opens into. ``messages`` is the
     live list the host hands the engine tool; the page's size depends on it
@@ -760,8 +800,15 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
         if resolved.status != "ok":
             raise ExpansionError(unresolved_message(resolved))
         target = target_for(records, cover, resolved, raw=bool(raw))
+    # The records paging began on (Codex review of ca0969d, finding 2): a token carries
+    # their identity, and a later page on other records (the active form of a message
+    # changed, a result the host rewrote since) is refused, never spliced.
+    identity = records_identity(target)
+    if state is not None and state["r"] != identity:
+        raise ExpansionError("the content changed since page 1 (the host rewrote a record it holds, or a later "
+                             "compaction replaced it); start again from the handle, without page")
     token_state = {"v": TOKEN_VERSION, "t": tool_name, "s": store_uuid, "h": resolved.handle,
-                   "m": "raw" if raw else "collapsed"}
+                   "m": "raw" if raw else "collapsed", "r": identity}
     cursor = Cursor(state["i"], state["f"], state["o"]) if state else Cursor()
     page = state["n"] if state else 1
     if cursor.item >= len(target.items) and not (cursor.item == 0 and not target.items):
@@ -776,9 +823,9 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
         elif cursor.field >= len(fields):
             raise ExpansionError("page is a garbled next_page token: it names a field this item does not have")
         else:
-            value = fields[cursor.field][1]
+            path, value = fields[cursor.field]
             length = len(value) if isinstance(value, str) else len(json.dumps(value, ensure_ascii=False))
-            if cursor.offset > length or (cursor.offset and isinstance(value, dict) and is_image_part(value)):
+            if cursor.offset > length or (cursor.offset and is_content_image(path, value)):
                 raise ExpansionError("page is a garbled next_page token: its offset lies outside the field it "
                                      "names")
     estimator = engine._estimator()
