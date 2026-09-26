@@ -82,7 +82,7 @@ def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> "_Instructi
     return instruction
 
 
-def _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload) -> None:
+def _check_instruction_delivered(instruction, engine, resolve_active_lcm_engine, payload) -> None:
     """The request's system prompt carries the plugin's section, for a session an LCM
     engine serves; checked once per distinct prompt (#16). Never raises into the host.
 
@@ -90,19 +90,30 @@ def _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload
     so nothing in it waits on the store: the registry lookup holds the registry's lock
     for a dictionary read, the check holds its own lock for a set lookup, and the event
     is handed to ``RecordStore.event_deferred``, which queues it and writes it on a
-    thread of its own."""
-    from .guidance import check_delivery
+    thread of its own. The host hands the hook no agent and no engine, only the session
+    id; where no LCM copy is bound to it while the host's context engine is ``lcm``, that
+    fact is recorded (in the store of this load's engine), never passed over."""
+    from .guidance import check_delivery, note_unbound_session
 
     session_id = str(payload.get("session_id") or "")
     active = resolve_active_lcm_engine(session_id=session_id) if session_id else None
     if active is None or getattr(active, "name", None) != "lcm":
-        return
+        target = engine
+    else:
+        target = active
 
     def _record(kind, detail):
         try:
-            active._records.event_deferred(kind, detail=detail)
+            target._records.event_deferred(kind, detail=detail)
         except Exception:
             logger.error("LCM could not hand over the store event %s: %s", kind, detail, exc_info=True)
+
+    if target is engine:
+        try:
+            note_unbound_session(session_id, _record)
+        except Exception:
+            logger.warning("LCM could not note that it cannot check its instruction", exc_info=True)
+        return
 
     try:
         check_delivery(active, payload.get("system_prompt"), payload.get("request_messages"),
@@ -110,6 +121,29 @@ def _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload
                        refused=instruction.refused, record=_record)
     except Exception:
         logger.warning("LCM could not check that its instruction reached the agent", exc_info=True)
+
+
+def _note_unload() -> None:
+    """The host unloads the plugin (``unload()``, or the first half of a forced reload):
+    its section and its delivery check are unregistered, while the engine copies of the
+    agents already running stay bound. For each such copy, a WARNING and an event record
+    that until the plugin is loaded again, a rebuild of that session's prompt carries no
+    section and no request of it is checked (#16). A reload that follows registers both
+    again, and the copies stay bound in the registry that outlives it."""
+    from .engine_registry import bound_engines
+
+    fact = ("the host unloaded the plugin: its system-prompt section and its delivery check are unregistered "
+            "until the plugin is loaded again; a prompt rebuilt meanwhile carries no section, and no request "
+            "is checked")
+    for bound in bound_engines():
+        host_session_id = str(getattr(bound, "_session_id", "") or "")
+        logger.warning("LCM: %s (host session %s)", fact, host_session_id)
+        try:
+            bound._records.event_deferred("instruction_not_delivered",
+                                          detail={"host_session_id": host_session_id, "fact": fact})
+        except Exception:
+            logger.error("LCM could not hand over the store event for the unload of host session %s",
+                         host_session_id, exc_info=True)
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -233,6 +267,7 @@ def register(ctx):
     on_unload = getattr(ctx, "on_unload", None)
     if callable(on_unload):
         def _close_registered_engine() -> None:
+            _note_unload()
             engine.close("the plugin was unloaded")
 
         on_unload(_close_registered_engine)
@@ -276,7 +311,7 @@ def register(ctx):
             turn_signals.request_sent(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""),
                                       payload.get("conversation_history"))
             # #16: the system prompt this request sends carries the plugin's section.
-            _check_instruction_delivered(instruction, resolve_active_lcm_engine, payload)
+            _check_instruction_delivered(instruction, engine, resolve_active_lcm_engine, payload)
 
         register_hook("pre_api_request", _on_pre_api_request)
         register_hook("pre_llm_call", _on_pre_llm_call_turn)

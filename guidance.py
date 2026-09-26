@@ -32,9 +32,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from .engine_registry import PROCESS_STATE
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +170,40 @@ def _sections_present(prompt: str) -> tuple:
 
 
 # Guards each engine copy's set of the prompts it has checked; held only for a set lookup.
-_SEEN_LOCK = threading.Lock()
+# It lives in the process state that outlives a reload of the plugin, as the engine
+# copies whose sets it guards do (``engine_registry``).
+_SEEN_LOCK = PROCESS_STATE.seen_lock
 _NO_SYSTEM_PROMPT = "no system-level prompt"
+
+
+def note_unbound_session(host_session_id: str, record: Callable[..., None]) -> None:
+    """The hook ran for a host session no LCM engine copy is bound to, while the host's
+    ``context.engine`` names ``lcm``: the plugin cannot check that session's prompt, and
+    records exactly that, once per host session id in this process (#16)."""
+    if not host_session_id:
+        return
+    with _SEEN_LOCK:
+        if host_session_id in PROCESS_STATE.unbound_sessions_noted:
+            return
+        PROCESS_STATE.unbound_sessions_noted.add(host_session_id)
+    if _configured_context_engine() != "lcm":
+        return
+    fact = ("the plugin cannot check that its instruction reached this session: the host's context.engine is "
+            "lcm, and no LCM engine copy is bound to this host session id")
+    logger.warning("LCM: %s (host session %s)", fact, host_session_id)
+    record("instruction_not_delivered", {"host_session_id": host_session_id, "fact": fact})
+
+
+def _configured_context_engine() -> str:
+    """``context.engine`` as the host reads it for each agent it builds
+    (``agent/agent_init.py`` ``_select_context_engine``), "" where it cannot be read."""
+    try:
+        from hermes_cli.config import load_config_readonly  # type: ignore
+        cfg = load_config_readonly()
+    except Exception:
+        return ""
+    context = cfg.get("context", {}) if isinstance(cfg, dict) else {}
+    return str((context.get("engine", "compressor") if isinstance(context, dict) else "") or "compressor")
 
 
 def _first_sight(engine: Any, key: str) -> bool:

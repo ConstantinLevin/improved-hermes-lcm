@@ -4,21 +4,59 @@ Isolated from ``engine.py`` (WS5 seam): LCM clones register their own
 session/conversation binding so the system-prompt section of the instruction and
 the ``/lcm`` command find the active clone instead of the process-wide plugin
 singleton. The lock and the two weak
-registries live here alongside the pure resolver/matcher helpers that read
-them. ``engine.py`` imports the shared lock, the two registries, the removal
+registries are held in process state that outlives a reload of the plugin (below),
+alongside the pure resolver/matcher helpers that read them. ``engine.py`` imports the shared lock, the two registries, the removal
 helper, and the public ``resolve_active_lcm_engine`` entry point; the binding
 methods on ``LCMEngine`` mutate the same shared objects by reference.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
+import types
 import weakref
 from typing import Any
 
-_ACTIVE_ENGINE_REGISTRY_LOCK = threading.RLock()
-_ACTIVE_ENGINES_BY_SESSION_ID = weakref.WeakValueDictionary()
-_ACTIVE_ENGINES_BY_CONVERSATION_ID = weakref.WeakValueDictionary()
+# The registry outlives a forced reload of the plugin. The host's loader evicts this
+# package and every submodule before it loads the plugin again (``hermes_cli/
+# plugins_loader.py`` ``_load_directory_module``, ``_evict_modules``), while the agents
+# already running keep the engine copies bound here; a registry held in this module would
+# be replaced by an empty one, and the reloaded section and delivery check would find no
+# engine for them. So the registry, and the lock of the delivery check's seen-prompt sets,
+# live in one process-wide object under a name outside the plugin's package, created
+# once and taken over by every later load.
+_PROCESS_STATE_NAME = "_hermes_lcm_process_state"
+
+
+def _process_state() -> types.ModuleType:
+    state = sys.modules.get(_PROCESS_STATE_NAME)
+    if state is None:
+        fresh = types.ModuleType(_PROCESS_STATE_NAME, "Hermes-LCM state that outlives a reload of the plugin.")
+        fresh.registry_lock = threading.RLock()
+        fresh.by_session_id = weakref.WeakValueDictionary()
+        fresh.by_conversation_id = weakref.WeakValueDictionary()
+        fresh.seen_lock = threading.Lock()
+        fresh.unbound_sessions_noted = set()
+        state = sys.modules.setdefault(_PROCESS_STATE_NAME, fresh)
+    return state
+
+
+PROCESS_STATE = _process_state()
+_ACTIVE_ENGINE_REGISTRY_LOCK = PROCESS_STATE.registry_lock
+_ACTIVE_ENGINES_BY_SESSION_ID = PROCESS_STATE.by_session_id
+_ACTIVE_ENGINES_BY_CONVERSATION_ID = PROCESS_STATE.by_conversation_id
+
+
+def bound_engines() -> list:
+    """Every engine copy bound to a host session in this process, once each."""
+    with _ACTIVE_ENGINE_REGISTRY_LOCK:
+        seen, engines = set(), []
+        for engine in list(_ACTIVE_ENGINES_BY_SESSION_ID.values()):
+            if id(engine) not in seen:
+                seen.add(id(engine))
+                engines.append(engine)
+        return engines
 
 
 def _is_usable_lcm_engine(engine: Any) -> bool:
