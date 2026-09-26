@@ -220,14 +220,16 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
     (None, why) where the host cannot resolve it (no credentials, no provider).
 
     A fallback never becomes the target (the orchestrator's ruling on the Codex review of
-    903281e): the final resolution must land on the session route's own provider and
-    model, the host's main-route target (``_normalize_main_runtime``, 3080, and
+    903281e): the provider label the host resolves must be the session route's own, the
+    label the host's main-route target carries (``_normalize_main_runtime``, 3080, and
     ``_main_route_target``, 4534: the provider as ``update_model`` named it, lower-cased,
     a MoA preset's aggregator; a ``custom:<name>`` without a config entry and with a base
-    URL labelled ``custom``, 4583-4587) and its model or the host's normalisation of it
-    for the provider (``_normalize_resolved_model``). Where the host would take another
-    provider or model (its main provider unhealthy, a fallback configured), the route is
-    refused: "the session route is not available; the host would fall back to …"."""
+    URL labelled ``custom``, 4583-4587). Only the label is compared, host value with host
+    value; the target's model is the one the host's resolution returned, never a
+    prediction of the plugin's (the orchestrator's ruling on the Codex review of a8608a2).
+    Where the host would take another provider (its main provider unhealthy, a fallback
+    configured), the route is refused: "the session route is not available; the host
+    would fall back to …"."""
     try:
         from agent.auxiliary_client import (  # type: ignore
             _fallback_provider_from_label, _main_route_target, _normalize_main_runtime, _resolve_call_client)
@@ -238,7 +240,7 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
             _normalize_main_runtime(route.main_runtime()), None)
     except Exception as exc:
         return None, f"the host's main-route target cannot be read ({type(exc).__name__}: {exc})"
-    own_label, own_model = str(main_provider or "").strip().lower(), str(main_model or "").strip()
+    own_label = str(main_provider or "").strip().lower()
     if own_label.startswith("custom:") and main_base_url:
         try:
             from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
@@ -259,9 +261,9 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
     if not label or label == "auto" or not model:
         return None, (f"the host's client resolution names no provider and model for the session's route "
                       f"({label or '?'}/{model or '?'})")
-    if label != own_label or model not in _host_model_forms(own_model, label):
+    if label != own_label:
         return None, (f"the session route is not available; the host would fall back to {label}/{model} (the "
-                      f"session's route is {own_label}/{own_model})")
+                      f"session's route is on {own_label})")
     return (label, model, str(getattr(client, "base_url", "") or ""), _client_wire(client),
             type(client).__name__), ""
 
@@ -483,20 +485,6 @@ class _RouteRecord(dict):
             self.routes.append((str(self.get("provider") or "").strip(), str(value or "").strip()))
 
 
-def _host_model_forms(model: str, provider: str) -> set[str]:
-    """The model id as asked for, and as the host normalises it for the provider that
-    receives it (``_normalize_resolved_model``, agent/auxiliary_client.py at 7b761da)."""
-    forms = {model.strip()}
-    try:
-        from agent.auxiliary_client import _normalize_resolved_model  # type: ignore
-        normalised = _normalize_resolved_model(model, provider)
-        if isinstance(normalised, str) and normalised.strip():
-            forms.add(normalised.strip())
-    except Exception:
-        pass
-    return forms
-
-
 def _session_route_target(route: SummariserRoute) -> Optional[tuple[str, str]]:
     """The provider label and the model of the route's target, as resolved once when the
     route was made (``session_route``); never resolved again here."""
@@ -514,12 +502,13 @@ def _same_provider_label(route: SummariserRoute, label: str) -> bool:
     return target is not None and str(label or "").strip().lower() == target[0]
 
 
-def _session_route_model_forms(route: SummariserRoute, provider: str) -> set[str]:
-    """The model ids a record of the session's route may carry: the host's target model
-    (``_session_route_target``; a MoA session's aggregator model, not ``default``), as
-    asked for and as the host normalises it for ``provider``."""
+def _same_model(route: SummariserRoute, model: str) -> bool:
+    """Whether a ``route_info`` record's model is the target's: exactly the model the
+    host's resolution returned (``_session_route_target``), host value with host value;
+    the plugin normalises no model (the orchestrator's ruling on the Codex review of
+    a8608a2)."""
     target = _session_route_target(route)
-    return _host_model_forms(target[1], provider) if target is not None else set()
+    return target is not None and str(model or "").strip() == target[1]
 
 
 def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -> bool:
@@ -537,7 +526,7 @@ def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -
     aliases = _host_local_server_aliases() or frozenset()
     if target[0] == "custom" or target[0] in aliases:
         return False
-    return answered[1] in _session_route_model_forms(route, answered[0])
+    return _same_model(route, answered[1])
 
 
 # The complete ending and every other, in the Chat Completions shape the host hands each
@@ -650,7 +639,7 @@ def check_route_records(route: SummariserRoute, routes: list[tuple[str, str]]) -
                 detail=f"route_info names {record[0] or '?'}/{record[1] or '?'}; the summariser is "
                        f"{route.describe()} (#33 D9)",
             )
-        if record[1] not in _session_route_model_forms(route, record[0]):
+        if not _same_model(route, record[1]):
             raise SummaryFailure(
                 "the host routed the summariser's call through another model", transient=False, kind="route",
                 detail=f"route_info names {record[0] or '?'}/{record[1] or '?'} among {len(routes)} record(s); the "
