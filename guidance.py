@@ -176,10 +176,19 @@ _SEEN_LOCK = PROCESS_STATE.seen_lock
 _NO_SYSTEM_PROMPT = "no system-level prompt"
 
 
-def note_unbound_session(host_session_id: str, record: Callable[..., None]) -> None:
-    """The hook ran for a host session no LCM engine copy is bound to, while the host's
-    ``context.engine`` names ``lcm``: the plugin cannot check that session's prompt, and
-    records exactly that, once per host session id in this process (#16).
+def note_unbound_session(host_session_id: str, hermes_home: str, record: Callable[..., None]) -> None:
+    """The hook ran for a host session no LCM engine copy is bound to, while the
+    ``context.engine`` of the home this load serves names ``lcm``: the plugin cannot
+    check that session's prompt, and records exactly that, once per host session id in
+    this process (#16). Where that home's ``context.engine`` cannot be read, that is
+    recorded too.
+
+    ``hermes_home`` is the home captured when this load was registered, never the home
+    the caller happens to be scoped to: the host stores a hook's callback as given and
+    runs it in its caller's scope (``hermes_cli/plugins.py`` ``register_hook``,
+    ``hermes_cli/plugins_dispatch.py`` ``invoke_hook``), and reads a manager's own config
+    under an explicit scope of that manager's home (``plugins.py`` ``_tool_override_allowed``
+    with ``_plugin_home_scope``), which is what this does.
 
     A session counts as noted only once its event is written: until then it is pending,
     so that a request in flight does not record it twice, and an event whose store was
@@ -192,11 +201,17 @@ def note_unbound_session(host_session_id: str, record: Callable[..., None]) -> N
                 or host_session_id in PROCESS_STATE.unbound_sessions_pending):
             return
         PROCESS_STATE.unbound_sessions_pending.add(host_session_id)
-    if _configured_context_engine() != "lcm":
+    configured = _configured_context_engine(hermes_home)
+    if configured is None:
+        fact = (f"the plugin cannot check that its instruction reached this session: no LCM engine copy is "
+                f"bound to this host session id, and the context.engine of {hermes_home or 'its home'} "
+                f"cannot be read")
+    elif configured != "lcm":
         _mark_unbound_noted(host_session_id)
         return
-    fact = ("the plugin cannot check that its instruction reached this session: the host's context.engine is "
-            "lcm, and no LCM engine copy is bound to this host session id")
+    else:
+        fact = ("the plugin cannot check that its instruction reached this session: the host's context.engine is "
+                "lcm, and no LCM engine copy is bound to this host session id")
     logger.warning("LCM: %s (host session %s)", fact, host_session_id)
     handed = record("instruction_not_delivered", {"host_session_id": host_session_id, "fact": fact},
                     on_written=lambda: _mark_unbound_noted(host_session_id))
@@ -212,14 +227,26 @@ def _mark_unbound_noted(host_session_id: str) -> None:
         PROCESS_STATE.unbound_sessions_noted.add(host_session_id)
 
 
-def _configured_context_engine() -> str:
-    """``context.engine`` as the host reads it for each agent it builds
-    (``agent/agent_init.py`` ``_select_context_engine``), "" where it cannot be read."""
+def _configured_context_engine(hermes_home: str) -> Optional[str]:
+    """``context.engine`` of the Hermes home ``hermes_home``, as the host reads it for each
+    agent it builds (``agent/agent_init.py`` ``_select_context_engine``), read under an
+    explicit override of that home for this thread's context only
+    (``hermes_constants.set_hermes_home_override``, what the host's ``_plugin_home_scope``
+    sets); None where it cannot be read."""
+    if not hermes_home:
+        return None
     try:
         from hermes_cli.config import load_config_readonly  # type: ignore
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # type: ignore
+    except Exception:
+        return None
+    token = set_hermes_home_override(hermes_home)
+    try:
         cfg = load_config_readonly()
     except Exception:
-        return ""
+        return None
+    finally:
+        reset_hermes_home_override(token)
     context = cfg.get("context", {}) if isinstance(cfg, dict) else {}
     return str((context.get("engine", "compressor") if isinstance(context, dict) else "") or "compressor")
 

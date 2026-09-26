@@ -112,7 +112,8 @@ def _check_instruction_delivered(instruction, engine, resolve_active_lcm_engine,
 
     if target is engine:
         try:
-            note_unbound_session(session_id, _record)
+            # The home this load was registered for (its engine's), not the caller's scope.
+            note_unbound_session(session_id, str(getattr(engine, "_hermes_home", "") or ""), _record)
         except Exception:
             logger.warning("LCM could not note that it cannot check its instruction", exc_info=True)
         return
