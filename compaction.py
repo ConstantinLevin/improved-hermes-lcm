@@ -1606,6 +1606,11 @@ class CompactionMixin:
                 merged = ["run", merged_groups, False]
             else:
                 merged = ["joined", merged_groups, False]
+            # A kept chunk a join takes is released (its summary with it): its groups are
+            # no longer kept, and may be split like any other (the orchestrator's ruling on
+            # the Codex review of 722d336).
+            for g in merged_groups:
+                kept_of.pop(g, None)
             work[low:high + 1] = [merged]
             at = low
 
@@ -1613,7 +1618,8 @@ class CompactionMixin:
         for kind, members, _summary in work:
             if kind == "raw":
                 continue
-            # A run below c/4 left alone is still split where its images pass the limit.
+            # A part below c/4 left alone (a run, or a join whose kept chunks were released)
+            # is still split where its images pass the limit.
             split_alone = (kind == "alone" and image_limit is not None
                            and sum(pictures[g] for g in members) > image_limit
                            and not any(g in kept_of for g in members))
