@@ -210,11 +210,7 @@ def _row_before_fill(raw: dict, *, needs_echo: bool, strict: bool) -> dict:
 def _as_the_host_sends_it(raw: dict, *, needs_echo: bool, strict: bool = False, fill: bool = True) -> dict:
     message = _row_before_fill(raw, needs_echo=needs_echo, strict=strict)
     if fill:
-        if strict:
-            _strict_import("empty-message fill", "agent.agent_runtime_helpers",
-                           "fill_empty_non_final_wire_payload")(message, is_final=False)
-        else:
-            _host_fill_empty(message)
+        _host_fill_empty(message)
     message.pop("_length_continuation_fragment", None)
     message.pop("_length_continuation_nudge", None)
     return message
@@ -225,12 +221,6 @@ def host_row_before_fill(raw: dict, *, pad: bool) -> dict:
     reasoning pad for the route (``host_reasoning_pad``), every host function called
     strictly: the host's own input to ``fill_empty_non_final_wire_payload``."""
     return _row_before_fill(raw, needs_echo=pad, strict=True)
-
-
-def host_row(raw: dict, *, pad: bool) -> dict:
-    """The record's row as the host's ``build_api_messages`` sends it (1221-1268), fill
-    included, strictly: the host's own input to its pre-call passes (``pairing``)."""
-    return _as_the_host_sends_it(raw, needs_echo=pad, strict=True, fill=True)
 
 
 def item_message(row: dict) -> dict:

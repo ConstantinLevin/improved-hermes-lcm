@@ -38,9 +38,9 @@ Recommended current-session escalation:
 Use as low-level drill-down after a known handle (`handle`):
 
 - a summary's (`s…`) or a chunk's (`c…`) handle returns that stretch: the messages verbatim, the readable reasoning beside them, each tool call with its handle (`t…`), name and arguments, without its result; `raw=true` puts the results inline;
-- a tool call's handle returns its result, the one the host sent with the call; where the host sent none, or its own stand-in, or did not send the call, a note says so; a message's handle (`m…`) returns that message;
+- a tool call's handle returns its result: the stored result that carries the call's id, before the next user or agent message; where none does, a note says so; where calls of one message share an id, every result of that id is returned and a note says the store cannot tell which answered which call; a message's handle (`m…`) returns that message;
 - a handle whose message the host has since rewritten is refused with the handle that stands for it now; expand that one;
-- a result longer than one page carries `next_page`; pass it as `page` for the rest; if what the handle opens into changed since the first page, the page is refused and you start again from the handle.
+- a result longer than one page carries `next_page`; pass it as `page` for the rest; if what the handle opens into changed since the first page, the page is refused and you start again from the handle. A page never leaves anything out: where one part cannot fit even on a page by itself, the call is refused, naming that part, its size and the page's limit, which is larger when `lcm_expand` is the only call in its message.
 
 Do not use it as broad first-step discovery.
 

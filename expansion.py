@@ -6,8 +6,9 @@
   several chunks, all of them, with the leaf summary of each named beside it as a
   lookup; a summary written from summaries, one layer: those summaries;
 - a chunk's handle (``c``): the stretch itself;
-- a tool call's handle (``t``): its result, the one the host's own pre-call passes send
-  with it, block by block (``pairing``);
+- a tool call's handle (``t``): its result, the stored result of its exact id in its
+  block (``pairing``); where the store cannot tell which result answered which call (calls
+  of one block sharing an id or an alias), every result of that group, attributed to none;
 - a message's handle (``m``): that message.
 
 A stretch comes back in its collapsed form by default: every user and agent message by
@@ -17,9 +18,10 @@ bookkeeping popped, the encrypted items withheld), less the host's ``_``-prefixe
 markers, every other key carried; the
 readable reasoning beside the agent's messages; and each tool call as its handle, its name
 and its arguments and every other key but the host's ids, without its result. The host's
-stand-ins (its fill of an empty message, its stand-in for a missing result) are quoted in
-notes, never shown as content. A result whose call is not in the same stretch stands as a
-pointer to that call, and a call or result the host does not send says why. ``raw`` puts
+fill of an empty message is quoted in a note, never shown as content. A result whose call
+is not in the same stretch stands as a pointer to that call; a call without a result, a
+result without a call and a group the store cannot pair say so, as facts of the store.
+What the provider received of calls and results is not reproduced (``pairing``). ``raw`` puts
 every result inline and adds the host's native carriers of a message. Encrypted reasoning
 stays out, and nothing stands where it was. The copies of repeated injections in the host's
 sidecar are not left out: the host records no producer (#36).
@@ -40,7 +42,12 @@ computes it for this result, and compared with the exact string the engine retur
 larger than a page is split over pages by character offset, each piece saying where it
 lies. An image is never split: it is returned as an image, in the ``_multimodal``
 envelope, counted against the page by the model table's rule (#21); one larger than a
-page, or one no rule counts, stands alone on its page. A page carries no image the host's
+page, or one no rule counts, stands alone on its page. Every other item or piece that
+cannot be split (an item without fields, a held image's mark, an empty field, the
+annotations every piece carries, the header every page carries) stands alone on the next
+page if it fits there, measured with the real ``next_page`` of that page; where it does not
+fit even alone, the page is refused, naming it (or the header, where the header alone does
+not fit), its size and the page's limit. Nothing is skipped. A page carries no image the host's
 converter for the session's route does not carry as an image, and no more images than the
 host's send path leaves room for in the request (``ImageRoom``).
 """
@@ -68,7 +75,6 @@ from .summariser_input import (
     HostUnavailable,
     host_fill_text,
     host_reasoning_pad,
-    host_row,
     host_row_before_fill,
     item_message,
 )
@@ -92,24 +98,26 @@ _UNRESOLVED = {
                          "to read behind the summary."),
 }
 
-# Notes on calls and results, from what the host's pre-call sanitizer sends (``pairing``).
+# Notes on calls and results: facts of the store (``pairing``), never what the host sends.
 NO_RESULT = "no result follows this call on the active record"
-_STAND_IN = "the host's pre-call sanitizer sends the provider its own stand-in for this call's result: {content}"
-_CALL_NOT_SENT = ("the host's pre-call sanitizer does not send this call to the provider: an earlier call of this "
-                  "message carries its host id {id}")
-_RESULT_NOT_SENT = {
-    "no_id": "the host's pre-call sanitizer does not send this result to the provider: it carries no host id",
-    "positional": ("the host's pre-call sanitizer does not send this result to the provider: no call before it, since "
-                   "the last assistant or user message, that is still waiting for a result has its host id {id}"),
-    "duplicate": ("the host's pre-call sanitizer does not send this result to the provider: it answers no call still "
-                  "waiting for a result"),
+_STRAY = {
+    "unknown": "no call of the message before this result has its host id {id}",
+    "no_id": "this result carries no host id, so no call pairs with it",
 }
-_ROLE_NOT_SENT = "the host's pre-call sanitizer does not send a message of role {role} to the provider"
+_GROUP = ("{k} calls and {j} results in this stretch carry the host id {id}; the store cannot tell which result "
+          "answered which call, and what the provider received of them depends on the host's sanitizer and on the "
+          "session's route, which this plugin does not reproduce")
 _FILL = "the host sends this empty message to the provider with its own stand-in as content: {content}"
 _FILL_UNSURE = ("whether the host sends this empty message with its own stand-in {content} depends on its "
                 "reasoning-echo setting (model.reasoning_echo), which the plugin cannot read")
-_SHARED = ("{k} calls of this message carry the host id {id}; the pairing shown is the host's, which the id cannot "
-           "confirm")
+
+
+
+def _group_note(group: host_pairing.Group) -> str:
+    """Rule 2's note: one id, or the overlapping ids of the group's calls."""
+    ids = [str(i) for i in group.ids]
+    said = ids[0] if len(ids) == 1 else ", ".join(ids[:-1]) + " or " + ids[-1] + " (overlapping)"
+    return _GROUP.format(k=len(group.calls), j=len(group.results), id=said)
 
 
 class ExpansionError(Exception):
@@ -207,7 +215,34 @@ def host_guardrail_margin(tool_name: str) -> int:
     return 2 * guidance + len("\n\n") + notice
 
 
+@dataclass(frozen=True)
+class PageLimit:
+    """A page's limit and where it comes from (``host_page_limit``), for a refusal to name."""
+
+    limit: int
+    threshold: int
+    turn_budget: int
+    calls: int
+    margin: int
+
+    @property
+    def alone(self) -> int:
+        """The limit when the call stands alone in its message."""
+        return min(self.threshold, self.turn_budget) - self.margin
+
+    def origin(self) -> str:
+        if self.turn_budget // self.calls < self.threshold:
+            return (f"the host's per-message budget divided among the {self.calls} calls of this message, less its "
+                    f"margin")
+        return "the host's threshold for one result, less its margin"
+
+
 def host_page_limit(engine: Any, tool_name: str, messages: Any) -> int:
+    """The limit of ``host_page_limits``."""
+    return host_page_limits(engine, tool_name, messages).limit
+
+
+def host_page_limits(engine: Any, tool_name: str, messages: Any) -> PageLimit:
     """The most characters a page may hold so that the host keeps it inline, from host
     values only (orchestrator ruling on the pre-review of 97a8483, finding 1):
 
@@ -240,11 +275,12 @@ def host_page_limit(engine: Any, tool_name: str, messages: Any) -> int:
     if calls is None:
         raise ExpansionError("the host handed no message list with the tool calls being answered, so the "
                              "share of the host's per-message budget a page may take is not known")
-    limit = min(int(threshold), int(turn_budget) // calls) - host_guardrail_margin(tool_name)
+    margin = host_guardrail_margin(tool_name)
+    limit = min(int(threshold), int(turn_budget) // calls) - margin
     if limit <= 0:
         raise ExpansionError(f"{calls} tool calls in one message leave a page no room within the host's budget of "
                              f"{int(turn_budget)} characters for the message; call {tool_name} in fewer at once")
-    return limit
+    return PageLimit(limit, int(threshold), int(turn_budget), calls, margin)
 
 
 # --- Tokens ---------------------------------------------------------------------------------
@@ -412,44 +448,37 @@ def _as_sent(raw: dict, route: "Route", *, raw_form: bool) -> tuple[dict, Option
     return message, note
 
 
-def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> tuple[list, bool]:
-    """The notes of one call, and whether a result answers it on the wire."""
-    notes = []
+def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> list:
+    """The note of one call: its group's (rule 2), or that no result of its id follows it
+    (rule 3), or none."""
     key = (handle, position)
-    answered = key in found.answer
-    if key in found.call_not_sent:
-        notes.append(_CALL_NOT_SENT.format(id=found.call_not_sent[key]))
-    elif not answered:
-        notes.append(NO_RESULT)
-        if key in found.stand_in:
-            notes.append(_STAND_IN.format(content=json.dumps(found.stand_in[key], ensure_ascii=False)))
-    if key in found.shared:
-        call_id, calls = found.shared[key]
-        notes.append(_SHARED.format(k=calls, id=call_id))
-    return notes, answered
+    if key in found.group:
+        return [_group_note(found.group[key])]
+    if key not in found.answer:
+        return [NO_RESULT]
+    return []
 
 
-def _record_notes(found: host_pairing.Pairing, handle: str, fill_note: Optional[str]) -> list:
-    """What the host does with a record as a whole: a role it does not send; its own
-    stand-in as the content of an empty message."""
-    notes = []
-    if handle in found.role_not_sent:
-        notes.append(_ROLE_NOT_SENT.format(role=json.dumps(found.role_not_sent[handle], ensure_ascii=False)))
-    if fill_note is not None:
-        notes.append(fill_note)
-    return notes
+def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
+    """The note of one result: its group's, or that it belongs to no call; or none."""
+    if handle in found.group:
+        return [_group_note(found.group[handle])]
+    if handle in found.stray:
+        why, call_id = found.stray[handle]
+        return [_STRAY[why].format(id=call_id)]
+    return []
 
 
 def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pairing.Pairing, route: "Route", *,
                   inline: set, raw_form: bool) -> Item:
     """One user or agent message by the host's rules (``_as_sent``), its readable
-    reasoning first, each tool call as ``_call_entry`` with what the host's pairing says of
-    it; in raw form also where its result is when this stretch does not hold it."""
+    reasoning first, each tool call as ``_call_entry`` with what the store's pairing says of
+    it; in raw form also where its result is when this stretch does not hold it, and for a
+    call of a group the store cannot pair, every result of the group."""
     message, fill_note = _as_sent(raw, route, raw_form=raw_form)
     annotations = {"handle": handle, "role": message.pop("role", raw.get("role"))}
-    notes = _record_notes(found, handle, fill_note)
-    if notes:
-        annotations["note"] = "; ".join(notes)
+    if fill_note is not None:
+        annotations["note"] = fill_note
     fields: dict = {}
     if raw.get("role") == "assistant":
         reasoning = readable_reasoning(raw)
@@ -461,12 +490,15 @@ def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pai
         shown = []
         for position, call in enumerate(tool_calls):
             entry = _call_entry(calls.get(position), call)
-            notes, answered = _call_notes(found, handle, position)
-            if raw_form:
-                if not answered:
+            notes = _call_notes(found, handle, position)
+            key = (handle, position)
+            if key in found.group:
+                entry["result_in"] = list(found.group[key].results)     # listed, attributed to none
+            elif raw_form:
+                if key not in found.answer:
                     entry["result"] = None
-                elif found.answer[(handle, position)] not in inline:
-                    entry["result_in"] = found.answer[(handle, position)]
+                elif found.answer[key] not in inline:
+                    entry["result_in"] = found.answer[key]
             if notes:
                 entry["note"] = "; ".join(notes)
             shown.append(entry)
@@ -498,8 +530,8 @@ def _result_item(handle: str, raw: dict, call: Optional[str], route: "Route", *,
 @dataclass
 class Order:
     """The active record's order (``RecordStore.active_units``), for pairing a stretch
-    through the blocks it lies in (``pairing``), on the session's route as read at the
-    call's entry."""
+    through the blocks it lies in (``pairing``); the session's route as read at the call's
+    entry, for the items' host rows and images."""
 
     records: list
     index: dict
@@ -511,21 +543,11 @@ class Order:
         return cls(records, {record: i for i, record in enumerate(records)}, route)
 
     def pairing(self, store: RecordStore, stretch: list[str]) -> host_pairing.Pairing:
-        try:
-            # The passes get the host's own input: each record's row as the host's
-            # build_api_messages sends it (the re-plan of #71, C3).
-            return host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles,
-                                               store.records_raw, api_mode=self.route.api_mode,
-                                               model=self.route.model,
-                                               row_of=lambda raw: host_row(raw, pad=self.route.pad))
-        except HostUnavailable as exc:
-            raise ExpansionError(str(exc)) from None
-        except host_pairing.PairingUnavailable as exc:
-            raise ExpansionError(str(exc)) from None
+        return host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles, store.records_raw)
 
 
 def _records_items(store: RecordStore, order: Order, records: list[tuple[str, dict]], *, raw: bool) -> list[dict]:
-    """The items of a run of records, collapsed or raw, paired by the host's rule over the
+    """The items of a run of records, collapsed or raw, paired by the store's rule over the
     active record (``pairing``)."""
     handles = [handle for handle, _raw in records]
     found = order.pairing(store, handles)
@@ -537,13 +559,7 @@ def _records_items(store: RecordStore, order: Order, records: list[tuple[str, di
         if message.get("role") == "tool":
             paired = found.result_of.get(handle)
             call = calls.get(paired[0], {}).get(paired[1]) if paired else None
-            notes = []
-            if handle in found.result_not_sent:
-                why, call_id = found.result_not_sent[handle]
-                notes.append(_RESULT_NOT_SENT[why].format(id=call_id))
-            if paired is not None and paired in found.shared:
-                call_id, count = found.shared[paired]
-                notes.append(_SHARED.format(k=count, id=call_id))
+            notes = _result_notes(found, handle)
             if raw:
                 items.append(_result_item(handle, message, call, order.route, inline=True, notes=notes,
                                           raw_form=True))
@@ -601,20 +617,29 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
                 items.append(Item({"chunk": chunk}))
         return Target(header, items)
     if resolved.kind == TOOL_CALL:
-        # The call's result is the one the host's rule pairs with it on the active record
-        # (round 5 of #71): read now, never stored.
+        # The call's result is the stored result of its exact id in its block (``pairing``):
+        # read now, never stored. For a call of a group the store cannot pair, every result
+        # of the group, attributed to none.
         record, position = resolved.record, int(resolved.position or 0)
         header = {"handle": handle, "kind": "tool_call", "form": "raw", "name": resolved.name, "call_in": record}
         found = order.pairing(store, [record])
-        notes, answered = _call_notes(found, record, position)
+        notes = _call_notes(found, record, position)
         if notes:
             header["note"] = "; ".join(notes)
-        if not answered:
+        group = found.group.get((record, position))
+        if group is not None:
+            results, of = list(group.results), None
+        elif (record, position) in found.answer:
+            results, of = [found.answer[(record, position)]], handle
+        else:
+            results, of = [], None
+        if not results:
             header["result"] = None
             return Target(header, [])
-        result = found.answer[(record, position)]
-        return Target(header, [_result_item(result, store.record_raw(result) or {}, handle, order.route, inline=True,
-                                            notes=[], raw_form=True)])
+        raws = store.records_raw(results)
+        return Target(header, [_result_item(result, raws.get(result) or {}, of, order.route, inline=True,
+                                            notes=_result_notes(found, result) if group is not None else [],
+                                            raw_form=True) for result in results])
     if resolved.kind == MESSAGE:
         return Target({"handle": handle, "kind": "message", "form": form},
                       _records_items(store, order, [(handle, store.record_raw(handle) or {})], raw=True))
@@ -1038,7 +1063,10 @@ def host_image_room(messages: Any, tool_name: str, route: Route) -> ImageRoom:
             OUTBOUND_IMAGE_BUDGET_BYTES,
             OUTBOUND_IMAGE_LIMIT,
         )
-        call_variants, result_variants, _coalesce = host_pairing.host_alias_helpers()
+        from agent.message_sanitization import (  # type: ignore
+            tool_call_id_variants as call_variants,
+            tool_result_id_variants as result_variants,
+        )
         if not isinstance(messages, list):
             raise ValueError("no message list")
         skeleton = tuple({"role": m.get("role"), "content": m.get("content")} for m in messages
@@ -1067,10 +1095,12 @@ class PageBuilder:
     """Fills pages of ``target`` from a cursor, each at most ``limit`` characters as the
     host measures the result it receives."""
 
-    def __init__(self, target: Target, *, limit: int, token_state: dict,
+    def __init__(self, target: Target, *, limit: Any, token_state: dict,
                  image_tokens: Callable[[dict], Optional[int]], image_room: ImageRoom):
         self.target = target
-        self.limit = limit
+        # ``limit`` is a ``PageLimit``, or a bare number where no origin is known.
+        self.origin = limit if isinstance(limit, PageLimit) else None
+        self.limit = limit.limit if isinstance(limit, PageLimit) else int(limit)
         self.token_state = token_state
         self.image_tokens = image_tokens
         self.image_room = image_room
@@ -1110,8 +1140,10 @@ class PageBuilder:
         summary = text + ("\n" + "\n".join(notes) if notes else "")
         return _Rendered(text, images, labels, counted, summary)
 
-    def fits(self, page_items: list, page: int) -> bool:
-        rendered = self.render(page_items, page, self._longest_token(page))
+    def fits(self, page_items: list, page: int, token: Any = "longest") -> bool:
+        """Whether ``page_items`` fit on page ``page``: measured with the longest token the
+        page could carry, or with ``token`` (a real one, or None for the last page)."""
+        rendered = self.render(page_items, page, self._longest_token(page) if token == "longest" else token)
         if not rendered.images:
             return len(rendered.text) <= self.limit
         if rendered.image_tokens is None:
@@ -1121,6 +1153,55 @@ class PageBuilder:
         text_chars = len(rendered.text) + sum(len(label) for label in rendered.labels)
         return (len(rendered.summary) <= self.limit
                 and text_chars + rendered.image_tokens * CHARS_PER_TOKEN <= self.limit)
+
+    def _size_alone(self, piece: Any, page: int, token: Any = "longest") -> int:
+        """The characters of a page holding only ``piece`` (its text; with images, the text
+        the host measures, the summary)."""
+        rendered = self.render([] if piece is None else [piece], page,
+                               self._longest_token(page) if token == "longest" else token)
+        return len(rendered.summary) if rendered.images else len(rendered.text)
+
+    def _token_after(self, page: int, i: int, f: int, o: int) -> Optional[str]:
+        """The real ``next_page`` of a page that ends at (i, f, o); None where nothing is left."""
+        items = self.target.items
+        if i < len(items) and f >= 0 and f >= len(self._fields_of(i)):
+            i, f, o = i + 1, -1, 0
+        if i >= len(items):
+            return None
+        return encode_token({**self.token_state, "i": i, "f": f, "o": o, "n": page + 1})
+
+    def _alone(self, page: int, index: Optional[int], unit: Any, after: tuple) -> tuple:
+        """An unsplittable unit that does not fit on the page as measured with the longest
+        token: on a page by itself, with the real token it ends on, it stands alone (the
+        cursor ``after`` it is returned); where it does not fit even so, the page is refused."""
+        token = self._token_after(page, *after)
+        if unit is None:
+            if self.fits([], page, token):
+                return after
+        elif self.fits([unit], page, token):
+            return after
+        self._refuse(page, index, unit, token)
+        return after
+
+    def _refuse(self, page: int, index: Optional[int], piece: Any, token: Any = "longest") -> None:
+        """Nothing is skipped (the orchestrator's ruling on the re-plan of #71, B): an
+        unsplittable item or piece that does not fit even on a page by itself refuses the
+        page, naming it and its size."""
+        total = len(self.target.items)
+        if piece is not None and self._size_alone(None, page, token) > self.limit:
+            index, piece = None, None           # the header alone does not fit: it is named
+        size = self._size_alone(piece, page, token)
+        if index is None:
+            what = "its header, which every page carries,"
+        else:
+            what = f"item {index + 1} of {total} ({_identity(self.target.items[index], piece)})"
+        origin = f" ({self.origin.origin()})" if self.origin else ""
+        alone = (f"; alone in a message it would hold {self.origin.alone}"
+                 if self.origin and self.origin.alone > self.limit else "")
+        token = "; this page's token stays valid" if page > 1 else ""
+        raise ExpansionError(f"page {page} of {self.target.header.get('handle')} cannot be built without leaving "
+                             f"something out: {what} needs {size} characters on a page by itself; a page here holds "
+                             f"{self.limit}{origin}{alone}. Nothing was skipped{token}.")
 
     def _room_alone(self, piece: dict) -> bool:
         images: list = []
@@ -1139,6 +1220,8 @@ class PageBuilder:
         items = self.target.items
         page_items: list = []
         i, f, o = cursor.item, cursor.field, cursor.offset
+        if i >= len(items) and not self.fits([], page, None):
+            self._refuse(page, None, None, None)     # nothing to carry, and the header does not fit
         while i < len(items):
             item = items[i]
             if f < 0:
@@ -1147,6 +1230,11 @@ class PageBuilder:
                     i, f, o = i + 1, -1, 0
                     continue
                 if page_items:
+                    break
+                if not self._fields_of(i):
+                    # No fields to split it by: alone on this page, or refused.
+                    i, f, o = self._alone(page, i, item, (i + 1, -1, 0))
+                    page_items.append(item)
                     break
                 f, o = 0, 0          # it does not fit alone: its fields, piece by piece
                 continue
@@ -1164,8 +1252,17 @@ class PageBuilder:
                         piece["held"] = self.image_room.why_not(canonical_image_part(value)[0],
                                                                 str(item.annotations.get("handle")),
                                                                 image_media_type(value))
-                        if not self.fits(page_items + [piece], page) and page_items:
+                        if not self.fits(page_items + [piece], page):
+                            if page_items:
+                                break
+                            # A mark is text: alone on this page, or refused.
+                            i, f, o = self._alone(page, i, piece, (i, f + 1, 0))
+                            page_items.append(piece)
                             break
+                    elif not page_items and not self.fits([piece], page):
+                        token = self._token_after(page, i, f + 1, 0)
+                        if self._size_alone(piece, page, token) > self.limit:
+                            self._refuse(page, i, piece, token)   # its page's text does not fit
                     # An image larger than a page, or one no rule counts, stands alone.
                     page_items.append(piece)
                     f, o = f + 1, 0
@@ -1185,7 +1282,11 @@ class PageBuilder:
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
             if not text:
                 piece = _piece(item, path, text="", offset=0, total=0, json_text=json_text)
-                if not self.fits(page_items + [piece], page) and page_items:
+                if not self.fits(page_items + [piece], page):
+                    if page_items:
+                        break
+                    i, f, o = self._alone(page, i, piece, (i, f + 1, 0))
+                    page_items.append(piece)
                     break
                 page_items.append(piece)
                 f, o = f + 1, 0
@@ -1197,8 +1298,10 @@ class PageBuilder:
             if length == 0:
                 if page_items:
                     break
-                raise ExpansionError(f"a page of {self.limit} characters cannot hold one character of {path} "
-                                     f"beside the page's own fields")
+                one = _piece(item, path, text=text[o:o + 1], offset=o, total=len(text), json_text=json_text)
+                i, f, o = self._alone(page, i, one, (i, f, o + 1) if o + 1 < len(text) else (i, f + 1, 0))
+                page_items.append(one)
+                break
             page_items.append(_piece(item, path, text=text[o:o + length], offset=o, total=len(text),
                                      json_text=json_text))
             o += length
@@ -1234,6 +1337,25 @@ class PageBuilder:
             else:
                 high = middle - 1
         return best
+
+
+def _identity(item: Item, piece: Any) -> str:
+    """What a refusal names: the item, and the field of a piece."""
+    said = item.annotations
+    if "summaries" in said:
+        name = f"the marker of chunk {said.get('chunk')}"
+    elif "summary" in said:
+        name = f"summary {said.get('summary')}"
+    elif "chunk" in said and "handle" not in said:
+        name = f"chunk {said.get('chunk')}"
+    elif said.get("role") == "tool":
+        name = f"result {said.get('handle')}" + (" as a pointer" if "content_chars" in said else "")
+    else:
+        name = f"message {said.get('handle')}"
+    path = piece.get("field") if isinstance(piece, dict) and piece is not item else None
+    if path is None:
+        return name
+    return f"{path} of {name}" + (", an image held with its reason" if "held" in piece else "")
 
 
 def target_identity(target: Target) -> str:
@@ -1276,7 +1398,7 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
         raw = state["m"] == "raw"
     if handle is None:
         raise ExpansionError("handle is required: the handle of a summary, chunk, tool call or message")
-    limit = host_page_limit(engine, tool_name, messages)
+    limit = host_page_limits(engine, tool_name, messages)
     records: RecordStore = engine._records
     with records.snapshot():
         store_uuid = records.identity().get("store_uuid")

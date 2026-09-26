@@ -1,263 +1,165 @@
-"""Which result answers which tool call: read off the host's own passes, never computed
-by the plugin (the plan of #71, approved 2026-09-26, §1.6).
+"""Which result belongs to which tool call: a fact of the store, never a prediction of
+what the host sends (the orchestrator's ruling on the re-plan of #71, 2026-09-26).
 
 The store keeps no pairing. A call's handle names (record, position) and nothing else
-(``RecordStore._write_tool_calls``). Which result answers it is what the host sends of the
-stored sequence, read off the host's own functions (agent/turn_context.py and
-agent/agent_runtime_helpers.py at Hermes 8afaab3703):
+(``RecordStore._write_tool_calls``). Which stored result belongs to it is read off the
+stored records alone:
 
-- on every api_mode but codex_responses, ``call_id`` and ``response_item_id`` are stripped
-  from a message's tool calls before anything else (``build_api_messages``, 1271-1274, by
-  ``ReasoningParamsMixin._should_sanitize_tool_calls`` and
-  ``_sanitize_tool_calls_for_strict_api``, agent/reasoning_params.py:219-236), which changes
-  a call's aliases;
-- then the four passes of ``sanitize_api_messages`` (3035-3046) that decide what is sent of
-  a call or a result, in the host's order: ``_drop_invalid_roles``,
-  ``_drop_results_without_ids``, ``_pair_tool_calls_positionally`` (a declared call without
-  a result gets the host's own stand-in) and ``_dedupe_tool_call_ids``.
+1. **Within the block**, a result belongs to a call iff the result's ``tool_call_id``
+   equals the call's ``id`` exactly. The block of a record is the nearest assistant or user
+   record at or before it, up to the next assistant or user record: records of every other
+   role lie inside. This is what the store's own write check guarantees for every result it
+   takes (``fresh_tail.check_tool_pairing``: a result names an earlier call's exact id).
+2. **A degenerate id group is stated, never resolved.** Where two or more calls of a
+   block carry one ``id``, or a call's aliases (its ``call_id``, its ``response_item_id``,
+   and each part of a composite ``a|b`` of any of them) include another call's ``id``, those
+   calls form one group, with every result of the block whose id is one of the group's
+   spellings; so does a single call that two or more results of the block name. Every call
+   and every result of the group carries one note saying that the store cannot tell which
+   result answered which call; every result of the group is listed under each of its
+   calls, and nothing is attributed.
+3. A call with no result of its exact id in the block has none; a result whose id no call
+   of the block carries, or that carries no id, belongs to none. Both are store facts.
 
-The other passes of ``sanitize_api_messages`` are not called: ``repair_empty_non_final_messages``
-changes only the content of empty messages and, when it fires, feeds the host's heal counter
-and a notice to its user (2632-2705); ``_drop_empty_tool_calls_arrays`` touches only empty or
-non-list ``tool_calls``; ``_repair_invalid_tool_call_names`` changes only a call's name and
-logs a warning into the host's log; ``_realign_tool_result_names`` changes only a result's
-name. Every pass pairs by id.
-
-**The block (the pairing's definition).** A record's pairing is what these passes send of
-the block that decides it: the nearest assistant or user record at or before it, up to the
-next assistant or user record. The positional pass resets at every assistant and user
-message and flushes at the end (2877-2903), so for it a block run equals a run over the
-whole list. The duplicate pass never resets (2919-2977): a kept call whose alias group no
-result of its run consumes stays outstanding into later messages. The host's own requests
-held a different past before a stretch at every request (summaries, later records), so
-there is no single run of the whole list to reproduce; the block is the definition, and
-every handle (a chunk, a message, a tool call) is paired through the same blocks. The
-carry-over across blocks is a named residual: it needs a call whose alias equals another
-call's id in the same message, which the host's own lists never hold after its repair.
-
-Not modelled: the host's time-dependent ``canonicalize_replay_history`` on later requests
-(agent/replay_cleanup.py), which is the host's rewrite of a request, not of the record.
+No host function is called here. What the provider received of a stretch depends on the
+host's pre-call sanitizer and on the session's route, and those differ from one another
+exactly where rule 2 applies (the re-plan of #71, section A); this plugin does not
+reproduce them.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 
-class PairingUnavailable(Exception):
-    """The host's functions cannot be read or run on these records: no pairing is known."""
+@dataclass
+class Group:
+    """Calls and results of one block that the store cannot pair (rule 2)."""
 
-
-def host_alias_helpers() -> tuple[Callable[[Any], frozenset], Callable[[Any], frozenset], Callable[[Any], str]]:
-    try:
-        from agent.message_sanitization import (  # type: ignore
-            coalesce_tool_call_id,
-            tool_call_id_variants,
-            tool_result_id_variants,
-        )
-    except Exception as exc:
-        raise PairingUnavailable(f"the host's tool-call id helpers (agent.message_sanitization) cannot be read "
-                                 f"({type(exc).__name__}: {exc}), so which result answers which call is not "
-                                 f"known") from None
-    return tool_call_id_variants, tool_result_id_variants, coalesce_tool_call_id
-
-
-def host_sending_passes() -> list[tuple[str, Callable]]:
-    """The host's pre-call passes that decide which calls and results are sent, in the
-    host's order (``sanitize_api_messages``, agent/agent_runtime_helpers.py:3035-3046)."""
-    try:
-        from agent.agent_runtime_helpers import (  # type: ignore
-            _dedupe_tool_call_ids,
-            _drop_invalid_roles,
-            _drop_results_without_ids,
-            _pair_tool_calls_positionally,
-        )
-    except Exception as exc:
-        raise PairingUnavailable(f"the host's pre-call sanitizer (agent.agent_runtime_helpers) cannot be read "
-                                 f"({type(exc).__name__}: {exc}), so which result answers which call is not "
-                                 f"known") from None
-    return [("_drop_invalid_roles", _drop_invalid_roles), ("_drop_results_without_ids", _drop_results_without_ids),
-            ("_pair_tool_calls_positionally", _pair_tool_calls_positionally),
-            ("_dedupe_tool_call_ids", _dedupe_tool_call_ids)]
-
-
-def host_strict_scrub(api_mode: str) -> Optional[Callable[[dict], Any]]:
-    """The host's scrub of Codex Responses fields from tool calls, where the host applies it
-    for this api_mode (``build_api_messages``, agent/turn_context.py:1271-1274); None where
-    it does not."""
-    try:
-        from agent.reasoning_params import ReasoningParamsMixin  # type: ignore
-    except Exception as exc:
-        raise PairingUnavailable(f"the host's strict-API tool-call scrub (agent.reasoning_params) cannot be read "
-                                 f"({type(exc).__name__}: {exc}), so which result answers which call is not "
-                                 f"known") from None
-    if not ReasoningParamsMixin._should_sanitize_tool_calls(SimpleNamespace(api_mode=api_mode)):
-        return None
-    return ReasoningParamsMixin._sanitize_tool_calls_for_strict_api
-
-
-_RECORD = "_lcm_pairing_record"
-_POSITION = "_lcm_pairing_position"
+    ids: list                                 # the distinct ``id`` values of its calls, in order
+    calls: list                               # (assistant record, position), in order
+    results: list                             # result records, in order
 
 
 @dataclass
 class Pairing:
-    """What the host's passes send of a run of blocks."""
+    """The store's pairing of a run of blocks."""
 
-    # result record -> (assistant record, position of the call it answers)
+    # result record -> (assistant record, position of the call it belongs to)
     result_of: dict = field(default_factory=dict)
-    # (assistant record, position) -> the result record that answers it on the wire
+    # (assistant record, position) -> the result record that belongs to it
     answer: dict = field(default_factory=dict)
-    # (assistant record, position) -> the content of the host's own stand-in for its result
-    stand_in: dict = field(default_factory=dict)
-    # (assistant record, position) -> the host id of a call the host does not send
-    call_not_sent: dict = field(default_factory=dict)
-    # result record -> (the pass that does not send it: "no_id", "positional",
-    # "duplicate"; its host id)
-    result_not_sent: dict = field(default_factory=dict)
-    # record -> its role, for a record of a role the host does not send
-    role_not_sent: dict = field(default_factory=dict)
-    # (assistant record, position) -> (host id, the calls of its message with that id)
-    shared: dict = field(default_factory=dict)
+    # (assistant record, position) or result record -> its Group
+    group: dict = field(default_factory=dict)
+    # result record -> ("unknown", its id) or ("no_id", None): a result that belongs to no call
+    stray: dict = field(default_factory=dict)
 
 
-def _copy_for_passes(record: str, raw: Any) -> dict:
-    """A shallow copy of the stored dict, tagged with its record, its tool calls copied and
-    tagged with their positions; content is shared: no pass changes content in place, each
-    rebuilds a message it changes (``{**msg, ...}``)."""
-    message = dict(raw) if isinstance(raw, dict) else {}
-    message[_RECORD] = record
-    calls = message.get("tool_calls")
-    if isinstance(calls, list):
-        copied = []
-        for position, call in enumerate(calls):
-            if isinstance(call, dict):
-                call = dict(call)
-                call[_POSITION] = position
-            copied.append(call)
-        message["tool_calls"] = copied
-    return message
+def _id_of(call: Any) -> Any:
+    return call.get("id") if isinstance(call, dict) else None
 
 
-def _pair_block(block: list[tuple[str, Any]], found: Pairing, *, api_mode: str, model: str,
-                row_of: Callable[[dict], dict]) -> None:
-    call_variants, result_variants, coalesce = host_alias_helpers()
-    passes = host_sending_passes()
-    scrub = host_strict_scrub(api_mode)
-    # The passes get the host's own input (the re-plan of #71, C3): each record's row as the
-    # host's build_api_messages sends it (``row_of``), then the host's scrub, as at
-    # agent/turn_context.py:1271-1274, then the passes as at agent_runtime_helpers.py:3039-3046.
-    tagged = [_copy_for_passes(record, row_of(raw) if isinstance(raw, dict) else raw) for record, raw in block]
-    if scrub is not None:
-        for message in tagged:
-            try:
-                scrub(message, model=model)
-            except Exception as exc:
-                raise PairingUnavailable(f"the host's strict-API tool-call scrub cannot be run on these records "
-                                         f"({type(exc).__name__}: {exc})") from None
+def _aliases(call: Any) -> set:
+    """A call's own spellings: its ``id``, ``call_id`` and ``response_item_id``, and each
+    part of a composite ``a|b`` of any of them."""
+    found: set = set()
+    if not isinstance(call, dict):
+        return found
+    for key in ("id", "call_id", "response_item_id"):
+        value = call.get(key)
+        if isinstance(value, str) and value:
+            found.add(value)
+            found.update(part for part in value.split("|") if part)
+    return found
 
-    calls_of: dict[str, list] = {}
-    for message in tagged:
-        calls = message.get("tool_calls")
-        if message.get("role") == "assistant" and isinstance(calls, list):
-            calls_of[message[_RECORD]] = [
-                (call.get(_POSITION, position) if isinstance(call, dict) else position, call,
-                 frozenset(call_variants(call)))
-                for position, call in enumerate(calls)]
-    # Which calls of one message share an id, by the host's alias helpers, on the calls as
-    # the host pairs them (after the scrub).
-    for record, calls in calls_of.items():
-        for position, call, variants in calls:
-            if not variants:
+
+def _joined(ci: Any, cj: Any) -> bool:
+    """Rule 2: two calls of one block share an ``id``, or one's aliases hold the other's."""
+    id_i, id_j = _id_of(ci), _id_of(cj)
+    return ((id_i is not None and id_i == id_j) or (isinstance(id_j, str) and id_j in _aliases(ci))
+            or (isinstance(id_i, str) and id_i in _aliases(cj)))
+
+
+def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
+    head_record, head = block[0]
+    calls: list = []
+    if isinstance(head, dict) and head.get("role") == "assistant" and isinstance(head.get("tool_calls"), list):
+        calls = list(enumerate(head["tool_calls"]))
+    results = [(record, raw) for record, raw in block if isinstance(raw, dict) and raw.get("role") == "tool"]
+
+    parent = list(range(len(calls)))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(calls)):
+        for j in range(i + 1, len(calls)):
+            if _joined(calls[i][1], calls[j][1]):
+                parent[root(j)] = root(i)
+    members: dict[int, list] = {}
+    for i in range(len(calls)):
+        members.setdefault(root(i), []).append(i)
+
+    claimed: set = set()
+    for indexes in members.values():
+        if len(indexes) == 1:
+            position, call = calls[indexes[0]]
+            call_id = _id_of(call)
+            mine = [record for record, raw in results
+                    if call_id is not None and raw.get("tool_call_id") == call_id]
+            if len(mine) <= 1:
+                if mine:
+                    found.answer[(head_record, position)] = mine[0]
+                    found.result_of[mine[0]] = (head_record, position)
+                    claimed.add(mine[0])
                 continue
-            sharing = [p for p, _c, v in calls if v & variants]
-            if len(sharing) > 1:
-                found.shared[(record, position)] = (coalesce(call) or sorted(variants)[0], len(sharing))
-
-    stages: list[list] = []
-    current = tagged
-    for name, host_pass in passes:
-        try:
-            current = host_pass(current)
-        except Exception as exc:
-            raise PairingUnavailable(f"the host's pre-call sanitizer ({name}) cannot be run on these records "
-                                     f"({type(exc).__name__}: {exc})") from None
-        stages.append(current)
-
-    def records_in(messages: list) -> set:
-        return {m.get(_RECORD) for m in messages if isinstance(m, dict) and m.get(_RECORD)}
-
-    after_roles, after_ids, after_positional, sent = (records_in(stage) for stage in stages)
-    for message in tagged:
-        record, role = message[_RECORD], message.get("role")
-        if record not in after_roles:
-            found.role_not_sent[record] = role
-            continue
-        if role != "tool" or record in sent:
-            continue
-        call_id = message.get("tool_call_id")
-        shown_id = str(call_id).strip() if call_id is not None else None
-        if record not in after_ids:
-            found.result_not_sent[record] = ("no_id", shown_id)
-        elif record not in after_positional:
-            found.result_not_sent[record] = ("positional", shown_id)
         else:
-            found.result_not_sent[record] = ("duplicate", shown_id)
+            spellings: set = set()
+            for i in indexes:
+                spellings |= _aliases(calls[i][1])
+            mine = [record for record, raw in results
+                    if isinstance(raw.get("tool_call_id"), str) and raw["tool_call_id"] in spellings]
+        ids: list = []
+        for i in indexes:
+            if _id_of(calls[i][1]) not in ids:
+                ids.append(_id_of(calls[i][1]))
+        group = Group(ids, [(head_record, calls[i][0]) for i in indexes], mine)
+        for key in group.calls:
+            found.group[key] = group
+        for record in mine:
+            found.group[record] = group
+            claimed.add(record)
 
-    # The sent output: each assistant with its calls, then what follows it before the next
-    # assistant or user message; a call's result is the tool message whose id is one of its
-    # aliases (unique once the host's passes ran).
-    holder: Optional[str] = None
-    sent_calls: list = []
-    for message in stages[-1]:
-        role = message.get("role") if isinstance(message, dict) else None
-        if role in ("assistant", "user"):
-            holder = message.get(_RECORD) if role == "assistant" else None
-            sent_calls = [(call.get(_POSITION), frozenset(call_variants(call)))
-                          for call in (message.get("tool_calls") or []) if isinstance(call, dict)] \
-                if role == "assistant" else []
-            if holder is not None:
-                sent_positions = {p for p, _v in sent_calls}
-                for position, call, _variants in calls_of.get(holder, []):
-                    if position not in sent_positions:
-                        found.call_not_sent[(holder, position)] = coalesce(call) or None
+    for record, raw in results:
+        if record in claimed:
             continue
-        if role != "tool" or holder is None:
-            continue
-        variants = frozenset(result_variants(message.get("tool_call_id")))
-        position = next((p for p, v in sent_calls if v & variants), None)
-        if position is None:
-            continue
-        record = message.get(_RECORD)
-        if record:
-            found.answer[(holder, position)] = record
-            found.result_of[record] = (holder, position)
+        call_id = raw.get("tool_call_id")
+        if call_id is None or (isinstance(call_id, str) and not call_id.strip()):
+            found.stray[record] = ("no_id", None)
         else:
-            content = message.get("content")
-            found.stand_in[(holder, position)] = content if isinstance(content, str) else json.dumps(content)
+            found.stray[record] = ("unknown", call_id)
 
 
 def _opens_block(message: Any) -> bool:
     return isinstance(message, dict) and message.get("role") in ("assistant", "user")
 
 
-def pair(sequence: list[tuple[str, Any]], *, api_mode: str, model: str = "",
-         row_of: Callable[[dict], dict]) -> Pairing:
-    """What the host sends of ``sequence`` ((record, the host's dict as stored), in the
-    active order), block by block (the module docstring); ``row_of`` gives a stored dict's
-    row as the host sends it."""
+def pair(sequence: list[tuple[str, Any]]) -> Pairing:
+    """The store's pairing of ``sequence`` ((record, the host's dict as stored), in the
+    active order), block by block (the module docstring)."""
     found = Pairing()
     block: list = []
     for record, raw in sequence:
         if _opens_block(raw) and block:
-            _pair_block(block, found, api_mode=api_mode, model=model, row_of=row_of)
+            _pair_block(block, found)
             block = []
         block.append((record, raw))
     if block:
-        _pair_block(block, found, api_mode=api_mode, model=model, row_of=row_of)
+        _pair_block(block, found)
     return found
 
 
@@ -290,8 +192,7 @@ def blocks_span(order: list[str], roles: Callable[[list[str]], dict], first: int
 
 
 def pairing_around(order: list[str], index: dict, records: list[str], roles: Callable[[list[str]], dict],
-                   raws: Callable[[list[str]], dict], *, api_mode: str, model: str = "",
-                   row_of: Callable[[dict], dict]) -> Pairing:
+                   raws: Callable[[list[str]], dict]) -> Pairing:
     """The pairing of ``records`` (contiguous in ``order``) through the blocks they lie in."""
     places = [index[r] for r in records if r in index]
     if not places:
@@ -299,5 +200,4 @@ def pairing_around(order: list[str], index: dict, records: list[str], roles: Cal
     start, end = blocks_span(order, roles, min(places), max(places))
     span = order[start:end]
     raw = raws(span)
-    return pair([(record, raw.get(record) or {}) for record in span], api_mode=api_mode, model=model,
-                row_of=row_of)
+    return pair([(record, raw.get(record) or {}) for record in span])
