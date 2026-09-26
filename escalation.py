@@ -587,8 +587,12 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
     if timeout is not None:
         call_kwargs["timeout"] = timeout
     response = call_llm(**call_kwargs)
+    # The authority on the route is what the host records in route_info; the response's
+    # own model field is not read: a snapshot or deployment id (Azure's gpt-4o answers
+    # gpt-4o-2024-08-06) cannot be mapped onto the host's ids without predicting another
+    # system by pattern (the orchestrator's ruling on the Codex review of ad21393). A route
+    # switch that leaves no record is the host's defect (#70).
     check_route_records(route, route_info.routes)
-    check_response_model(route, response)
     try:
         choice = response.choices[0]
         message = choice.message
@@ -610,30 +614,6 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
                              detail=f"content is {type(content).__name__}, finish_reason {finish_reason!r}")
     return content, str(finish_reason)
-
-
-def check_response_model(route: SummariserRoute, response: Any) -> None:
-    """The model the response reports against the target's model forms (the orchestrator's
-    ruling on the Codex review of 903281e): the host's credential rung can retry through
-    another provider and model without a ``route_info`` record
-    (``_ladder_credential_rungs``, agent/auxiliary_client.py:7576-7633 →
-    ``_prepare_same_provider_retry``, 3738, at origin/main d0288be5b3), so the response's
-    own ``model`` field is read too, and a model not among the target's (as asked for, or
-    either side normalised by the host's ``_normalize_resolved_model`` for the target's
-    provider) is a failed call of kind ``route``. A response without a model field adds
-    nothing here; ``route_info`` stands alone then. What stays unobservable: a switch that
-    leaves no record and keeps the same model id (a host defect, filed)."""
-    reported = str(getattr(response, "model", "") or "").strip()
-    target = _session_route_target(route)
-    if not reported or target is None:
-        return
-    forms = _session_route_model_forms(route, target[0])
-    if reported in forms or (_host_model_forms(reported, target[0]) & forms):
-        return
-    raise SummaryFailure(
-        "the response reports another model", transient=False, kind="route",
-        detail=f"the response's model is {reported!r}; the summariser is {route.describe()} (#33 D9)",
-    )
 
 
 def check_route_records(route: SummariserRoute, routes: list[tuple[str, str]]) -> None:
