@@ -15,7 +15,7 @@ Use for discovery across current-session stored messages and summaries.
 - Keep `sort='recency'` for recent events, use `sort='relevance'` for the strongest older match, and use `sort='hybrid'` when both matter.
 - Exact role/time filters apply before limiting where supported. `time_from`/`time_to` compare the time a message was stored, which is the time of the compaction that stored it, not the time it was said.
 - `sort='recency'` follows the conversation's order, newest first.
-- A message hit with `revises_node_id` is a summary row as the host rewrote it in the context (for example with the task list folded in); `lcm_expand(node_id=…)` on that id opens the summary's sources.
+- Each hit carries its `handle`. A message hit with `revises` is a summary row as the host rewrote it in the context (for example with the task list folded in); `lcm_expand(handle=…)` on the handle in `revises` opens the summary's stretch.
 
 Do not treat a short search snippet as sufficient evidence for a detail-heavy answer.
 
@@ -24,7 +24,7 @@ Do not treat a short search snippet as sufficient evidence for a detail-heavy an
 Use when current-session compacted material must be expanded and synthesized into a precise bounded answer.
 
 - Always provide `prompt`.
-- Provide either a small `query` or explicit `node_ids` when known.
+- Provide either a small `query` or the summaries' `handles` when known.
 - `query` follows the same narrow FTS construction rules as `lcm_grep`.
 - The expansion path is model-backed and bounded by answer/context token limits.
 
@@ -35,10 +35,11 @@ Recommended current-session escalation:
 
 ### `lcm_expand`
 
-Use as low-level drill-down after a known handle:
+Use as low-level drill-down after a known handle (`handle`):
 
-- `node_id` expands a current-session summary with source pagination;
-- `store_id` recovers one stored message as the host handed it over, with content pagination.
+- a summary's (`s…`) or a chunk's (`c…`) handle returns that stretch: the messages verbatim, the readable reasoning beside them, each tool call with its handle (`t…`), name and arguments, without its result; `raw=true` puts the results inline;
+- a tool call's handle returns its result; a message's handle (`m…`) returns that message;
+- a result longer than one page carries `next_page`; pass it as `page` for the rest.
 
 Do not use it as broad first-step discovery.
 

@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
+from . import expansion
 from .diagnostics import doctor_guidance_for_checks
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
@@ -110,14 +111,6 @@ def _parse_int_value(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-def _parse_non_negative_int(value: Any, default: int) -> int:
-    return max(0, _parse_int_value(value, default))
-
-
-def _parse_positive_int(value: Any, default: int) -> int:
-    return max(1, _parse_int_value(value, default))
 
 
 def _parse_optional_timestamp(value: Any, name: str) -> tuple[float | None, str | None]:
@@ -1078,12 +1071,27 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         result.pop("_sort_directness", None)
         result.pop("_hybrid_summary_override", None)
 
+    # The tools take handles (#29 W5): a hit names its record or summary by its handle.
+    shown = results[:limit]
+    record_handles = engine._records.handles_of_records(
+        r["store_id"] for r in shown if r.get("store_id") is not None)
+    derivation_handles = engine._records.handles_of_derivations(
+        [r["node_id"] for r in shown if r.get("node_id") is not None]
+        + [r["revises_node_id"] for r in shown if r.get("revises_node_id") is not None])
+    for result in shown:
+        if "store_id" in result:
+            result["handle"] = record_handles.get(result.pop("store_id"))
+        if "node_id" in result:
+            result["handle"] = derivation_handles.get(result.pop("node_id"))
+        if "revises_node_id" in result:
+            result["revises"] = derivation_handles.get(result.pop("revises_node_id"))
+
     response: Dict[str, Any] = {
         "query": query,
         "sort": sort,
         "limit": limit,
         "total_results": len(results),
-        "results": results[:limit],
+        "results": shown,
     }
     if role is not None:
         response["role"] = role
@@ -1098,140 +1106,127 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     return json.dumps(response)
 
 
-def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
-    """Expand a summary node or a stored message to its content.
+_LCM_EXPAND_REMOVED_ARGUMENTS = (
+    "node_id", "store_id", "max_tokens", "source_offset", "source_limit", "content_offset",
+    "include_exact_ref", "externalized_ref",
+)
 
-    Mode selection (exactly one is required):
-    - ``store_id``: fetch a single stored message by store_id, as stored
-    - ``node_id``: expand a summary node to its source messages (current session only)
 
-    ``store_id`` mode has no session check.
-    """
+def lcm_expand(args: Dict[str, Any], **kwargs) -> Any:
+    """Look behind a handle: one page of what it opens into (``expansion``, #18). The
+    result is the final string, or the ``_multimodal`` envelope where the page holds an
+    image; either way at most the host's spill threshold."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
-
-    removed = [name for name in ("include_exact_ref", "externalized_ref") if name in args]
+    removed = [name for name in _LCM_EXPAND_REMOVED_ARGUMENTS if name in args]
     if removed:
         return json.dumps({
-            "error": "lcm_expand no longer accepts: " + ", ".join(removed) + ".",
+            "error": "lcm_expand no longer accepts: " + ", ".join(removed)
+                     + ". It takes a handle (m, t, c or s and eight characters), raw, and page.",
         })
+    unknown = [name for name in args if name not in ("handle", "raw", "page")]
+    if unknown:
+        return json.dumps({"error": "lcm_expand takes handle, raw and page; not " + ", ".join(unknown)})
+    try:
+        return expansion.expand(engine, args)
+    except expansion.ExpansionError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    except Exception as exc:
+        # A store that cannot be read is said, never shown as an empty stretch.
+        logger.warning("lcm_expand failed", exc_info=True)
+        return json.dumps({"error": f"lcm_expand could not read the store ({type(exc).__name__}: {exc})"},
+                          ensure_ascii=False)
 
-    raw_store_id_arg = args.get("store_id")
-    raw_node_id_arg = args.get("node_id")
 
-    modes_provided: list[str] = []
-    if raw_store_id_arg is not None:
-        modes_provided.append("store_id")
-    if raw_node_id_arg is not None:
-        modes_provided.append("node_id")
+def _query_ids_to_handles(value: Any, record_handles: dict, derivation_handles: dict) -> Any:
+    """The query tool's output with every integer id the views use replaced by the
+    handle the agent can take (#29 W5): ``node_id``/``child_node_id``/``node_ids`` by
+    summary handles, ``store_id``/``next_store_id`` by message handles, and each
+    ``expand_args`` by the handle to expand (``lcm_expand`` pages by itself)."""
+    if isinstance(value, list):
+        return [_query_ids_to_handles(item, record_handles, derivation_handles) for item in value]
+    if not isinstance(value, dict):
+        return value
+    converted: Dict[str, Any] = {}
+    for key, item in value.items():
+        if key in ("node_id", "child_node_id") and isinstance(item, int):
+            converted[key.replace("node_id", "handle")] = derivation_handles.get(item)
+        elif key == "node_ids" and isinstance(item, list):
+            converted["handles"] = [derivation_handles.get(i) for i in item]
+        elif key in ("store_id", "next_store_id") and isinstance(item, int):
+            converted[key.replace("store_id", "handle")] = record_handles.get(item)
+        elif key == "expand_args" and isinstance(item, dict):
+            target = item.get("node_id") if item.get("node_id") is not None else item.get("store_id")
+            handles = derivation_handles if item.get("node_id") is not None else record_handles
+            converted[key] = {"handle": handles.get(target)}
+        else:
+            converted[key] = _query_ids_to_handles(item, record_handles, derivation_handles)
+    return converted
 
-    if len(modes_provided) > 1:
-        return json.dumps({
-            "error": (
-                "Provide only one of node_id, store_id "
-                f"(got {', '.join(modes_provided)})"
-            ),
-        })
-    if not modes_provided:
-        return json.dumps({
-            "error": "node_id or store_id is required",
-        })
 
-    max_tokens = _parse_positive_int(args.get("max_tokens", 4000), 4000)
-    source_offset = _parse_non_negative_int(args.get("source_offset", 0), 0)
-    source_limit_arg = args.get("source_limit")
-    source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
-    content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
-
-    if raw_store_id_arg is not None:
-        try:
-            store_id = int(raw_store_id_arg)
-        except (TypeError, ValueError, OverflowError):
-            return json.dumps({"error": "store_id must be an integer"})
-        stored = engine._store.get(store_id)
-        if stored is None:
-            return json.dumps({"error": f"Message store_id {store_id} not found"})
-        transcript_content, image_spans = _stored_content_text(stored)
-        sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset, image_spans)
-        engine_session_id = engine.current_session_id
-        stored_session_id = stored.get("session_id", "")
-        result: Dict[str, Any] = {
-            "store_id": store_id,
-            "source_type": "raw_message",
-            "session_id": stored_session_id,
-            "source": stored.get("source") or "",
-            "conversation_id": stored.get("conversation_id") or "",
-            "role": stored.get("role"),
-            "timestamp": stored.get("timestamp", 0),
-            "tool_call_id": stored.get("tool_call_id") or "",
-            "from_current_session": bool(engine_session_id) and stored_session_id == engine_session_id,
-            "content": sliced["content"],
-            "content_chars": sliced["content_chars"],
-            "content_offset": sliced["content_offset"],
-            "content_returned_chars": sliced["content_returned_chars"],
-            "content_truncated": sliced["content_truncated"],
-            "next_content_offset": sliced["next_content_offset"],
-            "has_more": sliced["has_more"],
-        }
-        if stored.get("revises_node_id") is not None:
-            # A summary row the host rewrote: it stands beside the chain and revises
-            # this summary, which the context shows re-emitted from its derivation.
-            result["revises_node_id"] = stored["revises_node_id"]
-        return json.dumps(result)
-
-    node_id = raw_node_id_arg
-
-    node = _get_session_node(engine, node_id)
-    if node is None:
-        return json.dumps({"error": f"Node {node_id} not found in current session"})
-
-    if node.source_type == "messages":
-        messages, pagination = _expand_message_sources(
-            engine,
-            node,
-            max_tokens=max_tokens,
-            source_offset=source_offset,
-            source_limit=source_limit,
-            content_offset=content_offset,
-        )
-        return json.dumps(
-            {
-                "node_id": node_id,
-                "depth": node.depth,
-                "source_type": "messages",
-                "expanded": messages,
-                "pagination": pagination,
-            }
-        )
-
-    if node.source_type == "nodes":
-        children, pagination = _expand_child_nodes(
-            engine,
-            node,
-            max_tokens=max_tokens,
-            source_offset=source_offset,
-            source_limit=source_limit,
-        )
-        return json.dumps(
-            {
-                "node_id": node_id,
-                "depth": node.depth,
-                "source_type": "nodes",
-                "expanded": children,
-                "pagination": pagination,
-            }
-        )
-
-    return json.dumps({"error": f"Unknown source_type: {node.source_type}"})
+def _collect_ids(value: Any, records: set, derivations: set) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _collect_ids(item, records, derivations)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("node_id", "child_node_id") and isinstance(item, int):
+                derivations.add(item)
+            elif key == "node_ids" and isinstance(item, list):
+                derivations.update(i for i in item if isinstance(i, int))
+            elif key in ("store_id", "next_store_id") and isinstance(item, int):
+                records.add(item)
+            else:
+                _collect_ids(item, records, derivations)
 
 
 def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
-    """Answer a question by expanding matching summaries or explicit node ids."""
+    """Answer a question over summaries, given by their handles or found by a search.
+
+    The tools take handles (#29 W5): each handle is resolved in the caller's session and
+    one that does not resolve is refused, never skipped; the answer's references are
+    handles. The query itself is #19's and is rebuilt there."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
+    if "node_ids" in args:
+        return json.dumps({"error": "lcm_expand_query no longer accepts node_ids; give the summaries' handles "
+                                    "as handles"})
+    handles = args.get("handles")
+    inner = {key: value for key, value in args.items() if key != "handles"}
+    if handles is not None:
+        if not isinstance(handles, list) or not handles:
+            return json.dumps({"error": "handles must be a list of summary handles"})
+        session = engine.current_session_id
+        records = engine._records
+        node_ids: list[int] = []
+        with records.snapshot():
+            cover = records.cover(session) if session else None
+            for handle in handles:
+                resolved = records.resolve(str(handle), session, cover)
+                if resolved.status != "ok":
+                    return json.dumps({"error": expansion.unresolved_message(resolved)}, ensure_ascii=False)
+                if resolved.kind != "s":
+                    return json.dumps({"error": f"{resolved.handle} is not a summary's handle; this tool reads "
+                                                f"summaries, lcm_expand opens the others"})
+                node_ids.append(records.derivations([resolved.handle])[resolved.handle][0])
+        inner["node_ids"] = node_ids
+    result = _lcm_expand_query_by_ids(inner, engine)
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    record_ids: set = set()
+    derivation_ids: set = set()
+    _collect_ids(payload, record_ids, derivation_ids)
+    return json.dumps(_query_ids_to_handles(
+        payload, engine._records.handles_of_records(record_ids),
+        engine._records.handles_of_derivations(derivation_ids)), ensure_ascii=False)
 
+
+def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
+    """The query over the views' integer ids, as a5c61ca had it (#19 rebuilds it)."""
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         return json.dumps({"error": "prompt is required"})
@@ -1276,7 +1271,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         nodes = engine._dag.search(query, session_id=engine.current_session_id, limit=max_results)
         raw_results = engine._store.search(query, session_id=engine.current_session_id, limit=max_results)
     else:
-        return json.dumps({"error": "Provide either query or node_ids"})
+        return json.dumps({"error": "Provide either query or handles"})
 
     if not nodes and not raw_results:
         return json.dumps(

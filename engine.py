@@ -48,7 +48,8 @@ from .plugin_sessions import PluginSessions
 from .record_store import RecordStore
 from .record_write import RecordWriteMixin
 from .store import MessageStore
-from .tokens import ESTIMATE_LABEL, Estimator, count_messages_tokens
+from .results import final_result
+from .tokens import Estimator, count_messages_tokens
 from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
@@ -93,40 +94,6 @@ def _close_helpers(helpers: tuple, label: str, reason_box: list, backup: Optiona
             logger.warning("LCM could not close the %s of %s (%s)", type(helper).__name__, label, reason,
                            exc_info=True)
     logger.info("LCM closed the store connections of %s: %s", label, reason)
-
-
-# The keys under which the tools show the plugin's own estimate (the views' token
-# columns, derived from records.est_tokens and derivations.est_tokens, and their sums).
-# The host's own counts (last_prompt_tokens and the like) are not estimates and are not
-# labelled. Beside every such count that can hold images stands the number of images
-# its estimate left uncounted (records.est_uncounted_images and its sums, #35).
-_ESTIMATE_KEYS = frozenset({
-    "token_count", "source_token_count", "est_tokens", "tokens", "source_tokens", "token_estimate",
-    "estimated_tokens", "effective_fresh_tail_tokens", "total_tokens", "total_source_tokens",
-    "total_summary_tokens",
-})
-_UNCOUNTED_NOTE = "; beside each count that can hold images, the images it left uncounted (*uncounted_images)"
-
-
-def _has_token_count(value: Any) -> bool:
-    if isinstance(value, dict):
-        return any(k in _ESTIMATE_KEYS or _has_token_count(v) for k, v in value.items())
-    if isinstance(value, list):
-        return any(_has_token_count(v) for v in value)
-    return False
-
-
-def _label_token_counts(result: str) -> str:
-    """A tool result that shows the plugin's token counts says what they are: an
-    estimate (#21). The label is added at the top of the result object."""
-    try:
-        payload = json.loads(result)
-    except (TypeError, ValueError):
-        return result
-    if isinstance(payload, dict) and _has_token_count(payload) and "token_counts" not in payload:
-        payload = {"token_counts": ESTIMATE_LABEL + _UNCOUNTED_NOTE, **payload}
-        return json.dumps(payload, ensure_ascii=False)
-    return result
 
 
 class ReviewForkDetachRefused(RuntimeError):
@@ -1066,7 +1033,9 @@ class LCMEngine(
         }
         handler = handlers.get(name)
         if handler:
-            return _label_token_counts(handler(args, engine=self))
+            # The final string (or the _multimodal envelope, as it is): what a page was
+            # measured as (``results.final_result``, #18).
+            return final_result(handler(args, engine=self))
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
 
     def _database_path_source(self) -> str:

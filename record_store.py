@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -85,6 +86,33 @@ def _warn_media(handle: str, message: dict) -> None:
         logger.warning("LCM could not check record %s for media", handle, exc_info=True)
 
 
+HANDLE_RE = re.compile(r"[mtcs][a-z2-7]{8}")
+
+
+@dataclass(frozen=True)
+class Cover:
+    """A session's latest effective return as the tools read it (``RecordStore.cover``)."""
+
+    session: str
+    compaction: int
+    summaries: list        # the summary entries' derivation handles, in return order
+    reaches: dict          # derivation -> the chunks it reaches, in order
+    chunks: list           # every chunk under the summaries, in cover order
+    tail: list             # the record entries (the stored fresh tail), in order
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """What a handle names for a caller (#29 W5). ``status``: "ok"; "malformed" (not a
+    handle); "unknown" (not in this store); "other_session"; "inactive" (this session's,
+    but not on its active record: a reverted branch, an attempt that never took effect,
+    or a session with no effective compaction yet)."""
+
+    status: str
+    kind: str
+    handle: str
+
+
 def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
     if not isinstance(value, str) or ":" not in value:
         return None
@@ -141,6 +169,9 @@ class RecordStore:
         # How deep the thread that holds ``_lock`` is inside ``_tx``: an inner ``_tx``
         # joins the outer transaction (the planning transaction, ``planning``).
         self._tx_depth = 0
+        # How deep the thread that holds ``_lock`` is inside ``snapshot``: a read
+        # transaction, in which no event is flushed (that would need the write lock).
+        self._read_depth = 0
         self._pending_events: list[tuple] = []
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(
             str(self.db_path),
@@ -254,7 +285,7 @@ class RecordStore:
         """Write the events not written yet, in their own short transaction; inside an
         open transaction they wait for its end (``_tx`` flushes after its commit)."""
         with self._lock:
-            if not self._pending_events or self._conn is None or self._tx_depth:
+            if not self._pending_events or self._conn is None or self._tx_depth or self._read_depth:
                 return
             conn = self._conn
             try:
@@ -608,6 +639,215 @@ class RecordStore:
             (session, after or 0),
         )
         return {int(row_id): str(record) for row_id, record in rows}
+
+    # --- Reading for the tools (#18; #29 W5) -----------------------------------------
+
+    @contextlib.contextmanager
+    def snapshot(self):
+        """One read transaction around a tool's reads, so that a compaction committing
+        meanwhile, in this process or another, is not half seen. It holds the helper's
+        lock and, in rollback-journal mode, a shared lock on the file: a writer's commit
+        waits for it (within its busy timeout), so nothing slow runs inside it, and never
+        a model call. Inside an open transaction of this helper it joins that one."""
+        with self._lock:
+            conn = self._conn
+            if self._tx_depth or self._read_depth:
+                self._read_depth += 1
+                try:
+                    yield
+                finally:
+                    self._read_depth -= 1
+                return
+            conn.execute("BEGIN")
+            self._read_depth = 1
+            try:
+                yield
+            except BaseException:
+                self._rollback(conn)
+                raise
+            else:
+                conn.execute("COMMIT")
+            finally:
+                self._read_depth = 0
+            self._flush_events()
+
+    def cover(self, session: str) -> Optional["Cover"]:
+        """What the session's latest effective compaction returned, as the tools see it:
+        its summary entries in order, the chunks each reaches, and its record entries
+        (the stored fresh tail). None where the session has no effective compaction."""
+        compaction = self.effective_compaction(session)
+        if compaction is None:
+            return None
+        entries = self.return_entries(compaction)
+        summaries: list[str] = []
+        tail: list[str] = []
+        for position in sorted(entries):
+            kind, record, derivation, _raw = entries[position]
+            if kind == "summary" and derivation:
+                summaries.append(str(derivation))
+            elif kind == "record" and record:
+                tail.append(str(record))
+        reaches = {derivation: self._chunks_of(derivation) for derivation in summaries}
+        chunks = [chunk for derivation in summaries for chunk in reaches[derivation]]
+        return Cover(session=session, compaction=compaction, summaries=summaries, reaches=reaches,
+                     chunks=chunks, tail=tail)
+
+    def resolve(self, handle: str, session: str, cover: Optional["Cover"]) -> "Resolved":
+        """What a handle names, for the tools of ``session`` (#29 W5): a handle resolves
+        only in this store and only in the caller's plugin session, and there only where
+        the session's active record holds it (its latest effective return: the stored tail,
+        and the chunks under its summaries). Never against a host identifier."""
+        text = str(handle or "").strip()
+        if not HANDLE_RE.fullmatch(text):
+            return Resolved("malformed", "", text)
+        kind = text[0]
+        home: Optional[str] = None
+        if kind == MESSAGE:
+            rows = self._q("SELECT session FROM records WHERE handle = ?", (text,))
+            home = str(rows[0][0]) if rows else None
+        elif kind == TOOL_CALL:
+            rows = self._q("SELECT r.session, r.handle FROM tool_calls t JOIN records r ON r.handle = t.record "
+                           "WHERE t.handle = ?", (text,))
+            home = str(rows[0][0]) if rows else None
+        elif kind == CHUNK:
+            rows = self._q("SELECT session FROM chunks WHERE handle = ?", (text,))
+            home = str(rows[0][0]) if rows else None
+        elif kind == DERIVATION:
+            reached = self._chunks_of(text) if self._q("SELECT 1 FROM derivations WHERE handle = ?", (text,)) else []
+            if reached:
+                sessions = {str(s) for (s,) in self._q(
+                    f"SELECT DISTINCT session FROM chunks WHERE handle IN ({','.join('?' * len(reached))})", reached)}
+                # A derivation reaches the chunks of one session; more than one is no session's.
+                home = next(iter(sessions)) if len(sessions) == 1 else ""
+        if home is None:
+            return Resolved("unknown", kind, text)
+        if home != session:
+            return Resolved("other_session", kind, text)
+        if cover is None:
+            return Resolved("inactive", kind, text)
+        chunks = set(cover.chunks)
+        if kind == CHUNK:
+            active = text in chunks
+        elif kind == DERIVATION:
+            active = all(chunk in chunks for chunk in reached)
+        else:
+            record = text if kind == MESSAGE else str(rows[0][1])
+            active = self._record_active(record, cover)
+        return Resolved("ok" if active else "inactive", kind, text)
+
+    def _record_active(self, record: str, cover: "Cover") -> bool:
+        if record in cover.tail:
+            return True
+        if not cover.chunks:
+            return False
+        return bool(self._q(
+            f"SELECT 1 FROM chunk_members WHERE record = ? AND chunk IN ({','.join('?' * len(cover.chunks))}) "
+            f"LIMIT 1", (record, *cover.chunks)))
+
+    def chunk_records(self, chunk: str) -> list[tuple[str, dict]]:
+        """(record handle, the host's dict as stored) of a chunk's members, in order."""
+        return [(str(handle), json.loads(raw)) for handle, raw in self._q(
+            "SELECT r.handle, r.raw FROM chunk_members m JOIN records r ON r.handle = m.record "
+            "WHERE m.chunk = ? ORDER BY m.ordinal", (chunk,))]
+
+    def record_raw(self, record: str) -> Optional[dict]:
+        rows = self._q("SELECT raw FROM records WHERE handle = ?", (record,))
+        return json.loads(rows[0][0]) if rows else None
+
+    def derivation_sources(self, derivation: str) -> list[tuple[Optional[str], Optional[str]]]:
+        """(chunk, source derivation) of a derivation, in order: exactly one is set."""
+        return [(c, d) for c, d in self._q(
+            "SELECT chunk, source_derivation FROM derivation_sources WHERE derivation = ? ORDER BY ordinal",
+            (derivation,))]
+
+    def derivation_text(self, derivation: str) -> Optional[str]:
+        rows = self._q("SELECT text FROM derivations WHERE handle = ?", (derivation,))
+        return str(rows[0][0]) if rows else None
+
+    def leaf_summaries(self, chunks: Sequence[str], among: Sequence[str]) -> dict[str, str]:
+        """chunk -> the summary among ``among`` whose only source is that chunk."""
+        found: dict[str, str] = {}
+        for derivation in among:
+            sources = self.derivation_sources(derivation)
+            if len(sources) == 1 and sources[0][0] in chunks:
+                found[str(sources[0][0])] = derivation
+        return found
+
+    def tool_calls_of(self, records: Sequence[str]) -> dict[str, dict[int, str]]:
+        """record -> {position in its ``tool_calls``: the call's handle}. A revision's
+        calls keep the handles its sources' calls have (``begin_compaction``); those are
+        given under the revision, by position where the call ids agree."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, dict[int, str]] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            for record, position, handle in self._q(
+                    f"SELECT record, position, handle FROM tool_calls WHERE record IN ({','.join('?' * len(part))})",
+                    part):
+                found.setdefault(str(record), {})[int(position)] = str(handle)
+        return found
+
+    def revision_call_handles(self, revision: str) -> dict[str, str]:
+        """tool_call_id -> the call handle its sources hold, for a revision record."""
+        sources = [str(s) for (s,) in self._q(
+            "SELECT source_record FROM revision_sources WHERE revision = ? AND source_record IS NOT NULL",
+            (revision,))]
+        if not sources:
+            return {}
+        return {str(call_id): str(handle) for call_id, handle in self._q(
+            f"SELECT tool_call_id, handle FROM tool_calls WHERE tool_call_id IS NOT NULL AND record IN "
+            f"({','.join('?' * len(sources))})", sources)}
+
+    def record_kind(self, record: str) -> Optional[str]:
+        rows = self._q("SELECT kind FROM records WHERE handle = ?", (record,))
+        return str(rows[0][0]) if rows else None
+
+    def call_of_result(self, records: Sequence[str]) -> dict[str, str]:
+        """result record -> the handle of the tool call it answers, where one is recorded."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, str] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            marks = ",".join("?" * len(part))
+            for handle, result in self._q(
+                    f"SELECT handle, result_record FROM tool_calls WHERE result_record IN ({marks}) "
+                    f"UNION ALL SELECT tool_call, result_record FROM tool_results WHERE result_record IN ({marks})",
+                    part + part):
+                found.setdefault(str(result), str(handle))
+        return found
+
+    def tool_call(self, handle: str) -> Optional[tuple[str, int, Optional[str]]]:
+        """(the assistant record, the call's position in it, its result record) of a call
+        handle; the result from ``tool_results`` where a later compaction recorded it."""
+        rows = self._q("SELECT record, position, result_record FROM tool_calls WHERE handle = ?", (handle,))
+        if not rows:
+            return None
+        record, position, result = rows[0]
+        if result is None:
+            linked = self._q("SELECT result_record FROM tool_results WHERE tool_call = ? LIMIT 1", (handle,))
+            result = linked[0][0] if linked else None
+        return str(record), int(position), (str(result) if result else None)
+
+    def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
+        """record id (the views' store_id) -> its handle."""
+        wanted = [int(i) for i in dict.fromkeys(record_ids) if i is not None]
+        found: dict[int, str] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({int(i): str(h) for i, h in self._q(
+                f"SELECT record_id, handle FROM records WHERE record_id IN ({','.join('?' * len(part))})", part)})
+        return found
+
+    def handles_of_derivations(self, derivation_ids: Iterable[int]) -> dict[int, str]:
+        """derivation id (the views' node_id) -> its handle."""
+        wanted = [int(i) for i in dict.fromkeys(derivation_ids) if i is not None]
+        found: dict[int, str] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({int(i): str(h) for i, h in self._q(
+                f"SELECT derivation_id, handle FROM derivations WHERE derivation_id IN ({','.join('?' * len(part))})",
+                part)})
+        return found
 
     # --- The invariant (#29 W7, #34 D5) --------------------------------------------
 
