@@ -108,14 +108,18 @@ class Resolved:
     but not on its active record: a reverted branch, an attempt that never took effect,
     or a session with no effective compaction yet); "summary_revision" (a message handle
     naming the host's rewrite of a summary row the plugin returned, a revision beside the
-    chain, #15: the summary is expanded, not the row; ``of`` names it); "dropped_call" (a
-    tool call whose message stands on the active record in a rewrite that no longer shows it;
-    ``of`` names the rewrite)."""
+    chain, #15: the summary is expanded, not the row; ``of`` names it). For a message or a
+    tool call: ``record`` (the message's record), and for a call ``position`` (0-based) and
+    ``name``. For "inactive": ``cause``, the store's facts about why (``inactive_cause``)."""
 
     status: str
     kind: str
     handle: str
     of: str = ""
+    record: str = ""
+    position: Optional[int] = None
+    name: Optional[str] = None
+    cause: Optional[dict] = None
 
 
 def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
@@ -728,32 +732,113 @@ class RecordStore:
             return Resolved("unknown", kind, text)
         if home != session:
             return Resolved("other_session", kind, text)
-        if cover is None:
-            return Resolved("inactive", kind, text)
-        chunks = set(cover.chunks)
+        chunks = set(cover.chunks) if cover is not None else set()
         if kind == CHUNK:
-            active = text in chunks
-        elif kind == DERIVATION:
-            active = all(chunk in chunks for chunk in reached)
-        else:
-            record = text if kind == MESSAGE else str(rows[0][1])
-            active = self._record_active(record, cover)
-            if not active and kind == TOOL_CALL:
-                # A revision keeps its sources' calls and their handles (``begin_compaction``):
-                # the call is active where an active revision of its record carries it
-                # (finding 4 of the Codex review of 3a4e019).
-                active = self.active_holder(text, cover) is not None
-                if not active:
-                    # Its message is on the active record in a rewritten form that no longer
-                    # shows this call (Codex review of ca0969d, finding 1): said as such.
-                    rewritten = self.active_form(record, cover)
-                    if rewritten is not None:
-                        return Resolved("dropped_call", kind, text, of=rewritten)
-            if not active and kind == MESSAGE:
-                revised = self._q("SELECT derivation FROM summary_revisions WHERE revision = ? LIMIT 1", (text,))
-                if revised:
-                    return Resolved("summary_revision", kind, text, of=str(revised[0][0]))
-        return Resolved("ok" if active else "inactive", kind, text)
+            if text in chunks:
+                return Resolved("ok", kind, text)
+            written_by = self._q("SELECT compaction FROM chunks WHERE handle = ?", (text,))[0][0]
+            return Resolved("inactive", kind, text, cause=self._compaction_cause(int(written_by), session))
+        if kind == DERIVATION:
+            if reached and all(chunk in chunks for chunk in reached):
+                return Resolved("ok", kind, text)
+            written_by = self._q("SELECT compaction FROM derivations WHERE handle = ?", (text,))[0][0]
+            cause = self._compaction_cause(int(written_by), session) if written_by is not None else None
+            return Resolved("inactive", kind, text, cause=cause or {"kind": "none"})
+        # A message, or a tool call: (the record, the call's position in it). A call is on
+        # the active record exactly while its record is (round 5 of #71): its handle names
+        # that record's call, and a rewrite of the record has calls of its own.
+        record, position, name = text, None, None
+        if kind == TOOL_CALL:
+            record, position = self._q("SELECT record, position FROM tool_calls WHERE handle = ?", (text,))[0]
+            record, position = str(record), int(position)
+            raw = self.record_raw(record) or {}
+            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+            call = calls[position] if position < len(calls) and isinstance(calls[position], dict) else {}
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            name = function.get("name")
+        if cover is not None and self._record_active(record, cover):
+            return Resolved("ok", kind, text, record=record, position=position, name=name)
+        if kind == MESSAGE:
+            revised = self._q("SELECT derivation FROM summary_revisions WHERE revision = ? LIMIT 1", (text,))
+            if revised:
+                return Resolved("summary_revision", kind, text, of=str(revised[0][0]))
+        return Resolved("inactive", kind, text, record=record, position=position, name=name,
+                        cause=self.inactive_cause(record, session, cover))
+
+    # --- Why a record is not on the active record: store facts only ------------------
+
+    def _compaction_cause(self, compaction: int, session: str) -> Optional[dict]:
+        """"rejected" or "unconfirmed" where the store says so of the compaction that
+        wrote something; None where that compaction took effect."""
+        if self._q("SELECT 1 FROM rejections WHERE compaction = ? LIMIT 1", (compaction,)):
+            return {"kind": "rejected", "compaction": compaction}
+        if not self.is_settled(compaction):
+            return {"kind": "unconfirmed", "compaction": compaction}
+        return None
+
+    def inactive_cause(self, record: str, session: str, cover: Optional["Cover"]) -> dict:
+        """The cause, as the store records it, of a record not being on the active record
+        (the orchestrator's ruling on round 5 of #71: no text claims a cause the store did
+        not record). The first that holds:
+
+        - "revised": a record revising it (transitively, ``revision_lineage``) stands on the
+          active record: that record, the compaction that wrote it, the revisions between,
+          and the other records a merge took in with it;
+        - "rejected" / "unconfirmed": the compaction that wrote it was rejected by the host,
+          or is neither confirmed, adopted nor rejected;
+        - "left": an effective compaction's list held it (k), and a later effective
+          compaction's list (n) held neither it nor a revision of it;
+        - "none": the store records nothing that says why."""
+        if cover is not None:
+            parent: dict[str, Optional[str]] = {record: None}
+            frontier = [record]
+            found: Optional[str] = None
+            while frontier and found is None:
+                current, frontier = frontier[0], frontier[1:]
+                for (step,) in self._q("SELECT revision FROM revision_sources WHERE source_record = ? "
+                                       "ORDER BY revision", (current,)):
+                    step = str(step)
+                    if step in parent:
+                        continue
+                    parent[step] = current
+                    if self._record_active(step, cover):
+                        found = step
+                        break
+                    frontier.append(step)
+            if found is not None:
+                path = [found]
+                while parent[path[-1]] is not None:
+                    path.append(parent[path[-1]])
+                path.reverse()                          # record, ..., found
+                on_path = set(path)
+                together: list[str] = []
+                for revision in path[1:]:
+                    for (source,) in self._q("SELECT source_record FROM revision_sources WHERE revision = ? AND "
+                                             "source_record IS NOT NULL ORDER BY ordinal", (revision,)):
+                        if str(source) not in on_path and str(source) not in together:
+                            together.append(str(source))
+                written_by = self._q("SELECT compaction FROM records WHERE handle = ?", (found,))[0][0]
+                return {"kind": "revised", "active": found, "compaction": int(written_by),
+                        "via": path[1:-1], "together": together}
+        own = self._q("SELECT compaction FROM records WHERE handle = ?", (record,))
+        if own:
+            cause = self._compaction_cause(int(own[0][0]), session)
+            if cause is not None:
+                return cause
+        effective = [int(c) for (c,) in self._q(
+            "SELECT compaction_id FROM effective_compactions WHERE session = ? ORDER BY compaction_id", (session,))]
+        forms = {record} | set(self.revision_lineage(record, upward=False))
+        holders = {int(c) for (c,) in self._q(
+            f"SELECT DISTINCT compaction FROM compaction_inputs WHERE record IN ({','.join('?' * len(forms))})",
+            list(forms))}
+        held_self = {int(c) for (c,) in self._q(
+            "SELECT DISTINCT compaction FROM compaction_inputs WHERE record = ?", (record,))}
+        stood = [c for c in effective if c in held_self]
+        if stood:
+            later = [c for c in effective if c > stood[-1] and c not in holders]
+            if later:
+                return {"kind": "left", "stood": stood[-1], "gone": later[0]}
+        return {"kind": "none"}
 
     def _record_active(self, record: str, cover: "Cover") -> bool:
         if record in cover.tail:
@@ -794,9 +879,8 @@ class RecordStore:
         return found
 
     def tool_calls_of(self, records: Sequence[str]) -> dict[str, dict[int, str]]:
-        """record -> {position in its ``tool_calls``: the call's handle}. A revision's
-        calls keep the handles its sources' calls have (``begin_compaction``); those are
-        given under the revision, by position where the call ids agree."""
+        """record -> {position in its ``tool_calls``: the call's handle}: the handles minted
+        with each record, its own and no other's (``_write_tool_calls``)."""
         wanted = [r for r in dict.fromkeys(records) if r]
         found: dict[str, dict[int, str]] = {}
         for start in range(0, len(wanted), 500):
@@ -807,14 +891,13 @@ class RecordStore:
                 found.setdefault(str(record), {})[int(position)] = str(handle)
         return found
 
-    # --- Revisions: one walk (Codex review of 9a787bd, findings 2 and 3) ---------------
+    # --- Revisions ----------------------------------------------------------------------
 
     def revision_lineage(self, record: str, *, upward: bool) -> list[str]:
-        """The one walk over a record's revisions, transitively: ``upward`` its sources (the
-        records it revises, and theirs), else its revisions (the records that revise it, and
-        theirs), nearest first, the record itself excluded. Every use of a revision's
-        ancestry or descendants goes through here: the active form of a record, the call
-        handles a revision inherits, the call a revised result answers."""
+        """A record's revisions, transitively: ``upward`` its sources (the records it
+        revises, and theirs), else its revisions (the records that revise it, and theirs),
+        nearest first, the record itself excluded. It names causes (``inactive_cause``);
+        no handle is carried along it."""
         column, other = ("revision", "source_record") if upward else ("source_record", "revision")
         found: list[str] = []
         frontier = [record]
@@ -827,103 +910,55 @@ class RecordStore:
                     frontier.append(str(step))
         return found
 
-    def active_form(self, record: str, cover: "Cover") -> Optional[str]:
-        """The form of a record the active record holds: the record itself where it is
-        active, else the nearest of its revisions, at any depth, that is; None where
-        neither is."""
-        for candidate in [record] + self.revision_lineage(record, upward=False):
-            if self._record_active(candidate, cover):
-                return candidate
-        return None
-
-    def shown_call_handles(self, record: str, _memo: Optional[dict] = None) -> dict[str, str]:
-        """tool_call_id -> the handle of each call a record shows (Codex review of
-        ca0969d, finding 1): the calls written for the record itself, and, for a revision,
-        each call its ``tool_calls`` still carry that an immediate source shows, carried step
-        by step. A call is inherited only while every consecutive revision carries it: once a
-        revision drops it, a later reuse of the host's id is a new call with a new handle
-        (#29 W5: a handle never leads to other content)."""
-        memo = _memo if _memo is not None else {}
-        if record in memo:
-            return memo[record]
-        memo[record] = {}                       # a guard against a cycle in the sources
-        shown: dict[str, str] = {
-            str(call_id): str(handle) for call_id, handle in self._q(
-                "SELECT tool_call_id, handle FROM tool_calls WHERE record = ? AND tool_call_id IS NOT NULL "
-                "ORDER BY position", (record,))}
-        if self.record_kind(record) == "revision":
-            raw = self.record_raw(record) or {}
-            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
-            carried = [str(c.get("id")) for c in calls if isinstance(c, dict) and c.get("id")]
-            for (source,) in self._q("SELECT source_record FROM revision_sources WHERE revision = ? "
-                                     "AND source_record IS NOT NULL ORDER BY ordinal", (record,)):
-                inherited = self.shown_call_handles(str(source), memo)
-                for call_id in carried:
-                    if call_id not in shown and call_id in inherited:
-                        shown[call_id] = inherited[call_id]
-        memo[record] = shown
-        return shown
+    def active_units(self, cover: "Cover") -> list[list[str]]:
+        """The active record in its order, as units: each chunk under the cover's summaries,
+        its members in order, then the stored tail. A tool call and its results never lie
+        in two units (the cut never separates them), but pairing reads across a boundary
+        anyway (``expansion._unit_pairing``)."""
+        units: list[list[str]] = []
+        if cover.chunks:
+            members: dict[str, list[str]] = {}
+            for chunk, record in self._q(
+                    f"SELECT chunk, record FROM chunk_members WHERE chunk IN ({','.join('?' * len(cover.chunks))}) "
+                    f"ORDER BY chunk, ordinal", tuple(cover.chunks)):
+                members.setdefault(str(chunk), []).append(str(record))
+            units.extend(members.get(chunk, []) for chunk in cover.chunks)
+        units.append(list(cover.tail))
+        return units
 
     def record_kind(self, record: str) -> Optional[str]:
         rows = self._q("SELECT kind FROM records WHERE handle = ?", (record,))
         return str(rows[0][0]) if rows else None
 
-    def call_of_result(self, records: Sequence[str]) -> dict[str, str]:
-        """result record -> the handle of the tool call it answers, where one is recorded:
-        for a revised result, the call its nearest ancestor answers (``revision_lineage``)."""
-        found: dict[str, str] = {}
-        for record in dict.fromkeys(r for r in records if r):
-            for candidate in [record] + (self.revision_lineage(record, upward=True)
-                                         if self.record_kind(record) == "revision" else []):
-                rows = self._q("SELECT handle FROM tool_calls WHERE result_record = ? UNION ALL "
-                               "SELECT tool_call FROM tool_results WHERE result_record = ? LIMIT 1",
-                               (candidate, candidate))
-                if rows:
-                    found[record] = str(rows[0][0])
-                    break
+    def tool_call(self, handle: str) -> Optional[tuple[str, int, Optional[str]]]:
+        """(the assistant record, the call's position in it, the host's id there) of a call
+        handle. A call handle is minted with its record and never inherited: a rewrite of
+        the message has calls of its own."""
+        rows = self._q("SELECT record, position, tool_call_id FROM tool_calls WHERE handle = ?", (handle,))
+        if not rows:
+            return None
+        record, position, call_id = rows[0]
+        return str(record), int(position), (str(call_id) if call_id is not None else None)
+
+    def record_roles(self, records: Sequence[str]) -> dict[str, Optional[str]]:
+        """record -> the role its message has, as written beside it."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, Optional[str]] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({str(h): (str(role) if role is not None else None) for h, role in self._q(
+                f"SELECT handle, role FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
         return found
 
-    def tool_call(self, handle: str) -> Optional[tuple[str, int, list[str]]]:
-        """(the assistant record, the call's position in it, every result record recorded
-        for it) of a call handle: its own result, and the ``tool_results`` links a later
-        compaction wrote, in the order written. Which of them is on the active record is
-        the caller's to ask (``active_result``)."""
-        rows = self._q("SELECT record, position, result_record FROM tool_calls WHERE handle = ?", (handle,))
-        if not rows:
-            return None
-        record, position, result = rows[0]
-        results = [str(result)] if result else []
-        results += [str(r) for (r,) in self._q(
-            "SELECT result_record FROM tool_results WHERE tool_call = ? ORDER BY rowid", (handle,)) if r]
-        return str(record), int(position), list(dict.fromkeys(results))
-
-    def active_result(self, handle: str, cover: "Cover") -> tuple[Optional[str], Optional[str]]:
-        """(the call's result on the active record, or None; where none is, the newest
-        result recorded for it, whose own resolution says why it is not active, or None
-        where no result is recorded at all). Findings 3 of the Codex review of 3a4e019: a
-        link into a compaction that never took effect is not the result."""
-        found = self.tool_call(handle)
-        if found is None or not found[2]:
-            return None, None
-        for result in found[2]:
-            active = self.active_form(result, cover)
-            if active is not None:
-                return active, None
-        return None, found[2][-1]
-
-    def active_holder(self, handle: str, cover: "Cover") -> Optional[str]:
-        """The active record that shows a call: the active form of its assistant record
-        (``active_form``), where that form shows this very handle (``shown_call_handles``:
-        carried through every revision, never re-attached to a reused host id); None where
-        none is."""
-        rows = self._q("SELECT record FROM tool_calls WHERE handle = ?", (handle,))
-        if not rows:
-            return None
-        record = str(rows[0][0])
-        active = self.active_form(record, cover)
-        if active is None or active == record:
-            return active
-        return active if handle in self.shown_call_handles(active).values() else None
+    def records_raw(self, records: Sequence[str]) -> dict[str, dict]:
+        """record -> the host's dict as stored."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, dict] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({str(h): json.loads(raw) for h, raw in self._q(
+                f"SELECT handle, raw FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
+        return found
 
     def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
         """record id (the views' store_id) -> its handle."""
@@ -986,6 +1021,10 @@ class RecordStore:
           its first member stands on the branch. A chunk of records beside the chain
           only (host insertions) has no place on the branch and takes no part in the
           order. Every summary entry reaches at least one chunk.
+        - Every call handle of the session names a position of an assistant record's
+          ``tool_calls`` and keeps the host id the record holds there, and every assistant
+          record has a handle for each of its positions (a second handle for one position
+          the table's UNIQUE(record, position) already refuses; this finds the gaps).
 
         The whole check reads one snapshot: it runs inside one read transaction, so
         a compaction committing meanwhile is not half seen. In rollback-journal mode
@@ -1196,6 +1235,39 @@ class RecordStore:
                 problem(f"summary entry {position} stands before an entry whose run begins earlier")
             previous_first = ranks[0]
 
+        # The call handles (round 5 of #71): each names (record, position) of an assistant
+        # record of this session, the host's id beside it is the one the record holds at
+        # that position, and every assistant record has exactly one handle per call.
+        raws = {str(h): json.loads(r) for h, r in self._q(
+            "SELECT handle, raw FROM records WHERE session = ? AND role = 'assistant'", (session,))}
+        rows_of: dict[str, dict[int, Optional[str]]] = {}
+        for handle, record, position, call_id in self._q(
+                "SELECT t.handle, t.record, t.position, t.tool_call_id FROM tool_calls t JOIN records r "
+                "ON r.handle = t.record WHERE r.session = ?", (session,)):
+            record, position = str(record), int(position)
+            raw = raws.get(record)
+            calls = raw.get("tool_calls") if isinstance(raw, dict) and isinstance(raw.get("tool_calls"), list) \
+                else None
+            if calls is None:
+                problem(f"call handle {handle} names record {record}, which is not an assistant record "
+                        f"with tool calls")
+                continue
+            if position >= len(calls):
+                problem(f"call handle {handle} names position {position} of record {record}, "
+                        f"which has {len(calls)} calls")
+                continue
+            held = calls[position].get("id") if isinstance(calls[position], dict) else None
+            held = str(held) if held not in (None, "") else None
+            if held != call_id:
+                problem(f"call handle {handle} keeps the host id {call_id!r}; record {record} holds {held!r} "
+                        f"at position {position}")
+            rows_of.setdefault(record, {})[position] = call_id
+        for record, raw in raws.items():
+            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+            if sorted(rows_of.get(record, {})) != list(range(len(calls))):
+                problem(f"assistant record {record} has {len(calls)} calls and handles for positions "
+                        f"{sorted(rows_of.get(record, {}))}")
+
         return {
             "session": session,
             "compaction": compaction,
@@ -1240,10 +1312,10 @@ class RecordStore:
         Returns the compaction id, the record of every input position that has one,
         and the chunk handles in the order given. Each new record takes the
         predecessor its entry names (the classification decides it, #29 W3/W4); a
-        revision also gets its ``revision_sources``. Tool calls are written for new
-        transcript and host insertions; a revision keeps its original's calls. A chunk
-        is given as the input positions of its members, in order; every member must
-        have a record.
+        revision also gets its ``revision_sources``. Every assistant record written, a
+        revision included, gets a handle of its own for each of its tool calls
+        (``_write_tool_calls``); nothing is inherited. A chunk is given as the input
+        positions of its members, in order; every member must have a record.
         """
         records: dict[int, str] = {}
         chunk_handles: list[str] = []
@@ -1302,20 +1374,12 @@ class RecordStore:
                                     "source_position) VALUES (?, ?, ?, ?)",
                                     (handle, ordinal, source[1], source[2]),
                                 )
-                        # A call an immediate source shows, and this revision still carries,
-                        # keeps its handle (``shown_call_handles``, read inside this
-                        # transaction, which holds the sources just written; the revision has
-                        # no calls of its own yet); every other call is written as new, a
-                        # reused host id after a gap included.
-                        known = set(self.shown_call_handles(handle))
-                        written.append((handle, message, known))
-                    else:
-                        written.append((handle, message, set()))
+                    written.append((handle, message))
                 conn.execute(
                     "INSERT INTO compaction_inputs(compaction, position, host_row_id, record) VALUES (?, ?, ?, ?)",
                     (cid, entry.position, entry.host_row_id, records.get(entry.position)),
                 )
-            self._write_tool_calls(conn, session, cid, written)
+            self._write_tool_calls(conn, written)
             for positions in chunks:
                 members = [records[position] for position in positions]
                 handle = self._insert_with_handle(
@@ -1329,7 +1393,7 @@ class RecordStore:
                     [(handle, ordinal, record) for ordinal, record in enumerate(members)],
                 )
                 chunk_handles.append(handle)
-        for handle, message, _known in written:
+        for handle, message in written:
             _warn_media(handle, message)
         if uncounted:
             # "Known, or nothing" (#35): the estimate of these records leaves images
@@ -1342,59 +1406,25 @@ class RecordStore:
             )
         return int(cid), records, chunk_handles
 
-    def _write_tool_calls(
-        self,
-        conn: sqlite3.Connection,
-        session: str,
-        cid: int,
-        written: list[tuple[str, dict, set]],
-    ) -> None:
-        """One row per tool call, pointing into its assistant record by position; a
-        result recorded in the same compaction is its ``result_record``, one recorded
-        by a later compaction is linked through ``tool_results``. Each entry carries
-        the call ids that already have a handle (a revision's sources) and are skipped."""
-        results_by_call_id: dict[str, list[str]] = {}
-        for handle, message, _known in written:
-            if message.get("role") == "tool" and message.get("tool_call_id"):
-                results_by_call_id.setdefault(str(message["tool_call_id"]), []).append(handle)
-        claimed: set[str] = set()
-        for handle, message, known in written:
-            calls = message.get("tool_calls") or []
+    def _write_tool_calls(self, conn: sqlite3.Connection, written: list[tuple[str, dict]]) -> None:
+        """One handle per tool call of every assistant record written, named by (record,
+        position in its ``tool_calls``) and minted here, with the record (#29 W5; the
+        orchestrator's ruling on round 5 of #71): never inherited from a record this one
+        revises, never carried by the host's id, never re-pointed. The host's id is kept
+        beside it as the record holds it. Which result answers a call is not stored: it is
+        read, in the active order, by the host's own pairing rule (``pairing``)."""
+        for handle, message in written:
+            calls = message.get("tool_calls")
             if message.get("role") != "assistant" or not isinstance(calls, list):
                 continue
             for index, call in enumerate(calls):
-                call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
-                if call_id and call_id in known:
-                    continue
-                result = None
-                for candidate in results_by_call_id.get(call_id, []):
-                    if candidate not in claimed:
-                        result = candidate
-                        claimed.add(candidate)
-                        break
+                call_id = call.get("id") if isinstance(call, dict) else None
                 self._insert_with_handle(
                     conn,
                     TOOL_CALL,
-                    "INSERT INTO tool_calls(handle, record, position, tool_call_id, result_record) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (handle, index, call_id or None, result),
+                    "INSERT INTO tool_calls(handle, record, position, tool_call_id) VALUES (?, ?, ?, ?)",
+                    (handle, index, str(call_id) if call_id not in (None, "") else None),
                 )
-        for call_id, handles in results_by_call_id.items():
-            for result in handles:
-                if result in claimed:
-                    continue
-                row = conn.execute(
-                    "SELECT t.handle FROM tool_calls t JOIN records r ON r.handle = t.record "
-                    "WHERE r.session = ? AND t.tool_call_id = ? AND t.result_record IS NULL "
-                    "AND NOT EXISTS (SELECT 1 FROM tool_results x WHERE x.tool_call = t.handle) "
-                    "ORDER BY r.rowid DESC, t.position DESC LIMIT 1",
-                    (session, call_id),
-                ).fetchone()
-                if row is not None:
-                    conn.execute(
-                        "INSERT INTO tool_results(tool_call, result_record, compaction) VALUES (?, ?, ?)",
-                        (row[0], result, cid),
-                    )
 
     def write_derivation(
         self,

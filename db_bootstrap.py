@@ -44,7 +44,11 @@ logger = logging.getLogger(__name__)
 # wipes the store). Format 11 adds ``derivations.withheld_reasoning``: the encrypted
 # reasoning withheld from the summariser's input, named in the summary's provenance (#8);
 # and drops ``derivations.expand_hint``, a text a pattern took from the summary (#9).
-STORE_FORMAT = "ihl-store/11"
+# Format 12 stores no pairing of a result with its call: ``tool_calls.result_record``
+# and the ``tool_results`` table go, and a tool call's handle is minted with its record,
+# never inherited (#18, round 5 of #71); which result answers which call is read at the
+# time of the question, by the host's own rule.
+STORE_FORMAT = "ihl-store/12"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -259,7 +263,6 @@ INSERT_ONLY_TABLES = (
     "compactions",
     "records",
     "tool_calls",
-    "tool_results",
     "compaction_inputs",
     "chunks",
     "chunk_members",
@@ -337,21 +340,14 @@ CREATE TABLE records (
 );
 CREATE INDEX idx_records_session ON records(session, record_id);
 
+-- One handle per tool call of an assistant record: (record, position), minted with the
+-- record. The host's id is kept as the record holds it; it is not an identity.
 CREATE TABLE tool_calls (
     handle TEXT PRIMARY KEY,
     record TEXT NOT NULL REFERENCES records(handle),
     position INTEGER NOT NULL,
     tool_call_id TEXT,
-    result_record TEXT REFERENCES records(handle),
     UNIQUE (record, position)
-);
-CREATE INDEX idx_tool_calls_id ON tool_calls(tool_call_id);
-
-CREATE TABLE tool_results (
-    tool_call TEXT NOT NULL REFERENCES tool_calls(handle),
-    result_record TEXT NOT NULL REFERENCES records(handle),
-    compaction INTEGER NOT NULL REFERENCES compactions(compaction_id),
-    PRIMARY KEY (tool_call, result_record)
 );
 
 CREATE TABLE compaction_inputs (

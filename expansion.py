@@ -6,7 +6,8 @@
   several chunks, all of them, with the leaf summary of each named beside it as a
   lookup; a summary written from summaries, one layer: those summaries;
 - a chunk's handle (``c``): the stretch itself;
-- a tool call's handle (``t``): its result;
+- a tool call's handle (``t``): its result, the one the host's own rule pairs with it on
+  the active record (``pairing``);
 - a message's handle (``m``): that message.
 
 A stretch comes back in its collapsed form by default: every user and agent message as
@@ -14,8 +15,14 @@ stored (its ``content``, never the host's ``api_content`` sidecar, which carries
 injections and the memory prefetch), the readable reasoning beside the agent's messages
 (plain reasoning, as the summariser reads it: ``summariser_input``), and each tool call
 as its handle, its name and its arguments, without its result. A result whose call is
-not in the same stretch stands as a pointer to that call. ``raw`` puts every result
-inline. Encrypted reasoning stays out, and nothing stands where it was.
+not in the same stretch stands as a pointer to that call, and one the host's rule pairs
+with no call says why. ``raw`` puts every result inline. Encrypted reasoning stays out,
+and nothing stands where it was.
+
+A handle that is not on the active record is refused with the cause the store records
+(``RecordStore.inactive_cause``): the record that stands for it now, the compaction the
+host rejected or has not confirmed, or the compaction whose list no longer held it; where
+the store records none, it says so.
 
 **Pages.** One mechanism for every tool that returns more than one page: an opaque
 ``next_page`` token names where the next page begins (a record, a field of it and a
@@ -28,7 +35,8 @@ computes it for this result, and compared with the exact string the engine retur
 larger than a page is split over pages by character offset, each piece saying where it
 lies. An image is never split: it is returned as an image, in the ``_multimodal``
 envelope, counted against the page by the model table's rule (#21); one larger than a
-page, or one no rule counts, stands alone on its page.
+page, or one no rule counts, stands alone on its page. A page carries no more images than
+the host's send path leaves room for in the request (``ImageRoom``).
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
+from . import pairing as host_pairing
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL
 from .message_content import image_media_type, is_image_part
 from .record_store import HANDLE_RE, Cover, RecordStore, Resolved
@@ -51,24 +60,36 @@ from .results import final_result
 from .summariser_input import _readable_reasoning as readable_reasoning
 from .tokens import CHARS_PER_TOKEN
 
-TOKEN_VERSION = 1
+# 2: a call's handle names (record, position), and a page's records are paired at read
+# time (round 5 of #71); a token of version 1 is refused with its own text.
+TOKEN_VERSION = 2
 
-# What each status of ``RecordStore.resolve`` tells the agent.
+# What each status of ``RecordStore.resolve`` tells the agent; "inactive" is told by its
+# cause (``_inactive_text``).
 _UNRESOLVED = {
     "malformed": ("{handle!r} is not a handle. A handle is a kind letter (m a message, t a tool call, c a chunk, "
                   "s a summary) and eight characters, as the summaries in your context and these tools show them."),
     "unknown": "{handle} is unknown in this store: no message, tool call, chunk or summary has this handle here.",
     "other_session": ("{handle} belongs to another session. A handle resolves only in the session that holds it; "
                       "this session cannot reach another's past."),
-    "inactive": ("{handle} is this session's, but not on its active record: it lies on a branch an undo or retry "
-                 "left behind, or in a compaction that never took effect."),
-    "dropped_call": ("{handle} is a tool call its message no longer shows: the host rewrote that message without "
-                     "it (the rewrite is {of}), so nothing stands behind this handle on the active record. A call "
-                     "the rewrite shows under the same host id is another call, with its own handle."),
     "summary_revision": ("{handle} is the host's rewrite of summary {of} in your context (the row the plugin "
                          "returned, as the host changed it, for example with its task list folded in). Expand {of} "
                          "to read behind the summary."),
 }
+
+# Notes on calls and results, from the host's pairing rule (``pairing``).
+NO_RESULT = "no result follows this call on the active record"
+_UNPAIRED = {
+    "unknown": "no call of the message before this result has its host id {id}",
+    "taken": ("the call the host's list rule gives the host id {id} was already answered by an earlier result; "
+              "the rule drops this one as a stray"),
+    "no_id": ("this result carries no host id, so no call pairs with it, and the host's pre-call sanitizer does not "
+              "send it to the provider"),
+}
+_SHARED = ("this message carries {k} calls with the host id {id}, and {j} with it {follow} them; the host's "
+           "list rule answers the first call with the first of them and drops the later ones as strays, and its "
+           "pre-call sanitizer sends the provider only the first call and result of one id, so the id cannot confirm "
+           "which call a result answered")
 
 
 class ExpansionError(Exception):
@@ -77,7 +98,44 @@ class ExpansionError(Exception):
 
 
 def unresolved_message(resolved: Resolved) -> str:
+    if resolved.status == "inactive":
+        return _inactive_text(resolved)
     return _UNRESOLVED[resolved.status].format(handle=resolved.handle, of=resolved.of)
+
+
+def _inactive_text(resolved: Resolved) -> str:
+    """The store's cause of a handle not being on the active record (round 5 of #71): only
+    what the store records, never a guess at what the host did."""
+    cause = resolved.cause or {"kind": "none"}
+    kind = cause.get("kind")
+    if resolved.kind == TOOL_CALL:
+        prefix = (f"{resolved.handle} is call {(resolved.position or 0) + 1} ({resolved.name or 'no name'}) of "
+                  f"message {resolved.record}. ")
+        subject = resolved.record
+    else:
+        prefix, subject = "", (resolved.record or resolved.handle)
+    if kind == "revised":
+        text = f"{subject} is a message the host rewrote. It stands on the active record as {cause['active']}, " \
+               f"recorded by compaction {cause['compaction']}"
+        if cause.get("via"):
+            text += f", after {', '.join(cause['via'])}"
+        if cause.get("together"):
+            text += f", together with {', '.join(cause['together'])}"
+        text += f". Expand {cause['active']}."
+        if resolved.kind == TOOL_CALL:
+            text += " A rewritten message's calls have handles of their own."
+    elif kind == "rejected":
+        text = (f"{subject} was recorded by compaction {cause['compaction']}, which the host rejected; it never stood "
+                f"on the active record.")
+    elif kind == "unconfirmed":
+        text = (f"{subject} was recorded by compaction {cause['compaction']}, which the host has not confirmed; it is "
+                f"not on the active record.")
+    elif kind == "left":
+        text = (f"{subject} stood on the active record at compaction {cause['stood']}; the host's list at compaction "
+                f"{cause['gone']} held neither it nor a rewrite of it.")
+    else:
+        text = f"{subject} is not on the active record, and the store records no cause."
+    return prefix + text
 
 
 # --- The page limit -------------------------------------------------------------------------
@@ -190,7 +248,12 @@ def decode_token(token: Any) -> dict:
         state = json.loads(base64.b64decode(standard, validate=True).decode("utf-8"))
     except (binascii.Error, UnicodeDecodeError, ValueError):
         raise ExpansionError("page is not a next_page token of these tools") from None
-    if not isinstance(state, dict) or not _plain_int(state.get("v")) or state.get("v") != TOKEN_VERSION:
+    if not isinstance(state, dict) or not _plain_int(state.get("v")):
+        raise ExpansionError("page is not a next_page token of these tools")
+    if 1 <= state["v"] < TOKEN_VERSION:
+        raise ExpansionError("page is a token of an earlier version of these tools; start again from the handle, "
+                             "without page")
+    if state["v"] != TOKEN_VERSION:
         raise ExpansionError("page is not a next_page token of these tools")
     # Every field, by type and range: a garbled token is refused with what is wrong in it.
     checks = (
@@ -244,9 +307,23 @@ def _call_parts(call: Any) -> tuple[Any, Any]:
     return None, None
 
 
-def _message_item(handle: str, raw: dict, calls: dict[int, str], by_call_id: dict[str, str]) -> dict:
+def _shared_note(note: tuple) -> str:
+    call_id, calls, results = note
+    return _SHARED.format(k=calls, id=call_id, j=f"{results} result" if results == 1 else f"{results} results",
+                          follow="follows" if results == 1 else "follow")
+
+
+def _unpaired_note(unpaired: tuple) -> str:
+    why, call_id = unpaired
+    return _UNPAIRED[why].format(id=call_id)
+
+
+def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pairing.Pairing, *, inline: set,
+                  with_results: bool) -> dict:
     """One user or agent message: its content as stored, its readable reasoning beside it,
-    each tool call as its handle, name and arguments."""
+    each tool call as its handle, name and arguments, and what the host's pairing says of
+    it: where several calls share an id, a note; in raw form, where its result is when
+    this stretch does not hold it, or that none follows it."""
     item: dict = {"handle": handle, "role": raw.get("role")}
     if raw.get("role") == "assistant":
         reasoning = readable_reasoning(raw)
@@ -258,19 +335,30 @@ def _message_item(handle: str, raw: dict, calls: dict[int, str], by_call_id: dic
         shown = []
         for position, call in enumerate(tool_calls):
             name, arguments = _call_parts(call)
-            call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
-            entry = {"handle": calls.get(position) or by_call_id.get(call_id)}
+            entry: dict = {"handle": calls.get(position)}
             if name is None and arguments is None:
                 entry["call"] = call          # a shape other than the host's: as stored
             else:
                 entry["name"] = name
                 entry["arguments"] = arguments
+            notes = []
+            if with_results:
+                result = found.answer.get((handle, position))
+                if result is None:
+                    entry["result"] = None
+                    notes.append(NO_RESULT)
+                elif result not in inline:
+                    entry["result_in"] = result
+            if (handle, position) in found.shared_calls:
+                notes.append(_shared_note(found.shared_calls[(handle, position)]))
+            if notes:
+                entry["note"] = "; ".join(notes)
             shown.append(entry)
         item["tool_calls"] = shown
     return item
 
 
-def _result_item(handle: str, raw: dict, call: Optional[str], *, inline: bool) -> dict:
+def _result_item(handle: str, raw: dict, call: Optional[str], *, inline: bool, notes: list) -> dict:
     item: dict = {"handle": handle, "role": raw.get("role"), "result_of": call}
     name = raw.get("name") or raw.get("tool_name")
     if name:
@@ -280,64 +368,70 @@ def _result_item(handle: str, raw: dict, call: Optional[str], *, inline: bool) -
     else:
         content = raw.get("content")
         item["content_chars"] = len(content) if isinstance(content, str) else len(json.dumps(content, ensure_ascii=False))
-        item["note"] = "the result of a call this stretch does not hold; expand its own handle to read it"
+    if notes:
+        item["note"] = "; ".join(notes)
     return item
 
 
-def _records_items(store: RecordStore, cover: Cover, records: list[tuple[str, dict]], *, raw: bool) -> list[dict]:
-    """The items of a run of records, collapsed or raw."""
+@dataclass
+class Order:
+    """The active record's order (``RecordStore.active_units``), for pairing a stretch
+    with what decides it (``pairing.window``)."""
+
+    records: list
+    index: dict
+
+    @classmethod
+    def of(cls, store: RecordStore, cover: Cover) -> "Order":
+        records = [record for unit in store.active_units(cover) for record in unit]
+        return cls(records, {record: i for i, record in enumerate(records)})
+
+    def pairing(self, store: RecordStore, stretch: list[str]) -> host_pairing.Pairing:
+        try:
+            return host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles,
+                                               store.records_raw)
+        except host_pairing.PairingUnavailable as exc:
+            raise ExpansionError(str(exc)) from None
+
+
+def _records_items(store: RecordStore, order: Order, records: list[tuple[str, dict]], *, raw: bool) -> list[dict]:
+    """The items of a run of records, collapsed or raw, paired by the host's rule over the
+    active record (``pairing``)."""
     handles = [handle for handle, _raw in records]
-    calls = store.tool_calls_of(handles)
-    call_of = store.call_of_result([h for h, r in records if r.get("role") == "tool"])
-    shown_calls: set = set()
-    by_record_call_id: dict[str, dict[str, str]] = {}
-    for handle, message in records:
-        if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
-            # The calls this record shows, its own and those carried to it through every
-            # revision (``shown_call_handles``).
-            by_call_id = store.shown_call_handles(handle)
-            by_record_call_id[handle] = by_call_id
-            shown_calls.update(h for h in calls.get(handle, {}).values())
-            shown_calls.update(by_call_id.values())
+    found = order.pairing(store, handles)
+    calls = store.tool_calls_of(handles + [record for record, _position in found.result_of.values()])
+    held = set(handles)
+    inline = {h for h, r in records if r.get("role") == "tool"} if raw else set()
     items: list[dict] = []
     for handle, message in records:
         if message.get("role") == "tool":
-            call = call_of.get(handle)
+            paired = found.result_of.get(handle)
+            call = calls.get(paired[0], {}).get(paired[1]) if paired else None
+            notes = []
+            if handle in found.unpaired:
+                notes.append(_unpaired_note(found.unpaired[handle]))
+            if handle in found.shared_results:
+                notes.append(_shared_note(found.shared_results[handle]))
             if raw:
-                items.append(_result_item(handle, message, call, inline=True))
-            elif call is None or call not in shown_calls:
-                items.append(_result_item(handle, message, call, inline=False))
+                items.append(_result_item(handle, message, call, inline=True, notes=notes))
+            elif paired is None or paired[0] not in held:
+                if paired is not None:
+                    notes.insert(0, "the result of a call this stretch does not hold; expand its own handle to "
+                                    "read it")
+                items.append(_result_item(handle, message, call, inline=False, notes=notes))
             continue
-        items.append(_message_item(handle, message, calls.get(handle, {}), by_record_call_id.get(handle, {})))
-    if raw:
-        # Raw puts every result inline; a call whose result is not in this stretch says
-        # where it is, or that none is recorded, as a tool call's own expansion does.
-        inline = {h for h, r in records if r.get("role") == "tool"}
-        for item in items:
-            for entry in item.get("tool_calls") or ():
-                if not entry.get("handle"):
-                    continue
-                result, inactive = store.active_result(entry["handle"], cover)
-                if result is None and inactive is None:
-                    entry["result"] = None
-                    entry["note"] = "no result of this call is recorded in the store"
-                elif result is None:
-                    entry["result"] = None
-                    entry["note"] = (f"the result recorded for this call, {inactive}, is not on the active record; "
-                                     f"expand {inactive} to read why")
-                elif result not in inline:
-                    entry["result_in"] = result
+        items.append(_message_item(handle, message, calls.get(handle, {}), found, inline=inline, with_results=raw))
     return items
 
 
-def target_for(store: RecordStore, cover: Cover, resolved: Resolved, *, raw: bool) -> Target:
+def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: bool) -> Target:
     """What ``resolved`` opens into (the module docstring), read from the store. Called
     inside the caller's read transaction (``RecordStore.snapshot``)."""
     handle = resolved.handle
     form = "raw" if raw else "collapsed"
     if resolved.kind == CHUNK:
         return Target({"handle": handle, "kind": "chunk", "form": form},
-                      _records_items(store, cover, store.chunk_records(handle), raw=raw))
+                      _records_items(store, order, store.chunk_records(handle), raw=raw))
     if resolved.kind == DERIVATION:
         sources = store.derivation_sources(handle)
         header: dict = {"handle": handle, "kind": "summary", "form": form}
@@ -345,14 +439,14 @@ def target_for(store: RecordStore, cover: Cover, resolved: Resolved, *, raw: boo
             chunks = [str(chunk) for chunk, _derivation in sources]
             header["chunks"] = chunks
             if len(chunks) == 1:
-                return Target(header, _records_items(store, cover, store.chunk_records(chunks[0]), raw=raw))
+                return Target(header, _records_items(store, order, store.chunk_records(chunks[0]), raw=raw))
             # A summary written from the raw of several chunks (#34 D6, "raw"): all of them,
             # each opened by a marker naming its chunk and that chunk's own summary.
             leaves = store.leaf_summaries(chunks, _all_summaries(store, chunks))
             items: list[dict] = []
             for chunk in chunks:
                 items.append({"chunk": chunk, "summary": leaves.get(chunk)})
-                items.extend(_records_items(store, cover, store.chunk_records(chunk), raw=raw))
+                items.extend(_records_items(store, order, store.chunk_records(chunk), raw=raw))
             return Target(header, items)
         # A summary written from summaries (#34 D6, "summaries"): one layer down.
         header["form"] = "summaries"
@@ -366,31 +460,25 @@ def target_for(store: RecordStore, cover: Cover, resolved: Resolved, *, raw: boo
                 items.append({"chunk": chunk})
         return Target(header, items)
     if resolved.kind == TOOL_CALL:
-        found = store.tool_call(handle)
-        if found is None:
-            raise ExpansionError(f"{handle} is unknown in this store")
-        record, position, _results = found
-        assistant = store.record_raw(record) or {}
-        calls = assistant.get("tool_calls") if isinstance(assistant.get("tool_calls"), list) else []
-        name, _arguments = _call_parts(calls[position]) if position < len(calls) else (None, None)
-        header = {"handle": handle, "kind": "tool_call", "form": "raw", "name": name,
-                  "call_in": store.active_holder(handle, cover) or record}
-        result, inactive = store.active_result(handle, cover)
-        if result is None and inactive is None:
-            header["result"] = None
-            header["note"] = "no result of this call is recorded in the store"
-            return Target(header, [])
+        # The call's result is the one the host's rule pairs with it on the active record
+        # (round 5 of #71): read now, never stored.
+        record, position = resolved.record, int(resolved.position or 0)
+        header = {"handle": handle, "kind": "tool_call", "form": "raw", "name": resolved.name, "call_in": record}
+        found = order.pairing(store, [record])
+        notes = []
+        if (record, position) in found.shared_calls:
+            notes.append(_shared_note(found.shared_calls[(record, position)]))
+        result = found.answer.get((record, position))
         if result is None:
-            # Only an active result is returned (finding 3 of the Codex review of
-            # 3a4e019): a link into a compaction that never took effect is not it.
-            why = store.resolve(inactive, cover.session, cover)
-            reason = f": {unresolved_message(why)}" if why.status != "ok" else ""
-            raise ExpansionError(f"the result recorded for {handle} is {inactive}, which is not on the active "
-                                 f"record{reason}")
-        return Target(header, [_result_item(result, store.record_raw(result) or {}, handle, inline=True)])
+            header["result"] = None
+            header["note"] = "; ".join([NO_RESULT] + notes)
+            return Target(header, [])
+        if notes:
+            header["note"] = "; ".join(notes)
+        return Target(header, [_result_item(result, store.record_raw(result) or {}, handle, inline=True, notes=[])])
     if resolved.kind == MESSAGE:
         return Target({"handle": handle, "kind": "message", "form": form},
-                      _records_items(store, cover, [(handle, store.record_raw(handle) or {})], raw=True))
+                      _records_items(store, order, [(handle, store.record_raw(handle) or {})], raw=True))
     raise ExpansionError(f"{handle} is not a handle this tool opens")
 
 
@@ -527,9 +615,12 @@ def _image_or_mark(part: dict, images: list, describe: list) -> dict:
     canonical, why = canonical_image_part(part)
     if canonical is None:
         # Refused visibly, never dropped: the page says an image stands here and why it is
-        # not shown.
-        return {"type": "image", "not_shown": f"an image ({image_media_type(part)}) {why}; "
+        # not shown, with the file id where the part has one.
+        mark = {"type": "image", "not_shown": f"an image ({image_media_type(part)}) {why}; "
                                               f"the host's converters take no such part"}
+        if part.get("file_id"):
+            mark["file_id"] = part["file_id"]
+        return mark
     images.append(canonical)
     describe.append(image_media_type(part))
     return {"type": "image", "image": len(images)}
@@ -539,7 +630,8 @@ def _replace_images(page_items: list, images: list, describe: list) -> list:
     """The page's items with each image part of a message's content replaced by its mark,
     the images collected in order. Only content parts are images (``is_content_image``):
     an item's ``content`` list, the envelope's ``content`` list, and a piece's ``value``
-    where the piece is one of those parts."""
+    where the piece is one of those parts. A piece the request has no room for
+    (``PageBuilder.build``) carries the reason in ``held`` and is marked, not shown."""
     def parts(content: list) -> list:
         return [_image_or_mark(p, images, describe) if isinstance(p, dict) and is_image_part(p) else p
                 for p in content]
@@ -547,55 +639,120 @@ def _replace_images(page_items: list, images: list, describe: list) -> list:
     replaced: list = []
     for item in page_items:
         item = dict(item)
+        held = item.pop("held", None)
         content = item.get("content")
         if isinstance(content, list):
             item["content"] = parts(content)
         elif isinstance(content, dict) and isinstance(content.get("content"), list):
             item["content"] = dict(content, content=parts(content["content"]))
         if "value" in item and is_content_image(str(item.get("field") or ""), item["value"]):
-            item["value"] = _image_or_mark(item["value"], images, describe)
+            if held is not None:
+                mark = {"type": "image", "not_shown": f"an image ({image_media_type(item['value'])}): {held}"}
+                if item["value"].get("file_id"):
+                    mark["file_id"] = item["value"]["file_id"]
+                item["value"] = mark
+            else:
+                item["value"] = _image_or_mark(item["value"], images, describe)
         replaced.append(item)
     return replaced
 
 
 @dataclass(frozen=True)
-class ImageCeiling:
-    """The most images, and image bytes, one request carries before the host's send path
-    retires image-bearing tool results unseen: ``OUTBOUND_IMAGE_LIMIT`` blocks and
-    ``OUTBOUND_IMAGE_BUDGET_BYTES`` (agent/image_eviction_policy.py:26-27 at Hermes
-    d0288be5b3), applied on the main agent's send path to every request whatever its wire
-    (``evict_stale_outbound_tool_images``, agent/turn_request_assembly.py:153-155,
-    agent/chat_completion_helpers.py:2247-2248; agent/context_compressor.py:1478-1510), and
-    again by the Anthropic converter by blocks (``_evict_old_screenshots``,
-    agent/anthropic_message_convert.py:605). Bytes are measured as the host measures them
-    (``_image_payload``, agent/context_compressor.py:1452). ``measure`` is None where the
-    host cannot be read: then one image per page (unknown is never unlimited)."""
+class ImageRoom:
+    """The room the host's send path leaves this page's images in the request that will
+    carry it (the orchestrator's ruling on round 5 of #71, 5(a) as changed).
 
-    blocks: int
-    budget_bytes: Optional[int]
+    The host retires image-bearing tool results on its send path by one policy,
+    ``outbound_image_retire_count`` (agent/image_eviction_policy.py:33 at Hermes
+    d0288be5b3; ``OUTBOUND_IMAGE_LIMIT`` blocks and ``OUTBOUND_IMAGE_BUDGET_BYTES``,
+    26-27), applied to every request whatever its wire (``evict_stale_outbound_tool_images``,
+    agent/context_compressor.py:1478-1510) and again by blocks by the Anthropic converter
+    (``_evict_old_screenshots``, agent/anthropic_message_convert.py:605). Counted, over the
+    live list the host hands the tool and measured by the host's ``_image_payload``
+    (context_compressor.py:1452): the uploads the host reserves (images outside tool
+    results), the older carriers, the earlier results of this message already in the list,
+    and our page. Of the calls of this message still to come, only this tool's are known
+    image sources: they share the room equally (``share``, this one included). A page is
+    admitted where, with ``share`` carriers like it at the newest end, the host retires no
+    more carriers than it retires without them, so never one of them.
+
+    Another tool's later result may carry images this cannot foresee; that retirement is
+    the host's, visible in its own placeholder, and where the message has such calls the
+    page says so (``note``). Where the host cannot be read, a page carries one image and
+    says why (unknown is never unlimited)."""
+
+    retire: Optional[Callable]
     measure: Optional[Callable[[dict], tuple]]
-    basis: str
+    older: tuple = ()               # (blocks, bytes) of each carrier in the list, newest first
+    reserved: tuple = (0, 0)        # (blocks, bytes) the host reserves
+    share: int = 1
+    note: str = ""
+
+    def baseline(self) -> int:
+        return self.retire([b for b, _s in self.older], self.reserved[0],
+                           carrier_bytes_newest_first=[s for _b, s in self.older], reserved_bytes=self.reserved[1])
 
     def admits(self, images: list) -> bool:
-        if len(images) > self.blocks:
-            return False
-        if self.measure is None or self.budget_bytes is None:
+        if not images:
             return True
-        _blocks, size = self.measure({"role": "tool", "content": list(images)})
-        return size <= self.budget_bytes
+        if self.retire is None or self.measure is None:
+            return len(images) <= 1
+        blocks, size = self.measure({"role": "tool", "content": list(images)})
+        carriers = [(blocks, size)] * self.share + list(self.older)
+        retired = self.retire([b for b, _s in carriers], self.reserved[0],
+                              carrier_bytes_newest_first=[s for _b, s in carriers], reserved_bytes=self.reserved[1])
+        return retired <= self.baseline()
+
+    def why_not(self) -> str:
+        shared = (f", shared with {self.share - 1} more {'call' if self.share == 2 else 'calls'} of this tool in "
+                  f"this message") if self.share > 1 else ""
+        reserved, older = self.reserved[0], sum(b for b, _s in self.older)
+        return (f"not shown: the host's send path has no room for it in this request without retiring earlier "
+                f"images ({reserved} {'image' if reserved == 1 else 'images'} it reserves and {older} in earlier "
+                f"results stand in it{shared}); it stays in the store under this handle")
 
 
-def host_image_ceiling() -> ImageCeiling:
+_OTHER_CALLS_NOTE = ("the host may retire this page's images if other results of this turn carry images; expand "
+                     "again later to see them")
+
+
+def host_image_room(messages: Any, tool_name: str) -> ImageRoom:
+    """The ``ImageRoom`` of this call, from the live list and the host's own functions."""
     try:
-        from agent.image_eviction_policy import OUTBOUND_IMAGE_BUDGET_BYTES, OUTBOUND_IMAGE_LIMIT  # type: ignore
         from agent.context_compressor import _image_payload  # type: ignore
-        blocks, budget = int(OUTBOUND_IMAGE_LIMIT), int(OUTBOUND_IMAGE_BUDGET_BYTES)
-        if blocks < 1 or budget < 1:
-            raise ValueError(f"limit {blocks}, budget {budget}")
-        return ImageCeiling(blocks, budget, _image_payload, "the host's send-path ceiling")
+        from agent.image_eviction_policy import outbound_image_retire_count  # type: ignore
+        call_variants, result_variants, _coalesce = host_pairing.host_alias_helpers()
+        if not isinstance(messages, list):
+            raise ValueError("no message list")
+        older: list = []
+        reserved = [0, 0]
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            blocks, size = _image_payload(message)
+            if not blocks:
+                continue
+            if message.get("role") == "tool":
+                older.append((int(blocks), int(size)))
+            else:
+                reserved[0] += int(blocks)
+                reserved[1] += int(size)
+        # The message being answered, and which of its calls no result in the list answers.
+        at = next(i for i in range(len(messages) - 1, -1, -1)
+                  if isinstance(messages[i], dict) and messages[i].get("role") == "assistant")
+        answered: set = set()
+        for message in messages[at + 1:]:
+            if isinstance(message, dict) and message.get("role") == "tool":
+                answered |= set(result_variants(message.get("tool_call_id")))
+        pending = [call for call in (messages[at].get("tool_calls") or [])
+                   if not (set(call_variants(call)) & answered)]
+        ours = sum(1 for call in pending if _call_parts(call)[0] == tool_name)
+        others = len(pending) - ours
+        return ImageRoom(outbound_image_retire_count, _image_payload, tuple(older), tuple(reserved),
+                         max(1, ours), _OTHER_CALLS_NOTE if others else "")
     except Exception as exc:
-        return ImageCeiling(1, None, None, f"the host's send-path ceiling cannot be read "
-                                           f"({type(exc).__name__}): one image per page")
+        return ImageRoom(None, None, note=f"the host's send-path image ceiling cannot be read ({type(exc).__name__}: "
+                                          f"{exc}), so this page carries at most one image")
 
 
 class PageBuilder:
@@ -603,12 +760,12 @@ class PageBuilder:
     host measures the result it receives."""
 
     def __init__(self, target: Target, *, limit: int, token_state: dict,
-                 image_tokens: Callable[[dict], Optional[int]], image_ceiling: "ImageCeiling"):
+                 image_tokens: Callable[[dict], Optional[int]], image_room: ImageRoom):
         self.target = target
         self.limit = limit
         self.token_state = token_state
         self.image_tokens = image_tokens
-        self.image_ceiling = image_ceiling
+        self.image_room = image_room
         self._fields: dict[int, list] = {}
 
     def _fields_of(self, index: int) -> list:
@@ -616,15 +773,19 @@ class PageBuilder:
             self._fields[index] = fields_of(self.target.items[index])
         return self._fields[index]
 
-    def _payload(self, page_items: list, page: int, next_page: Optional[str]) -> dict:
-        return {**self.target.header, "items_total": len(self.target.items), "page": page,
-                "next_page": next_page, "items": page_items}
+    def _payload(self, page_items: list, page: int, next_page: Optional[str], images: bool) -> dict:
+        payload = {**self.target.header, "items_total": len(self.target.items), "page": page,
+                   "next_page": next_page}
+        if images and self.image_room.note:
+            payload["images_note"] = self.image_room.note
+        payload["items"] = page_items
+        return payload
 
     def render(self, page_items: list, page: int, next_page: Optional[str]) -> _Rendered:
         images: list = []
         media: list = []
         items = _replace_images(copy.deepcopy(page_items), images, media)
-        text = final_result(self._payload(items, page, next_page))
+        text = final_result(self._payload(items, page, next_page, bool(images)))
         labels: list = []
         counted: Optional[int] = 0
         notes = []
@@ -647,11 +808,16 @@ class PageBuilder:
             return len(rendered.text) <= self.limit
         if rendered.image_tokens is None:
             return False
-        if not self.image_ceiling.admits(rendered.images):
+        if not self.image_room.admits(rendered.images):
             return False
         text_chars = len(rendered.text) + sum(len(label) for label in rendered.labels)
         return (len(rendered.summary) <= self.limit
                 and text_chars + rendered.image_tokens * CHARS_PER_TOKEN <= self.limit)
+
+    def _room_alone(self, piece: dict) -> bool:
+        images: list = []
+        _replace_images([dict(piece)], images, [])
+        return self.image_room.admits(images)
 
     def _longest_token(self, page: int) -> str:
         """A token at least as long as any this page could carry: the page is fitted with
@@ -684,6 +850,12 @@ class PageBuilder:
             if is_content_image(path, value):
                 piece = _piece(item, path, value=value)
                 if self.fits(page_items + [piece], page) or not page_items:
+                    if not self._room_alone(piece):
+                        # The request has no room for it even alone: marked, never sent
+                        # to be retired unseen (``ImageRoom``).
+                        piece["held"] = self.image_room.why_not()
+                        if not self.fits(page_items + [piece], page) and page_items:
+                            break
                     # An image larger than a page, or one no rule counts, stands alone.
                     page_items.append(piece)
                     f, o = f + 1, 0
@@ -799,7 +971,7 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
         resolved = records.resolve(str(handle), session, cover)
         if resolved.status != "ok":
             raise ExpansionError(unresolved_message(resolved))
-        target = target_for(records, cover, resolved, raw=bool(raw))
+        target = target_for(records, Order.of(records, cover), resolved, raw=bool(raw))
     # The records paging began on (Codex review of ca0969d, finding 2): a token carries
     # their identity, and a later page on other records (the active form of a message
     # changed, a result the host rewrote since) is refused, never spliced.
@@ -830,6 +1002,6 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
                                      "names")
     estimator = engine._estimator()
     builder = PageBuilder(target, limit=limit, token_state=token_state, image_tokens=estimator.image,
-                          image_ceiling=host_image_ceiling())
+                          image_room=host_image_room(messages, tool_name))
     result, _next = builder.build(cursor, page)
     return result
