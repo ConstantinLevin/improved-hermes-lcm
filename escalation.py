@@ -120,18 +120,23 @@ class SummariserRoute:
     source: str = "session"
     # The provider as the host (``update_model``) named it.
     named_provider: str = ""
-    # The route the host routes the session to, resolved once, by the host's own functions
-    # (``_resolve_route_target``): the provider label and model it records in route_info,
-    # and the base URL and wire it calls. A MoA session (``moa``/``default``) is its
-    # aggregator's provider and model. The only source of the summariser's provider and
-    # model for everything the plugin decides: the model table's row, the input (images,
-    # reasoning), the window, B, the image limit, the endpoint's limiter, the provenance
-    # and D9 (the orchestrator's ruling on the Codex review of 080f5a3). Empty where the
-    # host could not be read: the route is then refused.
+    # The route the host routes the session to, resolved once, from the host's final
+    # client resolution (``_resolve_route_target``): the provider label and model it
+    # records in route_info, the endpoint it calls and the wire of the client it builds. A
+    # MoA session (``moa``/``default``) is its aggregator's, as the host finally builds it.
+    # The only source of the summariser's provider and model for everything the plugin
+    # decides: the model table's row, the input (images, reasoning), the window, B, the
+    # image limit, the endpoint's limiter, the provenance and D9 (the orchestrator's
+    # rulings on the Codex reviews of 080f5a3 and e229fd0). ``target_api_mode`` is empty
+    # where the host's client is of a wire the plugin has not established
+    # (``target_client`` names it). Empty throughout where the host could not resolve the
+    # route (``target_problem`` says why): the route is then refused.
     target_provider: str = ""
     target_model: str = ""
     target_base_url: str = ""
     target_api_mode: str = ""
+    target_client: str = ""
+    target_problem: str = ""
 
     def table_provider(self) -> str:
         """The provider the model table's route rows are keyed on: the target's."""
@@ -171,51 +176,67 @@ def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mo
     at Hermes 9fc7f17906). Its target is resolved here, once (``_resolve_route_target``)."""
     route = SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
                             api_mode=api_mode, source="session", named_provider=provider)
-    target = _resolve_route_target(route)
+    target, problem = _resolve_route_target(route)
     if target is None:
-        return route
-    target_provider, target_model, target_base_url, target_api_mode = target
+        return replace(route, target_problem=problem)
+    target_provider, target_model, target_base_url, target_api_mode, target_client = target
     return replace(route, target_provider=target_provider, target_model=target_model,
-                   target_base_url=target_base_url, target_api_mode=target_api_mode)
+                   target_base_url=target_base_url, target_api_mode=target_api_mode, target_client=target_client)
 
 
-def _resolve_route_target(route: SummariserRoute) -> Optional[tuple[str, str, str, str]]:
-    """The route the host routes the session's own route to: (provider label, model, base
-    URL, wire), resolved by the host's own functions, read at Hermes origin/main
-    d0288be5b3 (agent/auxiliary_client.py):
-    - ``call_llm`` with no task and no provider resolves "auto" (``_resolve_task_provider_model``,
-      6072); ``_resolve_auto_branch`` (4967) tags the client with the label
-      ``_resolve_auto_route`` (4647) returns, and ``_prepare_aux_request`` records it
-      through ``_fallback_provider_from_label`` (7345), which only strips fallback wrappers;
-    - the target is the host's: ``_normalize_main_runtime`` (3080; the provider
-      lower-cased) and ``_main_route_target`` (4534; ``moa`` replaced by its aggregator's
-      provider and model, and its base URL and wire dropped, 4552-4556), called here, not
-      mirrored;
-    - ``_try_main_provider_route`` (4560) returns the target's provider as the label for
-      every branch, except a named ``custom:<name>`` without a config entry and with a
-      base URL, routed on the anonymous custom arm as ``custom`` (4583-4587): no host
-      function carries that rewrite, so it is read here with the host's own entry lookup;
-    - the model recorded is the target's model, or the host's normalisation of it for the
-      provider (``_normalize_resolved_model``, through ``resolve_provider_client``):
-      ``_host_model_forms`` takes both.
-    None where the host cannot be read or names no target."""
+def _client_wire(client: Any) -> str:
+    """The wire of a client the host built, by its class (agent/auxiliary_client.py at
+    origin/main d0288be5b3): ``AnthropicAuxiliaryClient`` (1814) is the Anthropic
+    Messages converter, ``CodexAuxiliaryClient`` (1660) the Responses API, a plain
+    ``openai.OpenAI`` client Chat Completions; any other (Bedrock, Gemini native, …) is a
+    wire the plugin has not established: ""."""
     try:
-        from agent.auxiliary_client import _main_route_target, _normalize_main_runtime  # type: ignore
-        provider, model, base_url, _key, api_mode = _main_route_target(
-            _normalize_main_runtime(route.main_runtime()), None)
+        from agent.auxiliary_client import AnthropicAuxiliaryClient, CodexAuxiliaryClient  # type: ignore
+        import openai
     except Exception:
-        return None
-    provider, model = str(provider or "").strip().lower(), str(model or "").strip()
-    if not provider or provider == "auto" or not model:
-        return None
-    if provider.startswith("custom:") and base_url:
-        try:
-            from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
-            if _get_named_custom_provider(provider) is None:
-                provider = "custom"
-        except Exception:
-            return None
-    return provider, model, str(base_url or ""), str(api_mode or "")
+        return ""
+    if isinstance(client, AnthropicAuxiliaryClient):
+        return "anthropic_messages"
+    if isinstance(client, CodexAuxiliaryClient):
+        return "codex_responses"
+    if type(client) is openai.OpenAI:
+        return "chat_completions"
+    return ""
+
+
+def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, str, str, str, str]], str]:
+    """The route the host takes for the session's own route: (provider label, model,
+    endpoint, wire, client class), from the host's final client resolution, the same
+    ``call_llm`` performs, without a request (the orchestrator's ruling on the Codex
+    review of e229fd0), read at Hermes origin/main d0288be5b3 (agent/auxiliary_client.py):
+    ``call_llm`` → ``_prepare_aux_request`` (7305) → ``_resolve_task_provider_model`` (6072;
+    "auto" with no task and no provider) → ``_resolve_call_client`` (7237), called here
+    with the same arguments, which builds the client (``_get_cached_client`` →
+    ``_resolve_auto_branch``, 4967 → ``_resolve_auto_route``, 4647: MoA unwrapped to its
+    aggregator, a named provider's config entry applied, the provider's normalisation of
+    the model). From its result, as ``_prepare_aux_request`` records it (7343-7345): the
+    label ``_fallback_provider_from_label(effective_provider or resolved_provider)``, the
+    final model; and the client's ``base_url`` and class (``_client_wire``). Returns
+    (None, why) where the host cannot resolve it (no credentials, no provider)."""
+    try:
+        from agent.auxiliary_client import _fallback_provider_from_label, _resolve_call_client  # type: ignore
+    except Exception as exc:
+        return None, f"the host's client resolution cannot be read ({type(exc).__name__}: {exc})"
+    try:
+        resolved = _resolve_call_client(
+            None, provider=None, model=None, base_url=None, api_key=None, resolved_provider="auto",
+            resolved_model=None, resolved_base_url=None, resolved_api_key=None, resolved_api_mode=None,
+            main_runtime=route.main_runtime(), async_mode=False)
+        client, final_model, resolved_provider, effective_provider = resolved
+    except Exception as exc:
+        return None, f"the host cannot route the session's summariser ({type(exc).__name__}: {exc})"
+    label = str(_fallback_provider_from_label(effective_provider or resolved_provider) or "").strip().lower()
+    model = str(final_model or "").strip()
+    if not label or label == "auto" or not model:
+        return None, (f"the host's client resolution names no provider and model for the session's route "
+                      f"({label or '?'}/{model or '?'})")
+    return (label, model, str(getattr(client, "base_url", "") or ""), _client_wire(client),
+            type(client).__name__), ""
 
 
 def _host_local_server_aliases() -> Optional[frozenset]:

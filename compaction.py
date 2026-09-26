@@ -671,7 +671,10 @@ class CompactionMixin:
         label = (f"c = {c} tokens by the plugin's estimate: {config.chunk_tokens} provider tokens / "
                  f"{config.estimate_ratio}, #31's p50 of the provider's count over characters / 4")
         bound, bound_label = self._summariser_bound(focus_topic)
-        if bound is None or bound >= c:
+        if bound is None:
+            unknown = self._window_unknown()
+            return c, (f"{label}; {unknown}" if unknown else label)
+        if bound >= c:
             return c, label
         return bound, f"c = {bound} tokens by the plugin's estimate, below #31's {c}: B, {bound_label}"
 
@@ -729,6 +732,21 @@ class CompactionMixin:
                        f"window less {facts.output_cap or 0} output; {facts.basis}), less its prompt of "
                        f"{prompt.tokens}{' with the focus text' if focus_topic else ''}, over {worst}, the "
                        f"estimate's worst case (#34 D4): {bound} by the estimate")
+
+    def _window_unknown(self) -> str:
+        """Where the model table has no row, or no window, for the summariser's target: no
+        B exists and the window is not checked, and that is said (the orchestrator's
+        ruling on the Codex review of e229fd0: unknown is never unlimited, and never
+        silent). "" where the window is known or there is no route."""
+        route, _why = self._summariser_route()
+        if route is None:
+            return ""
+        facts = self._summariser_wire(route)[0]
+        if facts is not None and facts.context_window:
+            return ""
+        return (f"the summariser's window is not known (the model table has no {'window' if facts else 'row'} for "
+                f"{route.target_provider}/{route.target_model}): no B, the chunks are not checked against its "
+                f"window, and a refusal of the provider's is the only bound")
 
     def _image_limit(self) -> Optional[int]:
         """The most images one chunk may carry to the summariser (``wire_image_limit``),
@@ -1152,9 +1170,8 @@ class CompactionMixin:
                           "would borrow an endpoint of its own, which the session did not name")
         route = session_route(self.provider, self.model, self.base_url, self.api_key, self.api_mode)
         if not route.target_provider:
-            return None, (f"the host could not resolve the route it takes for the session's "
-                          f"{self.provider}/{self.model} (its _main_route_target): the summariser's provider and "
-                          f"model are not known")
+            return None, (f"the route the host takes for the session's {self.provider}/{self.model} is not known: "
+                          f"{route.target_problem}")
         return route, ""
 
     def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
@@ -2180,6 +2197,27 @@ class CompactionMixin:
         # only a group that cannot be divided, or a chunk an earlier attempt cut: never
         # with placeholders in their place, since a loss is a failure (see the PR).
         step.at = "checking each chunk's images against the wire's limit"
+        if not route.target_api_mode:
+            # The wire of the client the host builds for the summariser is not one the
+            # plugin has established (``_client_wire``): whether it keeps every image is not
+            # known, so a chunk carrying one is not sent ("Known, or nothing"; the
+            # orchestrator's ruling on the Codex review of e229fd0).
+            for number, chunk in enumerate(chunks, start=1):
+                if kept_state.get(tuple(chunk)) == "summarised":
+                    continue
+                carried = sum(image_count(summariser_message(raw, record, prepared[number].wire))
+                              for record, raw in prepared[number].records)
+                if carried:
+                    self._rollback_planning(attempt, RuntimeError("images on a wire not established"))
+                    self._record_event(attempt, "images_on_unknown_wire",
+                                       {"chunk": number, "images": carried, "client": route.target_client})
+                    return self._abort(
+                        messages,
+                        f"chunk {number} of {len(chunks)} carries {carried} image{'' if carried == 1 else 's'}, and "
+                        f"the host routes the summariser {route.describe()} through a {route.target_client}, a wire "
+                        f"the plugin has not established: it cannot be shown that the summariser receives every "
+                        f"image (#8)",
+                    )
         if image_limit is not None:
             for number, chunk in enumerate(chunks, start=1):
                 if kept_state.get(tuple(chunk)) == "summarised":
@@ -2239,6 +2277,16 @@ class CompactionMixin:
                         f"{estimate.label()}), more than it can read in one call ({model_facts.context_window} "
                         f"window less {model_facts.output_cap or 0} output; {model_facts.basis})",
                     )
+        else:
+            # No window known: no B and no check, and that is said, in the log and in the
+            # compaction's record (the orchestrator's ruling on the Codex review of e229fd0).
+            unknown = self._window_unknown()
+            if unknown:
+                logger.warning("LCM compacts without a window check: %s", unknown)
+                self._record_event(attempt, "summariser_window_unknown",
+                                   {"summariser": route.describe(), "target": [route.target_provider,
+                                                                              route.target_model],
+                                    "why": unknown})
         # The cut is recorded: commit the planning transaction before any call starts. A
         # commit that fails (the busy timeout, a full disk) wrote nothing: a visible
         # abort, the context untouched (#7).
