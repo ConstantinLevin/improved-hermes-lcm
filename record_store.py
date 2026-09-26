@@ -736,6 +736,11 @@ class RecordStore:
         else:
             record = text if kind == MESSAGE else str(rows[0][1])
             active = self._record_active(record, cover)
+            if not active and kind == TOOL_CALL:
+                # A revision keeps its sources' calls and their handles (``begin_compaction``):
+                # the call is active where an active revision of its record carries it
+                # (finding 4 of the Codex review of 3a4e019).
+                active = self.active_holder(text, cover) is not None
             if not active and kind == MESSAGE:
                 revised = self._q("SELECT derivation FROM summary_revisions WHERE revision = ? LIMIT 1", (text,))
                 if revised:
@@ -823,17 +828,62 @@ class RecordStore:
                 found.setdefault(str(result), str(handle))
         return found
 
-    def tool_call(self, handle: str) -> Optional[tuple[str, int, Optional[str]]]:
-        """(the assistant record, the call's position in it, its result record) of a call
-        handle; the result from ``tool_results`` where a later compaction recorded it."""
+    def tool_call(self, handle: str) -> Optional[tuple[str, int, list[str]]]:
+        """(the assistant record, the call's position in it, every result record recorded
+        for it) of a call handle: its own result, and the ``tool_results`` links a later
+        compaction wrote, in the order written. Which of them is on the active record is
+        the caller's to ask (``active_result``)."""
         rows = self._q("SELECT record, position, result_record FROM tool_calls WHERE handle = ?", (handle,))
         if not rows:
             return None
         record, position, result = rows[0]
-        if result is None:
-            linked = self._q("SELECT result_record FROM tool_results WHERE tool_call = ? LIMIT 1", (handle,))
-            result = linked[0][0] if linked else None
-        return str(record), int(position), (str(result) if result else None)
+        results = [str(result)] if result else []
+        results += [str(r) for (r,) in self._q(
+            "SELECT result_record FROM tool_results WHERE tool_call = ? ORDER BY rowid", (handle,)) if r]
+        return str(record), int(position), list(dict.fromkeys(results))
+
+    def active_result(self, handle: str, cover: "Cover") -> tuple[Optional[str], Optional[str]]:
+        """(the call's result on the active record, or None; where none is, the newest
+        result recorded for it, whose own resolution says why it is not active, or None
+        where no result is recorded at all). Findings 3 of the Codex review of 3a4e019: a
+        link into a compaction that never took effect is not the result."""
+        found = self.tool_call(handle)
+        if found is None or not found[2]:
+            return None, None
+        for result in found[2]:
+            if self._record_active(result, cover):
+                return result, None
+        return None, found[2][-1]
+
+    def _revisions_of(self, record: str) -> list[str]:
+        """Every revision written of a record, and of its revisions, transitively."""
+        found: list[str] = []
+        frontier = [record]
+        while frontier:
+            current = frontier.pop()
+            for (revision,) in self._q("SELECT revision FROM revision_sources WHERE source_record = ?", (current,)):
+                if str(revision) not in found:
+                    found.append(str(revision))
+                    frontier.append(str(revision))
+        return found
+
+    def active_holder(self, handle: str, cover: "Cover") -> Optional[str]:
+        """The active record that shows a call: its own assistant record, or an active
+        revision of it whose ``tool_calls`` carry the call's id; None where none is."""
+        rows = self._q("SELECT record, tool_call_id FROM tool_calls WHERE handle = ?", (handle,))
+        if not rows:
+            return None
+        record, call_id = str(rows[0][0]), rows[0][1]
+        if self._record_active(record, cover):
+            return record
+        for revision in self._revisions_of(record):
+            if not self._record_active(revision, cover):
+                continue
+            raw = self.record_raw(revision) or {}
+            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+            if call_id and any(isinstance(c, dict) and str(c.get("id") or "") == str(call_id) for c in calls):
+                return revision
+        return None
 
     def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
         """record id (the views' store_id) -> its handle."""

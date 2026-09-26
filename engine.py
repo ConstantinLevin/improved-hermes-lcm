@@ -1017,28 +1017,45 @@ class LCMEngine(
         # its compaction's name, a return adopted without one, the bindings. So a
         # summary a compaction inside this turn put into the context can be expanded
         # at once.
-        if self._closed_reason is not None:
-            return json.dumps({"error": f"LCM's store connections of this engine were closed "
-                                        f"({self._closed_reason}); a closed engine is never reused"})
-        messages = kwargs.get("messages")
-        if messages:
-            self._bind_from_list(messages)
-        handlers = {
-            "lcm_grep": lcm_tools.lcm_grep,
-            "lcm_expand": lcm_tools.lcm_expand,
-            "lcm_expand_query": lcm_tools.lcm_expand_query,
-            "lcm_status": lcm_tools.lcm_status,
-            "lcm_inspect": lcm_tools.lcm_inspect,
-            "lcm_doctor": lcm_tools.lcm_doctor,
-        }
-        handler = handlers.get(name)
-        if handler:
-            # The final string (or the _multimodal envelope, as it is): what a page was
-            # measured as (``results.final_result``, #18).
+        #
+        # One boundary around the whole of a tool's work (finding 6 of the Codex review of
+        # 3a4e019, as in #64): whatever fails in it, a store closed meanwhile included,
+        # comes back as an honest error naming the step, and nothing raises into the host.
+        # The handlers' own errors, which name a better cause, stay as they are. Only a
+        # BaseException passes, the host's cancellation (``AuxiliaryExplicitCancellation``,
+        # agent/auxiliary_client.py:212 at Hermes d0288be5b3) and the interpreter's own.
+        step = "checking the engine"
+        try:
+            if self._closed_reason is not None:
+                return json.dumps({"error": f"LCM's store connections of this engine were closed "
+                                            f"({self._closed_reason}); a closed engine is never reused"})
+            messages = kwargs.get("messages")
+            if messages:
+                step = "settling the list the host handed over"
+                self._bind_from_list(messages)
+            handlers = {
+                "lcm_grep": lcm_tools.lcm_grep,
+                "lcm_expand": lcm_tools.lcm_expand,
+                "lcm_expand_query": lcm_tools.lcm_expand_query,
+                "lcm_status": lcm_tools.lcm_status,
+                "lcm_inspect": lcm_tools.lcm_inspect,
+                "lcm_doctor": lcm_tools.lcm_doctor,
+            }
+            handler = handlers.get(name)
+            if not handler:
+                return json.dumps({"error": f"Unknown LCM tool: {name}"})
             # The live list goes with the call: a page's size depends on the tool calls of
             # the message being answered (``expansion.host_page_limit``).
-            return final_result(handler(args, engine=self, messages=messages))
-        return json.dumps({"error": f"Unknown LCM tool: {name}"})
+            step = f"running {name}"
+            result = handler(args, engine=self, messages=messages)
+            # The final string (or the _multimodal envelope, as it is): what a page was
+            # measured as (``results.final_result``, #18).
+            step = f"finishing the result of {name}"
+            return final_result(result)
+        except Exception as exc:
+            logger.warning("LCM tool %s failed while %s", name, step, exc_info=True)
+            return json.dumps({"error": f"LCM's {name} failed while {step}: {type(exc).__name__}: {exc}"},
+                              ensure_ascii=False)
 
     def _database_path_source(self) -> str:
         if self._config.database_path:

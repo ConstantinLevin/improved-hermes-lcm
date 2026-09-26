@@ -272,7 +272,7 @@ def _result_item(handle: str, raw: dict, call: Optional[str], *, inline: bool) -
     return item
 
 
-def _records_items(store: RecordStore, records: list[tuple[str, dict]], *, raw: bool) -> list[dict]:
+def _records_items(store: RecordStore, cover: Cover, records: list[tuple[str, dict]], *, raw: bool) -> list[dict]:
     """The items of a run of records, collapsed or raw."""
     handles = [handle for handle, _raw in records]
     calls = store.tool_calls_of(handles)
@@ -303,11 +303,14 @@ def _records_items(store: RecordStore, records: list[tuple[str, dict]], *, raw: 
             for entry in item.get("tool_calls") or ():
                 if not entry.get("handle"):
                     continue
-                found = store.tool_call(entry["handle"])
-                result = found[2] if found else None
-                if result is None:
+                result, inactive = store.active_result(entry["handle"], cover)
+                if result is None and inactive is None:
                     entry["result"] = None
                     entry["note"] = "no result of this call is recorded in the store"
+                elif result is None:
+                    entry["result"] = None
+                    entry["note"] = (f"the result recorded for this call, {inactive}, is not on the active record; "
+                                     f"expand {inactive} to read why")
                 elif result not in inline:
                     entry["result_in"] = result
     return items
@@ -320,7 +323,7 @@ def target_for(store: RecordStore, cover: Cover, resolved: Resolved, *, raw: boo
     form = "raw" if raw else "collapsed"
     if resolved.kind == CHUNK:
         return Target({"handle": handle, "kind": "chunk", "form": form},
-                      _records_items(store, store.chunk_records(handle), raw=raw))
+                      _records_items(store, cover, store.chunk_records(handle), raw=raw))
     if resolved.kind == DERIVATION:
         sources = store.derivation_sources(handle)
         header: dict = {"handle": handle, "kind": "summary", "form": form}
@@ -328,14 +331,14 @@ def target_for(store: RecordStore, cover: Cover, resolved: Resolved, *, raw: boo
             chunks = [str(chunk) for chunk, _derivation in sources]
             header["chunks"] = chunks
             if len(chunks) == 1:
-                return Target(header, _records_items(store, store.chunk_records(chunks[0]), raw=raw))
+                return Target(header, _records_items(store, cover, store.chunk_records(chunks[0]), raw=raw))
             # A summary written from the raw of several chunks (#34 D6, "raw"): all of them,
             # each opened by a marker naming its chunk and that chunk's own summary.
             leaves = store.leaf_summaries(chunks, _all_summaries(store, chunks))
             items: list[dict] = []
             for chunk in chunks:
                 items.append({"chunk": chunk, "summary": leaves.get(chunk)})
-                items.extend(_records_items(store, store.chunk_records(chunk), raw=raw))
+                items.extend(_records_items(store, cover, store.chunk_records(chunk), raw=raw))
             return Target(header, items)
         # A summary written from summaries (#34 D6, "summaries"): one layer down.
         header["form"] = "summaries"
@@ -352,19 +355,28 @@ def target_for(store: RecordStore, cover: Cover, resolved: Resolved, *, raw: boo
         found = store.tool_call(handle)
         if found is None:
             raise ExpansionError(f"{handle} is unknown in this store")
-        record, position, result = found
+        record, position, _results = found
         assistant = store.record_raw(record) or {}
         calls = assistant.get("tool_calls") if isinstance(assistant.get("tool_calls"), list) else []
         name, _arguments = _call_parts(calls[position]) if position < len(calls) else (None, None)
-        header = {"handle": handle, "kind": "tool_call", "form": "raw", "name": name, "call_in": record}
-        if result is None:
+        header = {"handle": handle, "kind": "tool_call", "form": "raw", "name": name,
+                  "call_in": store.active_holder(handle, cover) or record}
+        result, inactive = store.active_result(handle, cover)
+        if result is None and inactive is None:
             header["result"] = None
             header["note"] = "no result of this call is recorded in the store"
             return Target(header, [])
+        if result is None:
+            # Only an active result is returned (finding 3 of the Codex review of
+            # 3a4e019): a link into a compaction that never took effect is not it.
+            why = store.resolve(inactive, cover.session, cover)
+            reason = f": {unresolved_message(why)}" if why.status != "ok" else ""
+            raise ExpansionError(f"the result recorded for {handle} is {inactive}, which is not on the active "
+                                 f"record{reason}")
         return Target(header, [_result_item(result, store.record_raw(result) or {}, handle, inline=True)])
     if resolved.kind == MESSAGE:
         return Target({"handle": handle, "kind": "message", "form": form},
-                      _records_items(store, [(handle, store.record_raw(handle) or {})], raw=True))
+                      _records_items(store, cover, [(handle, store.record_raw(handle) or {})], raw=True))
     raise ExpansionError(f"{handle} is not a handle this tool opens")
 
 
@@ -420,8 +432,11 @@ def _piece(item: dict, path: str, *, value: Any = None, text: Optional[str] = No
         index = int(path[len("tool_calls["):path.index("]")])
         call = (item.get("tool_calls") or [])[index]
         piece["tool_call"] = call.get("handle")
-        if "name" in call:
-            piece["name"] = call["name"]
+        # Everything the call says beside its arguments (its name, and in a raw stretch
+        # where its result is or that none is recorded) goes with each piece.
+        for key, value in call.items():
+            if key not in ("handle", "arguments", "call"):
+                piece[key] = value
     if text is None:
         piece["value"] = value
     else:
@@ -456,16 +471,57 @@ def _replace_images(value: Any, images: list, describe: list) -> Any:
     return value
 
 
+@dataclass(frozen=True)
+class ImageCeiling:
+    """The most images, and image bytes, one request carries before the host's send path
+    retires image-bearing tool results unseen: ``OUTBOUND_IMAGE_LIMIT`` blocks and
+    ``OUTBOUND_IMAGE_BUDGET_BYTES`` (agent/image_eviction_policy.py:26-27 at Hermes
+    d0288be5b3), applied on the main agent's send path to every request whatever its wire
+    (``evict_stale_outbound_tool_images``, agent/turn_request_assembly.py:153-155,
+    agent/chat_completion_helpers.py:2247-2248; agent/context_compressor.py:1478-1510), and
+    again by the Anthropic converter by blocks (``_evict_old_screenshots``,
+    agent/anthropic_message_convert.py:605). Bytes are measured as the host measures them
+    (``_image_payload``, agent/context_compressor.py:1452). ``measure`` is None where the
+    host cannot be read: then one image per page (unknown is never unlimited)."""
+
+    blocks: int
+    budget_bytes: Optional[int]
+    measure: Optional[Callable[[dict], tuple]]
+    basis: str
+
+    def admits(self, images: list) -> bool:
+        if len(images) > self.blocks:
+            return False
+        if self.measure is None or self.budget_bytes is None:
+            return True
+        _blocks, size = self.measure({"role": "tool", "content": list(images)})
+        return size <= self.budget_bytes
+
+
+def host_image_ceiling() -> ImageCeiling:
+    try:
+        from agent.image_eviction_policy import OUTBOUND_IMAGE_BUDGET_BYTES, OUTBOUND_IMAGE_LIMIT  # type: ignore
+        from agent.context_compressor import _image_payload  # type: ignore
+        blocks, budget = int(OUTBOUND_IMAGE_LIMIT), int(OUTBOUND_IMAGE_BUDGET_BYTES)
+        if blocks < 1 or budget < 1:
+            raise ValueError(f"limit {blocks}, budget {budget}")
+        return ImageCeiling(blocks, budget, _image_payload, "the host's send-path ceiling")
+    except Exception as exc:
+        return ImageCeiling(1, None, None, f"the host's send-path ceiling cannot be read "
+                                           f"({type(exc).__name__}): one image per page")
+
+
 class PageBuilder:
     """Fills pages of ``target`` from a cursor, each at most ``limit`` characters as the
     host measures the result it receives."""
 
     def __init__(self, target: Target, *, limit: int, token_state: dict,
-                 image_tokens: Callable[[dict], Optional[int]]):
+                 image_tokens: Callable[[dict], Optional[int]], image_ceiling: "ImageCeiling"):
         self.target = target
         self.limit = limit
         self.token_state = token_state
         self.image_tokens = image_tokens
+        self.image_ceiling = image_ceiling
         self._fields: dict[int, list] = {}
 
     def _fields_of(self, index: int) -> list:
@@ -503,6 +559,8 @@ class PageBuilder:
         if not rendered.images:
             return len(rendered.text) <= self.limit
         if rendered.image_tokens is None:
+            return False
+        if not self.image_ceiling.admits(rendered.images):
             return False
         text_chars = len(rendered.text) + sum(len(label) for label in rendered.labels)
         return (len(rendered.summary) <= self.limit
@@ -579,6 +637,10 @@ class PageBuilder:
                 f, o = f + 1, 0
                 continue
             break
+        if i < len(items) and f >= 0 and f >= len(self._fields_of(i)):
+            # A page that ends with an item's last field (an image standing alone, for
+            # one) continues at the next item: a token never names a field past the end.
+            i, f, o = i + 1, -1, 0
         next_cursor = Cursor(i, f, o) if i < len(items) else None
         next_page = encode_token({**self.token_state, "i": i, "f": f, "o": o, "n": page + 1}) \
             if next_cursor is not None else None
@@ -653,13 +715,20 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
                              "opens into")
     if cursor.field >= 0:
         fields = fields_of(target.items[cursor.item])
-        if cursor.field >= len(fields):
+        if cursor.field == len(fields) and cursor.offset == 0:
+            # Just past an item's last field (a token of 3a4e019 after an image that stood
+            # alone): the next item (finding 1 of the Codex review of 3a4e019).
+            cursor = Cursor(cursor.item + 1, -1, 0)
+        elif cursor.field >= len(fields):
             raise ExpansionError("page is a garbled next_page token: it names a field this item does not have")
-        value = fields[cursor.field][1]
-        length = len(value) if isinstance(value, str) else len(json.dumps(value, ensure_ascii=False))
-        if cursor.offset > length or (cursor.offset and isinstance(value, dict) and is_image_part(value)):
-            raise ExpansionError("page is a garbled next_page token: its offset lies outside the field it names")
+        else:
+            value = fields[cursor.field][1]
+            length = len(value) if isinstance(value, str) else len(json.dumps(value, ensure_ascii=False))
+            if cursor.offset > length or (cursor.offset and isinstance(value, dict) and is_image_part(value)):
+                raise ExpansionError("page is a garbled next_page token: its offset lies outside the field it "
+                                     "names")
     estimator = engine._estimator()
-    builder = PageBuilder(target, limit=limit, token_state=token_state, image_tokens=estimator.image)
+    builder = PageBuilder(target, limit=limit, token_state=token_state, image_tokens=estimator.image,
+                          image_ceiling=host_image_ceiling())
     result, _next = builder.build(cursor, page)
     return result
