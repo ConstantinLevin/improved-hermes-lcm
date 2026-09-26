@@ -1164,6 +1164,10 @@ class LCMEngine(
         self._set_context_length(context_length, source="update_model")
         self._update_model_pending_session_start = True
         self._check_host_native_compaction()
+        # #16: on a runtime whose requests the plugin never sees, delivery of its
+        # instruction cannot be verified; that is logged once per engine copy.
+        from .guidance import warn_unverifiable_delivery
+        warn_unverifiable_delivery(self, self.api_mode)
 
     # -- Internal: overflow recovery ----------------------------------------
 
