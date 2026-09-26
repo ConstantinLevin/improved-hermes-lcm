@@ -1820,8 +1820,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "estimate_ratio": engine._config.estimate_ratio,
             "chunk": engine._chunk_label(),
             "summary_model": (
-                f"{engine._config.summary_provider}/{engine._config.summary_model}"
-                if engine._config.summary_model else f"(the session's model: {engine.provider}/{engine.model})"
+                engine._summariser_route()[1] or f"(the session's model: {engine.provider}/{engine.model})"
             ),
             "summary_reasoning_effort_default": engine._config.summary_reasoning_effort,
             "summary_calls_in_flight": engine._config.summary_calls_in_flight,

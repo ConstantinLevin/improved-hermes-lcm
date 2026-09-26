@@ -334,11 +334,10 @@ class LCMConfig:
     custom_instructions: str = ""
 
     # -- Models ---
-    # The summariser (#9). Empty summary_model: the model running the session, on the
-    # route the host hands update_model. Set: that model, called by the plugin's own
-    # client with the base URL, key ("none": no authentication) and API mode, all
-    # required with it (escalation.configured_route_problem); summary_provider is an
-    # optional label.
+    # The summariser (#9): the model running the session, on the route the host hands
+    # update_model. Any of the five summary_* route fields set is refused at load: a
+    # summariser other than the session's model is not supported in this build (#68,
+    # escalation.configured_route_problem).
     summary_model: str = ""
     summary_provider: str = ""
     summary_base_url: str = ""

@@ -19,15 +19,10 @@ record, filled at each compaction from what the host hands over, verbatim, and t
 compaction returns is emitted from that record (#29, #1, #3). A summary that cannot be written
 fails the compaction: nothing is truncated in its place, the context stays as it was, the host
 shows the cause, and compaction is tried again at the next occasion (#7). The summariser is the
-model running the session, called through the host on the route the host names for it, unless
-another is configured as a whole route, which the plugin calls with its own client and exactly
-what is configured, nothing of the host's provider settings: `LCM_SUMMARY_MODEL`,
-`LCM_SUMMARY_BASE_URL`, `LCM_SUMMARY_API_KEY` (`none` sends no authentication) and the wire in
-`LCM_SUMMARY_API_MODE` (`chat_completions`, `codex_responses`, or `anthropic_messages` where the
-host has the `anthropic` package); `LCM_SUMMARY_PROVIDER` is an optional label. Any other shape is
-refused at load with its reason. The reasoning effort is sent on a configured route only where the
-plugin's model table documents the field for that model, and the summary's provenance says what
-was sent. A reply from any other model is a failed summary (#9). The summariser reads a chunk's stored records as the messages they were, in
+model running the session, called through the host on the route the host names for it. A
+summariser other than the session's model (`LCM_SUMMARY_MODEL`, `_PROVIDER`, `_BASE_URL`,
+`_API_KEY`, `_API_MODE`) is not supported in this build and is refused at load (#68). A reply
+from any other model is a failed summary (#9). The summariser reads a chunk's stored records as the messages they were, in
 full: tool calls and results whole, readable reasoning marked, images only where it reads them;
 encrypted reasoning is withheld until the plugin knows which provider produced it (#8). A
 compaction's summariser calls, one per chunk, run at once, through one limiter per endpoint

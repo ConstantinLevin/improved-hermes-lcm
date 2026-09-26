@@ -34,10 +34,11 @@ Columns, each ``None`` where not established:
   produced matters too: the source of each row says what is known about that.
 
 - ``effort``: how a request on this route carries the reasoning effort (``EffortRule``),
-  from the provider's own documentation, cited with its date. Read only for a
-  configured route, which the plugin's own client calls; where it is None no effort is
-  sent and the summary's provenance says so. The session's route takes the effort
-  through the host's ``reasoning_config``.
+  from the provider's own documentation, cited with its date. The session's route
+  takes the effort through the host's ``reasoning_config``, so nothing in this build
+  reads the column: it is the documented mapping per row, kept for the session's
+  provider rows (the orchestrator's ruling on the Codex review of 40eda93; a configured
+  summariser, #68, would send it).
 
 A reasoning-summaries column is not built: readable reasoning reaches every summariser as
 text (R2), so nothing would read it (the orchestrator's ruling on 9.6).
@@ -100,8 +101,7 @@ class ModelFacts:
     ids: tuple[str, ...] = ()
     encrypted_reasoning: frozenset = field(default_factory=frozenset)
     # How a request on this route carries the reasoning effort, from the provider's own
-    # documentation (``EffortRule``); None where it is not documented or not read, and
-    # then no effort is sent to a configured route and its provenance says so.
+    # documentation (``EffortRule``); None where it is not documented or not read.
     effort: Optional["EffortRule"] = None
     # How a lookup found this row (set by ``lookup``).
     basis: str = ""

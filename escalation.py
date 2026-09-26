@@ -3,28 +3,22 @@
 The summariser reads the chunk's records as the messages they were, between its
 instructions (today's text) and a closing request; ``summariser_input`` builds that.
 
-The call names its whole route (#9), one of two:
-
-- the one configured for the plugin (model, base URL, wire and key, all four named) is
-  called through the plugin's own client (``summariser_client``; the orchestrator's
-  ruling on the Codex review of c2efe0e): exactly what the configuration names is
-  sent, and nothing of the host's provider resolution (its config entries, extra
-  headers, credential pools, wire detection, fallback ladder) reaches the call. The
-  reasoning effort is sent only in the request field the model table documents for
-  that model and wire (its ``effort`` column); where there is none, no effort is sent,
-  and the summary's provenance says so (``effort_sent``). The reply's text, finish
-  reason and reasoning are the provider's own stream's.
-- the session's own, as the host handed it to ``update_model``, is called through the
-  host's ``call_llm`` as its ``main_runtime``, which the host resolves the way it
-  resolves the main agent's route. It is made with no host task name (R8), so none of
-  the host's ``auxiliary.<task>`` settings reach it, with the reasoning effort passed
-  through the host's ``reasoning_config``, and with ``route_info``, which the host
-  fills with the route that answered. A reply from any other model than the
-  summariser is a failure (#33 D9): the host's fallback ladder answers a timeout, a
-  rate limit or another capacity error with the main agent's model or a configured
-  fallback, and says so only there. After a fallback, only the session route's own
-  provider and model are accepted, and only a provider that names its endpoint, since
-  ``route_info`` carries no base URL (the orchestrator's ruling on D9).
+The summariser is the session's model on the session's route (#9, the manifesto's
+default): the route the host handed ``update_model``, called through the host's
+``call_llm`` as its ``main_runtime``, which the host resolves the way it resolves the
+main agent's route. A summariser configured for the plugin (``LCM_SUMMARY_*``) is not
+supported in this build and is refused when the configuration is loaded (#68). The call
+is made with no host task name (R8), so none of the host's ``auxiliary.<task>`` settings
+reach it, with the reasoning effort passed through the host's ``reasoning_config``, and
+with ``route_info``, which the host fills with the route that answered. A reply from any
+other model than the summariser is a failure (#33 D9): the host's fallback ladder answers
+a timeout, a rate limit or another capacity error with the main agent's model or a
+configured fallback, and says so only there. After a fallback, only the session route's
+own provider and model are accepted, and only a provider that names its endpoint, since
+``route_info`` carries no base URL (the orchestrator's ruling on D9). A gap stays: where
+the host's ``_resolve_auto_route`` picks a fallback provider before its first
+``route_info`` record and that provider serves the same model id, the one record cannot
+tell it from the session's route (ask A-33.3).
 
 Two levels, each one call to the summariser with today's prompt text (#10 owns the
 texts): level 1 asks for a summary near the target budget; level 2, with today's
@@ -38,12 +32,10 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 - the call raises (a rate limit, a timeout, a connection or provider error);
 - another model answered (``route_info`` names another provider or model);
 - the reply has no ``choices[0].message`` (malformed), or its text is empty;
-- the reply ended otherwise than complete (``summariser_client.ending_failure``): Chat
-  Completions ``stop``, a Responses ``response.completed``, Anthropic ``end_turn`` are
-  the only summaries; the output limit, a content filter, a refusal, a tool call, an
-  error, no ending at all and every ending not known each fail with their kind (the
-  session's route is read by its Chat Completions ``finish_reason``, the shape the host
-  hands every wire's reply in);
+- the reply ended otherwise than complete (``ending_failure``): only ``finish_reason``
+  ``stop`` is a summary, read in the Chat Completions shape the host hands every wire's
+  reply in; the output limit, a content filter, a tool call, an error, no ending at all
+  and every ending not known each fail with their kind;
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
 
@@ -62,10 +54,9 @@ attribute guessed per provider.
 The budget is a target in the prompt text only. ``max_tokens`` is the summariser
 model's own output cap where the model table knows it (R5 b), and absent otherwise, so
 the plugin never cuts a summary at an output limit of its own; a reply stopped at the
-limit reports ``length`` and fails (#7). On the session's route, where the host rewrites a missing
-finish reason to "stop" (its Codex adapter always; its streamed collector when no chunk
-carried one), a cut reply can still pass: that is the host's, and asked of Hermes
-(A-7.1). The own client reads the provider's finish itself.
+limit reports ``length`` and fails (#7). Where the host rewrites a missing finish reason
+to "stop" (its Codex adapter always; its streamed collector when no chunk carried one),
+a cut reply can still pass: that is the host's, and asked of Hermes (A-7.1).
 
 Transient failures (HTTP 408/409/429/5xx, connection errors, timeouts) are retried at
 the same level after the longer of the provider's ``Retry-After`` and 2 s doubling to 30 s
@@ -115,22 +106,20 @@ REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhig
 
 @dataclass(frozen=True)
 class SummariserRoute:
-    """The summariser's whole route, explicit at every call (#9). ``source`` says where
-    it came from: ``session`` (the host's ``update_model``, called through the host as
-    its ``main_runtime``) or ``configured`` (called through the plugin's own client,
-    ``summariser_client``)."""
+    """The summariser's whole route, explicit at every call (#9): the session's, as the
+    host's ``update_model`` named it, called through the host as its ``main_runtime``."""
 
     provider: str
     model: str
     base_url: str = ""
-    # As the host or the configuration gave it: a string, or a callable the host
-    # resolves itself (it passes such callables through uncalled, ``_normalize_api_key``,
-    # agent/auxiliary_client.py at 7b761da). Never stringified, never shown.
+    # As the host gave it: a string, or a callable the host resolves itself (it passes
+    # such callables through uncalled, ``_normalize_api_key``, agent/auxiliary_client.py
+    # at 7b761da). Never stringified, never shown.
     api_key: Any = field(default="", repr=False)
     api_mode: str = ""
     source: str = "session"
-    # The provider as the host (``update_model``) or the configuration named it: the
-    # model table is keyed on it (9.6). For a configured route it is only a label.
+    # The provider as the host (``update_model``) named it: the model table is keyed on
+    # it (9.6).
     named_provider: str = ""
 
     def table_provider(self) -> str:
@@ -138,8 +127,6 @@ class SummariserRoute:
         return self.named_provider or self.provider
 
     def provenance_provider(self) -> str:
-        if self.source == "configured":
-            return f"{self.provider or 'configured'} [{self.base_url}, {self.api_mode}, the plugin's own client]"
         return self.provider
 
     def main_runtime(self) -> dict[str, Any]:
@@ -149,7 +136,7 @@ class SummariserRoute:
         return {key: value for key, value in fields.items() if value}
 
     def describe(self) -> str:
-        return f"{self.provider or 'configured'}/{self.model}"
+        return f"{self.provider}/{self.model}"
 
 
 def _host_provider(provider: str) -> Optional[str]:
@@ -172,10 +159,6 @@ def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mo
                            api_mode=api_mode, source="session", named_provider=provider)
 
 
-def _control_characters(value: str) -> bool:
-    return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
-
-
 def _host_local_server_aliases() -> Optional[frozenset]:
     """The host's local-server provider names (ollama, vllm, llama.cpp …), labels that
     name no endpoint in ``route_info`` (``_LOCAL_SERVER_ALIASES``,
@@ -189,52 +172,27 @@ def _host_local_server_aliases() -> Optional[frozenset]:
 
 
 def configured_route_problem(config: Any) -> Optional[str]:
-    """Why the plugin's configured summariser cannot be used, or None (#9). Checked when
+    """Why the plugin's summariser settings cannot be used, or None (#9). Checked when
     the configuration is loaded; every compaction then aborts with this cause.
 
-    A configured summariser is called through the plugin's own client with exactly what
-    the configuration names (``summariser_client``; the orchestrator's ruling on the
-    Codex review of c2efe0e): nothing of the host's provider resolution, config entries or
-    fallback ladder is involved. So all four must be named: the model, the base URL, the
-    wire (``chat_completions``, ``codex_responses`` or ``anthropic_messages``) and the key,
-    which may be ``none`` to send no authentication (a placeholder is never invented).
-    ``LCM_SUMMARY_PROVIDER`` is optional: a label for the provenance and the model
-    table's route rows. A wire whose client is not installed in the host's environment
-    (the ``anthropic`` SDK is an optional extra of Hermes) is refused; nothing is ever
-    installed lazily."""
-    from .summariser_client import WIRES, sdk_missing
-
-    model = str(getattr(config, "summary_model", "") or "").strip()
-    provider = str(getattr(config, "summary_provider", "") or "").strip()
-    base_url = str(getattr(config, "summary_base_url", "") or "").strip()
-    api_key = getattr(config, "summary_api_key", "") or ""
-    api_mode = str(getattr(config, "summary_api_mode", "") or "").strip()
+    The summariser is the session's model on the session's route. A summariser other
+    than that (any of ``LCM_SUMMARY_MODEL``, ``_PROVIDER``, ``_BASE_URL``, ``_API_KEY``,
+    ``_API_MODE`` set) is not supported in this build and is refused visibly (the
+    orchestrator's ruling on the Codex review of 40eda93; #68 carries what was learned
+    building it). The effort is checked because the session's route uses it."""
     effort = str(getattr(config, "summary_reasoning_effort", "") or "").strip().lower()
     if effort not in REASONING_EFFORTS:
         return (f"LCM_SUMMARY_REASONING_EFFORT {effort!r} is not one of the host's levels "
                 f"({', '.join(sorted(REASONING_EFFORTS))})")
-    if isinstance(api_key, str) and _control_characters(api_key):
-        return "LCM_SUMMARY_API_KEY contains a newline or another control character"
-    if not (model or provider or base_url or api_key or api_mode):
-        return None
-    missing = [name for name, value in (("LCM_SUMMARY_MODEL", model), ("LCM_SUMMARY_BASE_URL", base_url),
-                                        ("LCM_SUMMARY_API_MODE", api_mode),
-                                        ("LCM_SUMMARY_API_KEY", str(api_key).strip()))
-               if not value]
-    if missing:
-        return (f"the configured summariser does not name {', '.join(missing)}: the plugin's own client sends "
-                f"exactly the model, base URL, wire and key the configuration names, so all four are required "
-                f"(the key may be 'none' to send no authentication)")
-    if api_mode not in WIRES:
-        return f"LCM_SUMMARY_API_MODE {api_mode!r} is not one of {', '.join(WIRES)}"
-    if api_mode == "anthropic_messages" and base_url.rstrip("/").lower().endswith("/v1"):
-        # The Anthropic SDK appends /v1/messages to the base URL; the URL is sent as named,
-        # never rewritten, so one that ends in /v1 would reach .../v1/v1/messages.
-        return (f"LCM_SUMMARY_BASE_URL {base_url!r} ends in /v1: on anthropic_messages the client appends "
-                f"/v1/messages to the base URL, so name it without the /v1")
-    problem = sdk_missing(api_mode)
-    if problem is not None:
-        return f"the configured summariser's wire cannot be used: {problem}"
+    named = [env for attribute, env in (("summary_model", "LCM_SUMMARY_MODEL"),
+                                        ("summary_provider", "LCM_SUMMARY_PROVIDER"),
+                                        ("summary_base_url", "LCM_SUMMARY_BASE_URL"),
+                                        ("summary_api_key", "LCM_SUMMARY_API_KEY"),
+                                        ("summary_api_mode", "LCM_SUMMARY_API_MODE"))
+             if str(getattr(config, attribute, "") or "").strip()]
+    if named:
+        return (f"a summariser other than the session's model is not supported in this build (issue #68); "
+                f"unset {', '.join(named)}")
     return None
 
 
@@ -377,13 +335,9 @@ class CallSettings:
     route: SummariserRoute
     effort: str
     max_tokens: Optional[int] = None
-    # Every secret the plugin knows by value (the route's key when it is a string, the
-    # configured key): removed from any text that is logged, stored or shown.
+    # Every secret the plugin knows by value (the route's key when it is a string):
+    # removed from any text that is logged, stored or shown.
     secrets: tuple = field(default=(), repr=False)
-    # For a configured route: the request fields that carry the effort, from the model
-    # table's ``effort`` column ({} sends none), and what the provenance says was sent.
-    effort_param: dict = field(default_factory=dict)
-    effort_sent: str = ""
 
     def scrub(self, text: str) -> str:
         return scrub(text, self.secrets)
@@ -438,10 +392,11 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
 
 def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -> bool:
     """After a fallback, whether the route that answered is the session route's own
-    provider and model (the orchestrator's ruling on D9; D9 applies to the session route
-    only, since a configured route never passes the host's ladder). Only a provider that
-    names its endpoint counts: ``route_info`` carries no base URL, so a custom or
-    local-server label, which names none, is never taken for the session's route."""
+    provider and model (the orchestrator's ruling on D9). Only a provider that names its
+    endpoint counts: ``route_info`` carries no base URL, so a custom or local-server
+    label, which names none, is never taken for the session's route. What this cannot
+    see: a fallback the host picks before its first record, serving the same model id,
+    leaves one record that reads as the session's route (ask A-33.3)."""
     if route.source != "session" or not route.named_provider:
         return False
     named = _host_provider(route.named_provider)
@@ -454,43 +409,36 @@ def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -
     return answered[1] in _host_model_forms(route.model, answered[0])
 
 
-def _own_client_once(messages: list[dict[str, Any]], settings: CallSettings,
-                     timeout: Optional[float]) -> tuple[str, str]:
-    """One call of a configured route through the plugin's own client
-    (``summariser_client``). The SDK's errors are raised as they are, and read by their
-    HTTP status like the host's; a stream that ends without its terminal event is the
-    endpoint's failure, a deadline that passes while it streams is transient."""
-    from . import summariser_client
+# The complete ending and every other, in the Chat Completions shape the host hands each
+# wire's reply in (the ruling on the Codex review of 188fb8b): only ``stop`` is a
+# summary. Values by the openai SDK's type (2.24.0 ``finish_reason``: stop, length,
+# tool_calls, content_filter, function_call) and OpenRouter's normalised "error".
+_ENDINGS = {
+    "length": ("reply", "the reply was cut at the output limit"),
+    "content_filter": ("reply", "the provider's content filter stopped the reply"),
+    "tool_calls": ("reply", "the reply called a tool, and none was offered"),
+    "function_call": ("reply", "the reply called a function, and none was offered"),
+    "error": ("endpoint", "the provider ended the reply with an error"),
+}
 
-    try:
-        content, ending, _reasoning = summariser_client.call(
-            settings.route, messages, timeout=timeout, max_tokens=settings.max_tokens, effort=settings.effort_param)
-    except summariser_client.StreamEnded as exc:
-        raise SummaryFailure("the summariser's stream ended unfinished", transient=exc.deadline, kind="endpoint",
-                             detail=str(exc)) from None
-    # Only the wire's complete ending is a summary, whatever else ended it (the ruling on
-    # the Codex review of 188fb8b): each other ending fails with its kind.
-    failed = summariser_client.ending_failure(settings.route.api_mode, ending)
-    if failed is not None:
-        kind, why = failed
-        raise SummaryFailure("reply not complete", transient=False, kind=kind, detail=f"{why} (ending {ending!r})")
-    if not content.strip():
-        raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
-                             detail=f"no text, ending {ending!r}")
-    return content, str(ending)
+
+def ending_failure(finish_reason: Optional[str]) -> Optional[tuple[str, str]]:
+    """None for ``stop``, else (failure kind, why). No ending at all is the endpoint's;
+    an ending not known fails as ``other``."""
+    if finish_reason == "stop":
+        return None
+    if not finish_reason:
+        return "endpoint", "the reply came without an ending"
+    return _ENDINGS.get(finish_reason) or ("other", f"the reply ended {finish_reason!r}, not 'stop'")
 
 
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
                timeout: Optional[float] = None) -> tuple[str, str]:
-    """One call. A configured route goes through the plugin's own client; the session's
-    route through the host's ``call_llm``, as its ``main_runtime``. Returns (content,
-    finish_reason); raises on any failure of the call, a reply from another model, or a
-    reply of the wrong shape. ``timeout`` is what is left of the host's deadline at
-    dispatch; with no host deadline none is passed, and the host's own applies on the
-    session's route, the SDK's own on the own client (#33: no per-call timeout of the
-    plugin's own)."""
-    if settings.route.source == "configured":
-        return _own_client_once(messages, settings, timeout)
+    """One call on the session's route through the host's ``call_llm``, as its
+    ``main_runtime``. Returns (content, finish_reason); raises on any failure of the call,
+    a reply from another model, or a reply of the wrong shape. ``timeout`` is what is left
+    of the host's deadline at dispatch; with no host deadline none is passed, and the
+    host's own applies (#33: no per-call timeout of the plugin's own)."""
     from agent.auxiliary_client import call_llm
 
     route = settings.route
@@ -542,11 +490,8 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         raise SummaryFailure("malformed reply", transient=False, kind="endpoint",
                              detail=f"no choices[0].message ({type(exc).__name__})") from None
     finish_reason = getattr(choice, "finish_reason", None)
-    # The host hands every wire's reply in the Chat Completions shape: only ``stop`` is a
-    # complete ending (the ruling on the Codex review of 188fb8b).
-    from .summariser_client import ending_failure
-
-    failed = ending_failure("chat_completions", str(finish_reason) if finish_reason else None)
+    # Only ``stop`` is a complete ending (the ruling on the Codex review of 188fb8b).
+    failed = ending_failure(str(finish_reason) if finish_reason else None)
     if failed is not None:
         kind, why = failed
         raise SummaryFailure("reply not complete", transient=False, kind=kind,

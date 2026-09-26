@@ -433,6 +433,11 @@ class CompactionMixin:
             except ToolPairingError:
                 # compress() records the error and shows it; the preflight asks for it.
                 return self._mark_preflight_compression_requested()
+            except Exception:
+                # Sizing failed (``_sizing_failed``): compress() aborts with the cause and
+                # shows it; the preflight asks for it rather than raise into the host.
+                logger.warning("LCM preflight could not size the material outside the tail", exc_info=True)
+                return self._mark_preflight_compression_requested()
             smallest = self._smallest_run()
             if material.tokens >= smallest:
                 return self._mark_preflight_compression_requested()
@@ -948,6 +953,16 @@ class CompactionMixin:
         # this attempt name no compaction.
         attempt.compaction = None
 
+    def _sizing_failed(self, attempt, messages: List[Dict[str, Any]], what: str,
+                       exc: BaseException) -> List[Dict[str, Any]]:
+        """Sizing the material failed (a row the summariser's form or the estimate cannot
+        take: a ``RecursionError`` from deeply nested tool arguments, any other exception):
+        the compaction is aborted with the true cause and an event, never an exception out
+        of ``compress()`` (the orchestrator's ruling on the Codex review of 40eda93; #7)."""
+        logger.warning("LCM could not size the material while %s (%s: %s)", what, type(exc).__name__, exc)
+        self._record_event(attempt, "cut_sizing_failed", {"while": what, "error": f"{type(exc).__name__}: {exc}"})
+        return self._abort(messages, f"the material could not be sized while {what} ({type(exc).__name__}: {exc})")
+
     def _store_read_failed(self, attempt, messages: List[Dict[str, Any]], kind: str, what: str,
                            exc: BaseException) -> List[Dict[str, Any]]:
         """A store read of the compaction failed (a lock another process holds past the
@@ -964,18 +979,12 @@ class CompactionMixin:
         config = self._config
         problem = configured_route_problem(config)
         if problem is not None:
-            # Refused when the configuration was loaded, and every compaction says why.
+            # Refused when the configuration was loaded (a summariser other than the
+            # session's model, #68), and every compaction says why.
             return None, problem
-        if config.summary_model:
-            return SummariserRoute(
-                provider=config.summary_provider.strip(), model=config.summary_model.strip(),
-                base_url=config.summary_base_url.strip(), api_key=config.summary_api_key,
-                api_mode=config.summary_api_mode.strip(), source="configured",
-                named_provider=config.summary_provider.strip(),
-            ), ""
         if not (self.model and self.provider):
             return None, ("the session's model is not known: the host has not named its route "
-                          "through update_model, and no summariser is configured")
+                          "through update_model")
         if not self.base_url and _host_provider(self.provider) == "custom":
             return None, ("the session's route names provider custom without a base URL: the host "
                           "would borrow an endpoint of its own, which the session did not name")
@@ -983,14 +992,13 @@ class CompactionMixin:
 
     def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
         """The summariser's route, effort and output cap, or the reason there is none
-        (#9). No part of the route is guessed: the session's route is what the host
-        handed ``update_model``; a configured one names its model, base URL, wire and
-        key (``configured_route_problem``)."""
+        (#9). No part of the route is guessed: it is what the host handed
+        ``update_model``."""
         config = self._config
         route, problem = self._summariser_route()
         if route is None:
             return None, problem
-        secrets = tuple(s for s in (config.summary_api_key, self.api_key) if isinstance(s, str) and s)
+        secrets = tuple(s for s in (self.api_key,) if isinstance(s, str) and s)
         effort = None
         if self._plugin_session:
             try:
@@ -1002,37 +1010,12 @@ class CompactionMixin:
             return None, (f"the summariser's reasoning effort {effort!r} is not one of the host's levels "
                           f"({', '.join(sorted(REASONING_EFFORTS))})")
         facts = lookup_model(route.model, route.table_provider())
-        effort_param, effort_sent = self._effort_fields(route, facts, effort)
         return CallSettings(
             route=route,
             effort=effort,
             max_tokens=facts.output_cap if facts is not None else None,
             secrets=secrets,
-            effort_param=effort_param,
-            effort_sent=effort_sent,
         ), ""
-
-    @staticmethod
-    def _effort_fields(route: SummariserRoute, facts, effort: str) -> tuple[dict, str]:
-        """For a configured route, the request fields that carry the effort, from the model
-        table's ``effort`` column, and what the provenance says was sent (the ruling on
-        objection b): where the column is absent, or names another wire or not this level,
-        no effort is sent, and the provenance says so. The session's route passes the
-        effort through the host's ``reasoning_config``."""
-        if route.source != "configured":
-            return {}, f"{effort} (through the host's reasoning_config, as the host applies it)"
-        rule = facts.effort if facts is not None else None
-        if rule is None:
-            why = "the model table has no row for this route" if facts is None else \
-                "the model table documents no effort field for this route"
-            return {}, f"not sent ({effort} configured): {why}"
-        if rule.wire != route.api_mode:
-            return {}, f"not sent ({effort} configured): the documented field is for {rule.wire}, the route is " \
-                       f"{route.api_mode}"
-        fields = rule.fields(effort)
-        if fields is None:
-            return {}, f"not sent ({effort} configured): not among the documented levels ({', '.join(rule.levels)})"
-        return fields, f"{effort} ({rule.source})"
 
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
@@ -1162,8 +1145,7 @@ class CompactionMixin:
             )
             return ChunkSummary(text=text, level=level, budget=prepared.budget, finish_reason=finish_reason,
                                 model=route.model, provider=route.provenance_provider(), effort=settings.effort,
-                                withheld=json.dumps(withheld["record"]) if withheld is not None else None,
-                                effort_sent=settings.effort_sent or None)
+                                withheld=json.dumps(withheld["record"]) if withheld is not None else None)
 
         return run
 
@@ -1283,7 +1265,7 @@ class CompactionMixin:
                         attempt, chunk_handle, text=summary.text, level=summary.level, budget=summary.budget,
                         finish_reason=summary.finish_reason,
                         model=summary.model, provider=summary.provider, effort=summary.effort,
-                        withheld_reasoning=summary.withheld, effort_sent=summary.effort_sent,
+                        withheld_reasoning=summary.withheld,
                     )
                 except Exception as exc:
                     logger.warning("LCM could not write the summary of chunk %d of %d (%s: %s)",
@@ -1703,6 +1685,8 @@ class CompactionMixin:
         except ToolPairingError as exc:
             self._record_event(attempt, "tool_pairing_error", str(exc))
             return self._abort(messages, f"the tail cannot be placed: {exc}")
+        except Exception as exc:
+            return self._sizing_failed(attempt, messages, "placing the tail", exc)
         for chunk, why in frozen.recut + plan.recut:
             logger.warning("LCM cuts the %s chunk %s of attempt %d again: %s", chunk.state, chunk.chunk,
                            chunk.compaction, why)
@@ -1720,24 +1704,29 @@ class CompactionMixin:
         # The cut, before the boundary is checked: a rest below c/4 at the end of the
         # material stays raw and the tail begins at it (ruling on #61, 1).
         material = [index for index in range(tail_start) if index not in mechanism]
-        # The cut's unit: each row as the summariser receives it (``_cut_estimate``).
-        estimator, convert = self._cut_estimate()
-        # c and B with the prompt this attempt's calls carry, its focus text included.
-        limit = self._chunk_limit(focus_topic or "")
-        bound = self._summariser_bound(focus_topic or "")[0]
+        try:
+            # The cut's unit: each row as the summariser receives it (``_cut_estimate``).
+            cut_estimator, convert = self._cut_estimate()
+            # c and B with the prompt this attempt's calls carry, its focus text included.
+            limit = self._chunk_limit(focus_topic or "")
+            bound = self._summariser_bound(focus_topic or "")[0]
+        except Exception as exc:
+            return self._sizing_failed(attempt, messages, "sizing the chunks", exc)
         chunks: List[List[int]] = []
         waiting: List[int] = []
         if material:
             joins: List[dict] = []
             alone: List[dict] = []
             try:
-                chunks = self._cut_chunks(messages, material, limit, estimator,
+                chunks = self._cut_chunks(messages, material, limit, cut_estimator,
                                           kept=[positions for _chunk, positions in plan.kept],
                                           summarised=[chunk.state == "summarised" for chunk, _p in plan.kept],
                                           joins=joins, convert=convert, bound=bound, alone=alone)
             except ToolPairingError as exc:
                 self._record_event(attempt, "tool_pairing_error", str(exc))
                 return self._abort(messages, f"the material cannot be cut: {exc}")
+            except Exception as exc:
+                return self._sizing_failed(attempt, messages, "cutting the material", exc)
             for part in alone:
                 # Every merge is bounded by B (the orchestrator's ruling on the Codex
                 # review of c2efe0e): a part below c/4 that no neighbour takes within B
@@ -1807,7 +1796,7 @@ class CompactionMixin:
         if not material and waiting and not (force_overflow or provider_rejected):
             # Only a rest below c/4 stands outside the tail: nothing to compact yet, not a
             # failure (ruling on #61, 1), as the preflight says for the same list.
-            rest = estimator.messages([convert(messages[index]) for index in waiting])
+            rest = cut_estimator.messages([convert(messages[index]) for index in waiting])
             return self._unchanged_return(
                 messages, f"nothing to compact: what stands outside the fresh tail is below the smallest run that "
                           f"stands alone, c/4 ({rest.tokens} < {_smallest_for(limit)} tokens, {rest.label()}; "
@@ -1827,7 +1816,7 @@ class CompactionMixin:
                 f"{'tool group' if len(messages) - tail_start > 1 else 'message'} fill the context; outside them "
                 f"stands only the mechanism's layer (the system row and the summaries)",
             )
-        material_estimate = estimator.messages([convert(messages[index]) for index in material])
+        material_estimate = cut_estimator.messages([convert(messages[index]) for index in material])
 
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk,
         # the last step of the planning transaction.
@@ -2089,7 +2078,10 @@ class CompactionMixin:
         # The host sets its re-arm flag from this after the commit, and re-arms its
         # per-turn count when the next prompt is below threshold_tokens (#32 §9).
         self._publish("_last_compression_made_progress", True)
-        before, after = estimator.messages(messages), estimator.messages(result)
+        # The session's context, by the session's estimate, as the recovery cap is
+        # computed (``_overflow_recovery_assembly_cap``), never the summariser's.
+        session_estimator = self._estimator()
+        before, after = session_estimator.messages(messages), session_estimator.messages(result)
         over_cap = recovery_cap is not None and after.tokens > recovery_cap
         self._publish("_last_overflow_recovery_failed", over_cap)
         if over_cap:

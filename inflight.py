@@ -186,8 +186,6 @@ class ChunkSummary:
     effort: Optional[str]
     # The encrypted reasoning withheld from the summariser's input, as JSON (#8), or None.
     withheld: Optional[str] = None
-    # The effort field the call carried, or why none was sent (#9), or None.
-    effort_sent: Optional[str] = None
 
 
 @dataclass

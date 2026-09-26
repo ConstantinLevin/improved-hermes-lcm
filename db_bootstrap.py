@@ -43,10 +43,7 @@ logger = logging.getLogger(__name__)
 # A store of an earlier format is refused and begun again (#29 W8: a change of format
 # wipes the store). Format 11 adds ``derivations.withheld_reasoning``: the encrypted
 # reasoning withheld from the summariser's input, named in the summary's provenance (#8);
-# adds ``derivations.effort_sent``: the effort field the call actually carried, or why
-# none was sent (#9: a configured route sends the effort only where the model table
-# documents its field); and drops ``derivations.expand_hint``, a text a pattern took from
-# the summary (#9).
+# and drops ``derivations.expand_hint``, a text a pattern took from the summary (#9).
 STORE_FORMAT = "ihl-store/11"
 # The default file name under the host-given Hermes home.
 STORE_FILENAME = "lcm-record.db"
@@ -406,7 +403,6 @@ CREATE TABLE derivations (
     model TEXT,
     provider TEXT,
     effort TEXT,
-    effort_sent TEXT,
     prompt TEXT,
     budget INTEGER,
     finish_reason TEXT,
