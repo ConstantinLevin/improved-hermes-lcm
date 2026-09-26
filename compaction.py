@@ -96,6 +96,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from . import turn_signals
 from .escalation import (
     OWN_FAILURE_KINDS,
     REASONING_EFFORTS,
@@ -456,6 +457,12 @@ class CompactionMixin:
                                                      "turn's opening row")
         if _ends_with_tool_results(messages):
             return Occasion("running", True, False, "in a running turn: the list ends with tool results")
+        # A gap while the hooks say a turn runs: the turn is contested until the hooks
+        # settle it, so that what the plugin publishes without a list (threshold_tokens,
+        # should_compress) is τ too, as D1 wants at the gap. The review fork, which runs
+        # under its parent's id, never marks the parent's turn.
+        if not getattr(self, "_review_fork", False):
+            turn_signals.turn_start_seen(self._session_id, state.turn_id)
         if _is_next_user_message(last):
             return Occasion("gap", False, True, "a gap: a turn start while the hooks still say a turn runs (an "
                                                 "exit that skipped on_turn_complete)")

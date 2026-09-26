@@ -42,14 +42,27 @@ class TurnState:
     opening: Optional[Dict[str, Any]] = field(default=None, compare=False)
     # The last of this turn's events since pre_llm_call: "", TOOL_RESULT or API_RESPONSE.
     last_event: str = ""
+    # A list the plugin was handed while the hooks say this turn runs ended as a turn
+    # start does (a user row the host has not persisted, neither a steer nor flagged):
+    # the gap of #32 D1, a turn whose end the host skipped or a nudge the host knows only
+    # by its text. The plugin does not guess which: τ applies until the hooks settle it,
+    # by the next pre_llm_call (a new turn) or by a tool or a response of this turn (it
+    # lives). Only a list can see this; a read with no list before it cannot (A-32.2).
+    contested: bool = False
 
     def opening_row_id(self) -> Optional[int]:
         row_id = self.opening.get("_row_id") if isinstance(self.opening, dict) else None
         return row_id if isinstance(row_id, int) else None
 
     def running(self) -> bool:
-        """By the hooks alone: a turn runs and its list ends with tool results."""
-        return self.in_turn and self.last_event == TOOL_RESULT
+        """By the hooks alone: a turn runs, uncontested, and its list ends with tool
+        results."""
+        return self.in_turn and not self.contested and self.last_event == TOOL_RESULT
+
+    def raises(self) -> bool:
+        """Whether the published threshold is τ′ (#32 D2): a turn runs by the hooks and
+        no list has contested it since (D1: at the gap, τ)."""
+        return self.in_turn and not self.contested
 
 
 _LOCK = threading.Lock()
@@ -87,7 +100,22 @@ def _event(session_id: str, turn_id: str, event: str) -> None:
         current = _STATES.get(str(session_id))
         if current is None or not current.in_turn or current.turn_id != str(turn_id or ""):
             return
-        _STATES[str(session_id)] = replace(current, last_event=event)
+        # An event of this turn shows it lives: a contest from a nudge-shaped list ends.
+        _STATES[str(session_id)] = replace(current, last_event=event, contested=False)
+
+
+def turn_start_seen(session_id: str, turn_id: str) -> bool:
+    """A list ended as a turn start does while the hooks say the turn ``turn_id`` runs:
+    the turn is contested (#32 D1) until the hooks settle it. Returns whether it was
+    marked; a turn another event already replaced is left alone."""
+    if not session_id:
+        return False
+    with _LOCK:
+        current = _STATES.get(str(session_id))
+        if current is None or not current.in_turn or current.turn_id != str(turn_id or ""):
+            return False
+        _STATES[str(session_id)] = replace(current, contested=True)
+        return True
 
 
 def tool_ran(session_id: str, turn_id: str) -> None:

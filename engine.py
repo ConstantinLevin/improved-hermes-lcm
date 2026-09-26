@@ -514,14 +514,21 @@ class LCMEngine(
             return "between turns, by the hooks"
         after = {"tool_result": "after a tool round", "api_response": "after a response"}.get(state.last_event,
                                                                                              "before any tool round")
-        return f"in turn {state.turn_id or '?'}, {after}, by the hooks"
+        contested = ("; contested: a list since ended as a turn start does (τ until the hooks settle it)"
+                     if state.contested else "")
+        return f"in turn {state.turn_id or '?'}, {after}, by the hooks{contested}"
 
     @property
     def threshold_tokens(self) -> int:
-        """τ′ while the hook state says a turn runs for this copy's session, else τ
-        (#32 D2). The host reads it at the turn-start skip, the re-arm after a
-        compaction and the idle floor; ``should_compress`` applies τ or τ′ itself."""
-        return self._tau(raised=self._turn_state().in_turn)
+        """τ′ while the hook state says a turn runs for this copy's session and no list
+        has contested it since, else τ (#32 D1, D2): after a list showed the gap of a turn
+        start while the hooks still say a turn runs (an exit that skipped
+        ``on_turn_complete``), τ, until the hooks settle it. The host reads it at the
+        turn-start skip, the preflight passes, the gate's progress check, the re-arm
+        after a compaction and the idle floor; ``should_compress`` applies τ or τ′
+        itself. A read at a turn start before any list reaches the plugin cannot tell a
+        stale turn from a live one (ask A-32.2)."""
+        return self._tau(raised=self._turn_state().raises())
 
     @threshold_tokens.setter
     def threshold_tokens(self, value: Any) -> None:
