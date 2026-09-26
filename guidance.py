@@ -117,9 +117,42 @@ def sent_system_prompt(system_prompt: Any, request_messages: Any) -> Optional[st
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        texts = [block.get("text") for block in value if isinstance(block, dict) and isinstance(block.get("text"), str)]
+        # A block without text is skipped, never joined: Bedrock's ``{"cachePoint": ...}``
+        # carries none, and neither would any non-text block.
+        texts: list[str] = []
+        for block in value:
+            part = block.get("text") if isinstance(block, dict) else None
+            if isinstance(part, str):
+                texts.append(part)
         return "".join(texts) if texts else None
     return None
+
+
+# The host's runtimes whose requests never pass pre_api_request: the whole turn goes to a
+# subprocess before any request is assembled (``agent/conversation_loop.py:1581-1582``),
+# which is sent the prompt as ``developerInstructions`` (``agent/codex_runtime.py:490``).
+UNCHECKED_API_MODES = ("codex_app_server",)
+
+
+def note_unverifiable_delivery(engine: Any, api_mode: str) -> None:
+    """On a runtime whose requests the plugin never sees, record that the instruction's
+    delivery cannot be verified: a WARNING and an event, once per engine copy (#16). The
+    runtime is the ``api_mode`` the host hands the engine in ``update_model``, at agent
+    creation and at every switch of model or provider; at creation it arrives before the
+    copy is bound to a host session (``agent/agent_init.py:1971``, ``:1994``), so the note
+    waits for the binding, which calls this again. Whether the plugin should serve such a
+    runtime at all is not decided here (#24)."""
+    host_session_id = str(getattr(engine, "_session_id", "") or "")
+    if (api_mode not in UNCHECKED_API_MODES or not host_session_id
+            or not _first_sight(engine, f"api_mode {api_mode}")):
+        return
+    fact = f"delivery of the instruction cannot be verified: api_mode {api_mode} bypasses pre_api_request"
+    logger.warning("LCM: %s (host session %s)", fact, host_session_id)
+    try:
+        engine._records.event_deferred("instruction_not_delivered",
+                                       detail={"host_session_id": host_session_id, "fact": fact})
+    except Exception:
+        logger.error("LCM could not hand over the store event for: %s", fact, exc_info=True)
 
 
 def _sections_present(prompt: str) -> tuple:
