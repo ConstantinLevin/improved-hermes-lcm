@@ -856,7 +856,9 @@ class CompactionMixin:
             except Exception as exc:
                 logger.warning("LCM could not commit the planning transaction", exc_info=True)
                 self._record_event(attempt, "planning_commit_failed", repr(exc))
-                result = self._abort(messages, f"the store could not commit the compaction's planning ({exc})")
+                if not attempt.outcome.get("_last_compress_aborted"):
+                    result = self._abort(messages, f"the store could not commit the compaction's planning ({exc})")
+                # An attempt that already aborted keeps its first cause, the one the host shows.
         except AttemptCancelled:
             return messages
         except BaseException:
