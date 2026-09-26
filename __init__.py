@@ -102,11 +102,13 @@ def _check_instruction_delivered(instruction, engine, resolve_active_lcm_engine,
     else:
         target = active
 
-    def _record(kind, detail):
+    def _record(kind, detail, on_written=None) -> bool:
         try:
-            target._records.event_deferred(kind, detail=detail)
+            target._records.event_deferred(kind, detail=detail, on_written=on_written)
+            return True
         except Exception:
             logger.error("LCM could not hand over the store event %s: %s", kind, detail, exc_info=True)
+            return False
 
     if target is engine:
         try:
@@ -123,19 +125,21 @@ def _check_instruction_delivered(instruction, engine, resolve_active_lcm_engine,
         logger.warning("LCM could not check that its instruction reached the agent", exc_info=True)
 
 
-def _note_unload() -> None:
-    """The host unloads the plugin (``unload()``, or the first half of a forced reload):
-    its section and its delivery check are unregistered, while the engine copies of the
-    agents already running stay bound. For each such copy, a WARNING and an event record
-    that until the plugin is loaded again, a rebuild of that session's prompt carries no
-    section and no request of it is checked (#16). A reload that follows registers both
-    again, and the copies stay bound in the registry that outlives it."""
+def _note_unload(hermes_home: str) -> None:
+    """The host unloads the plugin's load for the Hermes home ``hermes_home``
+    (``unload()``, or the first half of a forced reload): that load's section and delivery
+    check are unregistered, while the engine copies of the agents already running on that
+    home stay bound. For each such copy, a WARNING and an event record that until the
+    plugin is loaded again, a rebuild of that session's prompt carries no section and no
+    request of it is checked (#16). The host scopes plugins by home, so the copies of
+    another home, served by that home's own load, are not touched. A reload that follows
+    registers both again, and the copies stay bound in the registry that outlives it."""
     from .engine_registry import bound_engines
 
     fact = ("the host unloaded the plugin: its system-prompt section and its delivery check are unregistered "
             "until the plugin is loaded again; a prompt rebuilt meanwhile carries no section, and no request "
             "is checked")
-    for bound in bound_engines():
+    for bound in bound_engines(hermes_home):
         host_session_id = str(getattr(bound, "_session_id", "") or "")
         logger.warning("LCM: %s (host session %s)", fact, host_session_id)
         try:
@@ -267,7 +271,7 @@ def register(ctx):
     on_unload = getattr(ctx, "on_unload", None)
     if callable(on_unload):
         def _close_registered_engine() -> None:
-            _note_unload()
+            _note_unload(str(getattr(engine, "_hermes_home", "") or hermes_home))
             engine.close("the plugin was unloaded")
 
         on_unload(_close_registered_engine)

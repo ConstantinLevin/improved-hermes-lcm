@@ -179,19 +179,37 @@ _NO_SYSTEM_PROMPT = "no system-level prompt"
 def note_unbound_session(host_session_id: str, record: Callable[..., None]) -> None:
     """The hook ran for a host session no LCM engine copy is bound to, while the host's
     ``context.engine`` names ``lcm``: the plugin cannot check that session's prompt, and
-    records exactly that, once per host session id in this process (#16)."""
+    records exactly that, once per host session id in this process (#16).
+
+    A session counts as noted only once its event is written: until then it is pending,
+    so that a request in flight does not record it twice, and an event whose store was
+    closed first waits in the process for the next store opened on its database
+    (``record_store``), where it is written and the session noted."""
     if not host_session_id:
         return
     with _SEEN_LOCK:
-        if host_session_id in PROCESS_STATE.unbound_sessions_noted:
+        if (host_session_id in PROCESS_STATE.unbound_sessions_noted
+                or host_session_id in PROCESS_STATE.unbound_sessions_pending):
             return
-        PROCESS_STATE.unbound_sessions_noted.add(host_session_id)
+        PROCESS_STATE.unbound_sessions_pending.add(host_session_id)
     if _configured_context_engine() != "lcm":
+        _mark_unbound_noted(host_session_id)
         return
     fact = ("the plugin cannot check that its instruction reached this session: the host's context.engine is "
             "lcm, and no LCM engine copy is bound to this host session id")
     logger.warning("LCM: %s (host session %s)", fact, host_session_id)
-    record("instruction_not_delivered", {"host_session_id": host_session_id, "fact": fact})
+    handed = record("instruction_not_delivered", {"host_session_id": host_session_id, "fact": fact},
+                    on_written=lambda: _mark_unbound_noted(host_session_id))
+    if not handed:
+        # Not handed over at all: the next request of this session tries again.
+        with _SEEN_LOCK:
+            PROCESS_STATE.unbound_sessions_pending.discard(host_session_id)
+
+
+def _mark_unbound_noted(host_session_id: str) -> None:
+    with _SEEN_LOCK:
+        PROCESS_STATE.unbound_sessions_pending.discard(host_session_id)
+        PROCESS_STATE.unbound_sessions_noted.add(host_session_id)
 
 
 def _configured_context_engine() -> str:

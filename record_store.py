@@ -26,15 +26,15 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import queue
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .db_bootstrap import close_connection, open_store
+from .engine_registry import PROCESS_STATE
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .inflight import ChunkSummary
 from .message_content import base64_like_strings, describe_image_part, image_parts, index_text
@@ -135,6 +135,26 @@ class InputEntry:
     sources: list = field(default_factory=list)
 
 
+def _database_key(db_path: Path) -> str:
+    return str(Path(db_path).resolve())
+
+
+def _orphan(db_path: Path, events: list) -> None:
+    """Events a closed store could not write wait in the process, by database, for the
+    next store opened on it (the state outlives a reload of the plugin)."""
+    if not events:
+        return
+    with PROCESS_STATE.orphan_lock:
+        PROCESS_STATE.orphan_events.setdefault(_database_key(db_path), []).extend(events)
+    logger.warning("LCM keeps %d store event(s) for %s until a store is opened on it again: %s",
+                   len(events), db_path, ", ".join(event[1] for event in events))
+
+
+def _take_orphans(db_path: Path) -> list:
+    with PROCESS_STATE.orphan_lock:
+        return PROCESS_STATE.orphan_events.pop(_database_key(db_path), [])
+
+
 class RecordStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -142,10 +162,16 @@ class RecordStore:
         # How deep the thread that holds ``_lock`` is inside ``_tx``: an inner ``_tx``
         # joins the outer transaction (the planning transaction, ``planning``).
         self._tx_depth = 0
+        # Each event: (at, kind, session, compaction, detail, on_written or None).
         self._pending_events: list[tuple] = []
-        # Events handed over by a thread that must not wait on ``_lock`` (``event_deferred``):
-        # taken into ``_pending_events`` under the lock by the next flush.
-        self._deferred_events: queue.SimpleQueue = queue.SimpleQueue()
+        # Events handed over by a thread that must not wait on ``_lock`` (``event_deferred``),
+        # guarded by ``_deferred_lock``, which is held only to append, to take the list, or
+        # to mark the store handed over, never across I/O. ``close`` marks it handed over
+        # and takes the list under that lock, so no event is appended to this store after
+        # its close has taken them: a later one goes to the process-wide orphans.
+        self._deferred_lock = threading.Lock()
+        self._deferred_events: list[tuple] = []
+        self._handed_over = False
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
@@ -158,13 +184,25 @@ class RecordStore:
             self._conn.close()
             self._conn = None
             raise
+        # Events an earlier store on this database could not write before it closed.
+        with self._lock:
+            self._pending_events.extend(_take_orphans(self.db_path))
+            self._flush_events()
 
     def close(self, reason: str = "closed") -> None:
         """Close the connection once any statement or transaction of this helper on
         another thread has finished (the helper's lock). Later use raises. Events still
-        pending, deferred ones included, are written first."""
+        pending, deferred ones included, are written first; what cannot be written waits
+        in the process for the next store opened on this database."""
         with self._lock:
+            with self._deferred_lock:
+                self._handed_over = True
+                self._pending_events.extend(self._deferred_events)
+                self._deferred_events = []
             self._flush_events()
+            if self._pending_events:
+                _orphan(self.db_path, self._pending_events)
+                self._pending_events = []
             self._conn = close_connection(self._conn, db_path=self.db_path, reason=reason, owner="the record")
 
     @contextlib.contextmanager
@@ -253,7 +291,7 @@ class RecordStore:
         text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
         logger.warning("LCM store event %s (session=%s compaction=%s): %s", kind, session, compaction, text)
         with self._lock:
-            self._pending_events.append((time.time(), kind, session, compaction, text))
+            self._pending_events.append((time.time(), kind, session, compaction, text, None))
             self._flush_events()
 
     def event_deferred(
@@ -263,15 +301,25 @@ class RecordStore:
         session: Optional[str] = None,
         compaction: Optional[int] = None,
         detail: Any = None,
+        on_written: Optional[Callable[[], None]] = None,
     ) -> None:
         """``event`` for a thread that must not wait on this helper's lock or on the
         store's write lock, such as a host hook under the host's timeout. It logs the
-        event at once, hands it over through a queue that never blocks, and writes it
-        on a thread of its own; a transaction that commits first, or ``close``, writes
-        it too. It never raises."""
+        event at once and hands it over under ``_deferred_lock``, held only to append;
+        a thread of its own writes it, as does a transaction that commits first or
+        ``close``. Once this store has been closed, the event waits in the process for the
+        next store opened on this database. ``on_written`` runs once the event is
+        committed, and only then. It never raises."""
         text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
         logger.warning("LCM store event %s (session=%s compaction=%s): %s", kind, session, compaction, text)
-        self._deferred_events.put((time.time(), kind, session, compaction, text))
+        item = (time.time(), kind, session, compaction, text, on_written)
+        with self._deferred_lock:
+            handed_over = self._handed_over
+            if not handed_over:
+                self._deferred_events.append(item)
+        if handed_over:
+            _orphan(self.db_path, [item])
+            return
         try:
             threading.Thread(target=self._flush_events, name="lcm-event-writer", daemon=True).start()
         except Exception:
@@ -281,18 +329,25 @@ class RecordStore:
     def _take_deferred_events(self) -> None:
         """Move the events handed over by ``event_deferred`` into the pending ones (under
         ``_lock``)."""
-        while True:
-            try:
-                self._pending_events.append(self._deferred_events.get_nowait())
-            except queue.Empty:
-                return
+        with self._deferred_lock:
+            taken, self._deferred_events = self._deferred_events, []
+        self._pending_events.extend(taken)
 
     def _flush_events(self) -> None:
         """Write the events not written yet, in their own short transaction; inside an
-        open transaction they wait for its end (``_tx`` flushes after its commit)."""
+        open transaction they wait for its end (``_tx`` flushes after its commit). Once
+        the connection is closed, they wait in the process for the next store opened on
+        this database. After the commit, each written event's ``on_written`` runs."""
         with self._lock:
             self._take_deferred_events()
-            if not self._pending_events or self._conn is None or self._tx_depth:
+            if self._conn is not None:
+                # Events an earlier, closed store on this database left behind.
+                self._pending_events.extend(_take_orphans(self.db_path))
+            if not self._pending_events or self._tx_depth:
+                return
+            if self._conn is None:
+                _orphan(self.db_path, self._pending_events)
+                self._pending_events = []
                 return
             conn = self._conn
             try:
@@ -300,7 +355,7 @@ class RecordStore:
                 try:
                     conn.executemany(
                         "INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
-                        self._pending_events,
+                        [event[:5] for event in self._pending_events],
                     )
                     conn.execute("COMMIT")
                 except BaseException:
@@ -315,7 +370,13 @@ class RecordStore:
                     exc_info=True,
                 )
                 return
-            self._pending_events = []
+            written, self._pending_events = self._pending_events, []
+        for event in written:
+            if event[5] is not None:
+                try:
+                    event[5]()
+                except Exception:
+                    logger.error("LCM could not note that store event %s was written", event[1], exc_info=True)
 
     # --- Reading ------------------------------------------------------------------
 
