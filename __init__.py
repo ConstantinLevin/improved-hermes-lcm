@@ -24,131 +24,61 @@ def _instruction_not_delivered(engine, why: str) -> None:
         logger.debug("LCM could not record that its instruction is not delivered", exc_info=True)
 
 
-class _Instruction:
-    """What the registration established: the section's text and the host's framing, or
-    why the plugin registered no section. The delivery check reads it (#16)."""
-
-    def __init__(self) -> None:
-        self.text = None
-        self.host = None
-        self.refused = None
-
-
-def _register_instruction(ctx, engine, resolve_active_lcm_engine) -> "_Instruction":
+def _register_instruction(ctx, engine, hermes_home: str):
     """The plugin's instruction as a section of the host's system prompt, and its two
-    skills, ``hermes-lcm:summaries`` and ``hermes-lcm:setup`` (#16).
+    skills, ``hermes-lcm:summaries`` and ``hermes-lcm:setup`` (#16). Returns this load's
+    :class:`guidance.DeliveryCheck`.
 
-    The section's content is a callable the host gives the session's metadata when it
-    renders the prompt: it returns the instruction only for a session this plugin's
-    engine serves, found in the engine registry by the host's session id, and "" (which
-    the host skips) for any other, so that an agent whose context engine is not LCM is
-    told nothing about LCM's summaries."""
-    from .guidance import SECTION_ID, SKILLS, HostSections, InstructionRefused, instruction_text
+    The section's text is static; the host calls the check's ``section`` when it renders
+    a prompt, and it gives the text where the ``context.engine`` of this load's home,
+    captured here, is ``lcm``, and "" (which the host skips) elsewhere, so that an agent
+    of a home whose context engine is not LCM is told nothing about LCM's summaries. A
+    reload registers a new callback and the unload removes this one."""
+    from .guidance import SECTION_ID, SKILLS, DeliveryCheck, HostSections, InstructionRefused, instruction_text
 
-    instruction = _Instruction()
+    text = host = refused = None
     register_section = getattr(ctx, "register_system_prompt_section", None)
     if not callable(register_section):
-        instruction.refused = "the host offers no register_system_prompt_section to this plugin"
+        refused = "the host offers no register_system_prompt_section to this plugin"
     else:
         try:
             host = HostSections()
             text = instruction_text(host.max_chars)
-
-            def _section(info):
-                session_id = str((info or {}).get("session_id") or "")
-                active = resolve_active_lcm_engine(session_id=session_id) if session_id else None
-                if active is None or getattr(active, "name", None) != "lcm":
-                    return ""
-                return text
-
-            register_section(SECTION_ID, _section, position="after_memory", max_chars=host.max_chars)
-            instruction.text, instruction.host = text, host
         except InstructionRefused as exc:
-            instruction.refused = str(exc)
+            refused = str(exc)
+    check = DeliveryCheck(hermes_home, text=text if refused is None else None, host=host, refused=refused)
+    if refused is None:
+        try:
+            register_section(SECTION_ID, check.section, position="after_memory", max_chars=host.max_chars)
         except Exception as exc:
-            instruction.refused = f"the host refused the section ({type(exc).__name__}: {exc})"
-    if instruction.refused is not None:
-        _instruction_not_delivered(engine, instruction.refused)
+            refused = f"the host refused the section ({type(exc).__name__}: {exc})"
+            check.text, check.refused = None, refused
+    if refused is not None:
+        _instruction_not_delivered(engine, refused)
 
     register_skill = getattr(ctx, "register_skill", None)
     if not callable(register_skill):
         logger.warning("LCM's skills are not registered: the host offers no register_skill to this plugin")
-        return instruction
+        return check
     for name, path, description in SKILLS:
         try:
             register_skill(name, path, description=description)
         except Exception as exc:
             logger.warning("LCM could not register its skill %s (%s): %s", name, path, exc)
-    return instruction
+    return check
 
 
-def _check_instruction_delivered(instruction, engine, resolve_active_lcm_engine, payload) -> None:
-    """The request's system prompt carries the plugin's section, for a session an LCM
-    engine serves; checked once per distinct prompt (#16). Never raises into the host.
-
-    It runs on the host's hook thread, under the host's timeout for ``pre_api_request``,
-    so nothing in it waits on the store: the registry lookup holds the registry's lock
-    for a dictionary read, the check holds its own lock for a set lookup, and the event
-    is handed to ``RecordStore.event_deferred``, which queues it and writes it on a
-    thread of its own. The host hands the hook no agent and no engine, only the session
-    id; where no LCM copy is bound to it while the host's context engine is ``lcm``, that
-    fact is recorded (in the store of this load's engine), never passed over."""
-    from .guidance import check_delivery, note_unbound_session
-
-    session_id = str(payload.get("session_id") or "")
-    active = resolve_active_lcm_engine(session_id=session_id) if session_id else None
-    if active is None or getattr(active, "name", None) != "lcm":
-        target = engine
-    else:
-        target = active
-
-    def _record(kind, detail, on_written=None) -> bool:
-        try:
-            target._records.event_deferred(kind, detail=detail, on_written=on_written)
-            return True
-        except Exception:
-            logger.error("LCM could not hand over the store event %s: %s", kind, detail, exc_info=True)
-            return False
-
-    if target is engine:
-        try:
-            # The home this load was registered for (its engine's), not the caller's scope.
-            note_unbound_session(session_id, str(getattr(engine, "_hermes_home", "") or ""), _record)
-        except Exception:
-            logger.warning("LCM could not note that it cannot check its instruction", exc_info=True)
-        return
-
+def _check_instruction_delivered(check, payload) -> None:
+    """The request's system-level prompt carries this load's section; checked once per
+    distinct prompt, logged where it does not (#16). Never raises into the host. It runs
+    on the host's hook thread under the host's timeout: it holds only the check's own lock
+    for a set operation, reads this load's home config where the section is missing, and
+    writes nothing to the store."""
     try:
-        check_delivery(active, payload.get("system_prompt"), payload.get("request_messages"),
-                       host_session_id=session_id, text=instruction.text, host=instruction.host,
-                       refused=instruction.refused, record=_record)
+        check.check(str(payload.get("session_id") or ""), payload.get("system_prompt"),
+                    payload.get("request_messages"))
     except Exception:
         logger.warning("LCM could not check that its instruction reached the agent", exc_info=True)
-
-
-def _note_unload(hermes_home: str) -> None:
-    """The host unloads the plugin's load for the Hermes home ``hermes_home``
-    (``unload()``, or the first half of a forced reload): that load's section and delivery
-    check are unregistered, while the engine copies of the agents already running on that
-    home stay bound. For each such copy, a WARNING and an event record that until the
-    plugin is loaded again, a rebuild of that session's prompt carries no section and no
-    request of it is checked (#16). The host scopes plugins by home, so the copies of
-    another home, served by that home's own load, are not touched. A reload that follows
-    registers both again, and the copies stay bound in the registry that outlives it."""
-    from .engine_registry import bound_engines
-
-    fact = ("the host unloaded the plugin: its system-prompt section and its delivery check are unregistered "
-            "until the plugin is loaded again; a prompt rebuilt meanwhile carries no section, and no request "
-            "is checked")
-    for bound in bound_engines(hermes_home):
-        host_session_id = str(getattr(bound, "_session_id", "") or "")
-        logger.warning("LCM: %s (host session %s)", fact, host_session_id)
-        try:
-            bound._records.event_deferred("instruction_not_delivered",
-                                          detail={"host_session_id": host_session_id, "fact": fact})
-        except Exception:
-            logger.error("LCM could not hand over the store event for the unload of host session %s",
-                         host_session_id, exc_info=True)
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -272,7 +202,6 @@ def register(ctx):
     on_unload = getattr(ctx, "on_unload", None)
     if callable(on_unload):
         def _close_registered_engine() -> None:
-            _note_unload(str(getattr(engine, "_hermes_home", "") or hermes_home))
             engine.close("the plugin was unloaded")
 
         on_unload(_close_registered_engine)
@@ -280,7 +209,9 @@ def register(ctx):
     # The instruction to the agent, as a system-prompt section, and the two skills
     # (#16). No hook injects it: a hook's text rides on the user's message and is
     # replayed on every later request, as if the user had written it (#36).
-    instruction = _register_instruction(ctx, engine, resolve_active_lcm_engine)
+    # The section is given where the context engine of the home this load was registered
+    # for is LCM: that home, captured now, never the scope a later caller has.
+    delivery_check = _register_instruction(ctx, engine, hermes_home)
 
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
@@ -316,7 +247,7 @@ def register(ctx):
             turn_signals.request_sent(str(payload.get("session_id") or ""), str(payload.get("turn_id") or ""),
                                       payload.get("conversation_history"))
             # #16: the system prompt this request sends carries the plugin's section.
-            _check_instruction_delivered(instruction, engine, resolve_active_lcm_engine, payload)
+            _check_instruction_delivered(delivery_check, payload)
 
         register_hook("pre_api_request", _on_pre_api_request)
         register_hook("pre_llm_call", _on_pre_llm_call_turn)

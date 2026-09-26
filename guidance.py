@@ -19,12 +19,17 @@ What the host does with a section, read at Hermes 34343e7:
   that would take the sections' total past 8,000 characters, in the order of their ids;
   either only with a warning in the host's own log (``hermes_cli/plugins_dispatch.py``
   ``render_system_prompt_sections``); a section whose callable raises is skipped the same
-  way, and the previous bytes are kept only when the whole render raises.
+  way, and the previous bytes are kept only when the whole render raises;
+- a plugin's hook and section callbacks are stored as given and run in their caller's
+  home scope (``hermes_cli/plugins.py`` ``register_hook``; ``hermes_cli/plugins_dispatch.py``
+  ``invoke_hook``); the host reads a manager's own config under an explicit scope of that
+  manager's home (``plugins.py`` ``_tool_override_allowed``).
 
-So the plugin checks its text against the host's limit itself and refuses it visibly, and
-it checks every distinct system prompt the host sends for its exact section
-(:func:`check_delivery`), recording ``instruction_not_delivered`` where it is missing:
-as the fact it knows, never with a cause it does not. The host's limits and its framing
+So the section's text is static and is given where the ``context.engine`` of this load's
+own home, captured when it was registered, is ``lcm``. The plugin checks the text against
+the host's limit itself and refuses it visibly, and :class:`DeliveryCheck` looks for the
+exact section in every distinct system prompt the host sends, logging a warning where it
+is missing: the facts it knows, never a cause it does not. The host's limit and framing
 are read from the host, never assumed.
 """
 
@@ -32,10 +37,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
-
-from .engine_registry import PROCESS_STATE
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +95,30 @@ def instruction_text(max_chars: int) -> str:
     return text
 
 
+def configured_context_engine(hermes_home: str) -> Optional[str]:
+    """``context.engine`` of the Hermes home ``hermes_home``, as the host reads it for each
+    agent it builds (``agent/agent_init.py`` ``_select_context_engine``), read under an
+    explicit override of that home for this thread's context only
+    (``hermes_constants.set_hermes_home_override``, what the host's ``_plugin_home_scope``
+    sets); None where it cannot be read."""
+    if not hermes_home:
+        return None
+    try:
+        from hermes_cli.config import load_config_readonly  # type: ignore
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # type: ignore
+    except Exception:
+        return None
+    token = set_hermes_home_override(hermes_home)
+    try:
+        cfg = load_config_readonly()
+    except Exception:
+        return None
+    finally:
+        reset_hermes_home_override(token)
+    context = cfg.get("context", {}) if isinstance(cfg, dict) else {}
+    return str((context.get("engine", "compressor") if isinstance(context, dict) else "") or "compressor")
+
+
 SYSTEM_LEVEL_ROLES = ("system", "developer")
 
 
@@ -129,33 +157,6 @@ def sent_system_prompt(system_prompt: Any, request_messages: Any) -> Optional[st
     return None
 
 
-# The host's runtimes whose requests never pass pre_api_request: the whole turn goes to a
-# subprocess before any request is assembled (``agent/conversation_loop.py:1581-1582``),
-# which is sent the prompt as ``developerInstructions`` (``agent/codex_runtime.py:490``).
-UNCHECKED_API_MODES = ("codex_app_server",)
-
-
-def note_unverifiable_delivery(engine: Any, api_mode: str) -> None:
-    """On a runtime whose requests the plugin never sees, record that the instruction's
-    delivery cannot be verified: a WARNING and an event, once per engine copy (#16). The
-    runtime is the ``api_mode`` the host hands the engine in ``update_model``, at agent
-    creation and at every switch of model or provider; at creation it arrives before the
-    copy is bound to a host session (``agent/agent_init.py:1971``, ``:1994``), so the note
-    waits for the binding, which calls this again. Whether the plugin should serve such a
-    runtime at all is not decided here (#24)."""
-    host_session_id = str(getattr(engine, "_session_id", "") or "")
-    if (api_mode not in UNCHECKED_API_MODES or not host_session_id
-            or not _first_sight(engine, f"api_mode {api_mode}")):
-        return
-    fact = f"delivery of the instruction cannot be verified: api_mode {api_mode} bypasses pre_api_request"
-    logger.warning("LCM: %s (host session %s)", fact, host_session_id)
-    try:
-        engine._records.event_deferred("instruction_not_delivered",
-                                       detail={"host_session_id": host_session_id, "fact": fact})
-    except Exception:
-        logger.error("LCM could not hand over the store event for: %s", fact, exc_info=True)
-
-
 def _sections_present(prompt: str) -> tuple:
     """The plugin sections the host framed into a prompt, as the host itself parses them
     back on a resume; () where the host's parser is not there or finds none."""
@@ -169,140 +170,89 @@ def _sections_present(prompt: str) -> tuple:
         return ()
 
 
-# Guards each engine copy's set of the prompts it has checked; held only for a set lookup.
-# It lives in the process state that outlives a reload of the plugin, as the engine
-# copies whose sets it guards do (``engine_registry``).
-_SEEN_LOCK = PROCESS_STATE.seen_lock
-_NO_SYSTEM_PROMPT = "no system-level prompt"
+class DeliveryCheck:
+    """One load's check that its section reached the request (#16).
 
+    It belongs to one registration: its home, captured when the load was registered, its
+    text and the host's framing, or why the load registered no section, and the set of the
+    prompts it has checked, under a lock held only for the set operation. A reload
+    registers a new one and the unload removes the old one's hook with it; nothing is
+    shared between loads, homes or processes. It writes nothing to the store: where the
+    section is missing it logs a warning in the host's log, once per distinct prompt, and
+    how the status view shows such warnings is #18's."""
 
-def note_unbound_session(host_session_id: str, hermes_home: str, record: Callable[..., None]) -> None:
-    """The hook ran for a host session no LCM engine copy is bound to, while the
-    ``context.engine`` of the home this load serves names ``lcm``: the plugin cannot
-    check that session's prompt, and records exactly that, once per host session id in
-    this process (#16). Where that home's ``context.engine`` cannot be read, that is
-    recorded too.
+    def __init__(self, hermes_home: str, *, text: Optional[str], host: Optional[HostSections],
+                 refused: Optional[str]) -> None:
+        self.hermes_home = hermes_home
+        self.text = text
+        self.host = host
+        self.refused = refused
+        self._lock = threading.Lock()
+        self._seen: set[str] = set()
 
-    ``hermes_home`` is the home captured when this load was registered, never the home
-    the caller happens to be scoped to: the host stores a hook's callback as given and
-    runs it in its caller's scope (``hermes_cli/plugins.py`` ``register_hook``,
-    ``hermes_cli/plugins_dispatch.py`` ``invoke_hook``), and reads a manager's own config
-    under an explicit scope of that manager's home (``plugins.py`` ``_tool_override_allowed``
-    with ``_plugin_home_scope``), which is what this does.
+    def section(self, info: Any) -> str:
+        """The section's content for the host's render: the static text where this load's
+        home names ``lcm`` as its context engine, else "" (which the host skips)."""
+        if self.text is None or configured_context_engine(self.hermes_home) != "lcm":
+            return ""
+        return self.text
 
-    A session counts as noted only once its event is written: until then it is pending,
-    so that a request in flight does not record it twice, and an event whose store was
-    closed first waits in the process for the next store opened on its database
-    (``record_store``), where it is written and the session noted."""
-    if not host_session_id:
-        return
-    with _SEEN_LOCK:
-        if (host_session_id in PROCESS_STATE.unbound_sessions_noted
-                or host_session_id in PROCESS_STATE.unbound_sessions_pending):
+    def _first_sight(self, key: str) -> bool:
+        with self._lock:
+            if key in self._seen:
+                return False
+            self._seen.add(key)
+            return True
+
+    def check(self, host_session_id: str, system_prompt: Any, request_messages: Any) -> None:
+        """Look for the section in one request's system-level prompt, as it was sent."""
+        prompt = sent_system_prompt(system_prompt, request_messages)
+        key = (hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest() if prompt is not None
+               else f"no system-level prompt {host_session_id}")
+        if not self._first_sight(key):
             return
-        PROCESS_STATE.unbound_sessions_pending.add(host_session_id)
-    configured = _configured_context_engine(hermes_home)
-    if configured is None:
-        fact = (f"the plugin cannot check that its instruction reached this session: no LCM engine copy is "
-                f"bound to this host session id, and the context.engine of {hermes_home or 'its home'} "
-                f"cannot be read")
-    elif configured != "lcm":
-        _mark_unbound_noted(host_session_id)
+        framed = self.host.frame(SECTION_ID, self.text) if self.host is not None and self.text else None
+        if prompt is not None and framed is not None and framed in prompt:
+            return
+        configured = configured_context_engine(self.hermes_home)
+        if configured is not None and configured != "lcm":
+            return  # the section is given only where this home's context engine is LCM
+        where = (f"; the context.engine of {self.hermes_home or 'this load’s home'} cannot be read"
+                 if configured is None else "")
+        if prompt is None:
+            logger.warning("LCM's instruction is not in the request of host session %s: the request the host "
+                           "sent carries no system-level prompt%s", host_session_id, where)
+            return
+        if self.refused is not None:
+            fact = f"the plugin registered no section: {self.refused}"
+        else:
+            fact = "the system prompt the host sent does not carry the plugin's section"
+        observed = ", ".join(
+            f"{section.id} ({len(self.host.frame(section.id, section.content)) if self.host else len(section.content)}"
+            f" characters)" for section in _sections_present(prompt)) or "none"
+        logger.warning("LCM's instruction is not in the system prompt of host session %s: %s%s; plugin sections "
+                       "the host's parser finds in it: %s", host_session_id, fact, where, observed)
+
+
+# The host's runtimes whose requests never pass pre_api_request: the whole turn goes to a
+# subprocess before any request is assembled (``agent/conversation_loop.py:1581-1582``),
+# which is sent the prompt as ``developerInstructions`` (``agent/codex_runtime.py:490``).
+UNCHECKED_API_MODES = ("codex_app_server",)
+_UNVERIFIABLE_LOCK = threading.Lock()
+
+
+def warn_unverifiable_delivery(engine: Any, api_mode: str) -> None:
+    """On a runtime whose requests the plugin never sees, log that the instruction's
+    delivery cannot be verified, once per engine copy (#16). The runtime is the
+    ``api_mode`` the host hands the engine in ``update_model``, at agent creation and at
+    every switch of model or provider. Whether the plugin should serve such a runtime at
+    all is not decided here (#24)."""
+    if api_mode not in UNCHECKED_API_MODES:
         return
-    else:
-        fact = ("the plugin cannot check that its instruction reached this session: the host's context.engine is "
-                "lcm, and no LCM engine copy is bound to this host session id")
-    logger.warning("LCM: %s (host session %s)", fact, host_session_id)
-    handed = record("instruction_not_delivered", {"host_session_id": host_session_id, "fact": fact},
-                    on_written=lambda: _mark_unbound_noted(host_session_id))
-    if not handed:
-        # Not handed over at all: the next request of this session tries again.
-        with _SEEN_LOCK:
-            PROCESS_STATE.unbound_sessions_pending.discard(host_session_id)
-
-
-def _mark_unbound_noted(host_session_id: str) -> None:
-    with _SEEN_LOCK:
-        PROCESS_STATE.unbound_sessions_pending.discard(host_session_id)
-        PROCESS_STATE.unbound_sessions_noted.add(host_session_id)
-
-
-def _configured_context_engine(hermes_home: str) -> Optional[str]:
-    """``context.engine`` of the Hermes home ``hermes_home``, as the host reads it for each
-    agent it builds (``agent/agent_init.py`` ``_select_context_engine``), read under an
-    explicit override of that home for this thread's context only
-    (``hermes_constants.set_hermes_home_override``, what the host's ``_plugin_home_scope``
-    sets); None where it cannot be read."""
-    if not hermes_home:
-        return None
-    try:
-        from hermes_cli.config import load_config_readonly  # type: ignore
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # type: ignore
-    except Exception:
-        return None
-    token = set_hermes_home_override(hermes_home)
-    try:
-        cfg = load_config_readonly()
-    except Exception:
-        return None
-    finally:
-        reset_hermes_home_override(token)
-    context = cfg.get("context", {}) if isinstance(cfg, dict) else {}
-    return str((context.get("engine", "compressor") if isinstance(context, dict) else "") or "compressor")
-
-
-def _first_sight(engine: Any, key: str) -> bool:
-    """True the first time this engine copy sees ``key`` (a prompt's digest), atomically.
-    Every request of the copy's host session id is checked against the same set, a review
-    fork's that runs under its parent's id included, so no prompt is recorded twice."""
-    with _SEEN_LOCK:
-        seen = getattr(engine, "_instruction_prompts_seen", None)
-        if seen is None:
-            seen = set()
-            engine._instruction_prompts_seen = seen
-        if key in seen:
-            return False
-        seen.add(key)
-        return True
-
-
-def check_delivery(engine: Any, system_prompt: Any, request_messages: Any, *, host_session_id: str,
-                   text: Optional[str], host: Optional[HostSections], refused: Optional[str],
-                   record: Callable[..., None]) -> None:
-    """Check one request's system prompt for the plugin's exact section, once per distinct
-    prompt of this engine copy (#16). Where it is missing, log a warning and record
-    ``instruction_not_delivered`` with what the plugin knows: that it registered no section,
-    and why, or that the prompt the host sent does not carry it. What can be seen in that
-    prompt, the plugin sections the host's own parser finds there and their sizes, is added
-    as an observation; the plugin names no cause it does not know.
-
-    ``text`` is the section's content and ``host`` the host's framing, so the section is
-    looked for exactly as the host frames it; ``refused`` is why the plugin registered
-    none. ``engine`` is the LCM copy serving the request's session. ``record`` must not
-    wait on the store: it runs on the host's hook thread."""
-    prompt = sent_system_prompt(system_prompt, request_messages)
-    if prompt is None:
-        if _first_sight(engine, _NO_SYSTEM_PROMPT):
-            fact = "the request the host sent carries no system-level prompt"
-            logger.warning("LCM's instruction is not in the request of host session %s: %s", host_session_id, fact)
-            record("instruction_not_delivered", {"host_session_id": host_session_id, "fact": fact})
-        return
-    digest = hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest()
-    if not _first_sight(engine, digest):
-        return
-    framed = host.frame(SECTION_ID, text) if host is not None and text else None
-    if framed is not None and framed in prompt:
-        return
-    if refused is not None:
-        fact = f"the plugin registered no section: {refused}"
-    else:
-        fact = "the system prompt the host sent does not carry the plugin's section"
-    present = _sections_present(prompt)
-    observed = [{"id": section.id, "chars": len(host.frame(section.id, section.content)) if host else
-                 len(section.content)} for section in present]
-    detail = {"host_session_id": host_session_id, "fact": fact,
-              "sections_the_hosts_parser_finds_in_it": observed}
-    logger.warning("LCM's instruction is not in the system prompt of host session %s: %s; plugin sections the "
-                   "host's parser finds in it: %s", host_session_id, fact,
-                   ", ".join(f"{item['id']} ({item['chars']} characters)" for item in observed) or "none")
-    record("instruction_not_delivered", detail)
+    with _UNVERIFIABLE_LOCK:
+        if getattr(engine, "_instruction_unverifiable_warned", False):
+            return
+        engine._instruction_unverifiable_warned = True
+    logger.warning("LCM: delivery of the instruction cannot be verified: api_mode %s bypasses pre_api_request "
+                   "(model %s, host session %s)", api_mode, getattr(engine, "model", ""),
+                   getattr(engine, "_session_id", "") or "not yet bound")

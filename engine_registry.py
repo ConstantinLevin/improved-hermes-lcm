@@ -1,85 +1,23 @@
 """Process-wide registry of active LCM runtime clones by session/lane.
 
 Isolated from ``engine.py`` (WS5 seam): LCM clones register their own
-session/conversation binding so the system-prompt section of the instruction and
-the ``/lcm`` command find the active clone instead of the process-wide plugin
-singleton. The lock and the two weak
-registries are held in process state that outlives a reload of the plugin (below),
-alongside the pure resolver/matcher helpers that read them. ``engine.py`` imports the shared lock, the two registries, the removal
+session/conversation binding so the ``/lcm`` command finds the active clone
+instead of the process-wide plugin singleton. The lock and the two weak
+registries live here alongside the pure resolver/matcher helpers that read
+them. ``engine.py`` imports the shared lock, the two registries, the removal
 helper, and the public ``resolve_active_lcm_engine`` entry point; the binding
 methods on ``LCMEngine`` mutate the same shared objects by reference.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 import threading
-import types
 import weakref
 from typing import Any
 
-# The registry outlives a forced reload of the plugin. The host's loader evicts this
-# package and every submodule before it loads the plugin again (``hermes_cli/
-# plugins_loader.py`` ``_load_directory_module``, ``_evict_modules``), while the agents
-# already running keep the engine copies bound here; a registry held in this module would
-# be replaced by an empty one, and the reloaded section and delivery check would find no
-# engine for them. So the registry, and the lock of the delivery check's seen-prompt sets,
-# live in one process-wide object under a name outside the plugin's package, created
-# once and taken over by every later load. So do the store events whose store was
-# closed before they could be written (``record_store``): they wait there, by database
-# path, for the next store opened on the same database.
-_PROCESS_STATE_NAME = "_hermes_lcm_process_state"
-
-
-def _process_state() -> types.ModuleType:
-    state = sys.modules.get(_PROCESS_STATE_NAME)
-    if state is None:
-        fresh = types.ModuleType(_PROCESS_STATE_NAME, "Hermes-LCM state that outlives a reload of the plugin.")
-        state = sys.modules.setdefault(_PROCESS_STATE_NAME, fresh)
-    # Each field is added once; a later load of a newer version adds the fields it needs
-    # to the state an earlier load created, and takes over those it finds.
-    for name, make in (
-        ("registry_lock", threading.RLock),
-        ("by_session_id", weakref.WeakValueDictionary),
-        ("by_conversation_id", weakref.WeakValueDictionary),
-        ("seen_lock", threading.Lock),
-        ("unbound_sessions_noted", set),
-        ("unbound_sessions_pending", set),
-        ("orphan_lock", threading.Lock),
-        ("orphan_events", dict),
-    ):
-        if not hasattr(state, name):
-            setattr(state, name, make())
-    return state
-
-
-PROCESS_STATE = _process_state()
-_ACTIVE_ENGINE_REGISTRY_LOCK = PROCESS_STATE.registry_lock
-_ACTIVE_ENGINES_BY_SESSION_ID = PROCESS_STATE.by_session_id
-_ACTIVE_ENGINES_BY_CONVERSATION_ID = PROCESS_STATE.by_conversation_id
-
-
-def same_home(left: str, right: str) -> bool:
-    """Whether two Hermes homes are the same directory; an empty one is none."""
-    if not left or not right:
-        return False
-    return os.path.realpath(left) == os.path.realpath(right)
-
-
-def bound_engines(hermes_home: str) -> list:
-    """Every engine copy of this process bound to a host session and serving the Hermes
-    home ``hermes_home``, once each. The registry spans the process, and the host scopes
-    plugins and their registrations by home: a copy serving another profile belongs to
-    that profile's load, not to this one."""
-    with _ACTIVE_ENGINE_REGISTRY_LOCK:
-        seen, engines = set(), []
-        for engine in list(_ACTIVE_ENGINES_BY_SESSION_ID.values()):
-            if id(engine) in seen or not same_home(str(getattr(engine, "_hermes_home", "") or ""), hermes_home):
-                continue
-            seen.add(id(engine))
-            engines.append(engine)
-        return engines
+_ACTIVE_ENGINE_REGISTRY_LOCK = threading.RLock()
+_ACTIVE_ENGINES_BY_SESSION_ID = weakref.WeakValueDictionary()
+_ACTIVE_ENGINES_BY_CONVERSATION_ID = weakref.WeakValueDictionary()
 
 
 def _is_usable_lcm_engine(engine: Any) -> bool:
