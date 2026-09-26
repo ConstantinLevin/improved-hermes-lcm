@@ -113,6 +113,7 @@ from .escalation import (
     configured_route_problem,
     failure_text,
     level_one_input,
+    prompt_inputs,
     session_route,
     summarize_chunk,
 )
@@ -156,6 +157,8 @@ _SMALLEST_STANDALONE_RUN = 0.25
 # The share of its source a summary's budget asks for (today's prompt, until #10):
 # min(max(2000, 0.20 × source), 12000). ρ in the tail's sizing (R9).
 _SUMMARY_BUDGET_SHARE = 0.20
+_SUMMARY_BUDGET_MIN = 2000
+_SUMMARY_BUDGET_MAX = 12000
 
 # "Keeps failing": a chunk of the same members failing in this many consecutive
 # attempts is a visible error and a store event naming it (#33, Decided; #7).
@@ -538,7 +541,7 @@ class CompactionMixin:
                 positions.add(index)
         return positions
 
-    def _chunk_limit(self) -> int:
+    def _chunk_limit(self, focus_topic: str = "") -> int:
         """c in the unit the plugin cuts in, its estimate (characters / 4, #21).
 
         #31 decides c = 50k provider tokens (``chunk_tokens``). The plugin cannot count
@@ -552,10 +555,11 @@ class CompactionMixin:
         Only the summariser bounds the chunk (#12): where the model table knows the
         summariser's window, c is at most what it can read in one call, by the
         estimate's worst case (#34 D4), ``_summariser_bound``; the cut uses that
-        effective c everywhere it uses c (the split, c/4, the joins)."""
-        return self._chunk_size()[0]
+        effective c everywhere it uses c (the split, c/4, the joins). ``focus_topic`` is
+        the attempt's focus text, which the summariser's prompt carries (B)."""
+        return self._chunk_size(focus_topic)[0]
 
-    def _chunk_size(self) -> tuple[int, str]:
+    def _chunk_size(self, focus_topic: str = "") -> tuple[int, str]:
         """The effective c by the estimate and its label (the orchestrator's rulings on
         D4, in the pre-review of 6a6a7f8 and on the Codex review of c2efe0e):
         c_eff = min(c, B), B the summariser's room in the estimate's unit
@@ -568,7 +572,7 @@ class CompactionMixin:
         c = max(1, int(config.chunk_tokens / config.estimate_ratio))
         label = (f"c = {c} tokens by the plugin's estimate: {config.chunk_tokens} provider tokens / "
                  f"{config.estimate_ratio}, #31's p50 of the provider's count over characters / 4")
-        bound, bound_label = self._summariser_bound()
+        bound, bound_label = self._summariser_bound(focus_topic)
         if bound is None or bound >= c:
             return c, label
         return bound, f"c = {bound} tokens by the plugin's estimate, below #31's {c}: B, {bound_label}"
@@ -597,12 +601,16 @@ class CompactionMixin:
             return summariser_message(message, _SIZING_HANDLE, wire) if isinstance(message, dict) else message
         return estimator, convert
 
-    def _summariser_bound(self) -> tuple[Optional[int], str]:
+    def _summariser_bound(self, focus_topic: str = "") -> tuple[Optional[int], str]:
         """B, the most one chunk may hold by the plugin's estimate so that the summariser
         can read it in one call: its window less its output cap and less its prompt,
         divided by the estimate's worst case observed (#34 D4); None where the model table
-        does not know the window or there is no summariser route. Reads nothing of the
-        store."""
+        does not know the window or there is no summariser route. The prompt is the
+        largest a call of this attempt can carry (the ruling on the Codex review of
+        188fb8b): the larger of the two levels' inputs without records, at the largest
+        budget, with the custom instructions and the attempt's focus text at their actual
+        length (none where the attempt has none: the preflight and the host's automatic
+        compaction pass none). Reads nothing of the store."""
         route, _why = self._summariser_route()
         if route is None:
             return None, ""
@@ -611,23 +619,26 @@ class CompactionMixin:
             return None, ""
         worst = float(self._config.estimate_ratio_max)
         room = facts.context_window - (facts.output_cap or 0)
-        prompt = Estimator(image_model=route.model, image_provider=route.table_provider(),
-                           reasoning_sent=wire.needs_reasoning_echo).messages(
-            level_one_input([], 12000, facts=wire, custom_instructions=self._config.custom_instructions))
+        estimator = Estimator(image_model=route.model, image_provider=route.table_provider(),
+                              reasoning_sent=wire.needs_reasoning_echo)
+        prompt = max((estimator.messages(inputs) for inputs in prompt_inputs(
+            _SUMMARY_BUDGET_MAX, facts=wire, focus_topic=focus_topic or "",
+            custom_instructions=self._config.custom_instructions)), key=lambda estimate: estimate.tokens)
         bound = int((room - prompt.in_provider_tokens(worst)) / worst)
         if bound <= 0:
             return None, ""
         return bound, (f"the summariser {route.describe()} reads {room} provider tokens ({facts.context_window} "
-                       f"window less {facts.output_cap or 0} output; {facts.basis}), less its prompt, over "
-                       f"{worst}, the estimate's worst case (#34 D4): {bound} by the estimate")
+                       f"window less {facts.output_cap or 0} output; {facts.basis}), less its prompt of "
+                       f"{prompt.tokens}{' with the focus text' if focus_topic else ''}, over {worst}, the "
+                       f"estimate's worst case (#34 D4): {bound} by the estimate")
 
-    def _smallest_run(self) -> int:
+    def _smallest_run(self, focus_topic: str = "") -> int:
         """c/4 in the estimate's unit: the smallest run that stands alone (#31), the
         same value the cut uses (``_smallest_for``)."""
-        return _smallest_for(self._chunk_limit())
+        return _smallest_for(self._chunk_limit(focus_topic))
 
-    def _chunk_label(self) -> str:
-        return self._chunk_size()[1]
+    def _chunk_label(self, focus_topic: str = "") -> str:
+        return self._chunk_size(focus_topic)[1]
 
     @staticmethod
     def _tail_floor(messages: List[Dict[str, Any]], mechanism: set, groups: List[List[int]],
@@ -721,8 +732,9 @@ class CompactionMixin:
 
     def _tail_plan(self, messages: List[Dict[str, Any]], mechanism: set,
                    occasion: Optional[Occasion] = None, frozen: Sequence[tuple] = (),
-                   fixed: Optional[tuple] = None) -> "TailPlan":
-        """Where the tail begins, and how it was sized (#13, #31).
+                   fixed: Optional[tuple] = None, focus_topic: str = "") -> "TailPlan":
+        """Where the tail begins, and how it was sized (#13, #31). ``focus_topic`` is the
+        attempt's focus text, which B counts (``_summariser_bound``).
 
         The tail takes what the target leaves: after the compaction the context is
         F + S + (the new summaries) + t + R_in, and it should come to G. In the plugin's
@@ -796,8 +808,8 @@ class CompactionMixin:
         held: List[tuple] = []
         recut: List[tuple] = []
         claimed: set = set()
-        smallest = self._smallest_run()
-        bound = self._summariser_bound()[0] if frozen else None
+        smallest = self._smallest_run(focus_topic)
+        bound = self._summariser_bound(focus_topic)[0] if frozen else None
         if frozen:
             # A kept chunk is weighed as the cut weighs it (``_cut_estimate``).
             cut_estimator, convert = self._cut_estimate()
@@ -810,7 +822,7 @@ class CompactionMixin:
                                        if isinstance(messages[i], dict) else 0)
                 return sum(cut_size[i] for i in indices)
 
-            limit = self._chunk_limit()
+            limit = self._chunk_limit(focus_topic)
             owner = {i: which for which, (_chunk, positions) in enumerate(frozen) for i in positions}
 
         def neighbour_takes(which: int, positions: List[int], weight: int) -> Optional[str]:
@@ -1158,7 +1170,7 @@ class CompactionMixin:
     @staticmethod
     def _summary_budget(source) -> int:
         """The summary's target length (today's prompt, until #10)."""
-        return min(max(2000, int(source.tokens * _SUMMARY_BUDGET_SHARE)), 12000)
+        return min(max(_SUMMARY_BUDGET_MIN, int(source.tokens * _SUMMARY_BUDGET_SHARE)), _SUMMARY_BUDGET_MAX)
 
     @staticmethod
     def _summariser_wire(route: SummariserRoute):
@@ -1686,7 +1698,8 @@ class CompactionMixin:
                                 "chunks": [{"chunk": chunk, "attempt": compaction, "without_identity": list(rows)}
                                            for chunk, compaction, rows in frozen.unidentified]})
         try:
-            plan = self._tail_plan(messages, mechanism, occasion, frozen.found, fixed=fixed)
+            plan = self._tail_plan(messages, mechanism, occasion, frozen.found, fixed=fixed,
+                                   focus_topic=focus_topic or "")
         except ToolPairingError as exc:
             self._record_event(attempt, "tool_pairing_error", str(exc))
             return self._abort(messages, f"the tail cannot be placed: {exc}")
@@ -1709,8 +1722,9 @@ class CompactionMixin:
         material = [index for index in range(tail_start) if index not in mechanism]
         # The cut's unit: each row as the summariser receives it (``_cut_estimate``).
         estimator, convert = self._cut_estimate()
-        limit = self._chunk_limit()
-        bound = self._summariser_bound()[0]
+        # c and B with the prompt this attempt's calls carry, its focus text included.
+        limit = self._chunk_limit(focus_topic or "")
+        bound = self._summariser_bound(focus_topic or "")[0]
         chunks: List[List[int]] = []
         waiting: List[int] = []
         if material:
@@ -1797,7 +1811,7 @@ class CompactionMixin:
             return self._unchanged_return(
                 messages, f"nothing to compact: what stands outside the fresh tail is below the smallest run that "
                           f"stands alone, c/4 ({rest.tokens} < {_smallest_for(limit)} tokens, {rest.label()}; "
-                          f"{self._chunk_label()}); it stays raw until more material joins it")
+                          f"{self._chunk_label(focus_topic or '')}); it stays raw until more material joins it")
         if not material:
             if force_overflow or provider_rejected:
                 self._publish("_last_overflow_recovery_failed", True)
@@ -1818,7 +1832,7 @@ class CompactionMixin:
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk,
         # the last step of the planning transaction.
         logger.info("LCM cut %d tokens of material into %d chunk%s (%s)", material_estimate.tokens, len(chunks),
-                    "" if len(chunks) == 1 else "s", self._chunk_label())
+                    "" if len(chunks) == 1 else "s", self._chunk_label(focus_topic or ""))
         # Kept chunks as they were, by their positions: summarised ones reuse their summary
         # whatever route wrote it; they are never summarised again (ruling on #61).
         kept_state = {tuple(positions): chunk.state for chunk, positions in plan.kept}

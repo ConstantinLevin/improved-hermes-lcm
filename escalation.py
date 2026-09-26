@@ -37,9 +37,13 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 
 - the call raises (a rate limit, a timeout, a connection or provider error);
 - another model answered (``route_info`` names another provider or model);
-- the reply has no ``choices[0].message`` (malformed; the own client: its stream ends
-  without the event that completes a reply), or its text is empty;
-- the provider stopped the reply at its output limit (``finish_reason == "length"``);
+- the reply has no ``choices[0].message`` (malformed), or its text is empty;
+- the reply ended otherwise than complete (``summariser_client.ending_failure``): Chat
+  Completions ``stop``, a Responses ``response.completed``, Anthropic ``end_turn`` are
+  the only summaries; the output limit, a content filter, a refusal, a tool call, an
+  error, no ending at all and every ending not known each fail with their kind (the
+  session's route is read by its Chat Completions ``finish_reason``, the shape the host
+  hands every wire's reply in);
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
 
@@ -459,18 +463,21 @@ def _own_client_once(messages: list[dict[str, Any]], settings: CallSettings,
     from . import summariser_client
 
     try:
-        content, finish_reason, _reasoning = summariser_client.call(
+        content, ending, _reasoning = summariser_client.call(
             settings.route, messages, timeout=timeout, max_tokens=settings.max_tokens, effort=settings.effort_param)
     except summariser_client.StreamEnded as exc:
         raise SummaryFailure("the summariser's stream ended unfinished", transient=exc.deadline, kind="endpoint",
                              detail=str(exc)) from None
+    # Only the wire's complete ending is a summary, whatever else ended it (the ruling on
+    # the Codex review of 188fb8b): each other ending fails with its kind.
+    failed = summariser_client.ending_failure(settings.route.api_mode, ending)
+    if failed is not None:
+        kind, why = failed
+        raise SummaryFailure("reply not complete", transient=False, kind=kind, detail=f"{why} (ending {ending!r})")
     if not content.strip():
         raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
-                             detail=f"no text, finish_reason {finish_reason!r}")
-    if finish_reason == "length":
-        raise SummaryFailure("reply cut at the output limit", transient=False, kind="reply",
-                             detail="finish_reason 'length'")
-    return content, finish_reason
+                             detail=f"no text, ending {ending!r}")
+    return content, str(ending)
 
 
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
@@ -535,14 +542,20 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         raise SummaryFailure("malformed reply", transient=False, kind="endpoint",
                              detail=f"no choices[0].message ({type(exc).__name__})") from None
     finish_reason = getattr(choice, "finish_reason", None)
+    # The host hands every wire's reply in the Chat Completions shape: only ``stop`` is a
+    # complete ending (the ruling on the Codex review of 188fb8b).
+    from .summariser_client import ending_failure
+
+    failed = ending_failure("chat_completions", str(finish_reason) if finish_reason else None)
+    if failed is not None:
+        kind, why = failed
+        raise SummaryFailure("reply not complete", transient=False, kind=kind,
+                             detail=f"{why} (finish_reason {finish_reason!r})")
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
         raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
                              detail=f"content is {type(content).__name__}, finish_reason {finish_reason!r}")
-    if finish_reason == "length":
-        raise SummaryFailure("reply cut at the output limit", transient=False, kind="reply",
-                             detail="finish_reason 'length'")
-    return content, str(finish_reason) if finish_reason is not None else ""
+    return content, str(finish_reason)
 
 
 @contextlib.contextmanager
@@ -656,6 +669,28 @@ def level_one_input(
         facts=facts,
         withheld=withheld,
     )
+
+
+def prompt_inputs(
+    largest_budget: int,
+    *,
+    facts: WireFacts,
+    focus_topic: str = "",
+    custom_instructions: str = "",
+) -> list[list[dict[str, Any]]]:
+    """Both levels' inputs without records, at the largest budget a chunk is given: what
+    a call carries beside its chunk, the focus text and the custom instructions included
+    at their actual length. The summariser's bound on a chunk (B) takes the larger of
+    the two (the ruling on the Codex review of 188fb8b)."""
+    request = _summary_request(focus_topic=focus_topic, custom_instructions=custom_instructions)
+    return [
+        level_one_input([], largest_budget, facts=facts, focus_topic=focus_topic,
+                        custom_instructions=custom_instructions),
+        summariser_messages([], instructions=_l2_instructions(int(largest_budget * _L2_BUDGET_RATIO),
+                                                               focus_topic=focus_topic,
+                                                               custom_instructions=custom_instructions),
+                            request=request, facts=facts),
+    ]
 
 
 def summarize_chunk(
