@@ -106,6 +106,7 @@ from .escalation import (
     _host_provider,
     configured_route_problem,
     failure_text,
+    level_one_input,
     session_route,
     summarize_chunk,
 )
@@ -770,6 +771,7 @@ class CompactionMixin:
                 provider=config.summary_provider.strip(), model=config.summary_model.strip(),
                 base_url=config.summary_base_url.strip(), api_key=config.summary_api_key,
                 api_mode=config.summary_api_mode.strip(), source="configured",
+                named_provider=config.summary_provider.strip(),
             )
         else:
             if not (self.model and self.provider):
@@ -789,7 +791,7 @@ class CompactionMixin:
         if effort not in REASONING_EFFORTS:
             return None, (f"the summariser's reasoning effort {effort!r} is not one of the host's levels "
                           f"({', '.join(sorted(REASONING_EFFORTS))})")
-        facts = lookup_model(route.model)
+        facts = lookup_model(route.model, route.table_provider())
         return CallSettings(
             route=route,
             effort=effort,
@@ -871,6 +873,7 @@ class CompactionMixin:
         focus_topic: Optional[str],
         record_handles: List[str],
         settings: CallSettings,
+        chunk_handle: str = "",
     ) -> Callable[[ChunkCall], ChunkSummary]:
         """What a worker runs for one chunk: its summary, or ``SummaryFailure`` (#7),
         with the summariser's route and effort (#9). Everything the call needs is read
@@ -883,15 +886,21 @@ class CompactionMixin:
         # What the summary replaces in the session's context, by the session's estimate
         # (R6): the acceptance compares the reply with this, by the same estimate.
         source = self._estimator().messages(chunk_messages)
-        budget = min(max(2000, int(source.tokens * _SUMMARY_BUDGET_SHARE)), 12000)
-        facts = lookup_model(settings.route.model)
+        budget = self._summary_budget(source)
+        facts, wire = self._summariser_wire(settings)
         route = settings.route
         records = list(zip(record_handles, chunk_messages))
-        # Images go in only where the model table says the summariser reads them; the
-        # reasoning field and the converter by the host's rules for the route.
-        wire = wire_facts(route.provider, route.model, route.base_url, route.api_mode,
-                          reads_images=bool(facts is not None and facts.reads_images))
         custom_instructions = self._config.custom_instructions
+        # The encrypted reasoning withheld from this chunk's input, named where it
+        # happens (#8, "Reasoning": never brushed over), in the log and in the summary's
+        # provenance.
+        counts: Dict[str, int] = {}
+        level_one_input(records, budget, facts=wire, focus_topic=focus_topic or "",
+                        custom_instructions=custom_instructions, withheld=counts)
+        withheld = self._withheld_note(counts, facts)
+        if withheld is not None:
+            logger.warning("LCM withholds from the summariser %s of chunk %s: %s", withheld["items_text"],
+                           chunk_handle, withheld["text"])
 
         def run(call: ChunkCall) -> ChunkSummary:
             text, level, finish_reason = summarize_chunk(
@@ -907,9 +916,48 @@ class CompactionMixin:
                               deadline=call.deadline),
             )
             return ChunkSummary(text=text, level=level, budget=budget, finish_reason=finish_reason,
-                                model=route.model, provider=route.provenance_provider(), effort=settings.effort)
+                                model=route.model, provider=route.provenance_provider(), effort=settings.effort,
+                                withheld=json.dumps(withheld["record"]) if withheld is not None else None)
 
         return run
+
+    @staticmethod
+    def _summary_budget(source) -> int:
+        """The summary's target length (today's prompt, until #10)."""
+        return min(max(2000, int(source.tokens * _SUMMARY_BUDGET_SHARE)), 12000)
+
+    @staticmethod
+    def _summariser_wire(settings: CallSettings):
+        """The summariser's row in the model table (by its route, 9.6) and what its
+        route means for its input: images go in only where the row says it reads them,
+        and where there is no row it is not known (#8); the reasoning field and the
+        converter by the host's rules for the route."""
+        route = settings.route
+        facts = lookup_model(route.model, route.table_provider())
+        wire = wire_facts(route.provider, route.model, route.base_url, route.api_mode,
+                          reads_images=facts.reads_images if facts is not None else None)
+        return facts, wire
+
+    @staticmethod
+    def _withheld_note(counts: Dict[str, int], facts) -> Optional[dict]:
+        """The named loss of the encrypted items withheld from a summariser (#8; R3 until
+        the producer is stamped, ask A-P): per kind, how many, and whether this
+        summariser's route takes that kind at all (the model table, 9.6), or that it is
+        not known. None where nothing was withheld."""
+        if not counts:
+            return None
+        takes = {}
+        for kind in counts:
+            takes[kind] = None if facts is None else (kind in facts.encrypted_reasoning)
+        words = {True: "this summariser's route takes that kind", False: "this summariser's route does not take "
+                 "that kind", None: "whether this summariser's route takes it is not known (no row)"}
+        items_text = ", ".join(f"{count} {kind}" for kind, count in sorted(counts.items()))
+        text = ("encrypted reasoning, withheld because its producer is not known (ask A-P); "
+                + "; ".join(f"{kind}: {words[takes[kind]]}" for kind in sorted(counts)))
+        return {"items_text": items_text, "text": text,
+                "record": {"withheld": counts, "reason": "producer not known (ask A-P)",
+                           "summariser_takes": takes,
+                           "table": facts.basis if facts is not None else "no row"}}
 
     def _calls_in_flight_limit(self, endpoint: str) -> int:
         """The endpoint's limit: its own where configured, else the default (#33)."""
@@ -990,6 +1038,7 @@ class CompactionMixin:
                         attempt, chunk_handle, text=summary.text, level=summary.level, budget=summary.budget,
                         finish_reason=summary.finish_reason, expand_hint=None,
                         model=summary.model, provider=summary.provider, effort=summary.effort,
+                        withheld_reasoning=summary.withheld,
                     )
                 except Exception as exc:
                     logger.warning("LCM could not write the summary of chunk %d of %d (%s: %s)",
@@ -1500,21 +1549,43 @@ class CompactionMixin:
                         "(%d summarised, %d retried as the same chunk)", len(states), states.count("summarised"),
                         states.count("cut"))
         # A chunk the summariser cannot read in one call would fail on every attempt; it
-        # is never cut (the tiny-chunk rule on #52). Only where the model table knows
-        # the window; counted by the plugin's estimate, its images by the summariser's rule.
-        model_facts = lookup_model(settings.route.model)
+        # is never cut (the tiny-chunk rule on #52; #34 D4). Only where the model table
+        # knows the window. What is counted is what the summariser receives (#8b): its
+        # level-1 input, an image it is not sent as its placeholder, readable reasoning as
+        # the text part it becomes; and it is compared like with like (the orchestrator's
+        # ruling): the estimate's characters / 4 converted into provider tokens by the
+        # worst case observed, never the median, images by the summariser's rule. A kept
+        # chunk that has its summary is not sent, so it is not checked.
+        model_facts, wire = self._summariser_wire(settings)
         if model_facts is not None and model_facts.context_window:
             room = model_facts.context_window - (model_facts.output_cap or 0)
-            summariser_estimate = Estimator(image_model=settings.route.model)
+            worst = float(self._config.estimate_ratio_max)
+            route = settings.route
+            summariser_estimate = Estimator(image_model=route.model, image_provider=route.table_provider(),
+                                            reasoning_sent=wire.needs_reasoning_echo)
+            session_estimate = self._estimator()
             for number, chunk in enumerate(chunks, start=1):
-                estimate = summariser_estimate.messages([messages[index] for index in chunk])
-                if estimate.tokens > room:
+                if kept_state.get(tuple(chunk)) == "summarised":
+                    continue
+                chunk_messages = [messages[index] for index in chunk]
+                # A record handle's length stands in for the handle each record gets when
+                # the chunk is written, below.
+                handles = ["m" + "?" * 8] * len(chunk_messages)
+                received = level_one_input(
+                    list(zip(handles, chunk_messages)),
+                    self._summary_budget(session_estimate.messages(chunk_messages)),
+                    facts=wire, focus_topic=focus_topic or "",
+                    custom_instructions=self._config.custom_instructions)
+                estimate = summariser_estimate.messages(received)
+                provider_tokens = estimate.in_provider_tokens(worst)
+                if provider_tokens > room:
                     return self._abort(
                         messages,
-                        f"chunk {number} of {len(chunks)} holds about {estimate.tokens} tokens "
-                        f"({estimate.label()}), more than the summariser {settings.route.describe()} can read "
-                        f"in one call ({model_facts.context_window} window less {model_facts.output_cap or 0} "
-                        f"output)",
+                        f"chunk {number} of {len(chunks)} would reach the summariser {route.describe()} as about "
+                        f"{provider_tokens} provider tokens ({estimate.tokens} by the plugin's estimate, its "
+                        f"characters / 4 times {worst}, the estimate's worst case observed, #34 D4; "
+                        f"{estimate.label()}), more than it can read in one call ({model_facts.context_window} "
+                        f"window less {model_facts.output_cap or 0} output; {model_facts.basis})",
                     )
         try:
             chunk_handles = self._write_compaction(attempt, entries, chunks, force=force)
@@ -1598,7 +1669,7 @@ class CompactionMixin:
                         attempt.session, records, exclude_chunk=chunk_handle, model=route.model,
                         provider=route.provenance_provider(), effort=settings.effort, any_route=frozen_summary),
                     run=self._chunk_run(chunk_messages, focus_topic=focus_topic, record_handles=records,
-                                        settings=settings),
+                                        settings=settings, chunk_handle=chunk_handle),
                     describe=describe,
                 )
             except Exception as exc:

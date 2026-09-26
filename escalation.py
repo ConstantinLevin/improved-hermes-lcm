@@ -11,7 +11,9 @@ host's ``reasoning_config``, and with ``route_info``, which the host fills with 
 route that answered. A reply from any other model than the summariser is a failure
 (#33 D9): the host's fallback ladder answers a timeout, a rate limit or another
 capacity error with the main agent's model or a configured fallback, and says so only
-there. When the main agent's model is the summariser, its answer is the summariser's.
+there. After a fallback, only the session route's own provider and model are accepted,
+and only a provider that names its endpoint, since ``route_info`` carries no base URL
+(the orchestrator's ruling on D9).
 
 Two levels, each one call to the summariser with today's prompt text (#10 owns the
 texts): level 1 asks for a summary near the target budget; level 2, with today's
@@ -113,6 +115,13 @@ class SummariserRoute:
     # host's custom form, "endpoint: resolved by the host" when it is passed as given
     # to a host branch that ignores an explicit base URL (ask A-9.2).
     endpoint_note: str = ""
+    # The provider as the host (``update_model``) or the configuration named it, kept
+    # where the call is made in the custom form: the model table is keyed on it (9.6).
+    named_provider: str = ""
+
+    def table_provider(self) -> str:
+        """The provider the model table's route rows are keyed on."""
+        return self.named_provider or self.provider
 
     def provenance_provider(self) -> str:
         return f"{self.provider} [{self.endpoint_note}]" if self.endpoint_note else self.provider
@@ -203,7 +212,7 @@ def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mo
     branch does not speak), it is passed as given, and the summary's provenance says
     the host resolved the endpoint."""
     route = SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
-                            api_mode=api_mode, source="session")
+                            api_mode=api_mode, source="session", named_provider=provider)
     if not base_url or host_ignores_base_url(provider) is None:
         return route
     wire = _host_api_mode(api_mode)
@@ -211,9 +220,10 @@ def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mo
     if has_key and wire in _CUSTOM_WIRES:
         return SummariserRoute(provider="custom", model=model, base_url=base_url, api_key=api_key,
                                api_mode=wire, source="session",
-                               endpoint_note=f"the session's {provider} endpoint")
+                               endpoint_note=f"the session's {provider} endpoint", named_provider=provider)
     return SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
-                           api_mode=api_mode, source="session", endpoint_note="endpoint: resolved by the host")
+                           api_mode=api_mode, source="session", endpoint_note="endpoint: resolved by the host",
+                           named_provider=provider)
 
 
 def _control_characters(value: str) -> bool:
@@ -487,6 +497,27 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
     return forms
 
 
+def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -> bool:
+    """After a fallback, whether the route that answered is the session route's own
+    provider and model (the orchestrator's ruling on D9): the host's last rung, the main
+    agent's model, is labelled with the main agent's provider, while the plugin may call
+    the session's route in the custom form (``session_route``), so the labels differ for
+    the same model on the same provider. Only a provider that names its endpoint counts:
+    ``route_info`` carries no base URL, so a custom or local-server label, which names
+    none, is never taken for the session's route. A configured summariser is never
+    accepted after a fallback, for the same reason."""
+    if route.source != "session" or not route.named_provider:
+        return False
+    named = _host_provider(route.named_provider)
+    label = _host_provider(answered[0])
+    if named is None or label is None or named != label:
+        return False
+    aliases = _host_local_server_aliases() or frozenset()
+    if named == "custom" or route.named_provider.strip().lower() in aliases:
+        return False
+    return answered[1] in _host_model_forms(route.model, answered[0])
+
+
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
                timeout: Optional[float] = None) -> tuple[str, str]:
     """One call through the host. Returns (content, finish_reason); raises on any
@@ -524,11 +555,15 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
             detail=f"route_info names {resolved[0] or '?'}/{resolved[1] or '?'} for the summariser "
                    f"{route.describe()} (#33 D9)",
         )
-    if answered != resolved:
+    if len(route_info.routes) > 1 and not _session_route_answered(route, answered):
+        # The host records the route once when it plans the call, and again before each
+        # fallback candidate (``_record_route_info``, agent/auxiliary_client.py at Hermes
+        # 916e1688ba; its same-provider transient retries record nothing), so a second
+        # record means a fallback candidate answered.
         raise SummaryFailure(
             "reply from another model", transient=False, kind="route",
-            detail=f"the host's route_info names {answered[0] or '?'}/{answered[1] or '?'} as the route that "
-                   f"answered, the summariser is {route.describe()}, which the host resolved as "
+            detail=f"the host fell back and its route_info names {answered[0] or '?'}/{answered[1] or '?'} as the "
+                   f"route that answered; the summariser is {route.describe()}, which the host resolved as "
                    f"{resolved[0]}/{resolved[1]} (#33 D9)",
         )
     try:
@@ -641,6 +676,29 @@ def _call_with_retries(
         return content, finish_reason
 
 
+def level_one_input(
+    records: list[tuple[str, dict]],
+    token_budget: int,
+    *,
+    facts: WireFacts,
+    depth: int = 0,
+    focus_topic: str = "",
+    custom_instructions: str = "",
+    withheld: Optional[dict] = None,
+) -> list[dict[str, Any]]:
+    """What the summariser receives at level 1, the larger of the two levels' inputs: its
+    instructions, the chunk's records as messages, and the closing request. The check of a
+    chunk against the summariser's window estimates exactly this (#8b, #34 D4)."""
+    return summariser_messages(
+        records,
+        instructions=_l1_instructions(token_budget, depth, focus_topic=focus_topic,
+                                      custom_instructions=custom_instructions),
+        request=_summary_request(focus_topic=focus_topic, custom_instructions=custom_instructions),
+        facts=facts,
+        withheld=withheld,
+    )
+
+
 def summarize_chunk(
     records: list[tuple[str, dict]],
     token_budget: int,
@@ -665,13 +723,8 @@ def summarize_chunk(
     level 2: the next level would meet the same provider with no time left.
     """
     request = _summary_request(focus_topic=focus_topic, custom_instructions=custom_instructions)
-    l1 = summariser_messages(
-        records,
-        instructions=_l1_instructions(token_budget, depth, focus_topic=focus_topic,
-                                      custom_instructions=custom_instructions),
-        request=request,
-        facts=facts,
-    )
+    l1 = level_one_input(records, token_budget, facts=facts, depth=depth, focus_topic=focus_topic,
+                         custom_instructions=custom_instructions)
     try:
         content, finish_reason = _call_with_retries(
             l1, source=source, settings=settings, path=path)
