@@ -207,6 +207,49 @@ class ChunkInput:
 
 
 @dataclass
+class _Step:
+    """The step of the planning phase under way, for the cause of a failure the
+    boundary catches (``_compress_impl``)."""
+
+    at: str
+
+
+@dataclass
+class _Planned:
+    """What the planning phase hands the dispatch: the recorded cut, each chunk's input,
+    and the endpoint's limiter, progress hook and deadline."""
+
+    route: Any
+    chunks: List[List[int]]
+    kept_state: Dict[tuple, str]
+    mechanism: set
+    tail_start: int
+    endpoint: str
+    limiter: Any
+    limit: int
+    still_wanted: Any
+    describe: Any
+    finished: Any
+    # Per chunk: (number, chunk handle, positions, records, subscriber, the worker's run).
+    calls: List[tuple]
+
+
+def _passes_the_boundary(exc: BaseException) -> bool:
+    """The exceptions the planning boundary lets through, to their current path: the
+    attempt's own cancellation (``compress()`` returns its input), the host's explicit
+    cancellation of an auxiliary attempt (``AuxiliaryExplicitCancellation``,
+    agent/auxiliary_client.py:212 at origin/main d0288be5b3), and the interpreter's
+    stops (KeyboardInterrupt, SystemExit, GeneratorExit)."""
+    if isinstance(exc, (AttemptCancelled, KeyboardInterrupt, SystemExit, GeneratorExit)):
+        return True
+    try:
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation  # type: ignore
+    except Exception:
+        return False
+    return isinstance(exc, AuxiliaryExplicitCancellation)
+
+
+@dataclass
 class TailPlan:
     """Where the tail begins and how it was sized (``_tail_plan``); with the chunks of
     an earlier attempt the cut keeps (``kept``) and those that reach the floor and stay
@@ -1716,6 +1759,48 @@ class CompactionMixin:
             return self._store_read_failed(attempt, messages, "fixed_prefix_unreadable",
                                            "the session's fixed prefix F", exc)
 
+        # The planning phase, from opening the planning transaction to the dispatch of the
+        # first call, inside one boundary (the orchestrator's ruling on the Codex review
+        # of a6e776e): any exception in it, but the attempt's and the host's cancellations,
+        # is a visible abort with its true cause and an event naming the step it was in
+        # (``_Step``, ``_planning_failed``). The handlers inside that give a better cause
+        # stay; the boundary catches everything else.
+        step = _Step("opening the planning transaction")
+        try:
+            planned = self._planning_phase(attempt, messages, step, occasion=occasion, fixed=fixed,
+                                           settings=settings, focus_topic=focus_topic, force=force,
+                                           force_overflow=force_overflow, provider_rejected=provider_rejected,
+                                           why_now=why_now)
+        except BaseException as exc:
+            if _passes_the_boundary(exc):
+                raise
+            return self._planning_failed(attempt, messages, step, exc)
+        if not isinstance(planned, _Planned):
+            return planned   # an abort or a no-op the planning phase returned itself
+        return self._dispatch_phase(attempt, messages, planned, settings=settings, focus_topic=focus_topic,
+                                    started=started, recovery_cap=recovery_cap)
+
+    def _planning_failed(self, attempt, messages: List[Dict[str, Any]], step: "_Step",
+                         exc: BaseException) -> List[Dict[str, Any]]:
+        """An exception inside the planning phase that no handler there named: the
+        planning transaction, where still open, is rolled back (nothing of the attempt is
+        recorded), an event names the step, and the host shows the true cause."""
+        logger.warning("LCM compaction failed while %s", step.at, exc_info=True)
+        if attempt.planning is not None:
+            self._rollback_planning(attempt, exc)
+        try:
+            self._record_event(attempt, "planning_phase_failed",
+                               {"step": step.at, "error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            logger.warning("LCM could not record the planning failure", exc_info=True)
+        return self._abort(messages, f"the compaction failed while {step.at} ({type(exc).__name__}: {exc})")
+
+    def _planning_phase(self, attempt, messages: List[Dict[str, Any]], step: "_Step", *, occasion: Occasion,
+                        fixed: tuple, settings: CallSettings, focus_topic: Optional[str], force: bool,
+                        force_overflow: bool, provider_rejected: bool, why_now: str):
+        """Steps 1 to 3 and the dispatch's preparation, inside ``_compress_impl``'s one
+        boundary: returns a ``_Planned`` to dispatch, or the list an abort or a no-op
+        returns. ``step.at`` names the step under way."""
         # The planning transaction (#33 D14 as revised 2026-09-25): every store read the
         # cut depends on, from the identity on, and the write of the cut, in one
         # BEGIN IMMEDIATE, after the attempt's captured check is asked inside it. A
@@ -1735,6 +1820,7 @@ class CompactionMixin:
 
         # 1. Identity (#29 W3). A list that cannot be classified is not compacted; a store
         # that cannot be read for it is a visible abort (#7), never an exception.
+        step.at = "classifying the list"
         try:
             entries = self._classify(attempt, messages)
         except Exception as exc:
@@ -1752,6 +1838,7 @@ class CompactionMixin:
         # On a retry the cut is frozen (#33 D14 as revised): every recorded chunk of the
         # unsettled attempts is found by its members' ids and records. What is cut
         # again is said visibly (ruling 3 on #61).
+        step.at = "reading the earlier attempts' chunks"
         try:
             frozen = self._frozen_candidates(
                 messages, {entry.position: entry.record for entry in entries
@@ -1774,6 +1861,7 @@ class CompactionMixin:
                                {"attempts": attempts,
                                 "chunks": [{"chunk": chunk, "attempt": compaction, "without_identity": list(rows)}
                                            for chunk, compaction, rows in frozen.unidentified]})
+        step.at = "placing the tail"
         try:
             plan = self._tail_plan(messages, mechanism, occasion, frozen.found, fixed=fixed,
                                    focus_topic=focus_topic or "")
@@ -1799,6 +1887,7 @@ class CompactionMixin:
         # The cut, before the boundary is checked: a rest below c/4 at the end of the
         # material stays raw and the tail begins at it (ruling on #61, 1).
         material = [index for index in range(tail_start) if index not in mechanism]
+        step.at = "sizing the chunks"
         try:
             # The cut's unit: each row as the summariser receives it (``_cut_estimate``).
             cut_estimator, convert = self._cut_estimate()
@@ -1814,6 +1903,7 @@ class CompactionMixin:
         if material:
             joins: List[dict] = []
             alone: List[dict] = []
+            step.at = "cutting the material"
             try:
                 chunks = self._cut_chunks(messages, material, limit, cut_estimator,
                                           kept=[positions for _chunk, positions in plan.kept],
@@ -1871,6 +1961,7 @@ class CompactionMixin:
                 logger.info("LCM leaves %d rows below c/4 at the end of the material raw (from position %d): the "
                             "tail begins at them, and they join material at a later compaction",
                             len(waiting), tail_start)
+        step.at = "checking the tail's boundary"
         unanswered = _unanswered_calls_at(messages, tail_start)
         if unanswered:
             # The forward check: a call at the boundary whose result is not in the list
@@ -1914,6 +2005,7 @@ class CompactionMixin:
                 f"{'tool group' if len(messages) - tail_start > 1 else 'message'} fill the context; outside them "
                 f"stands only the mechanism's layer (the system row and the summaries)",
             )
+        step.at = "estimating the material"
         material_estimate = cut_estimator.messages([convert(messages[index]) for index in material])
 
         # 3. Transaction 1: the compaction, its inputs, the new records and every chunk,
@@ -1928,6 +2020,7 @@ class CompactionMixin:
             logger.info("LCM keeps the cut of earlier attempts (#33 D14): %d recorded chunks as they were "
                         "(%d summarised, %d retried as the same chunk)", len(states), states.count("summarised"),
                         states.count("cut"))
+        step.at = "writing the compaction"
         try:
             chunk_handles = self._write_compaction(attempt, entries, chunks, force=force)
         except Exception as exc:
@@ -1940,6 +2033,7 @@ class CompactionMixin:
         # planning transaction, so that a chunk the summariser cannot read is refused
         # before its cut is committed: nothing of this attempt is then recorded.
         route = settings.route
+        step.at = "reading the chunks' records"
         members = [attempt.records[index] for chunk in chunks for index in chunk]
         try:
             facts = self._records.record_facts(members)
@@ -1953,6 +2047,7 @@ class CompactionMixin:
             self._record_event(attempt, "chunk_record_missing", {"records": missing})
             return self._abort(messages, f"the store holds no record {', '.join(missing)} of the chunks it just "
                                          f"recorded")
+        step.at = "building the summariser's input"
         prepared: Dict[int, ChunkInput] = {}
         for number, chunk in enumerate(chunks, start=1):
             records = [attempt.records[index] for index in chunk]
@@ -1982,6 +2077,7 @@ class CompactionMixin:
         # 6f4a351). The cut keeps divisible material within the limit, so this refuses
         # only a group that cannot be divided, or a chunk an earlier attempt cut: never
         # with placeholders in their place, since a loss is a failure (see the PR).
+        step.at = "checking each chunk's images against the wire's limit"
         if image_limit is not None:
             for number, chunk in enumerate(chunks, start=1):
                 if kept_state.get(tuple(chunk)) == "summarised":
@@ -2006,6 +2102,7 @@ class CompactionMixin:
                         f"request (agent/image_eviction_policy.py OUTBOUND_IMAGE_LIMIT): the rest would be removed "
                         f"unseen (#8)",
                     )
+        step.at = "checking each chunk against the summariser's window"
         model_facts = prepared[1].facts if prepared else None
         if model_facts is not None and model_facts.context_window:
             room = model_facts.context_window - (model_facts.output_cap or 0)
@@ -2043,6 +2140,7 @@ class CompactionMixin:
         # The cut is recorded: commit the planning transaction before any call starts. A
         # commit that fails (the busy timeout, a full disk) wrote nothing: a visible
         # abort, the context untouched (#7).
+        step.at = "committing the planning transaction"
         try:
             held_ms = attempt.end_planning()
         except Exception as exc:
@@ -2051,9 +2149,8 @@ class CompactionMixin:
             return self._abort(messages, f"the store could not commit the compaction's cut ({exc})")
         logger.info("LCM held the store's write lock for %.1f ms to plan and record the cut", held_ms or 0.0)
 
-        # 4. One summary per chunk, every chunk's call issued at once (#12, #33): each
-        # joins the call in flight for the same records, reuses a summary of them already
-        # written, or starts on a worker of its own.
+        # The dispatch's preparation, still inside the boundary: nothing is sent yet.
+        step.at = "preparing the dispatch"
         endpoint = endpoint_key(route.provider, route.base_url)
         limiter, limit = limiter_for(endpoint), self._calls_in_flight_limit(endpoint)
         # The host's progress hook and deadline, read here on the compress() thread (D10).
@@ -2070,15 +2167,11 @@ class CompactionMixin:
             return settings.scrub(str(exc)) if isinstance(exc, SummaryFailure) \
                 else failure_text(exc, settings.secrets)
 
-        subscribers: List[Subscriber] = []
-        ways: Dict[str, int] = {}
         # Every chunk's outcome arrives here, once, after it is complete: the one place
         # the compress() thread reads outcomes from.
         finished: "queue.Queue[int]" = queue.Queue()
+        calls: List[tuple] = []
         for number, (chunk_handle, chunk) in enumerate(zip(chunk_handles, chunks), start=1):
-            # A cancelled or no longer current attempt starts no further call (#29 W2 step 2).
-            if not still_wanted():
-                raise AttemptCancelled()
             records = [attempt.records[index] for index in chunk]
             # A member whose row has no host identity (the gateway's replayed history, or
             # host scaffolding the host never persists) is recorded anew at every attempt,
@@ -2101,6 +2194,31 @@ class CompactionMixin:
                                    {"chunk": chunk_handle, "error": f"{type(exc).__name__}: {exc}"})
                 return self._abort(messages, f"the summariser call of chunk {number} of {len(chunks)} could not be "
                                              f"prepared ({type(exc).__name__}: {exc})")
+            calls.append((number, chunk_handle, chunk, records, subscriber, run))
+        return _Planned(route=route, chunks=chunks, kept_state=kept_state, mechanism=mechanism,
+                        tail_start=tail_start, endpoint=endpoint, limiter=limiter, limit=limit,
+                        still_wanted=still_wanted, describe=describe, finished=finished, calls=calls)
+
+    def _dispatch_phase(self, attempt, messages: List[Dict[str, Any]], planned: "_Planned", *,
+                        settings: CallSettings, focus_topic: Optional[str], started: float,
+                        recovery_cap: Optional[int]) -> List[Dict[str, Any]]:
+        """Steps 4 and 5, after the planning boundary: from the dispatch of the first call
+        on, the calls, the wait and the return, each failure with its own handler (#7,
+        #33). Everything a call needs was prepared inside the boundary."""
+        route, chunks, kept_state = planned.route, planned.chunks, planned.kept_state
+        mechanism, tail_start = planned.mechanism, planned.tail_start
+        endpoint, limiter, limit = planned.endpoint, planned.limiter, planned.limit
+        still_wanted, describe, finished = planned.still_wanted, planned.describe, planned.finished
+
+        # 4. One summary per chunk, every chunk's call issued at once (#12, #33): each
+        # joins the call in flight for the same records, reuses a summary of them already
+        # written, or starts on a worker of its own.
+        subscribers: List[Subscriber] = []
+        ways: Dict[str, int] = {}
+        for number, chunk_handle, chunk, records, subscriber, run in planned.calls:
+            # A cancelled or no longer current attempt starts no further call (#29 W2 step 2).
+            if not still_wanted():
+                raise AttemptCancelled()
             # Attempts share a call only with the same summariser route and effort, the
             # rule a reuse applies (``summary_of_records``). The reuse reads the store; a
             # read that fails aborts the compaction (#7). Calls already started for
