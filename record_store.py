@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -85,6 +86,42 @@ def _warn_media(handle: str, message: dict) -> None:
         logger.warning("LCM could not check record %s for media", handle, exc_info=True)
 
 
+HANDLE_RE = re.compile(r"[mtcs][a-z2-7]{8}")
+
+
+@dataclass(frozen=True)
+class Cover:
+    """A session's latest effective return as the tools read it (``RecordStore.cover``)."""
+
+    session: str
+    compaction: int
+    summaries: list        # the summary entries' derivation handles, in return order
+    reaches: dict          # derivation -> the chunks it reaches, in order
+    chunks: list           # every chunk under the summaries, in cover order
+    tail: list             # the record entries (the stored fresh tail), in order
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """What a handle names for a caller (#29 W5). ``status``: "ok"; "malformed" (not a
+    handle); "unknown" (not in this store); "other_session"; "inactive" (this session's,
+    but not on its active record: a reverted branch, an attempt that never took effect,
+    or a session with no effective compaction yet); "summary_revision" (a message handle
+    naming the host's rewrite of a summary row the plugin returned, a revision beside the
+    chain, #15: the summary is expanded, not the row; ``of`` names it). For a message or a
+    tool call: ``record`` (the message's record), and for a call ``position`` (0-based) and
+    ``name``. For "inactive": ``cause``, the store's facts about why (``inactive_cause``)."""
+
+    status: str
+    kind: str
+    handle: str
+    of: str = ""
+    record: str = ""
+    position: Optional[int] = None
+    name: Optional[str] = None
+    cause: Optional[dict] = None
+
+
 def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
     if not isinstance(value, str) or ":" not in value:
         return None
@@ -141,6 +178,9 @@ class RecordStore:
         # How deep the thread that holds ``_lock`` is inside ``_tx``: an inner ``_tx``
         # joins the outer transaction (the planning transaction, ``planning``).
         self._tx_depth = 0
+        # How deep the thread that holds ``_lock`` is inside ``snapshot``: a read
+        # transaction, in which no event is flushed (that would need the write lock).
+        self._read_depth = 0
         self._pending_events: list[tuple] = []
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(
             str(self.db_path),
@@ -254,7 +294,7 @@ class RecordStore:
         """Write the events not written yet, in their own short transaction; inside an
         open transaction they wait for its end (``_tx`` flushes after its commit)."""
         with self._lock:
-            if not self._pending_events or self._conn is None or self._tx_depth:
+            if not self._pending_events or self._conn is None or self._tx_depth or self._read_depth:
                 return
             conn = self._conn
             try:
@@ -609,6 +649,330 @@ class RecordStore:
         )
         return {int(row_id): str(record) for row_id, record in rows}
 
+    # --- Reading for the tools (#18; #29 W5) -----------------------------------------
+
+    @contextlib.contextmanager
+    def snapshot(self):
+        """One read transaction around a tool's reads, so that a compaction committing
+        meanwhile, in this process or another, is not half seen. It holds the helper's
+        lock and, in rollback-journal mode, a shared lock on the file: a writer's commit
+        waits for it (within its busy timeout), so nothing slow runs inside it, and never
+        a model call. Inside an open transaction of this helper it joins that one."""
+        with self._lock:
+            conn = self._conn
+            if self._tx_depth or self._read_depth:
+                self._read_depth += 1
+                try:
+                    yield
+                finally:
+                    self._read_depth -= 1
+                return
+            conn.execute("BEGIN")
+            self._read_depth = 1
+            try:
+                yield
+            except BaseException:
+                self._rollback(conn)
+                raise
+            else:
+                conn.execute("COMMIT")
+            finally:
+                self._read_depth = 0
+            self._flush_events()
+
+    def cover(self, session: str) -> Optional["Cover"]:
+        """What the session's latest effective compaction returned, as the tools see it:
+        its summary entries in order, the chunks each reaches, and its record entries
+        (the stored fresh tail). None where the session has no effective compaction."""
+        compaction = self.effective_compaction(session)
+        if compaction is None:
+            return None
+        entries = self.return_entries(compaction)
+        summaries: list[str] = []
+        tail: list[str] = []
+        for position in sorted(entries):
+            kind, record, derivation, _raw = entries[position]
+            if kind == "summary" and derivation:
+                summaries.append(str(derivation))
+            elif kind == "record" and record:
+                tail.append(str(record))
+        reaches = {derivation: self._chunks_of(derivation) for derivation in summaries}
+        chunks = [chunk for derivation in summaries for chunk in reaches[derivation]]
+        return Cover(session=session, compaction=compaction, summaries=summaries, reaches=reaches,
+                     chunks=chunks, tail=tail)
+
+    def resolve(self, handle: str, session: str, cover: Optional["Cover"]) -> "Resolved":
+        """What a handle names, for the tools of ``session`` (#29 W5): a handle resolves
+        only in this store and only in the caller's plugin session, and there only where
+        the session's active record holds it (its latest effective return: the stored tail,
+        and the chunks under its summaries). Never against a host identifier."""
+        text = str(handle or "").strip()
+        if not HANDLE_RE.fullmatch(text):
+            return Resolved("malformed", "", text)
+        kind = text[0]
+        home: Optional[str] = None
+        if kind == MESSAGE:
+            rows = self._q("SELECT session FROM records WHERE handle = ?", (text,))
+            home = str(rows[0][0]) if rows else None
+        elif kind == TOOL_CALL:
+            rows = self._q("SELECT r.session, r.handle FROM tool_calls t JOIN records r ON r.handle = t.record "
+                           "WHERE t.handle = ?", (text,))
+            home = str(rows[0][0]) if rows else None
+        elif kind == CHUNK:
+            rows = self._q("SELECT session FROM chunks WHERE handle = ?", (text,))
+            home = str(rows[0][0]) if rows else None
+        elif kind == DERIVATION:
+            reached = self._chunks_of(text) if self._q("SELECT 1 FROM derivations WHERE handle = ?", (text,)) else []
+            if reached:
+                sessions = {str(s) for (s,) in self._q(
+                    f"SELECT DISTINCT session FROM chunks WHERE handle IN ({','.join('?' * len(reached))})", reached)}
+                # A derivation reaches the chunks of one session; more than one is no session's.
+                home = next(iter(sessions)) if len(sessions) == 1 else ""
+        if home is None:
+            return Resolved("unknown", kind, text)
+        if home != session:
+            return Resolved("other_session", kind, text)
+        chunks = set(cover.chunks) if cover is not None else set()
+        if kind == CHUNK:
+            if text in chunks:
+                return Resolved("ok", kind, text)
+            written_by = self._q("SELECT compaction FROM chunks WHERE handle = ?", (text,))[0][0]
+            return Resolved("inactive", kind, text, cause=self._compaction_cause(int(written_by), session))
+        if kind == DERIVATION:
+            if reached and all(chunk in chunks for chunk in reached):
+                return Resolved("ok", kind, text)
+            written_by = self._q("SELECT compaction FROM derivations WHERE handle = ?", (text,))[0][0]
+            cause = self._compaction_cause(int(written_by), session) if written_by is not None else None
+            return Resolved("inactive", kind, text, cause=cause or {"kind": "none"})
+        # A message, or a tool call: (the record, the call's position in it). A call is on
+        # the active record exactly while its record is (round 5 of #71): its handle names
+        # that record's call, and a rewrite of the record has calls of its own.
+        record, position, name = text, None, None
+        if kind == TOOL_CALL:
+            record, position = self._q("SELECT record, position FROM tool_calls WHERE handle = ?", (text,))[0]
+            record, position = str(record), int(position)
+            raw = self.record_raw(record) or {}
+            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+            call = calls[position] if position < len(calls) and isinstance(calls[position], dict) else {}
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            name = function.get("name")
+        if cover is not None and self._record_active(record, cover):
+            return Resolved("ok", kind, text, record=record, position=position, name=name)
+        if kind == MESSAGE:
+            revised = self._q("SELECT derivation FROM summary_revisions WHERE revision = ? LIMIT 1", (text,))
+            if revised:
+                return Resolved("summary_revision", kind, text, of=str(revised[0][0]))
+        return Resolved("inactive", kind, text, record=record, position=position, name=name,
+                        cause=self.inactive_cause(record, session, cover))
+
+    # --- Why a record is not on the active record: store facts only ------------------
+
+    def _compaction_cause(self, compaction: int, session: str) -> Optional[dict]:
+        """"rejected" or "unconfirmed" where the store says so of the compaction that
+        wrote something; None where that compaction took effect."""
+        if self._q("SELECT 1 FROM rejections WHERE compaction = ? LIMIT 1", (compaction,)):
+            return {"kind": "rejected", "compaction": compaction}
+        if not self.is_settled(compaction):
+            return {"kind": "unconfirmed", "compaction": compaction}
+        return None
+
+    def inactive_cause(self, record: str, session: str, cover: Optional["Cover"]) -> dict:
+        """The cause, as the store records it, of a record not being on the active record
+        (the orchestrator's ruling on round 5 of #71: no text claims a cause the store did
+        not record). A cause tells the record's history on the active path, not who wrote it
+        (ruling on the pre-review of 0771477, A): a record a retry reused stood where the
+        effective list held it. The first that holds:
+
+        - "revised": a record revising it (transitively, ``revision_lineage``) stands on the
+          active record: that record, the compaction that wrote it, the revisions between,
+          and the other records a merge took in with it;
+        - "left": an effective compaction's list held it (k), written there or reused, and
+          a later effective compaction's list (n) held neither it nor a revision of it;
+        - "rejected" / "unconfirmed", only for a record no effective list ever held: the
+          compaction that wrote it was rejected by the host, or is neither confirmed,
+          adopted nor rejected;
+        - "none": the store records nothing that says why."""
+        if cover is not None:
+            parent: dict[str, Optional[str]] = {record: None}
+            frontier = [record]
+            found: Optional[str] = None
+            while frontier and found is None:
+                current, frontier = frontier[0], frontier[1:]
+                # In write order (the re-plan of #71, C4), never the handles' text order.
+                for (step,) in self._q("SELECT s.revision FROM revision_sources s JOIN records r ON r.handle = "
+                                       "s.revision WHERE s.source_record = ? ORDER BY r.record_id", (current,)):
+                    step = str(step)
+                    if step in parent:
+                        continue
+                    parent[step] = current
+                    if self._record_active(step, cover):
+                        found = step
+                        break
+                    frontier.append(step)
+            if found is not None:
+                path = [found]
+                while parent[path[-1]] is not None:
+                    path.append(parent[path[-1]])
+                path.reverse()                          # record, ..., found
+                on_path = set(path)
+                together: list[str] = []
+                for revision in path[1:]:
+                    for (source,) in self._q("SELECT source_record FROM revision_sources WHERE revision = ? AND "
+                                             "source_record IS NOT NULL ORDER BY ordinal", (revision,)):
+                        if str(source) not in on_path and str(source) not in together:
+                            together.append(str(source))
+                written_by = self._q("SELECT compaction FROM records WHERE handle = ?", (found,))[0][0]
+                return {"kind": "revised", "active": found, "compaction": int(written_by),
+                        "via": path[1:-1], "together": together}
+        effective = [int(c) for (c,) in self._q(
+            "SELECT compaction_id FROM effective_compactions WHERE session = ? ORDER BY compaction_id", (session,))]
+        held_self = {int(c) for (c,) in self._q(
+            "SELECT DISTINCT compaction FROM compaction_inputs WHERE record = ?", (record,))}
+        stood = [c for c in effective if c in held_self]
+        if stood:
+            forms = {record} | set(self.revision_lineage(record))
+            holders = {int(c) for (c,) in self._q(
+                f"SELECT DISTINCT compaction FROM compaction_inputs WHERE record IN ({','.join('?' * len(forms))})",
+                list(forms))}
+            later = [c for c in effective if c > stood[-1] and c not in holders]
+            if later:
+                return {"kind": "left", "stood": stood[-1], "gone": later[0]}
+            return {"kind": "none"}
+        own = self._q("SELECT compaction FROM records WHERE handle = ?", (record,))
+        if own:
+            cause = self._compaction_cause(int(own[0][0]), session)
+            if cause is not None:
+                return cause
+        return {"kind": "none"}
+
+    def _record_active(self, record: str, cover: "Cover") -> bool:
+        if record in cover.tail:
+            return True
+        if not cover.chunks:
+            return False
+        return bool(self._q(
+            f"SELECT 1 FROM chunk_members WHERE record = ? AND chunk IN ({','.join('?' * len(cover.chunks))}) "
+            f"LIMIT 1", (record, *cover.chunks)))
+
+    def chunk_records(self, chunk: str) -> list[tuple[str, dict]]:
+        """(record handle, the host's dict as stored) of a chunk's members, in order."""
+        return [(str(handle), json.loads(raw)) for handle, raw in self._q(
+            "SELECT r.handle, r.raw FROM chunk_members m JOIN records r ON r.handle = m.record "
+            "WHERE m.chunk = ? ORDER BY m.ordinal", (chunk,))]
+
+    def record_raw(self, record: str) -> Optional[dict]:
+        rows = self._q("SELECT raw FROM records WHERE handle = ?", (record,))
+        return json.loads(rows[0][0]) if rows else None
+
+    def derivation_sources(self, derivation: str) -> list[tuple[Optional[str], Optional[str]]]:
+        """(chunk, source derivation) of a derivation, in order: exactly one is set."""
+        return [(c, d) for c, d in self._q(
+            "SELECT chunk, source_derivation FROM derivation_sources WHERE derivation = ? ORDER BY ordinal",
+            (derivation,))]
+
+    def derivation_text(self, derivation: str) -> Optional[str]:
+        rows = self._q("SELECT text FROM derivations WHERE handle = ?", (derivation,))
+        return str(rows[0][0]) if rows else None
+
+    def derivation_state(self, derivation: str) -> str:
+        """The state the store records for a derivation, from the compaction that wrote it
+        (``_compaction_cause``): "rejected", "unconfirmed", or "effective" where that
+        compaction took effect."""
+        rows = self._q("SELECT compaction FROM derivations WHERE handle = ?", (derivation,))
+        if not rows:
+            raise KeyError(f"no derivation {derivation} in this store")
+        if rows[0][0] is None:
+            return "none"             # the store records no compaction for it
+        cause = self._compaction_cause(int(rows[0][0]), "")
+        return cause["kind"] if cause is not None else "effective"
+
+    def tool_calls_of(self, records: Sequence[str]) -> dict[str, dict[int, str]]:
+        """record -> {position in its ``tool_calls``: the call's handle}: the handles minted
+        with each record, its own and no other's (``_write_tool_calls``)."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, dict[int, str]] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            for record, position, handle in self._q(
+                    f"SELECT record, position, handle FROM tool_calls WHERE record IN ({','.join('?' * len(part))})",
+                    part):
+                found.setdefault(str(record), {})[int(position)] = str(handle)
+        return found
+
+    # --- Revisions ----------------------------------------------------------------------
+
+    def revision_lineage(self, record: str) -> list[str]:
+        """A record's revisions, transitively (the records that revise it, and theirs),
+        nearest first, the record itself excluded. It names causes (``inactive_cause``);
+        no handle is carried along it."""
+        found: list[str] = []
+        frontier = [record]
+        while frontier:
+            current, frontier = frontier[0], frontier[1:]
+            for (step,) in self._q("SELECT revision FROM revision_sources WHERE source_record = ? "
+                                   "ORDER BY ordinal", (current,)):
+                if str(step) != record and str(step) not in found:
+                    found.append(str(step))
+                    frontier.append(str(step))
+        return found
+
+    def active_units(self, cover: "Cover") -> list[list[str]]:
+        """The active record in its order, as units: each chunk under the cover's summaries,
+        its members in order, then the stored tail. A tool call and its results never lie
+        in two units (the cut never separates them), but pairing reads across a boundary
+        anyway (``pairing.blocks_span``)."""
+        units: list[list[str]] = []
+        if cover.chunks:
+            members: dict[str, list[str]] = {}
+            for chunk, record in self._q(
+                    f"SELECT chunk, record FROM chunk_members WHERE chunk IN ({','.join('?' * len(cover.chunks))}) "
+                    f"ORDER BY chunk, ordinal", tuple(cover.chunks)):
+                members.setdefault(str(chunk), []).append(str(record))
+            units.extend(members.get(chunk, []) for chunk in cover.chunks)
+        units.append(list(cover.tail))
+        return units
+
+    def record_roles(self, records: Sequence[str]) -> dict[str, Optional[str]]:
+        """record -> the role its message has, as written beside it."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, Optional[str]] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({str(h): (str(role) if role is not None else None) for h, role in self._q(
+                f"SELECT handle, role FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
+        return found
+
+    def records_raw(self, records: Sequence[str]) -> dict[str, dict]:
+        """record -> the host's dict as stored."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, dict] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({str(h): json.loads(raw) for h, raw in self._q(
+                f"SELECT handle, raw FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
+        return found
+
+    def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
+        """record id (the views' store_id) -> its handle."""
+        wanted = [int(i) for i in dict.fromkeys(record_ids) if i is not None]
+        found: dict[int, str] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({int(i): str(h) for i, h in self._q(
+                f"SELECT record_id, handle FROM records WHERE record_id IN ({','.join('?' * len(part))})", part)})
+        return found
+
+    def handles_of_derivations(self, derivation_ids: Iterable[int]) -> dict[int, str]:
+        """derivation id (the views' node_id) -> its handle."""
+        wanted = [int(i) for i in dict.fromkeys(derivation_ids) if i is not None]
+        found: dict[int, str] = {}
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            found.update({int(i): str(h) for i, h in self._q(
+                f"SELECT derivation_id, handle FROM derivations WHERE derivation_id IN ({','.join('?' * len(part))})",
+                part)})
+        return found
+
     # --- The invariant (#29 W7, #34 D5) --------------------------------------------
 
     def identity(self) -> dict[str, Any]:
@@ -649,6 +1013,10 @@ class RecordStore:
           its first member stands on the branch. A chunk of records beside the chain
           only (host insertions) has no place on the branch and takes no part in the
           order. Every summary entry reaches at least one chunk.
+        - Every call handle of the session names a position of an assistant record's
+          ``tool_calls`` and keeps the host id the record holds there, and every assistant
+          record has a handle for each of its positions (a second handle for one position
+          the table's UNIQUE(record, position) already refuses; this finds the gaps).
 
         The whole check reads one snapshot: it runs inside one read transaction, so
         a compaction committing meanwhile is not half seen. In rollback-journal mode
@@ -859,6 +1227,39 @@ class RecordStore:
                 problem(f"summary entry {position} stands before an entry whose run begins earlier")
             previous_first = ranks[0]
 
+        # The call handles (round 5 of #71): each names (record, position) of an assistant
+        # record of this session, the host's id beside it is the one the record holds at
+        # that position, and every assistant record has exactly one handle per call.
+        raws = {str(h): json.loads(r) for h, r in self._q(
+            "SELECT handle, raw FROM records WHERE session = ? AND role = 'assistant'", (session,))}
+        rows_of: dict[str, dict[int, Optional[str]]] = {}
+        for handle, record, position, call_id in self._q(
+                "SELECT t.handle, t.record, t.position, t.tool_call_id FROM tool_calls t JOIN records r "
+                "ON r.handle = t.record WHERE r.session = ?", (session,)):
+            record, position = str(record), int(position)
+            raw = raws.get(record)
+            calls = raw.get("tool_calls") if isinstance(raw, dict) and isinstance(raw.get("tool_calls"), list) \
+                else None
+            if calls is None:
+                problem(f"call handle {handle} names record {record}, which is not an assistant record "
+                        f"with tool calls")
+                continue
+            if position >= len(calls):
+                problem(f"call handle {handle} names position {position} of record {record}, "
+                        f"which has {len(calls)} calls")
+                continue
+            held = calls[position].get("id") if isinstance(calls[position], dict) else None
+            held = str(held) if held not in (None, "") else None
+            if held != call_id:
+                problem(f"call handle {handle} keeps the host id {call_id!r}; record {record} holds {held!r} "
+                        f"at position {position}")
+            rows_of.setdefault(record, {})[position] = call_id
+        for record, raw in raws.items():
+            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+            if sorted(rows_of.get(record, {})) != list(range(len(calls))):
+                problem(f"assistant record {record} has {len(calls)} calls and handles for positions "
+                        f"{sorted(rows_of.get(record, {}))}")
+
         return {
             "session": session,
             "compaction": compaction,
@@ -903,10 +1304,10 @@ class RecordStore:
         Returns the compaction id, the record of every input position that has one,
         and the chunk handles in the order given. Each new record takes the
         predecessor its entry names (the classification decides it, #29 W3/W4); a
-        revision also gets its ``revision_sources``. Tool calls are written for new
-        transcript and host insertions; a revision keeps its original's calls. A chunk
-        is given as the input positions of its members, in order; every member must
-        have a record.
+        revision also gets its ``revision_sources``. Every assistant record written, a
+        revision included, gets a handle of its own for each of its tool calls
+        (``_write_tool_calls``); nothing is inherited. A chunk is given as the input
+        positions of its members, in order; every member must have a record.
         """
         records: dict[int, str] = {}
         chunk_handles: list[str] = []
@@ -965,25 +1366,12 @@ class RecordStore:
                                     "source_position) VALUES (?, ?, ?, ?)",
                                     (handle, ordinal, source[1], source[2]),
                                 )
-                        # Calls the sources already hold keep their handles; only the
-                        # revision's new calls are written, as for a new record.
-                        source_records = [s[1] for s in entry.sources if s[0] == "record"]
-                        known = {
-                            str(call_id)
-                            for (call_id,) in conn.execute(
-                                "SELECT tool_call_id FROM tool_calls WHERE tool_call_id IS NOT NULL AND record IN "
-                                f"({','.join('?' * len(source_records))})",
-                                source_records,
-                            ).fetchall()
-                        } if source_records else set()
-                        written.append((handle, message, known))
-                    else:
-                        written.append((handle, message, set()))
+                    written.append((handle, message))
                 conn.execute(
                     "INSERT INTO compaction_inputs(compaction, position, host_row_id, record) VALUES (?, ?, ?, ?)",
                     (cid, entry.position, entry.host_row_id, records.get(entry.position)),
                 )
-            self._write_tool_calls(conn, session, cid, written)
+            self._write_tool_calls(conn, written)
             for positions in chunks:
                 members = [records[position] for position in positions]
                 handle = self._insert_with_handle(
@@ -997,7 +1385,7 @@ class RecordStore:
                     [(handle, ordinal, record) for ordinal, record in enumerate(members)],
                 )
                 chunk_handles.append(handle)
-        for handle, message, _known in written:
+        for handle, message in written:
             _warn_media(handle, message)
         if uncounted:
             # "Known, or nothing" (#35): the estimate of these records leaves images
@@ -1010,59 +1398,25 @@ class RecordStore:
             )
         return int(cid), records, chunk_handles
 
-    def _write_tool_calls(
-        self,
-        conn: sqlite3.Connection,
-        session: str,
-        cid: int,
-        written: list[tuple[str, dict, set]],
-    ) -> None:
-        """One row per tool call, pointing into its assistant record by position; a
-        result recorded in the same compaction is its ``result_record``, one recorded
-        by a later compaction is linked through ``tool_results``. Each entry carries
-        the call ids that already have a handle (a revision's sources) and are skipped."""
-        results_by_call_id: dict[str, list[str]] = {}
-        for handle, message, _known in written:
-            if message.get("role") == "tool" and message.get("tool_call_id"):
-                results_by_call_id.setdefault(str(message["tool_call_id"]), []).append(handle)
-        claimed: set[str] = set()
-        for handle, message, known in written:
-            calls = message.get("tool_calls") or []
+    def _write_tool_calls(self, conn: sqlite3.Connection, written: list[tuple[str, dict]]) -> None:
+        """One handle per tool call of every assistant record written, named by (record,
+        position in its ``tool_calls``) and minted here, with the record (#29 W5; the
+        orchestrator's ruling on round 5 of #71): never inherited from a record this one
+        revises, never carried by the host's id, never re-pointed. The host's id is kept
+        beside it as the record holds it. Which result answers a call is not stored: it is
+        read, in the active order, by the host's own pairing rule (``pairing``)."""
+        for handle, message in written:
+            calls = message.get("tool_calls")
             if message.get("role") != "assistant" or not isinstance(calls, list):
                 continue
             for index, call in enumerate(calls):
-                call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
-                if call_id and call_id in known:
-                    continue
-                result = None
-                for candidate in results_by_call_id.get(call_id, []):
-                    if candidate not in claimed:
-                        result = candidate
-                        claimed.add(candidate)
-                        break
+                call_id = call.get("id") if isinstance(call, dict) else None
                 self._insert_with_handle(
                     conn,
                     TOOL_CALL,
-                    "INSERT INTO tool_calls(handle, record, position, tool_call_id, result_record) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (handle, index, call_id or None, result),
+                    "INSERT INTO tool_calls(handle, record, position, tool_call_id) VALUES (?, ?, ?, ?)",
+                    (handle, index, str(call_id) if call_id not in (None, "") else None),
                 )
-        for call_id, handles in results_by_call_id.items():
-            for result in handles:
-                if result in claimed:
-                    continue
-                row = conn.execute(
-                    "SELECT t.handle FROM tool_calls t JOIN records r ON r.handle = t.record "
-                    "WHERE r.session = ? AND t.tool_call_id = ? AND t.result_record IS NULL "
-                    "AND NOT EXISTS (SELECT 1 FROM tool_results x WHERE x.tool_call = t.handle) "
-                    "ORDER BY r.rowid DESC, t.position DESC LIMIT 1",
-                    (session, call_id),
-                ).fetchone()
-                if row is not None:
-                    conn.execute(
-                        "INSERT INTO tool_results(tool_call, result_record, compaction) VALUES (?, ?, ?)",
-                        (row[0], result, cid),
-                    )
 
     def write_derivation(
         self,
