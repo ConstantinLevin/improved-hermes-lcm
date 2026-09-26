@@ -390,6 +390,34 @@ def _host_model_forms(model: str, provider: str) -> set[str]:
     return forms
 
 
+def _same_provider_label(route: SummariserRoute, label: str) -> bool:
+    """Whether a ``route_info`` record's provider is the session route's own, as the host
+    labels the main provider it routes to (``_try_main_provider_route`` returns the main
+    provider; ``_record_route_info`` records it through ``_fallback_provider_from_label``,
+    agent/auxiliary_client.py:4560-4605 and 7345 at origin/main d0288be5b3): the same
+    provider after the host's own normalisation (``_normalize_aux_provider``); a
+    ``custom:<name>`` session, which the host routes and records as ``custom``, recorded
+    as ``custom``; an actual-route session (``hermes_cli.providers.is_actual_route``)
+    recorded as ``actual``. Probed: openrouter, custom, custom:foo (as custom), x-ai,
+    deepseek. Anything else is another provider."""
+    named = str(route.named_provider or route.provider or "").strip()
+    recorded = str(label or "").strip()
+    if not named or not recorded:
+        return False
+    host_named, host_recorded = _host_provider(named), _host_provider(recorded)
+    if host_named is not None and host_named == host_recorded:
+        return True
+    if named.lower().startswith("custom:") and recorded.lower() == "custom":
+        return True
+    if recorded.lower() == "actual":
+        try:
+            from hermes_cli.providers import is_actual_route  # type: ignore
+            return bool(is_actual_route(named, route.base_url))
+        except Exception:
+            return False
+    return False
+
+
 def _session_route_answered(route: SummariserRoute, answered: tuple[str, str]) -> bool:
     """After a fallback, whether the route that answered is the session route's own
     provider and model (the orchestrator's ruling on D9). Only a provider that names its
@@ -456,13 +484,24 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
     if timeout is not None:
         call_kwargs["timeout"] = timeout
     response = call_llm(**call_kwargs)
-    # D9, by the host's own resolution of this route, never by an alias table of the
-    # plugin's: the host's label for a provider is not its normalised name (an explicit
-    # "openai" route with a base URL is recorded as "custom", "x-ai" as "x-ai").
+    # D9, by the host's own resolution of this route and its own normalisation of provider
+    # names, never by an alias table of the plugin's (``_same_provider_label``).
     if not route_info.routes:
         raise SummaryFailure("reply on an unknown route", transient=False, kind="route",
                              detail="the host recorded no route in route_info (#33 D9)")
     resolved, answered = route_info.routes[0], route_info.routes[-1]
+    # Every record names the session route's own provider, however many there are (the
+    # orchestrator's ruling on the Codex review of 5b74bbc): the host can skip an
+    # unhealthy main provider and pick a fallback before its first record
+    # (``_resolve_auto_route``, agent/auxiliary_client.py:4649 at origin/main d0288be5b3),
+    # so one record naming another provider is a reply from another route.
+    other = next((record for record in route_info.routes if not _same_provider_label(route, record[0])), None)
+    if other is not None:
+        raise SummaryFailure(
+            "reply on another provider's route", transient=False, kind="route",
+            detail=f"route_info names {other[0] or '?'}/{other[1] or '?'}; the summariser is {route.describe()} "
+                   f"(#33 D9)",
+        )
     if resolved[1] not in _host_model_forms(route.model, resolved[0]):
         raise SummaryFailure(
             "the host resolved the summariser's route to another model", transient=False, kind="route",

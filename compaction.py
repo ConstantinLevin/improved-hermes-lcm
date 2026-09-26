@@ -206,6 +206,14 @@ class ChunkInput:
     withheld: Optional[dict]
 
 
+class _StageError(Exception):
+    """A failure of one stage of ``_tail_and_cut``, with the stage's name."""
+
+    def __init__(self, where: str, exc: BaseException) -> None:
+        super().__init__(f"{where}: {type(exc).__name__}: {exc}")
+        self.where, self.exc = where, exc
+
+
 @dataclass
 class _Step:
     """The step of the planning phase under way, for the cause of a failure the
@@ -254,13 +262,16 @@ class TailPlan:
     """Where the tail begins and how it was sized (``_tail_plan``); with the chunks of
     an earlier attempt the cut keeps (``kept``) and those that reach the floor and stay
     whole in the tail (``held``), each as (``FrozenChunk``, positions); and those it
-    does not keep after all (``recut``), each as (``FrozenChunk``, why)."""
+    does not keep after all (``recut``), each as (``FrozenChunk``, why); of those, the
+    ones released below c/4 for a neighbour to take (``released``, as (``FrozenChunk``,
+    positions)), which ``compress()`` keeps after all where the cut does not join them."""
 
     start: int
     label: str
     kept: List[tuple] = field(default_factory=list)
     held: List[tuple] = field(default_factory=list)
     recut: List[tuple] = field(default_factory=list)
+    released: List[tuple] = field(default_factory=list)
 
 
 @dataclass
@@ -813,9 +824,12 @@ class CompactionMixin:
 
     def _tail_plan(self, messages: List[Dict[str, Any]], mechanism: set,
                    occasion: Optional[Occasion] = None, frozen: Sequence[tuple] = (),
-                   fixed: Optional[tuple] = None, focus_topic: str = "") -> "TailPlan":
+                   fixed: Optional[tuple] = None, focus_topic: str = "",
+                   keep: Optional[set] = None) -> "TailPlan":
         """Where the tail begins, and how it was sized (#13, #31). ``focus_topic`` is the
-        attempt's focus text, which B counts (``_summariser_bound``).
+        attempt's focus text, which B counts (``_summariser_bound``). ``keep`` names frozen
+        chunks below c/4 not to release: ``compress()`` found that the cut would not join
+        them.
 
         The tail takes what the target leaves: after the compaction the context is
         F + S + (the new summaries) + t + R_in, and it should come to G. In the plugin's
@@ -888,6 +902,7 @@ class CompactionMixin:
         kept: List[tuple] = []
         held: List[tuple] = []
         recut: List[tuple] = []
+        released: List[tuple] = []
         claimed: set = set()
         smallest = self._smallest_run(focus_topic)
         bound = self._summariser_bound(focus_topic)[0] if frozen else None
@@ -914,6 +929,12 @@ class CompactionMixin:
             limit = self._chunk_limit(focus_topic)
             image_limit = self._image_limit()
             owner = {i: which for which, (_chunk, positions) in enumerate(frozen) for i in positions}
+        # Only what takes part in the cut can take a released chunk (the orchestrator's
+        # ruling on the Codex review of 5b74bbc): the entries before the tail, which begins
+        # at the sized start or after the last candidate below the floor, whichever is
+        # later. Rows in the tail are no neighbour.
+        cut_end = min(floor, max([sized] + [positions[-1] + 1 for _chunk, positions in frozen
+                                            if positions and positions[-1] < floor]))
 
         def within(tokens: int, images: int) -> bool:
             return (bound is None or tokens <= bound) and (image_limit is None or images <= image_limit)
@@ -923,7 +944,7 @@ class CompactionMixin:
             image limit, as the cut would (``_cut_chunks``), and which; None where none
             can (the orchestrator's ruling on 6736c1d: such a chunk, sent alone, stays
             frozen). The neighbours are the groups adjacent to it outside the mechanism's
-            layer and before the floor: another candidate is taken as one chunk of its
+            layer and before the tail (``cut_end``): another candidate is taken as one chunk of its
             weight, a group above c or above the image limit as an oversized chunk, any
             other group as part of a run, which is split again and so always takes it.
             Without B and an image limit nothing bounds a merge."""
@@ -931,7 +952,7 @@ class CompactionMixin:
                 return "any neighbour (the summariser's window is not known, so no bound applies)"
             pictured = cut_images(positions)
             before = next((i for i in range(positions[0] - 1, first - 1, -1) if i not in mechanism_set), None)
-            after = next((i for i in range(positions[-1] + 1, floor) if i not in mechanism_set), None)
+            after = next((i for i in range(positions[-1] + 1, cut_end) if i not in mechanism_set), None)
             for side, index in (("following", after), ("preceding", before)):
                 if index is None or index not in group_of:
                     continue
@@ -958,13 +979,16 @@ class CompactionMixin:
                 recut.append((chunk, "its members are no longer whole groups over consecutive entries of this list"))
                 continue
             weight = cut_weight(positions)
-            taker = neighbour_takes(which, positions, weight) if weight < smallest else None
+            taker = (neighbour_takes(which, positions, weight)
+                     if weight < smallest and chunk.chunk not in (keep or ()) else None)
             if weight < smallest and chunk.state != "summarised" and taker is not None:
                 # Below c/4 and a neighbour can now take it within B: cut again, so that it
                 # joins. One no neighbour can take within B was sent alone by the cut and
-                # stays frozen, its failures counted (the orchestrator's ruling on 6736c1d).
+                # stays frozen, its failures counted (the orchestrator's ruling on 6736c1d);
+                # so does one the cut would not join after all (``keep``, from compress()).
                 recut.append((chunk, f"it holds {weight} tokens by today's estimate, below c/4 = {smallest}, has "
                                      f"no summary, and {taker} can take it within B"))
+                released.append((chunk, positions))
                 continue
             if (bound is not None and weight > bound and chunk.state != "summarised"
                     and len({tuple(group_of[i]) for i in positions}) > 1):
@@ -999,7 +1023,7 @@ class CompactionMixin:
         if held:
             label += (f"; {len(held)} kept chunk{'' if len(held) == 1 else 's'} reach{'es' if len(held) == 1 else ''} "
                       f"the floor at {floor} and stay whole in the tail")
-        return TailPlan(start, label, kept=kept, held=held, recut=recut)
+        return TailPlan(start, label, kept=kept, held=held, recut=recut, released=released)
 
     def _tail_start(self, messages: List[Dict[str, Any]], mechanism: set,
                     occasion: Optional[Occasion] = None) -> int:
@@ -1780,6 +1804,48 @@ class CompactionMixin:
         return self._dispatch_phase(attempt, messages, planned, settings=settings, focus_topic=focus_topic,
                                     started=started, recovery_cap=recovery_cap)
 
+    def _tail_and_cut(self, messages: List[Dict[str, Any]], mechanism: set, occasion: Occasion,
+                      frozen: Sequence[tuple], *, fixed: tuple, focus_topic: str, limit: int,
+                      bound: Optional[int], image_limit: Optional[int], estimator: Estimator,
+                      convert: Callable[[Any], Any], step: Optional["_Step"] = None) -> tuple:
+        """The tail and the cut, planned together (the orchestrator's ruling on the Codex
+        review of 5b74bbc): a frozen chunk below c/4 is released only where the cut then
+        joins it. One the cut leaves raw, or cuts as the same chunk alone, is kept frozen
+        after all, and the plan is made again; each round keeps one more, so there are at
+        most as many rounds as frozen chunks. Returns (plan, material, chunks, joins,
+        alone); a failure is raised as ``_StageError`` naming the stage."""
+        keep: set = set()
+        while True:
+            if step is not None:
+                step.at = "placing the tail"
+            try:
+                plan = self._tail_plan(messages, mechanism, occasion, frozen, fixed=fixed, focus_topic=focus_topic,
+                                       keep=keep)
+            except Exception as exc:
+                raise _StageError("placing the tail", exc) from exc
+            material = [index for index in range(plan.start) if index not in mechanism]
+            chunks: List[List[int]] = []
+            joins: List[dict] = []
+            alone: List[dict] = []
+            if material:
+                if step is not None:
+                    step.at = "cutting the material"
+                try:
+                    chunks = self._cut_chunks(messages, material, limit, estimator,
+                                              kept=[positions for _chunk, positions in plan.kept],
+                                              summarised=[chunk.state == "summarised" for chunk, _p in plan.kept],
+                                              joins=joins, convert=convert, bound=bound, alone=alone,
+                                              image_limit=image_limit)
+                except Exception as exc:
+                    raise _StageError("cutting the material", exc) from exc
+            cut_as = {tuple(chunk) for chunk in chunks}
+            covered = {index for chunk in chunks for index in chunk}
+            idle = [chunk.chunk for chunk, positions in plan.released
+                    if tuple(positions) in cut_as or not covered.intersection(positions)]
+            if not idle:
+                return plan, material, chunks, joins, alone
+            keep.update(idle)
+
     def _planning_failed(self, attempt, messages: List[Dict[str, Any]], step: "_Step",
                          exc: BaseException) -> List[Dict[str, Any]]:
         """An exception inside the planning phase that no handler there named: the
@@ -1861,32 +1927,6 @@ class CompactionMixin:
                                {"attempts": attempts,
                                 "chunks": [{"chunk": chunk, "attempt": compaction, "without_identity": list(rows)}
                                            for chunk, compaction, rows in frozen.unidentified]})
-        step.at = "placing the tail"
-        try:
-            plan = self._tail_plan(messages, mechanism, occasion, frozen.found, fixed=fixed,
-                                   focus_topic=focus_topic or "")
-        except ToolPairingError as exc:
-            self._record_event(attempt, "tool_pairing_error", str(exc))
-            return self._abort(messages, f"the tail cannot be placed: {exc}")
-        except Exception as exc:
-            return self._sizing_failed(attempt, messages, "placing the tail", exc)
-        for chunk, why in frozen.recut + plan.recut:
-            logger.warning("LCM cuts the %s chunk %s of attempt %d again: %s", chunk.state, chunk.chunk,
-                           chunk.compaction, why)
-            self._record_event(attempt, "frozen_chunk_recut",
-                               {"chunk": chunk.chunk, "state": chunk.state, "attempt": chunk.compaction,
-                                "reason": why})
-        tail_start = plan.start
-        logger.info("LCM tail: %s", plan.label)
-        for chunk, positions in plan.held:
-            # #31 holds that the floor is never inside a kept chunk; where it is (at a
-            # gap, the newest tool group can stand in a chunk an earlier occasion cut),
-            # the chunk is not cut again: it stays whole in the tail this time.
-            self._record_event(attempt, "kept_chunk_reaches_floor",
-                               {"chunk": chunk.chunk, "state": chunk.state, "positions": [positions[0], positions[-1]]})
-        # The cut, before the boundary is checked: a rest below c/4 at the end of the
-        # material stays raw and the tail begins at it (ruling on #61, 1).
-        material = [index for index in range(tail_start) if index not in mechanism]
         step.at = "sizing the chunks"
         try:
             # The cut's unit: each row as the summariser receives it (``_cut_estimate``).
@@ -1898,23 +1938,37 @@ class CompactionMixin:
             image_limit = self._image_limit()
         except Exception as exc:
             return self._sizing_failed(attempt, messages, "sizing the chunks", exc)
-        chunks: List[List[int]] = []
+        try:
+            plan, material, chunks, joins, alone = self._tail_and_cut(
+                messages, mechanism, occasion, frozen.found, fixed=fixed, focus_topic=focus_topic or "",
+                limit=limit, bound=bound, image_limit=image_limit, estimator=cut_estimator, convert=convert,
+                step=step)
+        except _StageError as failure:
+            if isinstance(failure.exc, ToolPairingError):
+                self._record_event(attempt, "tool_pairing_error", str(failure.exc))
+                what = "the tail cannot be placed" if failure.where == "placing the tail" else \
+                    "the material cannot be cut"
+                return self._abort(messages, f"{what}: {failure.exc}")
+            return self._sizing_failed(attempt, messages, failure.where, failure.exc)
+        tail_start = plan.start
+        for chunk, why in frozen.recut + plan.recut:
+            logger.warning("LCM cuts the %s chunk %s of attempt %d again: %s", chunk.state, chunk.chunk,
+                           chunk.compaction, why)
+            self._record_event(attempt, "frozen_chunk_recut",
+                               {"chunk": chunk.chunk, "state": chunk.state, "attempt": chunk.compaction,
+                                "reason": why})
+        logger.info("LCM tail: %s", plan.label)
+        for chunk, positions in plan.held:
+            # #31 holds that the floor is never inside a kept chunk; where it is (at a
+            # gap, the newest tool group can stand in a chunk an earlier occasion cut),
+            # the chunk is not cut again: it stays whole in the tail this time.
+            self._record_event(attempt, "kept_chunk_reaches_floor",
+                               {"chunk": chunk.chunk, "state": chunk.state, "positions": [positions[0], positions[-1]]})
+        # The cut was made before the boundary is checked: a rest below c/4 at the end of
+        # the material stays raw and the tail begins at it (ruling on #61, 1).
         waiting: List[int] = []
+        step.at = "cutting the material"
         if material:
-            joins: List[dict] = []
-            alone: List[dict] = []
-            step.at = "cutting the material"
-            try:
-                chunks = self._cut_chunks(messages, material, limit, cut_estimator,
-                                          kept=[positions for _chunk, positions in plan.kept],
-                                          summarised=[chunk.state == "summarised" for chunk, _p in plan.kept],
-                                          joins=joins, convert=convert, bound=bound, alone=alone,
-                                          image_limit=image_limit)
-            except ToolPairingError as exc:
-                self._record_event(attempt, "tool_pairing_error", str(exc))
-                return self._abort(messages, f"the material cannot be cut: {exc}")
-            except Exception as exc:
-                return self._sizing_failed(attempt, messages, "cutting the material", exc)
             for part in alone:
                 # Every merge is bounded by B (the orchestrator's ruling on the Codex
                 # review of c2efe0e): a part below c/4 that no neighbour takes within B
