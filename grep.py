@@ -59,10 +59,10 @@ _ARGUMENTS = ("term", "scope", "all", "raw", "page")
 _REMOVED = ("query", "limit", "sort", "role", "time_from", "time_to", "mode", "session_scope", "session_id",
             "source", "conversation_id", "content_scope", "externalized_refs")
 
-NOTHING_STORED = "nothing of this session is stored yet: the store is filled at a compaction"
+NOTHING_STORED = "nothing of this session is on the active record yet: no compaction of it has taken effect"
 COUNT_ONLY = ("the term lies in this many chunks, too many to return; narrow the term or the scope, or call again "
               "with all=true for every one of them")
-TAIL_NOTE = "records of the fresh tail stored at the last compaction hold the term"
+TAIL_NOTE = "records of the fresh tail of the latest compaction that took effect hold the term"
 
 
 @dataclass

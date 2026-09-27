@@ -115,8 +115,8 @@ _UNRESOLVED = {
     "unknown": "{handle} is unknown in this store: no message, tool call, chunk or summary has this handle here.",
     "other_session": ("{handle} belongs to another session. A handle resolves only in the session that holds it; "
                       "this session cannot reach another's past."),
-    "summary_revision": ("{handle} is the host's rewrite of summary {of} in your context (the row the plugin "
-                         "returned, as the host changed it). Expand {of} to read behind the summary."),
+    "summary_revision": ("{handle} is the host's rewrite of summary {of} (the row the plugin returned, as the host "
+                         "changed it). Expand {of} to read behind the summary."),
 }
 
 # Notes on calls and results: facts of the store (``pairing``), never what the host sends.

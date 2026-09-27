@@ -685,10 +685,10 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> Any:
     except expansion.ExpansionError as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
     except Exception as exc:
-        # A store that cannot be read is said, never shown as "no hits".
+        # A failure is said as what it is, never shown as "no hits", and never given a cause
+        # the code did not establish (any step may have raised).
         logger.warning("lcm_grep failed", exc_info=True)
-        return json.dumps({"error": f"lcm_grep could not read the store ({type(exc).__name__}: {exc}); nothing was "
-                                    f"searched"}, ensure_ascii=False)
+        return json.dumps({"error": f"lcm_grep failed ({type(exc).__name__}: {exc})"}, ensure_ascii=False)
 
 
 _LCM_EXPAND_REMOVED_ARGUMENTS = (
@@ -718,10 +718,10 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> Any:
     except expansion.ExpansionError as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
     except Exception as exc:
-        # A store that cannot be read is said, never shown as an empty stretch.
+        # A failure is said as what it is, never shown as an empty stretch, and never given a
+        # cause the code did not establish (any step may have raised).
         logger.warning("lcm_expand failed", exc_info=True)
-        return json.dumps({"error": f"lcm_expand could not read the store ({type(exc).__name__}: {exc})"},
-                          ensure_ascii=False)
+        return json.dumps({"error": f"lcm_expand failed ({type(exc).__name__}: {exc})"}, ensure_ascii=False)
 
 
 def _query_ids_to_handles(value: Any, record_handles: dict, derivation_handles: dict) -> Any:

@@ -45,12 +45,12 @@ from typing import Any, Optional
 NOTE = ("the host retires images with its own placeholder when a request holds more than its ceiling or byte budget "
         "across uploads and earlier results, or when later results of this turn add images; the store keeps every "
         "image on this page, and expanding again returns it")
-ROUTE_FROM_ENGINE = "the session's route was read from the engine's last update_model"
+ROUTE_FROM_ENGINE = "the session's route was read from this engine's route attributes, not from a running turn's agent"
 GUARD_CAUSE = "the host's tool-loop guard has halted this turn and cannot append its notice to an image page"
 GUARD_CODES = ("identical_call_streak_halt", "identical_cycle_halt")
-GUARD_UNREAD = ("the host's tool-loop guard could not be read ({why}); if it has halted this turn, the host appends its "
-                "notice to this image page and the model receives the host's own error instead; the store keeps every "
-                "image on this page")
+GUARD_UNREAD = ("the host's tool-loop guard could not be read ({why}); where it has halted this turn, the host's commit "
+                "adds its notice to this result as text, which raises on an image page, and the model receives the "
+                "host's \"Error executing tool\" for this call instead; the store keeps every image on this page")
 
 
 class RoomUnavailable(Exception):
