@@ -710,16 +710,21 @@ class LCMEngine(
         with _ACTIVE_ENGINE_REGISTRY_LOCK:
             _remove_registry_entries_for_engine(self)
 
-    def _estimator(self) -> Estimator:
+    def _estimator(self, route: Optional[Dict[str, str]] = None) -> Estimator:
         """The estimate for this session's context (#21): images by the session model's
         rule, ``reasoning_content`` where the session's provider receives it (the host's
-        ``needs_reasoning_echo``)."""
+        ``needs_reasoning_echo``). ``route`` (provider, model, base_url) is a tool call's
+        snapshot of the session's route (``image_room.route_of``); without it, the engine's
+        last ``update_model``."""
+        provider = route["provider"] if route is not None else self.provider
+        model = route["model"] if route is not None else self.model
+        base_url = route["base_url"] if route is not None else self.base_url
         try:
             from agent.message_sanitization import needs_reasoning_echo  # type: ignore
-            echo = bool(needs_reasoning_echo(self.provider, self.model, self.base_url))
+            echo = bool(needs_reasoning_echo(provider, model, base_url))
         except Exception:
             echo = False
-        return Estimator(image_model=self.model, reasoning_sent=echo, image_provider=self.provider)
+        return Estimator(image_model=model, reasoning_sent=echo, image_provider=provider)
 
     def _fixed_prefix_fact(self) -> Optional[Dict[str, Any]]:
         """The session's latest ``fixed_prefix`` fact: {"F", "list_estimate",
@@ -1075,7 +1080,8 @@ class LCMEngine(
             # the message being answered (``expansion.host_page_limit``).
             step = f"running {name}"
             result = handler(args, engine=self, messages=messages)
-            # The final string: what a page was measured as (``results.final_result``, #18).
+            # The final string (or the _multimodal envelope, as it is): what a page was
+            # measured as (``results.final_result``, #18).
             step = f"finishing the result of {name}"
             return final_result(result)
         except Exception as exc:

@@ -172,22 +172,38 @@ class Estimator:
 
     def image(self, part: dict) -> Optional[int]:
         """One image's tokens by the model's rule, or None (uncounted)."""
-        from .image_size import image_dimensions
+        return self.image_count(part)[0]
+
+    def image_count(self, part: dict) -> tuple[Optional[int], str]:
+        """One image's tokens by the model's rule and the basis of that rule exactly as
+        ``model_table.lookup`` returned it (the route's row, the vendor's own API, or the
+        vendor's facts not established for this route), or None and why it is uncounted:
+        each cause asked on its own (no rule for the model; a rule of a kind not counted
+        here; a size that cannot be read, with the image's own reason), never inferred from
+        a None."""
+        from .image_size import image_dimensions_why
         from .model_table import AnthropicImageRule, OpenAIImageRule, lookup
 
         facts = lookup(self.image_model, self.image_provider)
         rule = facts.image_rule if facts is not None else None
+        who = (f"{self.image_model}" if self.image_model else "a session with an empty model name") + (
+            f" on {self.image_provider}" if self.image_provider else "")
+        if facts is None:
+            return None, f"the model table has no row for {who}"
         if rule is None:
-            return None
-        size = image_dimensions(part)
+            return None, f"the model table's row for {who} has no image rule"
+        if not isinstance(rule, (AnthropicImageRule, OpenAIImageRule)):
+            return None, f"the model table's image rule for {who} is of a kind this plugin does not count"
+        size, why = image_dimensions_why(part)
         if size is None:
-            return None
+            return None, f"{who} has an image rule, but {why}"
         if isinstance(rule, AnthropicImageRule):
-            return _anthropic_image_tokens(rule, *size)
-        if isinstance(rule, OpenAIImageRule):
-            # The part's own detail decides; the model's default only where it has none.
-            return _openai_image_tokens(rule, *size, detail=image_detail(part))
-        return None
+            return _anthropic_image_tokens(rule, *size), facts.basis
+        # The part's own detail decides; the model's default only where it has none.
+        detail = image_detail(part)
+        if rule.for_detail(detail) is None:
+            return None, f"the image rule for {who} gives no size for the detail level {detail!r} this image asks for"
+        return _openai_image_tokens(rule, *size, detail=detail), facts.basis
 
     def _content(self, content: Any) -> tuple[int, int, int]:
         """(characters, image tokens, uncounted images) of a content value."""

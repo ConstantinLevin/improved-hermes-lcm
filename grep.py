@@ -38,7 +38,6 @@ damaged page, a lock held past the busy timeout) is the tool's error.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -60,12 +59,10 @@ _ARGUMENTS = ("term", "scope", "all", "raw", "page")
 _REMOVED = ("query", "limit", "sort", "role", "time_from", "time_to", "mode", "session_scope", "session_id",
             "source", "conversation_id", "content_scope", "externalized_refs")
 
-NOTHING_STORED = ("nothing of this session is stored yet: the store is filled at a compaction, and until the first "
-                  "one everything of the session is in your context")
+NOTHING_STORED = "nothing of this session is on the active record yet: no compaction of it has taken effect"
 COUNT_ONLY = ("the term lies in this many chunks, too many to return; narrow the term or the scope, or call again "
               "with all=true for every one of them")
-TAIL_NOTE = ("records of the fresh tail stored at the last compaction hold the term; your context held them "
-             "verbatim then")
+TAIL_NOTE = "records of the fresh tail of the latest compaction that took effect hold the term"
 
 
 @dataclass
@@ -139,7 +136,10 @@ def _search(records: RecordStore, session: str, term: str, scope: str) -> _Found
     return found
 
 
-def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, everything: bool, raw: bool) -> Target:
+def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, everything: bool,
+            raw: bool) -> tuple[Target, Any]:
+    """What the search found, and the call's route snapshot (``expansion.Route.of``, read once,
+    where chunks are shown), which the page takes too; None where no chunk is shown."""
     matching = [c for c in found.chunks if any(r in found.hits for r in found.members.get(c, []))]
     tail_hits = [r for r in found.tail if r in found.hits]
     searched: dict = {"chunks": len(found.chunks)}
@@ -150,8 +150,9 @@ def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, eve
                     "searched": searched, "chunks_matching": len(matching)}
     if found.cover is None:
         header["note"] = NOTHING_STORED
-        return Target(header, [])
+        return Target(header, []), None
     items: list = []
+    route = None
     count_only = len(matching) >= GREP_COUNT_ONLY_AT and not everything
     if count_only:
         header["count_only"] = True
@@ -159,7 +160,7 @@ def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, eve
     else:
         # Built outside the snapshot: every row read here is of an insert-only table, and the
         # chunks were chosen in the snapshot (B7).
-        route = expansion.Route.of(engine) if matching else None
+        route = expansion.Route.of(engine, TOOL) if matching else None
         order = expansion.Order.of(records, found.cover, route) if matching else None
         hidden: dict = {}
         if not raw and matching:
@@ -173,7 +174,7 @@ def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, eve
             items.extend(expansion._records_items(records, order, records.chunk_records(chunk), raw=raw))
     if tail_hits:
         items.append(Item({"tail": TAIL_NOTE, "stored_at": found.stored_at}, plugin={"messages": tail_hits}))
-    return Target(header, items)
+    return Target(header, items), route
 
 
 def grep(engine: Any, args: dict, *, messages: Any = None) -> Any:
@@ -220,38 +221,15 @@ def grep(engine: Any, args: dict, *, messages: Any = None) -> Any:
     limit = expansion.host_page_limits(engine, TOOL, messages)
     records: RecordStore = engine._records
     found = _search(records, session, term, scope)
-    target = _target(records, engine, found, scope=scope, everything=everything, raw=raw)
+    target, route = _target(records, engine, found, scope=scope, everything=everything, raw=raw)
     identity = expansion.target_identity(target)
     if state is not None:
         if state["s"] != found.store_uuid:
             raise ExpansionError("page is a token of another store: the store it was issued by is not this one")
         if state["r"] != identity:
-            raise ExpansionError("what this search finds changed since page 1 (a compaction since, a record the host "
-                                 "rewrote, or code that changed); call again without page to start it")
+            raise ExpansionError(expansion.CHANGED.format(what="what this search returns",
+                                                          again="call again without page to start it"))
     token_state = {"v": expansion.TOKEN_VERSION, "t": TOOL, "s": found.store_uuid, "q": term, "p": scope,
                    "a": everything, "m": "raw" if raw else "collapsed", "r": identity}
-    return _serve(target, state, token_state, limit)
-
-
-def _serve(target: Target, state: Optional[dict], token_state: dict, limit: Any) -> Any:
-    """One page of ``target`` from the token's cursor, by expansion's one page mechanism.
-    The same steps as the end of ``expansion.expand``; they become one shared function when
-    image delivery has merged (B10)."""
-    cursor = expansion.Cursor(state["i"], state["f"], state["o"]) if state else expansion.Cursor()
-    page = state["n"] if state else 1
-    if cursor.item >= len(target.items) and not (cursor.item == 0 and not target.items):
-        raise ExpansionError("page is a garbled next_page token: it points past the end of what this search found")
-    if cursor.field >= 0:
-        fields = expansion.fields_of(target.items[cursor.item])
-        if cursor.field == len(fields) and cursor.offset == 0:
-            cursor = expansion.Cursor(cursor.item + 1, -1, 0)
-        elif cursor.field >= len(fields):
-            raise ExpansionError("page is a garbled next_page token: it names a field this item does not have")
-        else:
-            path, value = fields[cursor.field]
-            length = len(value) if isinstance(value, str) else len(json.dumps(value, ensure_ascii=False))
-            if cursor.offset > length or (cursor.offset and expansion.is_mark(path, value)):
-                raise ExpansionError("page is a garbled next_page token: its offset lies outside the field it names")
-    builder = expansion.PageBuilder(target, limit=limit, token_state=token_state)
-    result, _next = builder.build(cursor, page)
-    return result
+    # The one page mechanism of expansion (B10: the unification of grep._serve and expand's tail).
+    return expansion.serve_page(target, state, token_state, limit, found="what this search found", route=route)
