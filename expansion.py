@@ -1108,8 +1108,16 @@ def canonical_image_part(part: dict) -> tuple[Optional[dict], str]:
         elif isinstance(source, dict) and source.get("type") == "url" and isinstance(source.get("url"), str):
             url = source["url"]
         else:
-            kind_of = source.get("type") if isinstance(source, dict) else type(source).__name__
-            return None, f"stored as an image block with a source of type {kind_of!r}, which gives no URL"
+            # A stored value: its kind in JSON's words, its value as JSON (#82, the type-word ruling).
+            if "source" not in part:
+                said = "without a source"
+            elif not isinstance(source, dict):
+                said = f"whose source is {host_pairing.json_kind(source)}, not an object"
+            elif "type" not in source:
+                said = "whose source object has no type"
+            else:
+                said = f"whose source has type {host_pairing.id_text(source['type'])}"
+            return None, f"stored as an image block {said}, which gives no URL"
     else:
         return None, f"stored as a part of type {kind!r}"
     image_url: dict = {"url": url}
