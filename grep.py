@@ -167,11 +167,12 @@ def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, eve
             for chunk in matching:
                 hidden[chunk] = [r for r in found.members.get(chunk, []) if r in found.hits and roles.get(r) == "tool"]
         for chunk in matching:
-            fields = {"results_holding_term": hidden[chunk]} if hidden.get(chunk) else {}
-            items.append(Item({"chunk": chunk, "under": found.under.get(chunk)}, fields))
+            # The plugin's own fields (the item's ``lcm`` side, PR P): no host dict here.
+            said = {"results_holding_term": hidden[chunk]} if hidden.get(chunk) else {}
+            items.append(Item({"chunk": chunk, "under": found.under.get(chunk)}, plugin=said))
             items.extend(expansion._records_items(records, order, records.chunk_records(chunk), raw=raw))
     if tail_hits:
-        items.append(Item({"tail": TAIL_NOTE, "stored_at": found.stored_at}, {"messages": tail_hits}))
+        items.append(Item({"tail": TAIL_NOTE, "stored_at": found.stored_at}, plugin={"messages": tail_hits}))
     return Target(header, items)
 
 
