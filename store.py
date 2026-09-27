@@ -161,20 +161,6 @@ class MessageStore:
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
-    def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
-        """Retrieve multiple messages by store_id in a single query.
-
-        Returns a dict mapping store_id → message dict.
-        """
-        if not store_ids:
-            return {}
-        placeholders = ",".join("?" for _ in store_ids)
-        rows = self._locked.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
-            store_ids,
-        ).fetchall()
-        return {row[0]: self._row_to_dict(row) for row in rows}
-
     def get_returned_tail(self, session_id: str) -> List[Dict[str, Any]]:
         """The fresh tail as it was returned: the record entries of the session's
         latest effective return, in their return positions."""

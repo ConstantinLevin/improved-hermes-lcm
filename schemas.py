@@ -130,38 +130,35 @@ LCM_DOCTOR = {
     },
 }
 
-LCM_EXPAND_QUERY = {
-    "name": "lcm_expand_query",
+LCM_QUERY = {
+    "name": "lcm_query",
     "description": (
-        "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt and "
-        "the handles (s…) of the summaries to read (lcm_grep finds where a term lies). Uses the expansion path "
-        "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
-        "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
-        "Prefer this for questions about the active conversation after compaction."
+        "Ask a question about what stands behind summaries or chunks in your context, without loading it: "
+        "give their handles (s… or c…) and the question. Everything behind every handle is read whole, in one "
+        "call, by the model that writes your summaries; input too large for it is refused with its size, never "
+        "cut. It returns a report and excerpts. The report is a model's description, hedged: orientation, "
+        "never something to act on; it names the handles it draws on, which lcm_expand opens. Each excerpt was "
+        "found verbatim in the record named by \"in\" and may be relied on as an expansion may; an excerpt not "
+        "found verbatim is withheld and named. A result longer than one page carries next_page: call again "
+        "with page=next_page alone. The host's tool timeout can cut a long call off; its answer is then lost."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "The question or task to answer from expanded LCM context",
-            },
             "handles": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "The summary handles (s…) to expand",
+                "description": "The handles of the summaries (s…) or chunks (c…) whose stretches the question is about.",
             },
-            "max_tokens": {
-                "type": "integer",
-                "description": "Max answer tokens for bounded synthesis returned to the main agent (default 2000)",
-                "default": 2000,
+            "question": {
+                "type": "string",
+                "description": "The question.",
             },
-            "context_max_tokens": {
-                "type": "integer",
-                "description": "Expanded serialized summary/raw/child-source fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
-                "default": 32000,
+            "page": {
+                "type": "string",
+                "description": "The next_page token of an earlier result, given alone, to read its next page.",
             },
         },
-        "required": ["prompt"],
+        "required": [],
     },
 }

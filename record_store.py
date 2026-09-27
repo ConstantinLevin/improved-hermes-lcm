@@ -336,6 +336,11 @@ class RecordStore:
         rows = self._q("SELECT COUNT(*) FROM effective_compactions WHERE session = ?", (session,))
         return int(rows[0][0]) if rows else 0
 
+    def compaction_count(self, session: str) -> int:
+        """How many compactions of the session the store holds, whatever became of them."""
+        rows = self._q("SELECT COUNT(*) FROM compactions WHERE session = ?", (session,))
+        return int(rows[0][0]) if rows else 0
+
     def derivations(self, handles: Iterable[str]) -> dict[str, tuple[int, str]]:
         """handle -> (derivation id, text)."""
         wanted = [h for h in set(handles) if h]
@@ -952,26 +957,39 @@ class RecordStore:
                 f"SELECT handle, raw FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
         return found
 
-    def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
-        """record id (the views' store_id) -> its handle."""
-        wanted = [int(i) for i in dict.fromkeys(record_ids) if i is not None]
-        found: dict[int, str] = {}
+    def records_text(self, records: Sequence[str]) -> dict[str, str]:
+        """record -> its ``text`` as stored (what grep searches, ``message_content.grep_text``
+        at the time the record was written); the query's excerpt check reads this column, never
+        a recomputation (#19)."""
+        wanted = [r for r in dict.fromkeys(records) if r]
+        found: dict[str, str] = {}
         for start in range(0, len(wanted), 500):
             part = wanted[start:start + 500]
-            found.update({int(i): str(h) for i, h in self._q(
-                f"SELECT record_id, handle FROM records WHERE record_id IN ({','.join('?' * len(part))})", part)})
+            found.update({str(h): str(text) for h, text in self._q(
+                f"SELECT handle, text FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
         return found
 
-    def handles_of_derivations(self, derivation_ids: Iterable[int]) -> dict[int, str]:
-        """derivation id (the views' node_id) -> its handle."""
-        wanted = [int(i) for i in dict.fromkeys(derivation_ids) if i is not None]
-        found: dict[int, str] = {}
-        for start in range(0, len(wanted), 500):
-            part = wanted[start:start + 500]
-            found.update({int(i): str(h) for i, h in self._q(
-                f"SELECT derivation_id, handle FROM derivations WHERE derivation_id IN ({','.join('?' * len(part))})",
-                part)})
-        return found
+    # --- The query's stored results (#19 D3) -----------------------------------------
+
+    def write_query_report(self, *, report_id: str, session: str, question: str, body: str,
+                           model: Optional[str], provider: Optional[str], effort: Optional[str],
+                           finish_reason: Optional[str]) -> bool:
+        """One query's checked result, written once, in one short transaction. False, and
+        nothing written, when the report id is already taken."""
+        with self._tx() as conn:
+            if conn.execute("SELECT 1 FROM query_reports WHERE id = ?", (report_id,)).fetchone():
+                return False
+            conn.execute(
+                "INSERT INTO query_reports(id, session, created_at, question, body, model, provider, effort, "
+                "finish_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (report_id, session, time.time(), question, body, model or None, provider or None, effort or None,
+                 finish_reason or None))
+        return True
+
+    def query_report(self, report_id: str) -> Optional[tuple[str, str]]:
+        """(session, body) of a stored query result, or None."""
+        rows = self._q("SELECT session, body FROM query_reports WHERE id = ?", (report_id,))
+        return (str(rows[0][0]), str(rows[0][1])) if rows else None
 
     # --- The invariant (#29 W7, #34 D5) --------------------------------------------
 

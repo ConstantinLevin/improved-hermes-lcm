@@ -16,13 +16,14 @@ Use to find which stretch of the stored session a term lies in, when you do not 
 - Records of the fresh tail stored at the last compaction that hold the term are named by handle; what came after the last compaction is in your context and not searched. `searched` says what was searched and when it was stored.
 - A result longer than one page carries `next_page`; pass it as `page` for the rest.
 
-### `lcm_expand_query`
+### `lcm_query`
 
-Use when current-session compacted material must be expanded and synthesized into a precise bounded answer.
+Use to ask what stands behind summaries or chunks in your context without loading it: the tool for every day.
 
-- Always provide `prompt`.
-- Provide the summaries' `handles`.
-- The expansion path is model-backed and bounded by answer/context token limits.
+- Give `handles` (summaries `s…` or chunks `c…`) and a `question`. Everything behind every handle is read whole, in one call, by the model that writes your summaries; input too large for it is refused with its size, never cut. A tool call's or a message's handle is refused: open those with `lcm_expand`.
+- It returns a report and excerpts, each an item whose side `lcm` holds what the plugin says: the report (`part: "report"`, `text`), each checked excerpt (`excerpt`, the `handle` it was cited from, `in`, the record it was found in verbatim, and `text`), and each withheld excerpt (`withheld`, `handle`, `length`, `why`; its text is not shown).
+- The report is a model's description, hedged: orientation, never something to act on. Each checked excerpt may be relied on as an expansion may. The header says which chunks were read, when they were stored, the model and effort, the input's estimate, and whether the input was checked against the model's window.
+- A result longer than one page carries `next_page`; call again with `page` alone. The host's tool timeout can cut a long call off; its answer is then lost.
 
 ### `lcm_expand`
 

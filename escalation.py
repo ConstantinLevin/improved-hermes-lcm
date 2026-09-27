@@ -553,7 +553,7 @@ def ending_failure(finish_reason: Optional[str]) -> Optional[tuple[str, str]]:
 
 
 def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
-               timeout: Optional[float] = None) -> tuple[str, str]:
+               timeout: Optional[float] = None, usage: Optional[dict] = None) -> tuple[str, str]:
     """One call on the session's route through the host's ``call_llm``, as its
     ``main_runtime``. Returns (content, finish_reason); raises on any failure of the call,
     a reply from another model, or a reply of the wrong shape. ``timeout`` is what is left
@@ -587,8 +587,9 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         message = choice.message
     except Exception as exc:
         # The endpoint's fault, not the chunk's (orchestrator ruling on a3f2505): the
-        # response has no shape to read. A well-formed reply with no summary in it is the
-        # chunk's ("reply carries no summary" below): the model answered and wrote nothing.
+        # response has no shape to read. A well-formed reply with no text in it is the
+        # chunk's ("reply is empty" below): the model answered and wrote nothing. The words
+        # name no summary: the query (#19 D3) makes this call too.
         raise SummaryFailure("malformed reply", transient=False, kind="endpoint",
                              detail=f"no choices[0].message ({type(exc).__name__})") from None
     finish_reason = getattr(choice, "finish_reason", None)
@@ -600,8 +601,15 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
                              detail=f"{why} (finish_reason {finish_reason!r})")
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
-        raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
+        raise SummaryFailure("reply is empty: the model wrote no text", transient=False, kind="reply",
                              detail=f"content is {type(content).__name__}, finish_reason {finish_reason!r}")
+    if usage is not None:
+        # The provider's own counts, where the response carries them (the query's header).
+        counts = getattr(response, "usage", None)
+        for key in ("prompt_tokens", "completion_tokens"):
+            value = getattr(counts, key, None) if counts is not None else None
+            if isinstance(value, int) and not isinstance(value, bool):
+                usage[key] = value
     return content, str(finish_reason)
 
 
@@ -686,12 +694,14 @@ class CallPath:
 def _call_with_retries(
     messages: list[dict[str, Any]],
     *,
-    source: Estimate,
+    source: Optional[Estimate],
     settings: CallSettings,
     path: CallPath,
+    usage: Optional[dict] = None,
 ) -> tuple[str, str]:
     """One level: transient failures retried while the deadline allows; a reply that
-    does not shrink its source is a non-transient failure."""
+    does not shrink its source is a non-transient failure. ``source`` None (the query,
+    #19): no reply is measured against a source. ``usage`` receives the provider's counts."""
     backoff = _BACKOFF_FIRST_S
     retries = 0
     while True:
@@ -704,7 +714,7 @@ def _call_with_retries(
                         raise SummaryFailure("summariser call not made, no time left before the host's deadline",
                                              transient=True, kind="endpoint")
                 try:
-                    content, finish_reason = _call_once(messages, settings, timeout)
+                    content, finish_reason = _call_once(messages, settings, timeout, usage)
                 except SummaryFailure:
                     raise
                 except Exception as exc:
@@ -743,6 +753,8 @@ def _call_with_retries(
             continue
         # Both sides by the plugin's estimate (R6); the reply is text, the source may
         # hold images the estimate could not count, and the numbers say so.
+        if source is None:
+            return content, finish_reason
         reply_tokens = count_tokens(content)
         if reply_tokens >= source.tokens:
             raise SummaryFailure("reply not shorter than its source", transient=False, kind="reply",

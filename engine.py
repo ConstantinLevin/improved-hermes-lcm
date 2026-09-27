@@ -44,9 +44,9 @@ from .runtime_identity import (
 from .schemas import (
     LCM_DOCTOR,
     LCM_EXPAND,
-    LCM_EXPAND_QUERY,
     LCM_GREP,
     LCM_INSPECT,
+    LCM_QUERY,
     LCM_STATUS,
 )
 from .backup import DailyBackup
@@ -1036,7 +1036,7 @@ class LCMEngine(
         return [
             LCM_GREP,
             LCM_EXPAND,
-            LCM_EXPAND_QUERY,
+            LCM_QUERY,
             LCM_STATUS,
             LCM_INSPECT,
             LCM_DOCTOR,
@@ -1068,7 +1068,7 @@ class LCMEngine(
             handlers = {
                 "lcm_grep": lcm_tools.lcm_grep,
                 "lcm_expand": lcm_tools.lcm_expand,
-                "lcm_expand_query": lcm_tools.lcm_expand_query,
+                "lcm_query": lcm_tools.lcm_query,
                 "lcm_status": lcm_tools.lcm_status,
                 "lcm_inspect": lcm_tools.lcm_inspect,
                 "lcm_doctor": lcm_tools.lcm_doctor,

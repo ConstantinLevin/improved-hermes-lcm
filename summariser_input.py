@@ -165,11 +165,22 @@ def host_reasoning_pad(provider: str, model: str, base_url: str) -> bool:
 
 
 def wire_facts(provider: str, model: str, base_url: str, api_mode: str,
-               reads_images: Optional[bool]) -> WireFacts:
+               reads_images: Optional[bool], *, strict: bool = False) -> WireFacts:
     """The route's facts for the input: whether the host sends ``reasoning_content``
     to it (``needs_reasoning_echo``, agent/message_sanitization.py at 7b761da) and
     whether its wire is the host's Anthropic converter (provider anthropic, or the
-    anthropic_messages API mode)."""
+    anthropic_messages API mode). ``strict`` (the query, #19): every host function is
+    called, and one that cannot be read raises ``HostUnavailable`` naming it; the
+    summariser's call keeps its three fallbacks until #72 is worked."""
+    if strict:
+        echo = bool(_strict_import("reasoning-echo test", "agent.message_sanitization", "needs_reasoning_echo")(
+            provider, model, base_url))
+        mode = str(_strict_import("API mode canonicalisation", "hermes_cli.config_providers", "_canonical_api_mode")(
+            str(api_mode or ""))).lower()
+        dispatched = str(_strict_import("provider normalisation", "agent.auxiliary_client", "_normalize_aux_provider")(
+            provider))
+        anthropic = mode == "anthropic_messages" or (dispatched == "anthropic" and mode in ("", "anthropic_messages"))
+        return WireFacts(reads_images=reads_images, needs_reasoning_echo=echo, anthropic_converter=anthropic)
     try:
         from agent.message_sanitization import needs_reasoning_echo  # type: ignore
         echo = bool(needs_reasoning_echo(provider, model, base_url))
@@ -443,12 +454,31 @@ def _has_payload(message: dict) -> bool:
                 or (isinstance(message.get("reasoning_content"), str) and message["reasoning_content"].strip()))
 
 
+FILL_NOTE_LABEL = "[The host sends this empty message to the provider with its own stand-in as content:]"
+
+
 def summariser_message(raw: dict, record: str, facts: WireFacts,
-                       withheld: Optional[dict[str, int]] = None) -> dict:
+                       withheld: Optional[dict[str, int]] = None, *, strict: bool = False) -> dict:
     """One record's message as the summariser receives it (see the module docstring).
-    The encrypted items withheld from it are added to ``withheld`` by kind."""
-    message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
-    for kind, count in _withhold_encrypted(message).items():
+    The encrypted items withheld from it are added to ``withheld`` by kind.
+
+    ``strict`` (the query, #19; the summariser's call site moves to it with #72/#73):
+    every host function is called strictly (``HostUnavailable`` names the one that cannot
+    be read), and the host's fill of an empty non-final message is never given as the
+    message's content: the fill is asked on the host's own row before any step of the
+    plugin's (``host_fill_text``, A10), the content stays as stored, and a labelled part
+    quotes the host's stand-in."""
+    fill = None
+    if strict:
+        row = _row_before_fill(raw, needs_echo=facts.needs_reasoning_echo, strict=True)
+        fill = host_fill_text(row)
+        message = copy.deepcopy(row)
+        message.pop("_length_continuation_fragment", None)
+        message.pop("_length_continuation_nudge", None)
+    else:
+        message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
+    withheld_here = _withhold_encrypted(message)
+    for kind, count in withheld_here.items():
         if withheld is not None:
             withheld[kind] = withheld.get(kind, 0) + count
     if facts.reads_images is None:
@@ -459,8 +489,12 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
         readable = _readable_reasoning(raw)
         before = [{"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{readable}"}] if readable else []
         _add_parts(message, before, _malformed_argument_parts(message))
-        if not _has_payload(message):
+        # Strictly, the words "carried only reasoning … withheld" are said only of a message
+        # something was withheld from; an empty message is otherwise quoted by the fill note.
+        if not _has_payload(message) and (withheld_here or not strict):
             message["content"] = [{"type": "text", "text": _ONLY_WITHHELD_REASONING}]
+    if fill is not None:
+        _add_parts(message, [{"type": "text", "text": f"{FILL_NOTE_LABEL} {json.dumps(fill, ensure_ascii=False)}"}], [])
     return message
 
 
