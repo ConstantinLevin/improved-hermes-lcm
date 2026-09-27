@@ -175,8 +175,6 @@ def _state(value: Any) -> str:
         return f"blank ({text}), which cannot pair"
     if state == "structured":
         return f"{text}, which is not a string, a number or a boolean and cannot pair"
-    if host_pairing.blank_part(value):
-        return f"{text}, whose blank part cannot pair"
     return text
 
 
@@ -202,8 +200,7 @@ def _group_note(group: host_pairing.Group) -> str:
 
 def _aliases_said(call: Any) -> list:
     """Each stored id of a call, outside a group, that never pairs and that the cause does not
-    already say: an alias of it null, blank, a list or an object, or a composite id with a
-    blank part (#82)."""
+    already say: an alias of it null, blank, a list or an object (#82)."""
     if not isinstance(call, dict):
         return []
     said = []

@@ -32,8 +32,8 @@ the only way an id is shown. A stored id can be any JSON value (LEARNINGSFÃœRPLÃ
 domain axis). Two ids are the same iff both are scalars (``id_state``: a non-blank string, a
 number, a boolean) of the same JSON type with the same value: strings exactly, numbers by
 value (``1`` is ``1.0``, JSON's own equality of numbers), booleans as booleans, never as
-numbers. A null, blank, list or object id, and a blank part of a composite ``a|b``, never
-pairs (``unpairable``); since the item's ``message`` shows no host id (the handle replaces
+numbers. A null, blank, list or object id never pairs (``unpairable``); any other string
+is an ordinary id, compared exactly, whatever it holds; since the item's ``message`` shows no host id (the handle replaces
 it), the note is the only place such an id shows, and it names each, its state and that it
 cannot pair: a call's id and aliases, a result's id, every member call's of a group. No id
 is ever hashed. The
@@ -133,16 +133,10 @@ def id_text(value: Any) -> str:
 ID_KEYS = ("id", "call_id", "response_item_id")     # a call's host ids: its id, then its aliases
 
 
-def blank_part(value: Any) -> bool:
-    """Whether a composite ``a|b`` id holds a part of nothing but whitespace: a spelling that,
-    like a blank id, never pairs."""
-    return isinstance(value, str) and "|" in value and any(not part.strip() for part in value.split("|"))
-
-
 def unpairable(value: Any) -> bool:
-    """Whether a stored id, present, is one that never pairs, or holds a part that never does:
-    null, blank, a list or an object (``id_state``), or a composite with a blank part."""
-    return id_state(value) != "scalar" or blank_part(value)
+    """Whether a stored id, present, is one that never pairs: not a scalar (``id_state``:
+    null, blank, a list or an object). The complement of what ``same_id`` compares."""
+    return id_state(value) != "scalar"
 
 
 def _merge(spellings: list, more: list) -> list:
