@@ -130,27 +130,26 @@ _UNREACHED = {
 }
 
 # Notes on calls and results: facts of the store (``pairing``), never what the host sends.
-# Each cause as the pairing states it (``Pairing.unanswered``, ``stray``, ``elsewhere``; #78).
-NO_RESULT = "no result with this call's host id stands on the active record"
+# Each cause as the pairing states it (``Pairing.unanswered``, ``stray``; #78, #82); every id as
+# its JSON (``pairing.id_text``).
+NO_RESULT = ("no result with this call's host id stands in its block; the store pairs a result only within its "
+             "call's block")
 _UNANSWERED = {
     "no_id": "this call carries no host id, so no result pairs with it",
     "empty_id": "this call's host id is blank ({id}), so no result pairs with it",
     "structured_id": ("this call's host id is not a string, a number or a boolean but {id}; the store pairs a result "
-                      "by an exact id of those kinds, so no result pairs with it"),
-    "unasked": "no result with this call's host id stands in its block, and {why}",
+                      "only by an id of those kinds, so no result pairs with it"),
     "alias": ("result {result} of this call's block carries {alias}, another spelling of this call's host id, not the "
-              "id itself; the store pairs by the exact id and does not pair them"),
-    "elsewhere": ("result {result} carries this call's host id but stands outside this call's block, in the block "
-                  "that opens with {opener}; the store pairs a result only within its call's block"),
+              "id itself; the store pairs by the id and does not pair them"),
 }
 _STRAY = {
     "unknown": "no call of the message before this result has its host id {id} in any spelling",
     "no_id": "this result carries no host id, so no call pairs with it",
     "structured": ("this result's host id is not a string, a number or a boolean but {id}, so no call pairs with it by "
-                   "the store's exact-id rule"),
+                   "the store's rule"),
     "no_calls": "this result's block opens with {head}, which holds no tool calls, so no call pairs with it",
     "alias": ("this result's host id {id} is another spelling of call {position} of the message before it, not that "
-              "call's id; the store pairs by the exact id and does not pair them"),
+              "call's id; the store pairs by the id and does not pair them"),
 }
 _GROUP = ("{k} calls of message {head} and {j} results of its block are joined by the host ids or their other "
           "spellings {spellings}; the store cannot tell which result answered which call, and what the provider "
@@ -167,11 +166,10 @@ _FILL_UNREAD = ("whether the host sends its stand-in {content} for this empty me
 
 def _group_note(group: host_pairing.Group) -> str:
     """Rule 2's note: the block (its opening message) and every spelling that joined the
-    group, never "the host id" for a spelling that is an alias (#78)."""
-    # Every id of the group's calls that is no alias string (a blank one, a number, a list...),
-    # as its JSON, so no group's note names no spelling (#82).
-    said = list(group.spellings) + [json.dumps(i, ensure_ascii=False) for i in group.ids
-                                    if i is not None and not (isinstance(i, str) and i in group.spellings)]
+    group, never "the host id" for a spelling that is an alias (#78); every id its calls
+    carry, each as its JSON (``pairing.id_text``, #82), so no group's note names no spelling."""
+    said = [host_pairing.id_text(s) for s in group.spellings] + [
+        host_pairing.id_text(i) for i in group.ids if host_pairing.id_state(i) != "scalar"]
     return _GROUP.format(k=len(group.calls), j=len(group.results), head=group.calls[0][0], spellings=", ".join(said))
 
 
@@ -611,10 +609,9 @@ def _as_sent(raw: dict, route: "Route", *, raw_form: bool) -> tuple[dict, Option
 
 
 def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> list:
-    """The note of one call: its group's (rule 2), or why no result pairs with it, each cause
-    as the pairing and the active order state it (#78): no id; an alias of it on a result of
-    its block; a result of its exact id outside its block; none anywhere on the active
-    record."""
+    """The note of one call: its group's (rule 2), or why no result of its block pairs with it,
+    each cause as the pairing states it (#78, #82): no id; a blank or structured id; an alias
+    of it on a result of its block; none of its block carries its id."""
     key = (handle, position)
     if key in found.group:
         return [_group_note(found.group[key])]
@@ -624,21 +621,10 @@ def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> list
     if why == "no_id":
         return [_UNANSWERED["no_id"]]
     if why in ("empty_id", "structured_id"):
-        return [_UNANSWERED[why].format(id=_id_said(detail))]
+        return [_UNANSWERED[why].format(id=host_pairing.id_text(detail))]
     if why == "alias":
-        return [_UNANSWERED["alias"].format(result=detail[0], alias=detail[1])]
-    if key in found.elsewhere:
-        result, opener = found.elsewhere[key]
-        return [_UNANSWERED["elsewhere"].format(result=result, opener=opener)]
-    if key in found.unasked:
-        return [_UNANSWERED["unasked"].format(why=found.unasked[key])]
+        return [_UNANSWERED["alias"].format(result=detail[0], alias=host_pairing.id_text(detail[1]))]
     return [NO_RESULT]
-
-
-def _id_said(value: Any) -> str:
-    """A host id as a note shows it: a string as it is, anything else as its JSON (so 5 and
-    "5", true and "True", are told apart; #82)."""
-    return value if isinstance(value, str) and value.strip() else json.dumps(value, ensure_ascii=False)
 
 
 def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
@@ -647,7 +633,7 @@ def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
         return [_group_note(found.group[handle])]
     if handle in found.stray:
         why, call_id, detail = found.stray[handle]
-        return [_STRAY[why].format(id=_id_said(call_id), head=detail,
+        return [_STRAY[why].format(id=host_pairing.id_text(call_id), head=detail,
                                    position=(detail or 0) + 1 if why == "alias" else None)]
     return []
 
@@ -766,31 +752,9 @@ class Order:
         return cls(records, {record: i for i, record in enumerate(records)}, route)
 
     def pairing(self, store: RecordStore, stretch: list[str]) -> host_pairing.Pairing:
-        """The store's pairing of ``stretch`` through its blocks, and for each call its block
-        leaves unanswered with an id, where a result of that exact id stands elsewhere on the
-        active record (#78: asked, so "no result" is said only where there is none)."""
-        found = host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles, store.records_raw)
-        for key, (why, _detail) in found.unanswered.items():
-            if why != "none":
-                continue
-            raw = store.record_raw(key[0]) or {}
-            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
-            call = calls[key[1]] if key[1] < len(calls) and isinstance(calls[key[1]], dict) else {}
-            call_id = call.get("id")
-            # "none" is left only for a scalar id (``pairing.id_state``): a string, a number or a
-            # boolean, compared as SQLite's JSON gives the result's id back, as the block's own
-            # rule compares it (``==``). An integer beyond SQLite's is not asked, and said (#82).
-            if isinstance(call_id, int) and not isinstance(call_id, bool) and not -2 ** 63 <= call_id < 2 ** 63:
-                found.unasked[key] = (f"its host id {call_id} is an integer beyond the store's integer range, so "
-                                      f"whether a result carries it elsewhere on the active record was not asked")
-                continue
-            places = sorted(self.index[str(h)] for (h,) in store._q(
-                "SELECT handle FROM records WHERE role = 'tool' AND json_extract(raw, '$.tool_call_id') = ?",
-                (call_id,)) if str(h) in self.index)
-            if places:
-                opener, _end = host_pairing.blocks_span(self.records, store.record_roles, places[0], places[0])
-                found.elsewhere[key] = (self.records[places[0]], self.records[opener])
-        return found
+        """The store's pairing of ``stretch`` through the blocks it lies in: block-scoped, as
+        the store's rule is (``pairing``); no lookup outside the blocks (#82)."""
+        return host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles, store.records_raw)
 
 
 def _records_items(store: RecordStore, order: Order, records: list[tuple[str, dict]], *, raw: bool) -> list[dict]:

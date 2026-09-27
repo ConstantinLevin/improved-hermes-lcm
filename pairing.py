@@ -5,15 +5,16 @@ The store keeps no pairing. A call's handle names (record, position) and nothing
 (``RecordStore._write_tool_calls``). Which stored result belongs to it is read off the
 stored records alone:
 
-1. **Within the block**, a result belongs to a call iff the result's ``tool_call_id``
-   equals the call's ``id`` exactly. The block of a record is the nearest assistant or user
-   record at or before it, up to the next assistant or user record: records of every other
-   role lie inside. The store's write check (``fresh_tail.check_tool_pairing``) does not
-   guarantee this: it checks the whole list cumulatively, on stripped ids, and takes a
-   call's ``tool_call_id`` where its ``id`` is empty (``message_analysis._tool_call_id``); so
-   a stored result can stand outside its call's block or carry an alias of its call. Where
-   a call or a result is left unpaired, the pairing says why, from the block (#78, A11:
-   ``Pairing.unanswered``, ``Pairing.stray``).
+1. **Within the block**, a result belongs to a call iff the result's ``tool_call_id`` is
+   the same id as the call's ``id`` (``same_id``). The block of a record is the nearest
+   assistant or user record at or before it, up to the next assistant or user record:
+   records of every other role lie inside. The store's write check
+   (``fresh_tail.check_tool_pairing``) does not guarantee this: it checks the whole list
+   cumulatively, on ``str()``-ed and stripped ids, and takes a call's ``tool_call_id`` where
+   its ``id`` is empty (``message_analysis._tool_call_id``); so a stored result can stand
+   outside its call's block or carry an alias of its call. Where a call or a result is left
+   unpaired, the pairing says why, from the block (#78, A11: ``Pairing.unanswered``,
+   ``Pairing.stray``).
 2. **A degenerate id group is stated, never resolved.** Where two or more calls of a
    block carry one ``id``, or a call's aliases (its ``call_id``, its ``response_item_id``,
    and each part of a composite ``a|b`` of any of them) include another call's ``id``, those
@@ -22,8 +23,18 @@ stored records alone:
    and every result of the group carries one note saying that the store cannot tell which
    result answered which call; every result of the group is listed under each of its
    calls, and nothing is attributed.
-3. A call with no result of its exact id in the block has none; a result whose id no call
-   of the block carries, or that carries no id, belongs to none. Both are store facts.
+3. A call with no result of its id in the block has none; a result whose id no call of
+   the block carries, or that carries no id, belongs to none. Both are store facts.
+
+**Id equality** (#82): ``same_id`` is the only place two ids are compared, and ``id_text``
+the only way an id is shown. A stored id can be any JSON value (LEARNINGSFÜRPLÄNE A2 on the
+domain axis). Two ids are the same iff both are scalars (``id_state``: a non-blank string, a
+number, a boolean) of the same JSON type with the same value: strings exactly, numbers by
+value (``1`` is ``1.0``, JSON's own equality of numbers), booleans as booleans, never as
+numbers. A null, blank, list or object id is the same as nothing. No id is ever hashed. The
+host pairs only non-blank strings, stripped and split at ``|`` (agent/message_sanitization.py
+:496-515 at Hermes fbb06142ef); where a stored id is not a string, or carries whitespace, the
+store's pairing is the store's, and the notes say what the store holds.
 
 No host function is called here. What the provider received of a stretch depends on the
 host's pre-call sanitizer and on the session's route, and those differ from one another
@@ -33,6 +44,7 @@ reproduce them.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -41,10 +53,10 @@ from typing import Any, Callable
 class Group:
     """Calls and results of one block that the store cannot pair (rule 2)."""
 
-    ids: list                                 # the distinct ``id`` values of its calls, in order
+    ids: list                                 # the distinct ids of its calls, in order (``same_id``)
     calls: list                               # (assistant record, position), in order
     results: list                             # result records, in order
-    spellings: list = field(default_factory=list)   # every spelling that joined it, sorted (#78)
+    spellings: list = field(default_factory=list)   # every spelling that joined it, in order (#78)
 
 
 @dataclass
@@ -59,23 +71,16 @@ class Pairing:
     group: dict = field(default_factory=dict)
     # result record -> (why, its id, detail): a result that belongs to no call, and the block's
     # fact that says why: "no_id"; "structured" (its id is a list or an object, ``id_state``);
-    # "no_calls" (its block opens with ``detail``, a message
-    # holding no calls); "alias" (its id is another spelling of call ``detail`` of the block,
-    # not that call's id); "unknown" (no call of the block has its id in any spelling)
+    # "no_calls" (its block opens with ``detail``, a message holding no calls); "alias" (its
+    # id is another spelling of call ``detail`` of the block, not that call's id); "unknown"
+    # (no call of the block has its id in any spelling)
     stray: dict = field(default_factory=dict)
     # (assistant record, position) -> (why, detail): a call no result of its block pairs with,
     # and why, from the block: "no_id" (the call carries no id); "empty_id" / "structured_id"
-    # (its id, ``detail``, is blank, or a list or an object: ``id_state``); "alias" (result ``detail[0]``
-    # of the block carries the call's alias ``detail[1]``, not its id); "none" (no result of
-    # the block carries its id or an alias of it)
+    # (its id, ``detail``, is blank, or a list or an object: ``id_state``); "alias" (result
+    # ``detail[0]`` of the block carries the call's alias ``detail[1]``, not its id); "none"
+    # (no result of the block carries its id or an alias of it)
     unanswered: dict = field(default_factory=dict)
-    # (assistant record, position) -> (result record, the record that opens its block): for a
-    # call unanswered in its block, a result with its exact id elsewhere on the active record
-    # (asked by the caller, which holds the active order: ``expansion.Order.pairing``)
-    elsewhere: dict = field(default_factory=dict)
-    # (assistant record, position) -> why that was not asked (its id is a number the store's
-    # integers cannot hold)
-    unasked: dict = field(default_factory=dict)
 
 
 def _id_of(call: Any) -> Any:
@@ -86,8 +91,7 @@ def id_state(value: Any) -> str:
     """What a stored host id is, over its whole domain (#82, LEARNINGSFÜRPLÄNE A2 on the domain
     axis: the store takes any JSON value for a call's ``id``, and the pairing reads it):
     "none" (absent or null), "empty" (a string of nothing but whitespace), "scalar" (any other
-    string, a number or a boolean: an id compared as it is), "structured" (a list, an object:
-    no id to compare, said as such). Nothing here hashes or splits a value it has not asked."""
+    string, a number or a boolean), "structured" (a list, an object)."""
     if value is None:
         return "none"
     if isinstance(value, str):
@@ -97,25 +101,58 @@ def id_state(value: Any) -> str:
     return "structured"
 
 
-def _aliases(call: Any) -> set:
-    """A call's own spellings: its ``id``, ``call_id`` and ``response_item_id``, and each
-    part of a composite ``a|b`` of any of them."""
-    found: set = set()
+def _json_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "string"
+
+
+def same_id(a: Any, b: Any) -> bool:
+    """Whether two stored ids are the same id (the module docstring, "Id equality"): both
+    scalars of the same JSON type with the same value. The only comparison of ids."""
+    if id_state(a) != "scalar" or id_state(b) != "scalar" or _json_type(a) != _json_type(b):
+        return False
+    return a == b
+
+
+def id_text(value: Any) -> str:
+    """An id as a note shows it: its JSON, so "5" and 5, "true" and true, "[]" and [] are
+    told apart (#82). The only rendering of an id."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _merge(spellings: list, more: list) -> list:
+    for value in more:
+        if not any(same_id(value, have) for have in spellings):
+            spellings.append(value)
+    return spellings
+
+
+def _aliases(call: Any) -> list:
+    """A call's own spellings, in order: its ``id`` where it is a scalar, then its string
+    ``id``, ``call_id`` and ``response_item_id`` and each part of a composite ``a|b`` of
+    any of them; distinct by ``same_id``."""
+    found: list = []
     if not isinstance(call, dict):
         return found
+    if id_state(call.get("id")) == "scalar":
+        _merge(found, [call["id"]])
     for key in ("id", "call_id", "response_item_id"):
         value = call.get(key)
-        if isinstance(value, str) and value:
-            found.add(value)
-            found.update(part for part in value.split("|") if part)
+        if isinstance(value, str) and value.strip():
+            _merge(found, [value] + [part for part in value.split("|") if part.strip()])
     return found
+
+
+def _holds(spellings: list, value: Any) -> bool:
+    return any(same_id(value, spelling) for spelling in spellings)
 
 
 def _joined(ci: Any, cj: Any) -> bool:
     """Rule 2: two calls of one block share an ``id``, or one's aliases hold the other's."""
-    id_i, id_j = _id_of(ci), _id_of(cj)
-    return ((id_i is not None and id_i == id_j) or (isinstance(id_j, str) and id_j in _aliases(ci))
-            or (isinstance(id_i, str) and id_i in _aliases(cj)))
+    return _holds(_aliases(cj), _id_of(ci)) or _holds(_aliases(ci), _id_of(cj))
 
 
 def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
@@ -141,46 +178,45 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
     for i in range(len(calls)):
         members.setdefault(root(i), []).append(i)
 
-    claimed: set = set()
+    claimed: list = []
     for indexes in members.values():
         if len(indexes) == 1:
             position, call = calls[indexes[0]]
             call_id = _id_of(call)
             state = id_state(call_id)
-            mine = [record for record, raw in results
-                    if state == "scalar" and raw.get("tool_call_id") == call_id]
+            mine = [record for record, raw in results if same_id(raw.get("tool_call_id"), call_id)]
             if len(mine) <= 1:
                 if mine:
                     found.answer[(head_record, position)] = mine[0]
                     found.result_of[mine[0]] = (head_record, position)
-                    claimed.add(mine[0])
+                    claimed.append(mine[0])
                 elif state == "none":
                     found.unanswered[(head_record, position)] = ("no_id", None)
                 elif state in ("empty", "structured"):
                     found.unanswered[(head_record, position)] = (f"{state}_id", call_id)
                 else:
-                    other = _aliases(call) - {call_id}
+                    other = [spelling for spelling in _aliases(call) if not same_id(spelling, call_id)]
                     alias = next(((record, raw["tool_call_id"]) for record, raw in results
-                                  if isinstance(raw.get("tool_call_id"), str) and raw["tool_call_id"] in other), None)
+                                  if _holds(other, raw.get("tool_call_id"))), None)
                     found.unanswered[(head_record, position)] = ("alias", alias) if alias else ("none", None)
                 continue
             spellings = _aliases(call)
         else:
-            spellings: set = set()
+            spellings = []
             for i in indexes:
-                spellings |= _aliases(calls[i][1])
-            mine = [record for record, raw in results
-                    if isinstance(raw.get("tool_call_id"), str) and raw["tool_call_id"] in spellings]
+                _merge(spellings, _aliases(calls[i][1]))
+            mine = [record for record, raw in results if _holds(spellings, raw.get("tool_call_id"))]
         ids: list = []
         for i in indexes:
-            if _id_of(calls[i][1]) not in ids:
-                ids.append(_id_of(calls[i][1]))
-        group = Group(ids, [(head_record, calls[i][0]) for i in indexes], mine, sorted(spellings))
+            value = _id_of(calls[i][1])
+            if value is not None and not any(same_id(value, have) or value is have for have in ids):
+                ids.append(value)
+        group = Group(ids, [(head_record, calls[i][0]) for i in indexes], mine, spellings)
         for key in group.calls:
             found.group[key] = group
         for record in mine:
             found.group[record] = group
-            claimed.add(record)
+            claimed.append(record)
 
     for record, raw in results:
         if record in claimed:
@@ -194,8 +230,7 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         elif not calls:
             found.stray[record] = ("no_calls", call_id, head_record)
         else:
-            owner = next((position for position, call in calls
-                          if isinstance(call_id, str) and call_id in _aliases(call)), None)
+            owner = next((position for position, call in calls if _holds(_aliases(call), call_id)), None)
             found.stray[record] = ("alias", call_id, owner) if owner is not None else ("unknown", call_id, None)
 
 
