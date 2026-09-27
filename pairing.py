@@ -8,8 +8,12 @@ stored records alone:
 1. **Within the block**, a result belongs to a call iff the result's ``tool_call_id``
    equals the call's ``id`` exactly. The block of a record is the nearest assistant or user
    record at or before it, up to the next assistant or user record: records of every other
-   role lie inside. This is what the store's own write check guarantees for every result it
-   takes (``fresh_tail.check_tool_pairing``: a result names an earlier call's exact id).
+   role lie inside. The store's write check (``fresh_tail.check_tool_pairing``) does not
+   guarantee this: it checks the whole list cumulatively, on stripped ids, and takes a
+   call's ``tool_call_id`` where its ``id`` is empty (``message_analysis._tool_call_id``); so
+   a stored result can stand outside its call's block or carry an alias of its call. Where
+   a call or a result is left unpaired, the pairing says why, from the block (#78, A11:
+   ``Pairing.unanswered``, ``Pairing.stray``).
 2. **A degenerate id group is stated, never resolved.** Where two or more calls of a
    block carry one ``id``, or a call's aliases (its ``call_id``, its ``response_item_id``,
    and each part of a composite ``a|b`` of any of them) include another call's ``id``, those
@@ -40,6 +44,7 @@ class Group:
     ids: list                                 # the distinct ``id`` values of its calls, in order
     calls: list                               # (assistant record, position), in order
     results: list                             # result records, in order
+    spellings: list = field(default_factory=list)   # every spelling that joined it, sorted (#78)
 
 
 @dataclass
@@ -52,8 +57,20 @@ class Pairing:
     answer: dict = field(default_factory=dict)
     # (assistant record, position) or result record -> its Group
     group: dict = field(default_factory=dict)
-    # result record -> ("unknown", its id) or ("no_id", None): a result that belongs to no call
+    # result record -> (why, its id, detail): a result that belongs to no call, and the block's
+    # fact that says why: "no_id"; "no_calls" (its block opens with ``detail``, a message
+    # holding no calls); "alias" (its id is another spelling of call ``detail`` of the block,
+    # not that call's id); "unknown" (no call of the block has its id in any spelling)
     stray: dict = field(default_factory=dict)
+    # (assistant record, position) -> (why, detail): a call no result of its block pairs with,
+    # and why, from the block: "no_id" (the call carries no id); "alias" (result ``detail[0]``
+    # of the block carries the call's alias ``detail[1]``, not its id); "none" (no result of
+    # the block carries its id or an alias of it)
+    unanswered: dict = field(default_factory=dict)
+    # (assistant record, position) -> (result record, the record that opens its block): for a
+    # call unanswered in its block, a result with its exact id elsewhere on the active record
+    # (asked by the caller, which holds the active order: ``expansion.Order.pairing``)
+    elsewhere: dict = field(default_factory=dict)
 
 
 def _id_of(call: Any) -> Any:
@@ -116,7 +133,15 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
                     found.answer[(head_record, position)] = mine[0]
                     found.result_of[mine[0]] = (head_record, position)
                     claimed.add(mine[0])
+                elif call_id is None:
+                    found.unanswered[(head_record, position)] = ("no_id", None)
+                else:
+                    other = _aliases(call) - {call_id}
+                    alias = next(((record, raw["tool_call_id"]) for record, raw in results
+                                  if raw.get("tool_call_id") in other), None)
+                    found.unanswered[(head_record, position)] = ("alias", alias) if alias else ("none", None)
                 continue
+            spellings = _aliases(call)
         else:
             spellings: set = set()
             for i in indexes:
@@ -127,7 +152,7 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         for i in indexes:
             if _id_of(calls[i][1]) not in ids:
                 ids.append(_id_of(calls[i][1]))
-        group = Group(ids, [(head_record, calls[i][0]) for i in indexes], mine)
+        group = Group(ids, [(head_record, calls[i][0]) for i in indexes], mine, sorted(spellings))
         for key in group.calls:
             found.group[key] = group
         for record in mine:
@@ -139,9 +164,12 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
             continue
         call_id = raw.get("tool_call_id")
         if call_id is None or (isinstance(call_id, str) and not call_id.strip()):
-            found.stray[record] = ("no_id", None)
+            found.stray[record] = ("no_id", None, None)
+        elif not calls:
+            found.stray[record] = ("no_calls", call_id, head_record)
         else:
-            found.stray[record] = ("unknown", call_id)
+            owner = next((position for position, call in calls if call_id in _aliases(call)), None)
+            found.stray[record] = ("alias", call_id, owner) if owner is not None else ("unknown", call_id, None)
 
 
 def _opens_block(message: Any) -> bool:

@@ -88,7 +88,7 @@ from .image_room import (
 )
 from .message_content import image_media_type
 from .record_store import HANDLE_RE, Cover, RecordStore, Resolved
-from .results import final_result
+from .results import final_result, is_envelope
 from .tokens import CHARS_PER_TOKEN
 # Readable reasoning is what the summariser reads as readable, one rule (#8, #18).
 from .summariser_input import _readable_reasoning as readable_reasoning
@@ -112,22 +112,44 @@ TOKEN_VERSION = 4
 _UNRESOLVED = {
     "malformed": ("{handle!r} is not a handle. A handle is a kind letter (m a message, t a tool call, c a chunk, "
                   "s a summary) and eight characters, as the summaries in your context and these tools show them."),
-    "unknown": "{handle} is unknown in this store: no message, tool call, chunk or summary has this handle here.",
-    "other_session": ("{handle} belongs to another session. A handle resolves only in the session that holds it; "
-                      "this session cannot reach another's past."),
     "summary_revision": ("{handle} is the host's rewrite of summary {of} (the row the plugin returned, as the host "
                          "changed it). Expand {of} to read behind the summary."),
 }
+# "unknown" and "other_session" by the store fact that decided them (``Resolved.why``, #78).
+_KIND_NAME = {"m": "message", "t": "tool call", "c": "chunk", "s": "summary"}
+_UNREACHED = {
+    "no_row": "{handle} is unknown in this store: no {kind} has this handle here.",
+    "no_chunk": ("{handle} is a summary in this store, but the store records no chunk it was written from, so it "
+                 "belongs to no session and resolves in none."),
+    "session": ("{handle} belongs to another session of this store. A handle resolves only in the session that holds "
+                "it; this session cannot reach another's past."),
+    "sessions": ("{handle} is a summary whose chunks belong to {sessions} sessions of this store, so it belongs to no "
+                 "one session and resolves in none."),
+    "unrecorded_chunks": ("{handle} is a summary whose chunks the store holds no row of, so it belongs to no session "
+                          "and resolves in none."),
+}
 
 # Notes on calls and results: facts of the store (``pairing``), never what the host sends.
-NO_RESULT = "no result follows this call on the active record"
-_STRAY = {
-    "unknown": "no call of the message before this result has its host id {id}",
-    "no_id": "this result carries no host id, so no call pairs with it",
+# Each cause as the pairing states it (``Pairing.unanswered``, ``stray``, ``elsewhere``; #78).
+NO_RESULT = "no result with this call's host id stands on the active record"
+_UNANSWERED = {
+    "no_id": "this call carries no host id, so no result pairs with it",
+    "alias": ("result {result} of this call's block carries {alias}, another spelling of this call's host id, not the "
+              "id itself; the store pairs by the exact id and does not pair them"),
+    "elsewhere": ("result {result} carries this call's host id but stands outside this call's block, in the block "
+                  "that opens with {opener}; the store pairs a result only within its call's block"),
 }
-_GROUP = ("{k} calls and {j} results in this stretch carry the host id {id}; the store cannot tell which result "
-          "answered which call, and what the provider received of them depends on the host's sanitizer and on the "
-          "session's route, which this plugin does not reproduce")
+_STRAY = {
+    "unknown": "no call of the message before this result has its host id {id} in any spelling",
+    "no_id": "this result carries no host id, so no call pairs with it",
+    "no_calls": "this result's block opens with {head}, which holds no tool calls, so no call pairs with it",
+    "alias": ("this result's host id {id} is another spelling of call {position} of the message before it, not that "
+              "call's id; the store pairs by the exact id and does not pair them"),
+}
+_GROUP = ("{k} calls of message {head} and {j} results of its block are joined by the host ids or their other "
+          "spellings {spellings}; the store cannot tell which result answered which call, and what the provider "
+          "received of them depends on the host's sanitizer and on the session's route, which this plugin does not "
+          "reproduce")
 _FILL = "the host sends this empty message to the provider with its own stand-in as content: {content}"
 # A later page whose target's identity differs from page 1's (``target_identity``): only that is
 # known, never why.
@@ -138,10 +160,10 @@ _FILL_UNREAD = ("whether the host sends its stand-in {content} for this empty me
 
 
 def _group_note(group: host_pairing.Group) -> str:
-    """Rule 2's note: one id, or the overlapping ids of the group's calls."""
-    ids = [str(i) for i in group.ids]
-    said = ids[0] if len(ids) == 1 else ", ".join(ids[:-1]) + " or " + ids[-1] + " (overlapping)"
-    return _GROUP.format(k=len(group.calls), j=len(group.results), id=said)
+    """Rule 2's note: the block (its opening message) and every spelling that joined the
+    group, never "the host id" for a spelling that is an alias (#78)."""
+    said = list(group.spellings) + [json.dumps(i) for i in group.ids if not isinstance(i, str)]
+    return _GROUP.format(k=len(group.calls), j=len(group.results), head=group.calls[0][0], spellings=", ".join(said))
 
 
 class ExpansionError(Exception):
@@ -152,7 +174,34 @@ class ExpansionError(Exception):
 def unresolved_message(resolved: Resolved) -> str:
     if resolved.status == "inactive":
         return _inactive_text(resolved)
+    if resolved.status in ("unknown", "other_session"):
+        return _UNREACHED[resolved.why].format(handle=resolved.handle, kind=_KIND_NAME.get(resolved.kind, "row"),
+                                               sessions=resolved.sessions)
     return _UNRESOLVED[resolved.status].format(handle=resolved.handle, of=resolved.of)
+
+
+def call_named(resolved: Resolved) -> str:
+    """A call as a text names it: its tool name, or the step at which its stored call gives
+    none (``Resolved.name_why``), never "no name" (#78)."""
+    return resolved.name if resolved.name is not None else f"no tool name: {resolved.name_why}"
+
+
+def _compaction_said(subject: str, cause: dict) -> str:
+    """What the store records of the compaction that wrote ``subject`` and did not take
+    effect (``RecordStore._compaction_cause``), each state as recorded (#78)."""
+    compaction = cause["compaction"]
+    if cause["kind"] == "rejected":
+        text = f"{subject} was recorded by compaction {compaction}, which the host rejected ({cause.get('how')})"
+    elif cause.get("returned"):
+        text = (f"{subject} was recorded by compaction {compaction}, whose return reached the host; the store records "
+                f"no confirmation, adoption or rejection of it")
+    else:
+        events = cause.get("events") or []
+        text = (f"{subject} was recorded by compaction {compaction}, which never returned to the host (the store records "
+                f"no return of it" + (f"; its events: {', '.join(events)})" if events else ", and no event of it)"))
+    if cause.get("never_held"):
+        text += "; no effective compaction's list ever held it"
+    return text + "; it is not on the active record."
 
 
 def _inactive_text(resolved: Resolved) -> str:
@@ -161,8 +210,8 @@ def _inactive_text(resolved: Resolved) -> str:
     cause = resolved.cause or {"kind": "none"}
     kind = cause.get("kind")
     if resolved.kind == TOOL_CALL:
-        prefix = (f"{resolved.handle} is call {(resolved.position or 0) + 1} ({resolved.name or 'no name'}) of "
-                  f"message {resolved.record}. ")
+        prefix = (f"{resolved.handle} is call {(resolved.position or 0) + 1} ({call_named(resolved)}) of message "
+                  f"{resolved.record}. ")
         subject = resolved.record
     else:
         prefix, subject = "", (resolved.record or resolved.handle)
@@ -176,35 +225,51 @@ def _inactive_text(resolved: Resolved) -> str:
         text += f". Expand {cause['active']}."
         if resolved.kind == TOOL_CALL:
             text += " A rewritten message's calls have handles of their own."
-    elif kind == "rejected":
-        text = (f"{subject} was recorded by compaction {cause['compaction']}, which the host rejected; it never stood "
-                f"on the active record.")
-    elif kind == "unconfirmed":
-        text = (f"{subject} was recorded by compaction {cause['compaction']}, which the host has not confirmed; it is "
-                f"not on the active record.")
+    elif kind in ("rejected", "unconfirmed"):
+        text = _compaction_said(subject, cause)
     elif kind == "left":
         text = (f"{subject} stood on the active record at compaction {cause['stood']}; the host's list at compaction "
                 f"{cause['gone']} held neither it nor a rewrite of it.")
+    elif kind == "held_unreached":
+        text = (f"{subject} was held by the host's list at compaction {cause['stood']}, which took effect, and every "
+                f"later effective list held it or a rewrite of it; yet the session's latest effective return does not "
+                f"reach it.")
+    elif kind == "effective_unheld":
+        text = (f"{subject} was recorded by compaction {cause['compaction']}, which took effect, but no effective "
+                f"compaction's list ever held it; it is not on the active record.")
+    elif kind == "effective_unreached":
+        text = (f"{subject} was recorded by compaction {cause['compaction']}, which took effect, yet the session's "
+                f"latest effective return does not reach it.")
+    elif kind == "no_writer":
+        text = f"{subject} is a summary the store records no compaction for; it is not on the active record."
     else:
-        text = f"{subject} is not on the active record, and the store records no cause."
+        text = f"{subject} is not on the active record, and the store holds no row of the compaction that wrote it."
     return prefix + text
 
 
 # --- The page limit -------------------------------------------------------------------------
 
-def calls_in_current_message(messages: Any) -> Optional[int]:
-    """How many tool calls the assistant message now being answered holds: the last
-    assistant message with tool calls in the live list the host hands the engine tool
+def calls_in_current_message(messages: Any) -> tuple[Optional[int], str]:
+    """How many tool calls the assistant message now being answered holds, and "": the last
+    assistant message in the live list the host hands the engine tool
     (``handle_tool_call(..., messages=messages)``, agent/tool_executor.py:1655; the host
-    appends that message before running its calls and each result after it). None where
-    the list holds none."""
+    appends that message before running its calls and each result after it). Else None and
+    why, each asked on its own (#78, A11): no list; no assistant message in it; the last
+    assistant message has no ``tool_calls``, or not a list, or an empty one."""
     if not isinstance(messages, list):
-        return None
+        return None, f"the host handed no message list (it handed {type(messages).__name__})"
     for message in reversed(messages):
         if isinstance(message, dict) and message.get("role") == "assistant":
-            calls = message.get("tool_calls")
-            return len(calls) if isinstance(calls, list) and calls else None
-    return None
+            if "tool_calls" not in message:
+                return None, "the last assistant message of the list the host handed holds no tool_calls"
+            calls = message["tool_calls"]
+            if not isinstance(calls, list):
+                return None, (f"the last assistant message of the list the host handed holds tool_calls that are "
+                              f"not a list but {type(calls).__name__}")
+            if not calls:
+                return None, "the last assistant message of the list the host handed holds an empty tool_calls list"
+            return len(calls), ""
+    return None, f"the list of {len(messages)} messages the host handed holds no assistant message"
 
 
 def host_guardrail_margin(tool_name: str) -> int:
@@ -234,8 +299,10 @@ def host_guardrail_margin(tool_name: str) -> int:
         notice = max(len(guard._IDENTICAL_CALL_NOTICE.format(ordinal=guard._ordinal(big), tool_name=tool_name)),
                      len(guard._IDENTICAL_CYCLE_NOTICE.format(count=big, period=big, tool_name=tool_name)))
     except Exception as exc:
-        raise ExpansionError(f"the host's guardrail texts cannot be read ({type(exc).__name__}: {exc}), so the "
-                             f"room they take beside a page is not known") from None
+        # Everything in the try is the host's (its module, templates and functions), measured
+        # with this tool's name: the text names that and the exception, nothing else (#78).
+        raise ExpansionError(f"measuring the host's guardrail texts (agent.tool_guardrails) for {tool_name} raised "
+                             f"{type(exc).__name__} ({exc}), so the room they take beside a page is not known") from None
     return 2 * guidance + len("\n\n") + notice
 
 
@@ -289,16 +356,15 @@ def host_page_limits(engine: Any, tool_name: str, messages: Any) -> PageLimit:
         threshold = budget.resolve_threshold(tool_name)
         turn_budget = budget.turn_budget
     except Exception as exc:
-        raise ExpansionError(f"the host's spill threshold for {tool_name} cannot be read "
-                             f"({type(exc).__name__}: {exc}), so no page size is known") from None
+        raise ExpansionError(f"the host's _budget_for_agent / resolve_threshold for {tool_name} raised "
+                             f"{type(exc).__name__} ({exc}), so no page size is known") from None
     for name, value in (("threshold", threshold), ("turn budget", turn_budget)):
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise ExpansionError(f"the host's {name} for {tool_name} is {value!r}, not a size a page can be "
                                  f"measured against")
-    calls = calls_in_current_message(messages)
+    calls, why = calls_in_current_message(messages)
     if calls is None:
-        raise ExpansionError("the host handed no message list with the tool calls being answered, so the "
-                             "share of the host's per-message budget a page may take is not known")
+        raise ExpansionError(f"{why}, so the share of the host's per-message budget a page may take is not known")
     margin = host_guardrail_margin(tool_name)
     limit = min(int(threshold), int(turn_budget) // calls) - margin
     if limit <= 0:
@@ -412,9 +478,10 @@ class Item:
 
     - the plugin's side, rendered under the one key ``lcm``: ``annotations``, what the plugin
       says of the item (``handle``, ``role``, ``result_of``, ``note``, ``content_chars``,
-      ``chunk``, ``under``, ``summary``, ``summaries``, ``tail``, ``stored_at``, ``images``
-      and the call's provenance statements ``route_note``, ``images_note``, ``guard_note``,
-      ``_provenance``), which every piece of it carries; and ``plugin``, the plugin's own fields that can be split over
+      ``chunk``, ``under``, ``summary``, ``summaries``, ``tail``, ``compaction_began_at``,
+      ``images`` and the call's provenance statements ``route_note``, ``images_note``,
+      ``guard_note``, ``commit_note``, ``_provenance``), which every piece of it carries; and
+      ``plugin``, the plugin's own fields that can be split over
       pages (the readable ``reasoning``, each tool call's handle and notes by position under
       ``calls``, a summary's ``text``, grep's ``results_holding_term`` and ``messages``); a
       piece of a tool call carries that call's entry of ``calls`` as ``call``;
@@ -535,23 +602,33 @@ def _as_sent(raw: dict, route: "Route", *, raw_form: bool) -> tuple[dict, Option
 
 
 def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> list:
-    """The note of one call: its group's (rule 2), or that no result of its id follows it
-    (rule 3), or none."""
+    """The note of one call: its group's (rule 2), or why no result pairs with it, each cause
+    as the pairing and the active order state it (#78): no id; an alias of it on a result of
+    its block; a result of its exact id outside its block; none anywhere on the active
+    record."""
     key = (handle, position)
     if key in found.group:
         return [_group_note(found.group[key])]
-    if key not in found.answer:
-        return [NO_RESULT]
-    return []
+    if key in found.answer:
+        return []
+    why, detail = found.unanswered.get(key, ("none", None))
+    if why == "no_id":
+        return [_UNANSWERED["no_id"]]
+    if why == "alias":
+        return [_UNANSWERED["alias"].format(result=detail[0], alias=detail[1])]
+    if key in found.elsewhere:
+        result, opener = found.elsewhere[key]
+        return [_UNANSWERED["elsewhere"].format(result=result, opener=opener)]
+    return [NO_RESULT]
 
 
 def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
-    """The note of one result: its group's, or that it belongs to no call; or none."""
+    """The note of one result: its group's, or why it belongs to no call; or none."""
     if handle in found.group:
         return [_group_note(found.group[handle])]
     if handle in found.stray:
-        why, call_id = found.stray[handle]
-        return [_STRAY[why].format(id=call_id)]
+        why, call_id, detail = found.stray[handle]
+        return [_STRAY[why].format(id=call_id, head=detail, position=(detail or 0) + 1 if why == "alias" else None)]
     return []
 
 
@@ -669,7 +746,26 @@ class Order:
         return cls(records, {record: i for i, record in enumerate(records)}, route)
 
     def pairing(self, store: RecordStore, stretch: list[str]) -> host_pairing.Pairing:
-        return host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles, store.records_raw)
+        """The store's pairing of ``stretch`` through its blocks, and for each call its block
+        leaves unanswered with an id, where a result of that exact id stands elsewhere on the
+        active record (#78: asked, so "no result" is said only where there is none)."""
+        found = host_pairing.pairing_around(self.records, self.index, stretch, store.record_roles, store.records_raw)
+        for key, (why, _detail) in found.unanswered.items():
+            if why != "none":
+                continue
+            raw = store.record_raw(key[0]) or {}
+            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+            call = calls[key[1]] if key[1] < len(calls) and isinstance(calls[key[1]], dict) else {}
+            call_id = call.get("id")
+            if not isinstance(call_id, str):
+                continue
+            places = sorted(self.index[str(h)] for (h,) in store._q(
+                "SELECT handle FROM records WHERE json_extract(raw, '$.tool_call_id') = ?", (call_id,))
+                if str(h) in self.index)
+            if places:
+                opener, _end = host_pairing.blocks_span(self.records, store.record_roles, places[0], places[0])
+                found.elsewhere[key] = (self.records[places[0]], self.records[opener])
+        return found
 
 
 def _records_items(store: RecordStore, order: Order, records: list[tuple[str, dict]], *, raw: bool) -> list[dict]:
@@ -719,19 +815,22 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
                 return Target(header, _records_items(store, order, store.chunk_records(chunks[0]), raw=raw))
             # A summary written from the raw of several chunks (#34 D6, "raw"): all of them,
             # each opened by a marker naming its chunk and every leaf summary of that chunk, in
-            # write order, each with the state the store records for it from the compaction that
-            # wrote it (effective, unconfirmed, rejected). No choice is made among them.
+            # write order, each with the compaction that wrote it and the state the store records
+            # of that compaction (``RecordStore.compaction_state``). No choice is made among them.
             leaves: dict[str, list] = {}
             for derivation, chunk in _all_summaries(store, chunks):
-                leaves.setdefault(chunk, []).append({"summary": derivation,
-                                                     "state": store.derivation_state(derivation)})
+                written_by, state = store.compaction_state(derivation)
+                leaves.setdefault(chunk, []).append({"summary": derivation, "compaction": written_by,
+                                                     "compaction_state": state})
             items: list[Item] = []
             for chunk in chunks:
                 items.append(Item({"chunk": chunk, "summaries": leaves.get(chunk, [])}))
                 items.extend(_records_items(store, order, store.chunk_records(chunk), raw=raw))
             return Target(header, items)
-        # A summary written from summaries (#34 D6, "summaries"): one layer down.
-        header["form"] = "summaries"
+        # A summary written from summaries (#34 D6, "summaries"): one layer down. Where its
+        # sources mix summaries and chunks the form says so, and a chunk source says what it
+        # is (#78: the store's sources as they are, never one form for two).
+        header["form"] = "summaries" if all(derivation for _chunk, derivation in sources) else "summaries and chunks"
         items = []
         for chunk, derivation in sources:
             if derivation:
@@ -740,7 +839,8 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
                                            "its handle to read behind it"},
                                   plugin={"text": store.derivation_text(derivation)}))
             else:
-                items.append(Item({"chunk": chunk}))
+                items.append(Item({"chunk": chunk, "note": "a chunk this summary was written from; expand its "
+                                                           "handle to read its messages"}))
         return Target(header, items)
     if resolved.kind == TOOL_CALL:
         # The call's result is the stored result of its exact id in its block (``pairing``):
@@ -748,6 +848,8 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
         # of the group, attributed to none.
         record, position = resolved.record, int(resolved.position or 0)
         header = {"handle": handle, "kind": "tool_call", "form": "raw", "name": resolved.name, "call_in": record}
+        if resolved.name is None:
+            header["name_note"] = f"no tool name: {resolved.name_why}"     # the step, never "no name" (#78)
         found = order.pairing(store, [record])
         notes = _call_notes(found, record, position)
         if notes:
@@ -974,25 +1076,33 @@ def route_image_check(route: "Route", tool_name: str = "lcm_expand") -> Callable
     def check(part: dict) -> str:
         key = json.dumps(part, sort_keys=True, ensure_ascii=False)
         if key not in seen:
+            probe = _probe_messages(tool_name, part)
+            # Only the host's converter is inside the try (#78, A11): a failure of the plugin's
+            # own reading of its output is the tool's failure, never said to be the host's.
             try:
-                probe = _probe_messages(tool_name, part)
-                found, broken = wire_result(convert_request(route, probe), probe, 0)
-                # Each cause named where it arises: the pairing breaks at a step ``wire_result``
-                # names, or the paired result holds no image block.
-                if found is None:
-                    seen[key] = (f"the host's converter for this session's route ({route_name(route)}) does not carry "
-                                 f"this image to the model: {broken}")
-                elif found < 1:
-                    seen[key] = (f"the host's converter for this session's route ({route_name(route)}) does not carry "
-                                 f"this image to the model as an image: the tool result it builds holds no image "
-                                 f"block")
-                else:
-                    seen[key] = ""
+                wire = convert_request(route, probe)
             except RoomUnavailable as exc:
                 seen[key] = str(exc)
+                return seen[key]
             except Exception as exc:
-                seen[key] = (f"the host's converter for this session's route ({route_name(route)}) could not be run "
-                             f"on this image ({type(exc).__name__}: {exc})")
+                seen[key] = (f"the host's converter for this session's route ({route_name(route)}) raised "
+                             f"{type(exc).__name__} on this image ({exc})")
+                return seen[key]
+            try:
+                found, broken = wire_result(wire, probe, 0)
+            except RoomUnavailable as exc:
+                seen[key] = str(exc)
+                return seen[key]
+            # Each cause named where it arises: the pairing breaks at a step ``wire_result``
+            # names, or the paired result holds no image block.
+            if found is None:
+                seen[key] = (f"the host's converter for this session's route ({route_name(route)}) does not carry "
+                             f"this image to the model: {broken}")
+            elif found < 1:
+                seen[key] = (f"the host's converter for this session's route ({route_name(route)}) does not carry "
+                             f"this image to the model as an image: the tool result it builds holds no image block")
+            else:
+                seen[key] = ""
         return seen[key]
 
     return check
@@ -1024,7 +1134,10 @@ def _images_of(message: dict, handle: str, route: "Route") -> dict:
     own record of what it placed. Every image is decided here, when the item is built, so the
     token's hash covers it and the pieces of an item reassemble to it on every page."""
     content = message.get("content")
-    envelope = isinstance(content, dict) and bool(content.get("_multimodal"))
+    # The host's own envelope test (``results.is_envelope``: ``_multimodal is True`` and a list
+    # ``content``), never a truthiness of our own (#78: a marker that is not True is stored
+    # content, and no image of it is decided).
+    envelope = is_envelope(content)
     parts = content.get("content") if envelope else content
     if not isinstance(parts, list):
         return {}

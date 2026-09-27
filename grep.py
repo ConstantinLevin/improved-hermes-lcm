@@ -17,7 +17,8 @@ record of the scope is read and tested with Python's ``in``, in one snapshot of 
 There is no index: the column read is the one the hit is decided by, so no second copy of it
 exists that could disagree (measured on #76: about 0.1 s for a scope of 39 M characters, 0.6 s
 for 230 M). What came after the last compaction is not in the store: the result says what
-it searched and when that was stored.
+it searched and when the compaction whose return it searched began (``compaction_began_at``:
+the start of that compaction's planning, before any summary or confirmation, #78).
 
 **What a result holds**, never the term itself (the host classifies a result as failed when
 its first 500 characters hold the JSON string "error" or "failed", agent/display.py:975-1017
@@ -29,8 +30,8 @@ at Hermes cdcd53c2cd; the page token carries the term):
   show (tool results): an address, never the match; then the chunk's items as expansion
   gives them;
 - where records of the stored fresh tail hold the term, a note with their handles and the
-  time they were stored (the tail is no chunk; whether the context still holds them the
-  store learns only at the next compaction), in count-only mode too.
+  time the compaction that returned them began (the tail is no chunk; whether the context
+  still holds them the store learns only at the next compaction), in count-only mode too.
 
 A search that fails is an error, never "no hits": whatever reading the store raises (a
 damaged page, a lock held past the busy timeout) is the tool's error.
@@ -59,16 +60,39 @@ _ARGUMENTS = ("term", "scope", "all", "raw", "page")
 _REMOVED = ("query", "limit", "sort", "role", "time_from", "time_to", "mode", "session_scope", "session_id",
             "source", "conversation_id", "content_scope", "externalized_refs")
 
-NOTHING_STORED = "nothing of this session is on the active record yet: no compaction of it has taken effect"
 COUNT_ONLY = ("the term lies in this many chunks, too many to return; narrow the term or the scope, or call again "
               "with all=true for every one of them")
 TAIL_NOTE = "records of the fresh tail of the latest compaction that took effect hold the term"
 
 
+def nothing_stored(records: RecordStore, session: str) -> str:
+    """Why nothing of a session is on its active record (no effective compaction), as the
+    store records it (#78, A11): no compaction of it was attempted; or how many were, and of
+    those how many the host rejected, how many returned and are not settled, how many never
+    returned. Asked of the store, never "yet"."""
+    attempted = [int(c) for (c,) in records._q("SELECT compaction_id FROM compactions WHERE session = ?", (session,))]
+    if not attempted:
+        return "nothing of this session is stored: no compaction of it was attempted"
+    rejected = returned = unreturned = 0
+    for compaction in attempted:
+        cause = records._compaction_cause(compaction, session)
+        if cause is None:
+            continue
+        if cause["kind"] == "rejected":
+            rejected += 1
+        elif cause.get("returned"):
+            returned += 1
+        else:
+            unreturned += 1
+    return (f"nothing of this session is on the active record: none of its {len(attempted)} compactions took effect "
+            f"({rejected} rejected by the host, {returned} returned and not settled, {unreturned} never returned)")
+
+
 @dataclass
 class _Found:
     store_uuid: str
-    stored_at: Optional[str] = None
+    compaction_began_at: Optional[str] = None
+    nothing: str = ""                                   # ``nothing_stored`` where there is no cover
     chunks: list = field(default_factory=list)          # the chunks of the scope, in cover order
     tail: list = field(default_factory=list)            # the tail records of the scope (session only)
     members: dict = field(default_factory=dict)
@@ -95,7 +119,7 @@ def check_term(term: Any) -> str:
     return term
 
 
-def _stored_at(records: RecordStore, compaction: int) -> Optional[str]:
+def _began_at(records: RecordStore, compaction: int) -> Optional[str]:
     began = records.compaction_began_at(compaction)
     return datetime.fromtimestamp(began, timezone.utc).isoformat(timespec="seconds") if began is not None else None
 
@@ -109,9 +133,10 @@ def _search(records: RecordStore, session: str, term: str, scope: str) -> _Found
             if scope:
                 resolved = records.resolve(scope, session, None)
                 raise ExpansionError(expansion.unresolved_message(resolved))
+            found.nothing = nothing_stored(records, session)
             return found
         found.cover = cover
-        found.stored_at = _stored_at(records, cover.compaction)
+        found.compaction_began_at = _began_at(records, cover.compaction)
         for summary in cover.summaries:
             for chunk in cover.reaches.get(summary, []):
                 found.under[chunk] = summary
@@ -145,11 +170,11 @@ def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, eve
     searched: dict = {"chunks": len(found.chunks)}
     if found.session_scope:
         searched["tail_messages"] = len(found.tail)
-    searched["stored_at"] = found.stored_at
+    searched["compaction_began_at"] = found.compaction_began_at
     header: dict = {"kind": "grep", "scope": scope or "session", "form": "raw" if raw else "collapsed",
                     "searched": searched, "chunks_matching": len(matching)}
     if found.cover is None:
-        header["note"] = NOTHING_STORED
+        header["note"] = found.nothing
         return Target(header, []), None
     items: list = []
     route = None
@@ -173,7 +198,8 @@ def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, eve
             items.append(Item({"chunk": chunk, "under": found.under.get(chunk)}, plugin=said))
             items.extend(expansion._records_items(records, order, records.chunk_records(chunk), raw=raw))
     if tail_hits:
-        items.append(Item({"tail": TAIL_NOTE, "stored_at": found.stored_at}, plugin={"messages": tail_hits}))
+        items.append(Item({"tail": TAIL_NOTE, "compaction_began_at": found.compaction_began_at},
+                          plugin={"messages": tail_hits}))
     return Target(header, items), route
 
 

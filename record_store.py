@@ -110,7 +110,13 @@ class Resolved:
     naming the host's rewrite of a summary row the plugin returned, a revision beside the
     chain, #15: the summary is expanded, not the row; ``of`` names it). For a message or a
     tool call: ``record`` (the message's record), and for a call ``position`` (0-based) and
-    ``name``. For "inactive": ``cause``, the store's facts about why (``inactive_cause``)."""
+    ``name``, and where the stored call gives no name, ``name_why`` (the step at which it
+    gives none, #78: never "no name"). For "inactive": ``cause``, the store's facts about why
+    (``inactive_cause``). For "unknown" and "other_session": ``why``, which of the store's
+    facts decided it (#78, LEARNINGSFÜRPLÄNE A11): "no_row" (no row of the handle's kind),
+    "no_chunk" (a summary row that reaches no chunk), "session" (``home`` is another
+    session), "sessions" (a summary reaching the chunks of ``sessions`` sessions),
+    "unrecorded_chunks" (a summary reaching chunks the store has no row of)."""
 
     status: str
     kind: str
@@ -120,6 +126,36 @@ class Resolved:
     position: Optional[int] = None
     name: Optional[str] = None
     cause: Optional[dict] = None
+    why: str = ""
+    home: str = ""
+    sessions: int = 0
+    name_why: str = ""
+
+
+def _call_name(raw: dict, position: int) -> tuple[Optional[str], str]:
+    """The tool name of the call at ``position`` of a stored message, and "", or None and
+    the step at which the stored call gives no name (#78, A11: each asked on its own).
+    Handles are minted for every position of a ``tool_calls`` list (``_write_tool_calls``),
+    whatever the call's shape."""
+    calls = raw.get("tool_calls")
+    call = calls[position] if isinstance(calls, list) and 0 <= position < len(calls) else None
+    if not isinstance(call, dict):
+        return None, f"its stored call is not an object but {type(call).__name__}"
+    if "function" not in call:
+        return None, "its stored call has no function"
+    function = call["function"]
+    if not isinstance(function, dict):
+        return None, f"its stored call's function is not an object but {type(function).__name__}"
+    if "name" not in function:
+        return None, "its stored call's function has no name"
+    name = function["name"]
+    if name is None:
+        return None, "its stored call's function name is null"
+    if not isinstance(name, str):
+        return None, f"its stored call's function name is not a string but {type(name).__name__}"
+    if not name:
+        return None, "its stored call's function name is empty"
+    return name, ""
 
 
 def parse_ret_key(value: Any) -> Optional[tuple[int, int]]:
@@ -722,58 +758,78 @@ class RecordStore:
             rows = self._q("SELECT session FROM chunks WHERE handle = ?", (text,))
             home = str(rows[0][0]) if rows else None
         elif kind == DERIVATION:
-            reached = self._chunks_of(text) if self._q("SELECT 1 FROM derivations WHERE handle = ?", (text,)) else []
-            if reached:
-                sessions = {str(s) for (s,) in self._q(
-                    f"SELECT DISTINCT session FROM chunks WHERE handle IN ({','.join('?' * len(reached))})", reached)}
-                # A derivation reaches the chunks of one session; more than one is no session's.
-                home = next(iter(sessions)) if len(sessions) == 1 else ""
+            if not self._q("SELECT 1 FROM derivations WHERE handle = ?", (text,)):
+                return Resolved("unknown", kind, text, why="no_row")
+            reached = self._chunks_of(text)
+            if not reached:
+                return Resolved("unknown", kind, text, why="no_chunk")
+            sessions = {str(s) for (s,) in self._q(
+                f"SELECT DISTINCT session FROM chunks WHERE handle IN ({','.join('?' * len(reached))})", reached)}
+            # A derivation reaches the chunks of one session; any other count is said as it is.
+            if not sessions:
+                return Resolved("other_session", kind, text, why="unrecorded_chunks")
+            if len(sessions) > 1:
+                return Resolved("other_session", kind, text, why="sessions", sessions=len(sessions))
+            home = next(iter(sessions))
         if home is None:
-            return Resolved("unknown", kind, text)
+            return Resolved("unknown", kind, text, why="no_row")
         if home != session:
-            return Resolved("other_session", kind, text)
+            return Resolved("other_session", kind, text, why="session", home=home)
         chunks = set(cover.chunks) if cover is not None else set()
         if kind == CHUNK:
             if text in chunks:
                 return Resolved("ok", kind, text)
             written_by = self._q("SELECT compaction FROM chunks WHERE handle = ?", (text,))[0][0]
-            return Resolved("inactive", kind, text, cause=self._compaction_cause(int(written_by), session))
+            return Resolved("inactive", kind, text, cause=self._compaction_cause(int(written_by), session)
+                            or {"kind": "effective_unreached", "compaction": int(written_by)})
         if kind == DERIVATION:
-            if reached and all(chunk in chunks for chunk in reached):
+            if all(chunk in chunks for chunk in reached):
                 return Resolved("ok", kind, text)
             written_by = self._q("SELECT compaction FROM derivations WHERE handle = ?", (text,))[0][0]
-            cause = self._compaction_cause(int(written_by), session) if written_by is not None else None
-            return Resolved("inactive", kind, text, cause=cause or {"kind": "none"})
+            if written_by is None:
+                return Resolved("inactive", kind, text, cause={"kind": "no_writer"})
+            return Resolved("inactive", kind, text, cause=self._compaction_cause(int(written_by), session)
+                            or {"kind": "effective_unreached", "compaction": int(written_by)})
         # A message, or a tool call: (the record, the call's position in it). A call is on
         # the active record exactly while its record is (round 5 of #71): its handle names
         # that record's call, and a rewrite of the record has calls of its own.
-        record, position, name = text, None, None
+        record, position, name, name_why = text, None, None, ""
         if kind == TOOL_CALL:
             record, position = self._q("SELECT record, position FROM tool_calls WHERE handle = ?", (text,))[0]
             record, position = str(record), int(position)
-            raw = self.record_raw(record) or {}
-            calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
-            call = calls[position] if position < len(calls) and isinstance(calls[position], dict) else {}
-            function = call.get("function") if isinstance(call.get("function"), dict) else {}
-            name = function.get("name")
+            name, name_why = _call_name(self.record_raw(record) or {}, position)
         if cover is not None and self._record_active(record, cover):
-            return Resolved("ok", kind, text, record=record, position=position, name=name)
+            return Resolved("ok", kind, text, record=record, position=position, name=name, name_why=name_why)
         if kind == MESSAGE:
             revised = self._q("SELECT derivation FROM summary_revisions WHERE revision = ? LIMIT 1", (text,))
             if revised:
                 return Resolved("summary_revision", kind, text, of=str(revised[0][0]))
-        return Resolved("inactive", kind, text, record=record, position=position, name=name,
+        return Resolved("inactive", kind, text, record=record, position=position, name=name, name_why=name_why,
                         cause=self.inactive_cause(record, session, cover))
 
     # --- Why a record is not on the active record: store facts only ------------------
 
     def _compaction_cause(self, compaction: int, session: str) -> Optional[dict]:
-        """"rejected" or "unconfirmed" where the store says so of the compaction that
-        wrote something; None where that compaction took effect."""
-        if self._q("SELECT 1 FROM rejections WHERE compaction = ? LIMIT 1", (compaction,)):
-            return {"kind": "rejected", "compaction": compaction}
+        """What the store records of the compaction that wrote something, where it did not
+        take effect (#78, A11: each state asked on its own, never "has not confirmed" for an
+        attempt the host never received):
+
+        - "rejected": a rejection row, with the host's ``how``;
+        - "unconfirmed" with ``returned`` true: its return was written (``compaction_returns``)
+          and no confirmation, adoption or rejection of it is recorded;
+        - "unconfirmed" with ``returned`` false: no return of it was written; ``events`` are
+          the kinds of the store's events recorded for it, in order (empty where none).
+
+        None where that compaction took effect (confirmed or adopted, not rejected)."""
+        rejected = self._q("SELECT how FROM rejections WHERE compaction = ? ORDER BY rowid LIMIT 1", (compaction,))
+        if rejected:
+            return {"kind": "rejected", "compaction": compaction, "how": str(rejected[0][0])}
         if not self.is_settled(compaction):
-            return {"kind": "unconfirmed", "compaction": compaction}
+            if self._q("SELECT 1 FROM compaction_returns WHERE compaction = ? LIMIT 1", (compaction,)):
+                return {"kind": "unconfirmed", "compaction": compaction, "returned": True}
+            events = [str(k) for (k,) in self._q(
+                "SELECT kind FROM store_events WHERE compaction = ? ORDER BY event_id", (compaction,))]
+            return {"kind": "unconfirmed", "compaction": compaction, "returned": False, "events": events}
         return None
 
     def inactive_cause(self, record: str, session: str, cover: Optional["Cover"]) -> dict:
@@ -788,10 +844,13 @@ class RecordStore:
           and the other records a merge took in with it;
         - "left": an effective compaction's list held it (k), written there or reused, and
           a later effective compaction's list (n) held neither it nor a revision of it;
-        - "rejected" / "unconfirmed", only for a record no effective list ever held: the
-          compaction that wrote it was rejected by the host, or is neither confirmed,
-          adopted nor rejected;
-        - "none": the store records nothing that says why."""
+        - "held_unreached": an effective list held it (k) and every later one held it or a
+          rewrite of it, yet the latest effective return does not reach it;
+        - "rejected" / "unconfirmed" (``_compaction_cause``), only for a record no effective
+          list ever held (``never_held``, asked here);
+        - "effective_unheld": the compaction that wrote it took effect, and no effective
+          list ever held it;
+        - "none": the store holds no row of the record's writer."""
         if cover is not None:
             parent: dict[str, Optional[str]] = {record: None}
             frontier = [record]
@@ -837,12 +896,16 @@ class RecordStore:
             later = [c for c in effective if c > stood[-1] and c not in holders]
             if later:
                 return {"kind": "left", "stood": stood[-1], "gone": later[0]}
-            return {"kind": "none"}
+            # Every later effective list held it or a rewrite of it, and still the latest
+            # return does not reach it: the store's facts, said as they are (#78).
+            return {"kind": "held_unreached", "stood": stood[-1]}
         own = self._q("SELECT compaction FROM records WHERE handle = ?", (record,))
         if own:
             cause = self._compaction_cause(int(own[0][0]), session)
             if cause is not None:
-                return cause
+                # Asked here, not assumed: no effective list ever held it (``stood`` is empty).
+                return {**cause, "never_held": True}
+            return {"kind": "effective_unheld", "compaction": int(own[0][0])}
         return {"kind": "none"}
 
     def _record_active(self, record: str, cover: "Cover") -> bool:
@@ -874,17 +937,23 @@ class RecordStore:
         rows = self._q("SELECT text FROM derivations WHERE handle = ?", (derivation,))
         return str(rows[0][0]) if rows else None
 
-    def derivation_state(self, derivation: str) -> str:
-        """The state the store records for a derivation, from the compaction that wrote it
-        (``_compaction_cause``): "rejected", "unconfirmed", or "effective" where that
-        compaction took effect."""
+    def compaction_state(self, derivation: str) -> tuple[Optional[int], str]:
+        """The compaction that wrote a derivation and the state the store records of that
+        compaction (``_compaction_cause``; #78: the writer's state, never said to be the
+        summary's own): "took effect", "rejected", "returned, not settled", "not returned",
+        or (None, "no compaction recorded")."""
         rows = self._q("SELECT compaction FROM derivations WHERE handle = ?", (derivation,))
         if not rows:
             raise KeyError(f"no derivation {derivation} in this store")
         if rows[0][0] is None:
-            return "none"             # the store records no compaction for it
-        cause = self._compaction_cause(int(rows[0][0]), "")
-        return cause["kind"] if cause is not None else "effective"
+            return None, "no compaction recorded"
+        compaction = int(rows[0][0])
+        cause = self._compaction_cause(compaction, "")
+        if cause is None:
+            return compaction, "took effect"
+        if cause["kind"] == "rejected":
+            return compaction, "rejected"
+        return compaction, "returned, not settled" if cause.get("returned") else "not returned"
 
     def tool_calls_of(self, records: Sequence[str]) -> dict[str, dict[int, str]]:
         """record -> {position in its ``tool_calls``: the call's handle}: the handles minted
