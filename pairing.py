@@ -16,8 +16,9 @@ stored records alone:
    unpaired, the pairing says why, from the block (#78, A11: ``Pairing.unanswered``,
    ``Pairing.stray``).
 2. **A degenerate id group is stated, never resolved.** Where two or more calls of a
-   block carry one ``id``, or a call's aliases (its ``call_id``, its ``response_item_id``,
-   and each part of a composite ``a|b`` of any of them) include another call's ``id``, those
+   block carry one ``id``, or a call's spellings (its scalar ``id``, ``call_id`` and
+   ``response_item_id``, and each non-blank part of a composite ``a|b`` of any of them)
+   include another call's ``id``, those
    calls form one group, with every result of the block whose id is one of the group's
    spellings; so does a single call that two or more results of the block name. Every call
    and every result of the group carries one note saying that the store cannot tell which
@@ -31,7 +32,11 @@ the only way an id is shown. A stored id can be any JSON value (LEARNINGSFÃœRPLÃ
 domain axis). Two ids are the same iff both are scalars (``id_state``: a non-blank string, a
 number, a boolean) of the same JSON type with the same value: strings exactly, numbers by
 value (``1`` is ``1.0``, JSON's own equality of numbers), booleans as booleans, never as
-numbers. A null, blank, list or object id is the same as nothing. No id is ever hashed. The
+numbers. A null, blank, list or object id, and a blank part of a composite ``a|b``, never
+pairs (``unpairable``); since the item's ``message`` shows no host id (the handle replaces
+it), the note is the only place such an id shows, and it names each, its state and that it
+cannot pair: a call's id and aliases, a result's id, every member call's of a group. No id
+is ever hashed. The
 host pairs only non-blank strings, stripped and split at ``|`` (agent/message_sanitization.py
 :496-515 at Hermes fbb06142ef); where a stored id is not a string, or carries whitespace, the
 store's pairing is the store's, and the notes say what the store holds.
@@ -53,7 +58,7 @@ from typing import Any, Callable
 class Group:
     """Calls and results of one block that the store cannot pair (rule 2)."""
 
-    ids: list                                 # the distinct ids of its calls, in order (``same_id``)
+    members: list                             # each call as stored, in order (its ids, whatever their state)
     calls: list                               # (assistant record, position), in order
     results: list                             # result records, in order
     spellings: list = field(default_factory=list)   # every spelling that joined it, in order (#78)
@@ -70,17 +75,19 @@ class Pairing:
     # (assistant record, position) or result record -> its Group
     group: dict = field(default_factory=dict)
     # result record -> (why, its id, detail): a result that belongs to no call, and the block's
-    # fact that says why: "no_id"; "structured" (its id is a list or an object, ``id_state``);
-    # "no_calls" (its block opens with ``detail``, a message holding no calls); "alias" (its
-    # id is another spelling of call ``detail`` of the block, not that call's id); "unknown"
-    # (no call of the block has its id in any spelling)
+    # fact that says why: "no_id" (it carries no ``tool_call_id``); "unpairable" (its id is null,
+    # blank, a list or an object: ``id_state``); "no_calls" (its block opens with ``detail``, a
+    # message holding no calls); "alias" (its id is another spelling of call ``detail`` of the
+    # block, not that call's id); "unknown" (no call of the block has its id in any spelling)
     stray: dict = field(default_factory=dict)
     # (assistant record, position) -> (why, detail): a call no result of its block pairs with,
-    # and why, from the block: "no_id" (the call carries no id); "empty_id" / "structured_id"
-    # (its id, ``detail``, is blank, or a list or an object: ``id_state``); "alias" (result
+    # and why, from the block: "no_id" (the call carries no ``id``); "unpairable" (its id,
+    # ``detail``, is null, blank, a list or an object: ``id_state``); "alias" (result
     # ``detail[0]`` of the block carries the call's alias ``detail[1]``, not its id); "none"
     # (no result of the block carries its id or an alias of it)
     unanswered: dict = field(default_factory=dict)
+    # (assistant record, position) -> the call as stored, whose ids the notes state (#82)
+    calls: dict = field(default_factory=dict)
 
 
 def _id_of(call: Any) -> Any:
@@ -123,6 +130,21 @@ def id_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+ID_KEYS = ("id", "call_id", "response_item_id")     # a call's host ids: its id, then its aliases
+
+
+def blank_part(value: Any) -> bool:
+    """Whether a composite ``a|b`` id holds a part of nothing but whitespace: a spelling that,
+    like a blank id, never pairs."""
+    return isinstance(value, str) and "|" in value and any(not part.strip() for part in value.split("|"))
+
+
+def unpairable(value: Any) -> bool:
+    """Whether a stored id, present, is one that never pairs, or holds a part that never does:
+    null, blank, a list or an object (``id_state``), or a composite with a blank part."""
+    return id_state(value) != "scalar" or blank_part(value)
+
+
 def _merge(spellings: list, more: list) -> list:
     for value in more:
         if not any(same_id(value, have) for have in spellings):
@@ -131,18 +153,18 @@ def _merge(spellings: list, more: list) -> list:
 
 
 def _aliases(call: Any) -> list:
-    """A call's own spellings, in order: its ``id`` where it is a scalar, then its string
-    ``id``, ``call_id`` and ``response_item_id`` and each part of a composite ``a|b`` of
-    any of them; distinct by ``same_id``."""
+    """A call's own spellings, in order: its ``id``, ``call_id`` and ``response_item_id``
+    where each is a scalar, and each non-blank part of a composite ``a|b`` string of any of
+    them; distinct by ``same_id``. A null, blank, list or object id is no spelling."""
     found: list = []
     if not isinstance(call, dict):
         return found
-    if id_state(call.get("id")) == "scalar":
-        _merge(found, [call["id"]])
-    for key in ("id", "call_id", "response_item_id"):
+    for key in ID_KEYS:
         value = call.get(key)
-        if isinstance(value, str) and value.strip():
-            _merge(found, [value] + [part for part in value.split("|") if part.strip()])
+        if id_state(value) == "scalar":
+            _merge(found, [value])
+            if isinstance(value, str):
+                _merge(found, [part for part in value.split("|") if part.strip()])
     return found
 
 
@@ -161,6 +183,8 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
     if isinstance(head, dict) and head.get("role") == "assistant" and isinstance(head.get("tool_calls"), list):
         calls = list(enumerate(head["tool_calls"]))
     results = [(record, raw) for record, raw in block if isinstance(raw, dict) and raw.get("role") == "tool"]
+    for position, call in calls:
+        found.calls[(head_record, position)] = call
 
     parent = list(range(len(calls)))
 
@@ -190,10 +214,10 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
                     found.answer[(head_record, position)] = mine[0]
                     found.result_of[mine[0]] = (head_record, position)
                     claimed.append(mine[0])
-                elif state == "none":
+                elif not (isinstance(call, dict) and "id" in call):
                     found.unanswered[(head_record, position)] = ("no_id", None)
-                elif state in ("empty", "structured"):
-                    found.unanswered[(head_record, position)] = (f"{state}_id", call_id)
+                elif state != "scalar":
+                    found.unanswered[(head_record, position)] = ("unpairable", call_id)
                 else:
                     other = [spelling for spelling in _aliases(call) if not same_id(spelling, call_id)]
                     alias = next(((record, raw["tool_call_id"]) for record, raw in results
@@ -206,12 +230,8 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
             for i in indexes:
                 _merge(spellings, _aliases(calls[i][1]))
             mine = [record for record, raw in results if _holds(spellings, raw.get("tool_call_id"))]
-        ids: list = []
-        for i in indexes:
-            value = _id_of(calls[i][1])
-            if value is not None and not any(same_id(value, have) or value is have for have in ids):
-                ids.append(value)
-        group = Group(ids, [(head_record, calls[i][0]) for i in indexes], mine, spellings)
+        group = Group([calls[i][1] for i in indexes], [(head_record, calls[i][0]) for i in indexes], mine,
+                      spellings)
         for key in group.calls:
             found.group[key] = group
         for record in mine:
@@ -222,11 +242,10 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         if record in claimed:
             continue
         call_id = raw.get("tool_call_id")
-        state = id_state(call_id)
-        if state in ("none", "empty"):
+        if "tool_call_id" not in raw:
             found.stray[record] = ("no_id", None, None)
-        elif state == "structured":
-            found.stray[record] = ("structured", call_id, None)
+        elif id_state(call_id) != "scalar":
+            found.stray[record] = ("unpairable", call_id, None)
         elif not calls:
             found.stray[record] = ("no_calls", call_id, head_record)
         else:

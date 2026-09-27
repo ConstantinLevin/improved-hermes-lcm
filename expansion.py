@@ -136,25 +136,24 @@ NO_RESULT = ("no result with this call's host id stands in its block; the store 
              "call's block")
 _UNANSWERED = {
     "no_id": "this call carries no host id, so no result pairs with it",
-    "empty_id": "this call's host id is blank ({id}), so no result pairs with it",
-    "structured_id": ("this call's host id is not a string, a number or a boolean but {id}; the store pairs a result "
-                      "only by an id of those kinds, so no result pairs with it"),
+    "unpairable": "this call's host id is {state}, so no result pairs with it",
     "alias": ("result {result} of this call's block carries {alias}, another spelling of this call's host id, not the "
               "id itself; the store pairs by the id and does not pair them"),
 }
+_KEY_SAID = {"id": "host id", "call_id": "call_id", "response_item_id": "response_item_id"}
+_ALIAS_STATE = "this call's {key} is {state}"
 _STRAY = {
     "unknown": "no call of the message before this result has its host id {id} in any spelling",
     "no_id": "this result carries no host id, so no call pairs with it",
-    "structured": ("this result's host id is not a string, a number or a boolean but {id}, so no call pairs with it by "
-                   "the store's rule"),
+    "unpairable": "this result's host id is {state}, so no call pairs with it",
     "no_calls": "this result's block opens with {head}, which holds no tool calls, so no call pairs with it",
     "alias": ("this result's host id {id} is another spelling of call {position} of the message before it, not that "
               "call's id; the store pairs by the id and does not pair them"),
 }
 _GROUP = ("{k} calls of message {head} and {j} results of its block are joined by the host ids or their other "
-          "spellings {spellings}; the store cannot tell which result answered which call, and what the provider "
-          "received of them depends on the host's sanitizer and on the session's route, which this plugin does not "
-          "reproduce")
+          "spellings {spellings} ({members}); the store cannot tell which result answered which call, and what the "
+          "provider received of them depends on the host's sanitizer and on the session's route, which this plugin "
+          "does not reproduce")
 _FILL = "the host sends this empty message to the provider with its own stand-in as content: {content}"
 # A later page whose target's identity differs from page 1's (``target_identity``): only that is
 # known, never why.
@@ -164,13 +163,57 @@ _FILL_UNREAD = ("whether the host sends its stand-in {content} for this empty me
 
 
 
+def _state(value: Any) -> str:
+    """A stored id as a note says it (#82): its JSON (``pairing.id_text``), and where it never
+    pairs (``pairing.unpairable``), which state it is and that it cannot pair. The item's
+    ``message`` shows no host id, so this is the only place the stored value shows."""
+    text = host_pairing.id_text(value)
+    state = host_pairing.id_state(value)
+    if state == "none":
+        return "null, which cannot pair"
+    if state == "empty":
+        return f"blank ({text}), which cannot pair"
+    if state == "structured":
+        return f"{text}, which is not a string, a number or a boolean and cannot pair"
+    if host_pairing.blank_part(value):
+        return f"{text}, whose blank part cannot pair"
+    return text
+
+
+def _member_said(position: int, call: Any) -> str:
+    """One call of a group as its note lists it: its host id in whatever state it is stored,
+    and each alias of it that never pairs."""
+    if not isinstance(call, dict):
+        return f"call {position + 1}: {host_pairing.id_text(call)}, not an object"
+    said = [f"host id {_state(call['id'])}" if "id" in call else "no host id"]
+    said += [f"{key} {_state(call[key])}" for key in host_pairing.ID_KEYS[1:]
+             if key in call and host_pairing.unpairable(call[key])]
+    return f"call {position + 1}: " + ", ".join(said)
+
+
 def _group_note(group: host_pairing.Group) -> str:
-    """Rule 2's note: the block (its opening message) and every spelling that joined the
-    group, never "the host id" for a spelling that is an alias (#78); every id its calls
-    carry, each as its JSON (``pairing.id_text``, #82), so no group's note names no spelling."""
-    said = [host_pairing.id_text(s) for s in group.spellings] + [
-        host_pairing.id_text(i) for i in group.ids if host_pairing.id_state(i) != "scalar"]
-    return _GROUP.format(k=len(group.calls), j=len(group.results), head=group.calls[0][0], spellings=", ".join(said))
+    """Rule 2's note: the block (its opening message), every spelling that joined the group,
+    never "the host id" for a spelling that is an alias (#78), and every member call's host id
+    in whatever state it is stored, each as its JSON (#82)."""
+    members = "; ".join(_member_said(position, call) for (_record, position), call in zip(group.calls, group.members))
+    return _GROUP.format(k=len(group.calls), j=len(group.results), head=group.calls[0][0], members=members,
+                         spellings=", ".join(host_pairing.id_text(s) for s in group.spellings))
+
+
+def _aliases_said(call: Any) -> list:
+    """Each stored id of a call, outside a group, that never pairs and that the cause does not
+    already say: an alias of it null, blank, a list or an object, or a composite id with a
+    blank part (#82)."""
+    if not isinstance(call, dict):
+        return []
+    said = []
+    for key in host_pairing.ID_KEYS:
+        if key not in call or not host_pairing.unpairable(call[key]):
+            continue
+        if key == "id" and host_pairing.id_state(call[key]) != "scalar":
+            continue                                           # the cause says it
+        said.append(_ALIAS_STATE.format(key=_KEY_SAID[key], state=_state(call[key])))
+    return said
 
 
 class ExpansionError(Exception):
@@ -610,21 +653,23 @@ def _as_sent(raw: dict, route: "Route", *, raw_form: bool) -> tuple[dict, Option
 
 def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> list:
     """The note of one call: its group's (rule 2), or why no result of its block pairs with it,
-    each cause as the pairing states it (#78, #82): no id; a blank or structured id; an alias
-    of it on a result of its block; none of its block carries its id."""
+    each cause as the pairing states it (#78, #82): no id; a null, blank or structured id; an
+    alias of it on a result of its block; none of its block carries its id; and every alias of
+    it that never pairs (``_aliases_said``), for a paired call too."""
     key = (handle, position)
     if key in found.group:
         return [_group_note(found.group[key])]
+    also = _aliases_said(found.calls.get(key))
     if key in found.answer:
-        return []
+        return also
     why, detail = found.unanswered.get(key, ("none", None))
     if why == "no_id":
-        return [_UNANSWERED["no_id"]]
-    if why in ("empty_id", "structured_id"):
-        return [_UNANSWERED[why].format(id=host_pairing.id_text(detail))]
+        return [_UNANSWERED["no_id"]] + also
+    if why == "unpairable":
+        return [_UNANSWERED["unpairable"].format(state=_state(detail))] + also
     if why == "alias":
-        return [_UNANSWERED["alias"].format(result=detail[0], alias=host_pairing.id_text(detail[1]))]
-    return [NO_RESULT]
+        return [_UNANSWERED["alias"].format(result=detail[0], alias=host_pairing.id_text(detail[1]))] + also
+    return [NO_RESULT] + also
 
 
 def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
@@ -633,7 +678,7 @@ def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
         return [_group_note(found.group[handle])]
     if handle in found.stray:
         why, call_id, detail = found.stray[handle]
-        return [_STRAY[why].format(id=host_pairing.id_text(call_id), head=detail,
+        return [_STRAY[why].format(id=host_pairing.id_text(call_id), state=_state(call_id), head=detail,
                                    position=(detail or 0) + 1 if why == "alias" else None)]
     return []
 
