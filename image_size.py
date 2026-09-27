@@ -108,7 +108,7 @@ def image_dimensions_why(part: dict) -> tuple[Optional[tuple[int, int]], str]:
         if isinstance(value, str) and value and not value.startswith("data:"):
             return None, "it is a remote image (a URL this plugin does not fetch), so its size is not known"
         if part.get("file_id") and not value:
-            return None, "it is a file id only the provider holds, so its size is not known"
+            return None, "it is given by a file id and no image data, so its size is not known"
         if isinstance(value, str) and value.startswith("data:") and "," not in value:
             return None, "its data URL holds no data after its header, so its size is not known"
         if isinstance(value, str) and value.startswith("data:") and ";base64" not in value.partition(",")[0]:

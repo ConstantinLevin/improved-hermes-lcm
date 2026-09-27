@@ -116,8 +116,7 @@ _UNRESOLVED = {
     "other_session": ("{handle} belongs to another session. A handle resolves only in the session that holds it; "
                       "this session cannot reach another's past."),
     "summary_revision": ("{handle} is the host's rewrite of summary {of} in your context (the row the plugin "
-                         "returned, as the host changed it, for example with its task list folded in). Expand {of} "
-                         "to read behind the summary."),
+                         "returned, as the host changed it). Expand {of} to read behind the summary."),
 }
 
 # Notes on calls and results: facts of the store (``pairing``), never what the host sends.
@@ -130,6 +129,9 @@ _GROUP = ("{k} calls and {j} results in this stretch carry the host id {id}; the
           "answered which call, and what the provider received of them depends on the host's sanitizer and on the "
           "session's route, which this plugin does not reproduce")
 _FILL = "the host sends this empty message to the provider with its own stand-in as content: {content}"
+# A later page whose target's identity differs from page 1's (``target_identity``): only that is
+# known, never why.
+CHANGED = "{what} renders differently now than at page 1; {again}"
 _FILL_UNREAD = ("whether the host sends its stand-in {content} for this empty message depends on its reasoning-echo "
                 "setting, which could not be read ({why})")
 
@@ -300,8 +302,11 @@ def host_page_limits(engine: Any, tool_name: str, messages: Any) -> PageLimit:
     margin = host_guardrail_margin(tool_name)
     limit = min(int(threshold), int(turn_budget) // calls) - margin
     if limit <= 0:
-        raise ExpansionError(f"{calls} tool calls in one message leave a page no room within the host's budget of "
-                             f"{int(turn_budget)} characters for the message; call {tool_name} in fewer at once")
+        # What was computed, each term by itself; which one to change follows from them.
+        raise ExpansionError(f"a page has no room: the smaller of the host's threshold for one {tool_name} result "
+                             f"({int(threshold)} characters) and its budget of {int(turn_budget)} characters for the "
+                             f"message's results divided among its {calls} tool calls ({int(turn_budget) // calls}), "
+                             f"less the {margin} characters of the host's guardrail texts, is {limit}")
     return PageLimit(limit, int(threshold), int(turn_budget), calls, margin)
 
 
@@ -629,17 +634,23 @@ def _provenance(annotations: dict, images: dict, route: "Route", *, fill: bool =
     route was read from the engine and decided something here (an image it was asked about,
     or the host's fill of an empty message, its reasoning pad); ``images_note`` (the host's
     own retirement) and ``guard_note`` (the guard could not be read) where an image is
-    delivered. Each is a constant of the call (``Route.room``)."""
+    delivered; ``commit_note`` where an image is delivered and the host's commit was asked
+    without the running agent (its learned set unread). Each is a constant of the call
+    (``Route.room``)."""
     room = route.room
     if room is None:
         return
-    asked = any(kind != "held:part" for kind in images.values())     # "held:part": no route asked
+    # The images whose fate the route decided: the host's commit asked with its provider and
+    # model, the converter asked, or shown after both (``_images_of``).
+    asked = any(kind in ("shown", "held:commit", "held:route") for kind in images.values())
     if room.route_note and (asked or fill):
         annotations["route_note"] = room.route_note
     if "shown" in images.values():
         annotations["images_note"] = room.note
         if room.guard_unread:
             annotations["guard_note"] = room.guard_unread
+        if room.commit_unread:
+            annotations["commit_note"] = room.commit_unread
 
 
 @dataclass
@@ -908,7 +919,7 @@ def canonical_image_part(part: dict) -> tuple[Optional[dict], str]:
         detail = detail or part.get("detail")
         if not isinstance(url, str) or not url:
             return None, (f"stored as a {kind} part without an image URL"
-                          + (" (a file id only the provider holds)" if part.get("file_id") else ""))
+                          + (" (it carries a file id)" if part.get("file_id") else ""))
     elif kind == "image":
         source = part.get("source")
         if isinstance(source, dict) and source.get("type") == "base64" and isinstance(source.get("data"), str):
@@ -1031,12 +1042,20 @@ def _images_of(message: dict, handle: str, route: "Route") -> dict:
                                                 f"store still holds it"))
             placed[(*prefix, index)] = "held:part"            # the part itself: no route asked
             continue
-        verdict = route.check(canonical) if route.check is not None else "the session's route was not read"
-        by = "held:route"
+        # In the order of the host's chain from this result to the model, the first step that
+        # drops the image names why: the commit (text summary, the guard; ``Route.room``), the
+        # next request's byte budget, the route's converter.
+        room = route.room
+        verdict, by = "", ""
+        if room is not None and room.commit:
+            verdict, by = room.commit, "held:commit"
+        elif room is not None and room.blocked():
+            verdict, by = room.blocked(), "held:room"
         if not verdict:
             verdict, by = _over_budget(canonical), "held:budget"
-        if not verdict and route.room is not None:
-            verdict, by = route.room.blocked(), "held:room"
+        if not verdict:
+            verdict = route.check(canonical) if route.check is not None else "the session's route was not read"
+            by = "held:route"
         out.append(canonical if not verdict else _held_mark(part, handle, f"not shown: {verdict}; the store still "
                                                                          f"holds it"))
         placed[(*prefix, index)] = by if verdict else "shown"
@@ -1091,12 +1110,13 @@ class Route:
     # Why the agent's values were not read, where the route came from the engine (``route_of``).
     why: str = ""
     # What a request of this call has room for (``image_room.host_image_room``): the host's
-    # static limits, the guard's halt of the bound agent and the call's provenance statements,
-    # read once with the rest of the snapshot, before any item is built.
+    # commit (content list or text summary), the guard's halt of the bound agent, the host's
+    # static limits and the call's provenance statements, read once with the rest of the
+    # snapshot, before any item is built.
     room: Any = field(default=None, compare=False)
 
     @classmethod
-    def of(cls, engine: Any) -> "Route":
+    def of(cls, engine: Any, tool_name: str = "lcm_expand") -> "Route":
         values, source, agent, why = route_of(engine)
         api_mode, model, base_url, provider = (values["api_mode"], values["model"], values["base_url"],
                                                values["provider"])
@@ -1107,15 +1127,18 @@ class Route:
                 # the object it runs on, and the plugin writes nothing into the agent.
                 pad, pad_unread = bool(copy.copy(agent)._needs_thinking_reasoning_pad()), ""
             except AttributeError as exc:
-                pad_unread = f"the host's agent has no {exc.name or 'readable reasoning-pad decision'}"
+                # Raised by the host's method or on its way; the text names what was asked and
+                # what came back, never which attribute is "missing".
+                pad_unread = f"the bound agent's _needs_thinking_reasoning_pad raised AttributeError ({exc})"
         if pad is None:
             try:
                 pad = host_reasoning_pad(provider, model, base_url)
             except HostUnavailable as exc:
                 raise ExpansionError(str(exc)) from None
         bare = cls(api_mode, model, base_url, provider, pad)
-        return cls(api_mode, model, base_url, provider, pad, engine._estimator(values), route_image_check(bare),
-                   source, agent, pad_unread, why, host_image_room(source, agent, why))
+        return cls(api_mode, model, base_url, provider, pad, engine._estimator(values),
+                   route_image_check(bare, tool_name), source, agent, pad_unread, why,
+                   host_image_room(source, agent, why, values, tool_name))
 
 
 # --- Pages -----------------------------------------------------------------------------------
@@ -1473,10 +1496,8 @@ def target_identity(target: Target) -> str:
     item after every transformation between the store and the page (the host's row, the
     withholding, the marks, the notes), as JSON; pages are cut from exactly these items, so
     anything that changes what a page shows changes it (the orchestrator's cut of #71, C).
-    Sixteen hex characters of its SHA-256. A record the host rewrote, a note that changed (a
-    fill note after a route change), or a projection that changed (a reload onto other
-    code) changes it; a compaction that only records new material after the stretch does
-    not."""
+    Sixteen hex characters of its SHA-256. Only that it differs is known when a later page
+    compares it, never why, so the refusal says only that (LEARNINGSFÜRPLÄNE A11)."""
     payload = [target.header, [item.as_dict() for item in target.items]]
     text = json.dumps(payload, ensure_ascii=False, sort_keys=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
@@ -1487,7 +1508,7 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
     live list the host hands the engine tool; the page's size depends on it
     (``host_page_limit``)."""
     session = engine.current_session_id          # the caller's session, read once (#20)
-    route = Route.of(engine)                     # the session's route, read once (§1.4)
+    route = Route.of(engine, tool_name)          # the session's route, read once (§1.4)
     if not session:
         raise ExpansionError("this engine copy is bound to no session of the plugin, so no handle resolves")
     raw = args.get("raw", False)
@@ -1527,8 +1548,8 @@ def expand(engine: Any, args: dict, *, messages: Any = None, tool_name: str = "l
     # refused, never spliced.
     identity = target_identity(target)
     if state is not None and state["r"] != identity:
-        raise ExpansionError("the content changed since page 1 (a record the host rewrote, a pairing or note that "
-                             "changed, or code that changed); start again from the handle, without page")
+        raise ExpansionError(CHANGED.format(what="what this handle opens into", again="start again from the handle, "
+                                                                                          "without page"))
     token_state = {"v": TOKEN_VERSION, "t": tool_name, "s": store_uuid, "h": resolved.handle,
                    "m": "raw" if raw else "collapsed", "r": identity}
     return serve_page(target, state, token_state, limit, found="what this handle opens into", route=route)

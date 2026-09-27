@@ -115,12 +115,78 @@ def host_halt(agent: Optional[Any], why: str = "no running turn was bound") -> t
     try:
         halt = agent._tool_guardrails.halt_decision
     except AttributeError as exc:
-        return None, f"the host's agent has no {exc.name or 'readable halt'} to read"
+        return None, f"reading the bound agent's _tool_guardrails.halt_decision raised AttributeError ({exc})"
     if halt is None:
         return None, ""                                  # read: no halt stands
     if not hasattr(halt, "code"):
         return None, "the host's halt decision carries no code to read"
     return (GUARD_CAUSE if halt.code in GUARD_CODES else None), ""
+
+
+# --- The host's commit: the envelope's content list, or its text summary ------------------------
+
+COMMIT_UNREAD = ("whether the host sends the images of this page or its text summary also depends on the models the "
+                 "running agent learned this session to reject images in tool results (its "
+                 "_no_list_tool_content_models), which could not be read ({why}); the store keeps every image on this "
+                 "page")
+_PROBE_IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+
+
+def host_commit(tool_name: str, values: dict, agent: Optional[Any], why: str = "no running turn was bound"
+                ) -> tuple[str, str]:
+    """Whether the host's commit of this call's result passes an image page's content list to
+    the model or replaces it with its ``text_summary`` (tool_executor.py:1125,
+    ``_tool_result_content_for_active_model``, vision_message_prep.py:207-254 at Hermes
+    fbb06142ef), asked of the host's own method on an envelope with one image. With a bound
+    agent, on that agent (its provider, model, config and ``_no_list_tool_content_models``);
+    without one, on the host's mixin carrying the route's provider and model, and the agent's
+    set is said unread. Returns (why no image of this call reaches the model, "" where the
+    content list passes; why the answer rests on something unread, else ""). The cause is
+    named from the host's own inputs, in the method's order, each asked on its own."""
+    probe = {"_multimodal": True, "content": [{"type": "text", "text": "."}, dict(_PROBE_IMAGE)], "text_summary": "."}
+    unread = ""
+    if agent is not None:
+        subject = agent
+    else:
+        try:
+            mixin = _host("agent.vision_message_prep", "VisionMessagePrepMixin")
+        except RoomUnavailable as exc:
+            return "", str(exc)
+        subject = type("RouteAgent", (mixin,), {})()
+        subject.provider, subject.model, subject.base_url = values["provider"], values["model"], values["base_url"]
+        unread = COMMIT_UNREAD.format(why=why)
+    try:
+        passed = isinstance(subject._tool_result_content_for_active_model(tool_name, probe), list)
+    except Exception as exc:
+        return "", (f"whether the host sends the images of this page or its text summary could not be read: its "
+                    f"_tool_result_content_for_active_model raised {type(exc).__name__} ({exc}); the store keeps "
+                    f"every image on this page")
+    if passed:
+        return "", unread
+    provider = (getattr(subject, "provider", "") or "").strip()
+    model = (getattr(subject, "model", "") or "").strip()
+    who = f"{provider}/{model}"
+    summary = "the host sends the text summary of a page with images instead of its images"
+    try:
+        cfg = _host("hermes_cli.config", "load_config")()
+        vision = _host("agent.image_routing", "_lookup_supports_vision")(provider, model, cfg)
+    except Exception as exc:
+        return (f"{summary}: its vision lookup for {who} raised {type(exc).__name__} ({exc}), which it reads as no "
+                f"vision"), ""
+    if vision is False:
+        return f"{summary}: its vision lookup says {who} does not read images", ""
+    if vision is None:
+        return f"{summary}: its vision lookup has no answer for {who}, which it reads as no vision", ""
+    try:
+        rejects = _host("providers", "routed_model_rejects_vision_tool_messages")(provider, model)
+    except Exception:
+        rejects = False                                 # the host reads a failure here as compatible
+    if rejects:
+        return f"{summary}: the provider profile for {who} refuses images in tool results", ""
+    learned = getattr(subject, "_no_list_tool_content_models", None) or ()
+    if (provider.lower(), model) in learned:
+        return (f"{summary}: the running agent learned this session that {who} rejects images in tool results"), ""
+    return f"{summary} (its _tool_result_content_for_active_model returns the summary)", ""
 
 
 # --- The host's static limits --------------------------------------------------------------------
@@ -144,8 +210,11 @@ class ImageRoom:
     ``note`` (the host's own retirement), where an image is delivered."""
 
     def __init__(self, note: str = NOTE, guard: Optional[str] = None, route_note: str = "",
-                 guard_unread: str = ""):
+                 guard_unread: str = "", commit: str = "", commit_unread: str = ""):
         self.note, self.guard, self.route_note, self.guard_unread = note, guard, route_note, guard_unread
+        # The host's commit (``host_commit``): why no image of this call reaches the model, and
+        # why that answer rests on something unread.
+        self.commit, self.commit_unread = commit, commit_unread
         try:
             self.limit, self.budget, self.measure = static_limits()
             self.unreadable = ""
@@ -167,6 +236,8 @@ class ImageRoom:
         """Why no request of this call has room for any image, whatever the image: the guard
         has halted the turn, the host's limits cannot be read, or its ceiling admits none; ""
         where a request has room for one. Asked when an item is built (``_images_of``)."""
+        if self.commit:
+            return self.commit
         if self.guard is not None:
             return self.guard
         if self.unreadable:
@@ -186,13 +257,18 @@ class ImageRoom:
         raise RoomUnavailable("why_not was asked about an image the host's limits admit")
 
 
-def host_image_room(route_source: str, agent: Optional[Any], why: str = "") -> ImageRoom:
-    """The ``ImageRoom`` of this call, from its snapshot (``route_of``: the source, the bound
-    agent, and why the agent's values were not read)."""
-    guard, unread = host_halt(agent, why or "no running turn was bound")
-    route_note = f"{ROUTE_FROM_ENGINE}, since {why or 'no running turn was bound'}" if route_source != "agent" else ""
+def host_image_room(route_source: str, agent: Optional[Any], why: str = "", values: Optional[dict] = None,
+                    tool_name: str = "lcm_expand") -> ImageRoom:
+    """The ``ImageRoom`` of this call, from its snapshot (``route_of``: the route's values,
+    the source, the bound agent, and why the agent's values were not read)."""
+    why = why or "no running turn was bound"
+    guard, unread = host_halt(agent, why)
+    route_note = f"{ROUTE_FROM_ENGINE}, since {why}" if route_source != "agent" else ""
+    bound = agent if route_source == "agent" else None
+    commit, commit_unread = host_commit(tool_name, values or {"provider": "", "model": "", "base_url": ""}, bound, why)
     return ImageRoom(note=NOTE, guard=guard, route_note=route_note,
-                     guard_unread=GUARD_UNREAD.format(why=unread) if unread else "")
+                     guard_unread=GUARD_UNREAD.format(why=unread) if unread else "", commit=commit,
+                     commit_unread=commit_unread)
 
 
 # --- The route's converter on one image: which result, which slot, by position -------------------

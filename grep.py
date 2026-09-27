@@ -59,12 +59,10 @@ _ARGUMENTS = ("term", "scope", "all", "raw", "page")
 _REMOVED = ("query", "limit", "sort", "role", "time_from", "time_to", "mode", "session_scope", "session_id",
             "source", "conversation_id", "content_scope", "externalized_refs")
 
-NOTHING_STORED = ("nothing of this session is stored yet: the store is filled at a compaction, and until the first "
-                  "one everything of the session is in your context")
+NOTHING_STORED = "nothing of this session is stored yet: the store is filled at a compaction"
 COUNT_ONLY = ("the term lies in this many chunks, too many to return; narrow the term or the scope, or call again "
               "with all=true for every one of them")
-TAIL_NOTE = ("records of the fresh tail stored at the last compaction hold the term; your context held them "
-             "verbatim then")
+TAIL_NOTE = "records of the fresh tail stored at the last compaction hold the term"
 
 
 @dataclass
@@ -162,7 +160,7 @@ def _target(records: RecordStore, engine: Any, found: _Found, *, scope: str, eve
     else:
         # Built outside the snapshot: every row read here is of an insert-only table, and the
         # chunks were chosen in the snapshot (B7).
-        route = expansion.Route.of(engine) if matching else None
+        route = expansion.Route.of(engine, TOOL) if matching else None
         order = expansion.Order.of(records, found.cover, route) if matching else None
         hidden: dict = {}
         if not raw and matching:
@@ -229,8 +227,8 @@ def grep(engine: Any, args: dict, *, messages: Any = None) -> Any:
         if state["s"] != found.store_uuid:
             raise ExpansionError("page is a token of another store: the store it was issued by is not this one")
         if state["r"] != identity:
-            raise ExpansionError("what this search finds changed since page 1 (a compaction since, a record the host "
-                                 "rewrote, or code that changed); call again without page to start it")
+            raise ExpansionError(expansion.CHANGED.format(what="what this search returns",
+                                                          again="call again without page to start it"))
     token_state = {"v": expansion.TOKEN_VERSION, "t": TOOL, "s": found.store_uuid, "q": term, "p": scope,
                    "a": everything, "m": "raw" if raw else "collapsed", "r": identity}
     # The one page mechanism of expansion (B10: the unification of grep._serve and expand's tail).
