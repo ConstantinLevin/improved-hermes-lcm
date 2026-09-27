@@ -1,7 +1,7 @@
 """What a tool result is when it leaves the plugin: the final string the engine hands
-the host (``LCMEngine.handle_tool_call``). One function makes the string, so that a page
-is measured on the exact string the host receives and compares with its spill threshold
-(#18)."""
+the host (``LCMEngine.handle_tool_call``), or the ``_multimodal`` envelope, which the host
+carries as it is. One function makes the string, so that a page is measured on the exact
+string the host receives and compares with its spill threshold (#18)."""
 
 from __future__ import annotations
 
@@ -31,10 +31,23 @@ def _has_token_count(value: Any) -> bool:
     return False
 
 
+def is_envelope(value: Any) -> bool:
+    """The host's multimodal tool result, by the host's own test (``_is_multimodal_tool_result``,
+    agent/tool_dispatch_helpers.py:305-307 at Hermes 1c535d9689), called, never copied. Where
+    the host's test cannot be read this raises, and the tool's call answers with that error
+    (``LCMEngine.handle_tool_call``)."""
+    from agent.tool_dispatch_helpers import _is_multimodal_tool_result  # type: ignore
+
+    return bool(_is_multimodal_tool_result(value))
+
+
 def final_result(result: Any) -> Any:
-    """The tool result as the engine returns it: a payload (a dict) or a JSON string
-    becomes the final string, with the label its estimated token counts carry (#21) at the
-    top of the object. A string that is not a JSON object passes unchanged. Idempotent."""
+    """The tool result as the engine returns it: an envelope passes as it is; a payload (a
+    dict) or a JSON string becomes the final string, with the label its estimated token
+    counts carry (#21) at the top of the object. A string that is not a JSON object passes
+    unchanged. Idempotent."""
+    if is_envelope(result):
+        return result
     payload = result
     if isinstance(result, str):
         try:

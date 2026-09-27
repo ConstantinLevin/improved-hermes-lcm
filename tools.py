@@ -699,7 +699,8 @@ _LCM_EXPAND_REMOVED_ARGUMENTS = (
 
 def lcm_expand(args: Dict[str, Any], **kwargs) -> Any:
     """Look behind a handle: one page of what it opens into (``expansion``, #18). The
-    result is the final string, at most the host's spill threshold."""
+    result is the final string, or the ``_multimodal`` envelope where the page holds an
+    image; either way at most the host's spill threshold."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})

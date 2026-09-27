@@ -87,14 +87,44 @@ def _jpeg(data: bytes) -> Optional[tuple[int, int]]:
 
 def image_dimensions(part: dict) -> Optional[tuple[int, int]]:
     """(width, height) in pixels, or None where the header cannot tell."""
+    return image_dimensions_why(part)[0]
+
+
+def image_dimensions_why(part: dict) -> tuple[Optional[tuple[int, int]], str]:
+    """(width, height) in pixels and "", or None and why the size cannot be read: each
+    cause asked on its own, never inferred from a None."""
+    source = part.get("source")
+    value: Any = part.get("image_url", part.get("url"))
+    if isinstance(value, dict):
+        value = value.get("url")
+    if isinstance(source, dict) and source.get("type") == "base64":
+        if not isinstance(source.get("data"), str):
+            return None, "its base64 source carries no data string, so its size is not known"
+        if not source["data"]:
+            return None, "its base64 source is empty, so its size is not known"
+    else:
+        if isinstance(source, dict) and source.get("type") == "url":
+            return None, "it is a remote image (a URL source this plugin does not fetch), so its size is not known"
+        if isinstance(value, str) and value and not value.startswith("data:"):
+            return None, "it is a remote image (a URL this plugin does not fetch), so its size is not known"
+        if part.get("file_id") and not value:
+            return None, "it is a file id only the provider holds, so its size is not known"
+        if isinstance(value, str) and value.startswith("data:") and "," not in value:
+            return None, "its data URL holds no data after its header, so its size is not known"
+        if isinstance(value, str) and value.startswith("data:") and ";base64" not in value.partition(",")[0]:
+            return None, "its data URL is not base64, so its size is not read"
+        if isinstance(value, str) and value.startswith("data:") and not value.partition(",")[2]:
+            return None, "its data URL's data is empty, so its size is not known"
+        if not isinstance(value, str) or not value:
+            return None, "it carries no image data, so its size is not known"
     data = _data_bytes(part)
     if not data:
-        return None
+        return None, "its base64 data does not decode, so its size is not known"
     for reader in (_png, _jpeg, _gif, _webp):
         try:
             size = reader(data)
         except (struct.error, IndexError):
             size = None
         if size and size[0] > 0 and size[1] > 0:
-            return int(size[0]), int(size[1])
-    return None
+            return (int(size[0]), int(size[1])), ""
+    return None, "its data is not a PNG, JPEG, GIF or WebP whose header gives the size, so its size is not known"

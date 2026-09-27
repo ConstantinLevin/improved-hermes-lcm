@@ -54,8 +54,8 @@ LCM_EXPAND = {
         "reasoning beside it, and each tool call with its handle (t…), name and arguments but without its "
         "result; raw=true puts every result inline. A tool call's handle returns its result; a message's "
         "handle (m…) returns that message. A result longer than one page carries next_page: call again "
-        "with page=next_page for the rest. An image comes back as a mark with its media type, its size and "
-        "its message's handle: images are not delivered by expansion yet."
+        "with page=next_page for the rest. Images come back as images where the session's route carries "
+        "them; an image not shown stands as a mark saying why, and the store keeps it."
     ),
     "parameters": {
         "type": "object",
