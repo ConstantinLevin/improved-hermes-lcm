@@ -31,6 +31,13 @@ def is_envelope(value: Any) -> bool:
     return bool(_is_multimodal_tool_result(value))
 
 
+def estimate_label(estimates: tuple) -> str:
+    """The label of the estimates a tool declares it writes (``tools.ESTIMATES``): the keys as
+    declared, where the result holds them; nothing is looked up in the result."""
+    return (f"{ESTIMATE_LABEL}: the counts under the keys {', '.join(estimates)}, where this result holds them"
+            f"{_UNCOUNTED_NOTE}")
+
+
 def final_result(result: Any, estimates: tuple = ()) -> Any:
     """The tool result as the engine returns it: an envelope passes as it is; a payload (a
     dict) or a JSON string becomes the final string. Where the tool that wrote it declares
@@ -48,8 +55,7 @@ def final_result(result: Any, estimates: tuple = ()) -> Any:
     if not isinstance(payload, dict):
         return result if isinstance(result, str) else json.dumps(payload, ensure_ascii=False)
     if estimates and "token_counts" not in payload and "error" not in payload:
-        payload = {"token_counts": f"{ESTIMATE_LABEL}, under the keys {', '.join(estimates)}{_UNCOUNTED_NOTE}",
-                   **payload}
+        payload = {"token_counts": estimate_label(estimates), **payload}
     elif isinstance(result, str):
         return result
     return json.dumps(payload, ensure_ascii=False)

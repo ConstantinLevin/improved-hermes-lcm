@@ -60,16 +60,16 @@ _ARGUMENTS = ("term", "scope", "all", "raw", "page")
 _REMOVED = ("query", "limit", "sort", "role", "time_from", "time_to", "mode", "session_scope", "session_id",
             "source", "conversation_id", "content_scope", "externalized_refs")
 
-COUNT_ONLY = ("the term lies in this many chunks, too many to return; narrow the term or the scope, or call again "
-              "with all=true for every one of them")
+COUNT_ONLY = (f"the term lies in this many chunks; from {GREP_COUNT_ONLY_AT} chunks on only the count is returned: "
+              f"narrow the term or the scope, or call again with all=true for every one of them")
 TAIL_NOTE = "records of the fresh tail of the latest compaction that took effect hold the term"
 
 
 def nothing_stored(records: RecordStore, session: str) -> str:
     """Why nothing of a session is on its active record (no effective compaction), as the
     store records it (#78, A11): no compaction of it was attempted; or how many were, and of
-    those how many the host rejected, how many returned and are not settled, how many never
-    returned. Asked of the store, never "yet"."""
+    those how many the host rejected, how many have a return written and are not settled,
+    how many have no return written. Asked of the store, never "yet"."""
     attempted = [int(c) for (c,) in records._q("SELECT compaction_id FROM compactions WHERE session = ?", (session,))]
     if not attempted:
         return "nothing of this session is stored: no compaction of it was attempted"
@@ -85,7 +85,8 @@ def nothing_stored(records: RecordStore, session: str) -> str:
         else:
             unreturned += 1
     return (f"nothing of this session is on the active record: none of its {len(attempted)} compactions took effect "
-            f"({rejected} rejected by the host, {returned} returned and not settled, {unreturned} never returned)")
+            f"({rejected} rejected by the host, {returned} with a return written and not settled, {unreturned} with no "
+            f"return written)")
 
 
 @dataclass

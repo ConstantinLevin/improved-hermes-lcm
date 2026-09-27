@@ -162,7 +162,7 @@ _FILL_UNREAD = ("whether the host sends its stand-in {content} for this empty me
 def _group_note(group: host_pairing.Group) -> str:
     """Rule 2's note: the block (its opening message) and every spelling that joined the
     group, never "the host id" for a spelling that is an alias (#78)."""
-    said = list(group.spellings) + [json.dumps(i) for i in group.ids if not isinstance(i, str)]
+    said = list(group.spellings) + [json.dumps(i) for i in group.ids if i is not None and not isinstance(i, str)]
     return _GROUP.format(k=len(group.calls), j=len(group.results), head=group.calls[0][0], spellings=", ".join(said))
 
 
@@ -193,12 +193,12 @@ def _compaction_said(subject: str, cause: dict) -> str:
     if cause["kind"] == "rejected":
         text = f"{subject} was recorded by compaction {compaction}, which the host rejected ({cause.get('how')})"
     elif cause.get("returned"):
-        text = (f"{subject} was recorded by compaction {compaction}, whose return reached the host; the store records "
-                f"no confirmation, adoption or rejection of it")
+        text = (f"{subject} was recorded by compaction {compaction}, whose return the store wrote; the store records no "
+                f"confirmation, adoption or rejection of it")
     else:
         events = cause.get("events") or []
-        text = (f"{subject} was recorded by compaction {compaction}, which never returned to the host (the store records "
-                f"no return of it" + (f"; its events: {', '.join(events)})" if events else ", and no event of it)"))
+        text = (f"{subject} was recorded by compaction {compaction}, for which the store holds no return written"
+                + (f" (its events: {', '.join(events)})" if events else " and no event"))
     if cause.get("never_held"):
         text += "; no effective compaction's list ever held it"
     return text + "; it is not on the active record."
@@ -228,8 +228,8 @@ def _inactive_text(resolved: Resolved) -> str:
     elif kind in ("rejected", "unconfirmed"):
         text = _compaction_said(subject, cause)
     elif kind == "left":
-        text = (f"{subject} stood on the active record at compaction {cause['stood']}; the host's list at compaction "
-                f"{cause['gone']} held neither it nor a rewrite of it.")
+        text = (f"{subject} was held by the host's list at compaction {cause['stood']}, which took effect; the host's "
+                f"list at compaction {cause['gone']}, which took effect, held neither it nor a rewrite of it.")
     elif kind == "held_unreached":
         text = (f"{subject} was held by the host's list at compaction {cause['stood']}, which took effect, and every "
                 f"later effective list held it or a rewrite of it; yet the session's latest effective return does not "
@@ -243,7 +243,7 @@ def _inactive_text(resolved: Resolved) -> str:
     elif kind == "no_writer":
         text = f"{subject} is a summary the store records no compaction for; it is not on the active record."
     else:
-        text = f"{subject} is not on the active record, and the store holds no row of the compaction that wrote it."
+        text = f"{subject} is not on the active record, and the store holds no record row of it."
     return prefix + text
 
 
@@ -757,10 +757,13 @@ class Order:
             calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
             call = calls[key[1]] if key[1] < len(calls) and isinstance(calls[key[1]], dict) else {}
             call_id = call.get("id")
-            if not isinstance(call_id, str):
+            if call_id is None:
                 continue
+            # Asked for any id the call carries, as SQLite's JSON gives it back: a string or a
+            # number as itself, anything else as its compact JSON; only tool results (#78).
+            said = call_id if isinstance(call_id, (str, int, float)) else json.dumps(call_id, separators=(",", ":"))
             places = sorted(self.index[str(h)] for (h,) in store._q(
-                "SELECT handle FROM records WHERE json_extract(raw, '$.tool_call_id') = ?", (call_id,))
+                "SELECT handle FROM records WHERE role = 'tool' AND json_extract(raw, '$.tool_call_id') = ?", (said,))
                 if str(h) in self.index)
             if places:
                 opener, _end = host_pairing.blocks_span(self.records, store.record_roles, places[0], places[0])
@@ -869,7 +872,9 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
                                             notes=_result_notes(found, result) if group is not None else [],
                                             raw_form=True) for result in results])
     if resolved.kind == MESSAGE:
-        return Target({"handle": handle, "kind": "message", "form": form},
+        # A message is shown in raw form whatever was asked, and its header says so (#78: the
+        # header's form is the form of its items).
+        return Target({"handle": handle, "kind": "message", "form": "raw"},
                       _records_items(store, order, [(handle, store.record_raw(handle) or {})], raw=True))
     raise ExpansionError(f"{handle} is not a handle this tool opens")
 

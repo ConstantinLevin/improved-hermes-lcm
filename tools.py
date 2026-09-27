@@ -15,6 +15,7 @@ from .db_bootstrap import inspect_lcm_schema_health
 from .message_content import content_parts, is_image_part
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
+from .results import estimate_label
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 ESTIMATES = {
     "lcm_expand_query": ("token_count", "source_token_count"),
     "lcm_inspect": ("token_estimate", "token_count", "source_token_count", "estimated_tokens",
-                    "effective_fresh_tail_tokens", "total_tokens", "total_source_tokens"),
+                    "effective_fresh_tail_tokens", "total_tokens", "total_source_tokens", "tokens", "source_tokens"),
     "lcm_status": ("estimated_tokens", "total_tokens", "tokens", "source_tokens"),
     "lcm_doctor": ("token_count", "source_token_count", "total_source_tokens", "total_summary_tokens"),
 }
@@ -121,7 +122,11 @@ def _bound_operator_strings(value: Any) -> tuple[Any, int]:
 
 
 def _bounded_inspect_json(response: dict[str, Any]) -> str:
-    """Serialize ``lcm_inspect`` under one final response-size invariant."""
+    """Serialize ``lcm_inspect`` under one final response-size invariant. The estimate label
+    is part of what is bounded (#78: it is added here, so the size stated is the size sent;
+    ``results.final_result`` adds none where ``token_counts`` stands)."""
+    if "error" not in response:
+        response = {"token_counts": estimate_label(ESTIMATES["lcm_inspect"]), **response}
     payload, truncated_fields = _bound_operator_strings(response)
     total_truncated_fields = truncated_fields
     payload["char_limit"] = _LCM_INSPECT_MAX_RESPONSE_CHARS
@@ -136,6 +141,7 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
     # top-level sections in a deterministic priority order.  Never cut encoded
     # JSON mid-token; omitted sections are reported explicitly.
     priority = [
+        "token_counts",
         "read_only",
         "session_id",
         "conversation_id",

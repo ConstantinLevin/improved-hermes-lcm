@@ -138,7 +138,11 @@ def _call_name(raw: dict, position: int) -> tuple[Optional[str], str]:
     Handles are minted for every position of a ``tool_calls`` list (``_write_tool_calls``),
     whatever the call's shape."""
     calls = raw.get("tool_calls")
-    call = calls[position] if isinstance(calls, list) and 0 <= position < len(calls) else None
+    if not isinstance(calls, list):
+        return None, "its stored message holds no tool_calls list"
+    if not 0 <= position < len(calls):
+        return None, f"its stored message's tool_calls hold no position {position + 1}"
+    call = calls[position]
     if not isinstance(call, dict):
         return None, f"its stored call is not an object but {type(call).__name__}"
     if "function" not in call:
@@ -940,8 +944,8 @@ class RecordStore:
     def compaction_state(self, derivation: str) -> tuple[Optional[int], str]:
         """The compaction that wrote a derivation and the state the store records of that
         compaction (``_compaction_cause``; #78: the writer's state, never said to be the
-        summary's own): "took effect", "rejected", "returned, not settled", "not returned",
-        or (None, "no compaction recorded")."""
+        summary's own): "took effect", "rejected", "return written, not settled", "no return
+        written", or (None, "no compaction recorded")."""
         rows = self._q("SELECT compaction FROM derivations WHERE handle = ?", (derivation,))
         if not rows:
             raise KeyError(f"no derivation {derivation} in this store")
@@ -953,7 +957,7 @@ class RecordStore:
             return compaction, "took effect"
         if cause["kind"] == "rejected":
             return compaction, "rejected"
-        return compaction, "returned, not settled" if cause.get("returned") else "not returned"
+        return compaction, "return written, not settled" if cause.get("returned") else "no return written"
 
     def tool_calls_of(self, records: Sequence[str]) -> dict[str, dict[int, str]]:
         """record -> {position in its ``tool_calls``: the call's handle}: the handles minted
