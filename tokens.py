@@ -175,7 +175,9 @@ class Estimator:
         return self.image_count(part)[0]
 
     def image_count(self, part: dict) -> tuple[Optional[int], str]:
-        """One image's tokens by the model's rule and "", or None and why it is uncounted:
+        """One image's tokens by the model's rule and the basis of that rule exactly as
+        ``model_table.lookup`` returned it (the route's row, the vendor's own API, or the
+        vendor's facts not established for this route), or None and why it is uncounted:
         each cause asked on its own (no rule for the model; a rule of a kind not counted
         here; a size that cannot be read, with the image's own reason), never inferred from
         a None."""
@@ -196,12 +198,12 @@ class Estimator:
         if size is None:
             return None, f"{who} has an image rule, but {why}"
         if isinstance(rule, AnthropicImageRule):
-            return _anthropic_image_tokens(rule, *size), ""
+            return _anthropic_image_tokens(rule, *size), facts.basis
         # The part's own detail decides; the model's default only where it has none.
         detail = image_detail(part)
         if rule.for_detail(detail) is None:
             return None, f"the image rule for {who} gives no size for the detail level {detail!r} this image asks for"
-        return _openai_image_tokens(rule, *size, detail=detail), ""
+        return _openai_image_tokens(rule, *size, detail=detail), facts.basis
 
     def _content(self, content: Any) -> tuple[int, int, int]:
         """(characters, image tokens, uncounted images) of a content value."""

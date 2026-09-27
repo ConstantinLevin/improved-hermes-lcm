@@ -1205,7 +1205,8 @@ class PageBuilder:
         self.origin = limit if isinstance(limit, PageLimit) else None
         self.limit = limit.limit if isinstance(limit, PageLimit) else int(limit)
         self.token_state = token_state
-        # (tokens or None, why uncounted): ``Estimator.image_count`` of the call's route.
+        # (tokens and the rule's basis, or None and why uncounted): ``Estimator.image_count``
+        # of the call's route.
         self.image_tokens = image_tokens or (lambda _part: (None, "no route was handed to the page to count it by"))
         self.image_room = image_room or ImageRoom()
         self._fields: dict[int, list] = {}
@@ -1248,11 +1249,12 @@ class PageBuilder:
         counted: Optional[int] = 0
         notes = []
         for number, part in enumerate(images, start=1):
-            tokens, why = self.image_tokens(part)
+            tokens, said = self.image_tokens(part)
             counted = None if tokens is None or counted is None else counted + tokens
-            # The count's own cause (``Estimator.image_count``), never inferred from a None.
-            count = (f"{tokens} tokens by the model table's rule" if tokens is not None
-                     else f"not counted: {why}; so it stands alone on its page")
+            # The count's own basis, or its own cause (``Estimator.image_count``), each as the
+            # function states it: a label never claims a rule it did not get for this route.
+            count = (f"{tokens} tokens by the image rule in {said}" if tokens is not None
+                     else f"not counted: {said}; so it stands alone on its page")
             labels.append(f"[image {number} of this page ({media[number - 1]}; {count}), which the page above names "
                           f"as image {number}]")
             notes.append(f"[image {number} of this page ({media[number - 1]}) is not shown in this text]")
