@@ -33,13 +33,16 @@ domain axis). Two ids are the same iff both are scalars (``id_state``: a non-bla
 number, a boolean) of the same JSON type with the same value: strings exactly, numbers by
 value (``1`` is ``1.0``, JSON's own equality of numbers), booleans as booleans, never as
 numbers. A null, blank, list or object id never pairs (``unpairable``); any other string
-is an ordinary id, compared exactly, whatever it holds; since the item's ``message`` shows no host id (the handle replaces
-it), the note is the only place such an id shows, and it names each, its state and that it
-cannot pair: a call's id and aliases, a result's id, every member call's of a group. No id
-is ever hashed. The
-host pairs only non-blank strings, stripped and split at ``|`` (agent/message_sanitization.py
-:496-515 at Hermes fbb06142ef); where a stored id is not a string, or carries whitespace, the
-store's pairing is the store's, and the notes say what the store holds.
+is an ordinary id, compared exactly, whatever it holds. Since the item's ``message`` shows
+no host id (the handle replaces it), the note is the only place such an id shows, and it
+names each, its state and that it cannot pair: a call's id and aliases, a result's id,
+every member call's of a group. No id is ever hashed. The host pairs only non-blank
+strings, stripped and split at ``|`` (agent/message_sanitization.py:496-515 at Hermes
+fbb06142ef); where a stored id is not a string, or carries whitespace, the store's pairing
+is the store's, and the notes say what the store holds. Pairing (rule 1) is exact scalar
+equality and knows no composites; the host's alias forms (``call_id``,
+``response_item_id``, each part of a composite ``a|b``, ``_aliases``) serve rule 2 only,
+to flag a group where the host could pair differently.
 
 No host function is called here. What the provider received of a stretch depends on the
 host's pre-call sanitizer and on the session's route, and those differ from one another
