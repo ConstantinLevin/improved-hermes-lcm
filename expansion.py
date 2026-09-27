@@ -540,10 +540,9 @@ def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pai
             said.append(entry)
         plugin["calls"] = said
         fields["tool_calls"] = [_call_shown(call) for call in tool_calls]
-    elif stored_calls and not (annotations["role"] == "assistant" and (tool_calls is None or tool_calls == [])):
-        # Any other value is the host's own, as stored (PR P; staging dropped it). An
-        # assistant's empty or null ``tool_calls`` is left out as the host's chat transport
-        # leaves it out (agent/transports/chat_completions.py:415 at Hermes 97bacbbce5).
+    elif stored_calls:
+        # Any other value (``[]``, ``null``, a string, …) is the host's own, as stored (PR P;
+        # staging dropped it).
         fields["tool_calls"] = tool_calls
     message.pop("tool_call_id", None)
     fields.update(message)
