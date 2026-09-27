@@ -58,12 +58,14 @@ class Pairing:
     # (assistant record, position) or result record -> its Group
     group: dict = field(default_factory=dict)
     # result record -> (why, its id, detail): a result that belongs to no call, and the block's
-    # fact that says why: "no_id"; "no_calls" (its block opens with ``detail``, a message
+    # fact that says why: "no_id"; "structured" (its id is a list or an object, ``id_state``);
+    # "no_calls" (its block opens with ``detail``, a message
     # holding no calls); "alias" (its id is another spelling of call ``detail`` of the block,
     # not that call's id); "unknown" (no call of the block has its id in any spelling)
     stray: dict = field(default_factory=dict)
     # (assistant record, position) -> (why, detail): a call no result of its block pairs with,
-    # and why, from the block: "no_id" (the call carries no id); "alias" (result ``detail[0]``
+    # and why, from the block: "no_id" (the call carries no id); "empty_id" / "structured_id"
+    # (its id, ``detail``, is blank, or a list or an object: ``id_state``); "alias" (result ``detail[0]``
     # of the block carries the call's alias ``detail[1]``, not its id); "none" (no result of
     # the block carries its id or an alias of it)
     unanswered: dict = field(default_factory=dict)
@@ -71,10 +73,28 @@ class Pairing:
     # call unanswered in its block, a result with its exact id elsewhere on the active record
     # (asked by the caller, which holds the active order: ``expansion.Order.pairing``)
     elsewhere: dict = field(default_factory=dict)
+    # (assistant record, position) -> why that was not asked (its id is a number the store's
+    # integers cannot hold)
+    unasked: dict = field(default_factory=dict)
 
 
 def _id_of(call: Any) -> Any:
     return call.get("id") if isinstance(call, dict) else None
+
+
+def id_state(value: Any) -> str:
+    """What a stored host id is, over its whole domain (#82, LEARNINGSFÜRPLÄNE A2 on the domain
+    axis: the store takes any JSON value for a call's ``id``, and the pairing reads it):
+    "none" (absent or null), "empty" (a string of nothing but whitespace), "scalar" (any other
+    string, a number or a boolean: an id compared as it is), "structured" (a list, an object:
+    no id to compare, said as such). Nothing here hashes or splits a value it has not asked."""
+    if value is None:
+        return "none"
+    if isinstance(value, str):
+        return "scalar" if value.strip() else "empty"
+    if isinstance(value, (bool, int, float)):
+        return "scalar"
+    return "structured"
 
 
 def _aliases(call: Any) -> set:
@@ -126,19 +146,22 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         if len(indexes) == 1:
             position, call = calls[indexes[0]]
             call_id = _id_of(call)
+            state = id_state(call_id)
             mine = [record for record, raw in results
-                    if call_id is not None and raw.get("tool_call_id") == call_id]
+                    if state == "scalar" and raw.get("tool_call_id") == call_id]
             if len(mine) <= 1:
                 if mine:
                     found.answer[(head_record, position)] = mine[0]
                     found.result_of[mine[0]] = (head_record, position)
                     claimed.add(mine[0])
-                elif call_id is None:
+                elif state == "none":
                     found.unanswered[(head_record, position)] = ("no_id", None)
+                elif state in ("empty", "structured"):
+                    found.unanswered[(head_record, position)] = (f"{state}_id", call_id)
                 else:
                     other = _aliases(call) - {call_id}
                     alias = next(((record, raw["tool_call_id"]) for record, raw in results
-                                  if raw.get("tool_call_id") in other), None)
+                                  if isinstance(raw.get("tool_call_id"), str) and raw["tool_call_id"] in other), None)
                     found.unanswered[(head_record, position)] = ("alias", alias) if alias else ("none", None)
                 continue
             spellings = _aliases(call)
@@ -163,12 +186,16 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         if record in claimed:
             continue
         call_id = raw.get("tool_call_id")
-        if call_id is None or (isinstance(call_id, str) and not call_id.strip()):
+        state = id_state(call_id)
+        if state in ("none", "empty"):
             found.stray[record] = ("no_id", None, None)
+        elif state == "structured":
+            found.stray[record] = ("structured", call_id, None)
         elif not calls:
             found.stray[record] = ("no_calls", call_id, head_record)
         else:
-            owner = next((position for position, call in calls if call_id in _aliases(call)), None)
+            owner = next((position for position, call in calls
+                          if isinstance(call_id, str) and call_id in _aliases(call)), None)
             found.stray[record] = ("alias", call_id, owner) if owner is not None else ("unknown", call_id, None)
 
 
