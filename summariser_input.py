@@ -98,12 +98,14 @@ class HostUnavailable(Exception):
     call; the summariser's own path keeps its fallbacks, which are not D1's)."""
 
 
-def _strict_import(what: str, module: str, name: str) -> Any:
+def _strict_import(what: str, module: str, name: str,
+                   so: str = "the message as the host sends it is not known") -> Any:
+    """The host's function, or ``HostUnavailable`` naming it and what cannot be known without it."""
     try:
         return getattr(__import__(module, fromlist=[name]), name)
     except Exception as exc:
         raise HostUnavailable(f"the host's {what} ({module}.{name}) cannot be read ({type(exc).__name__}: {exc}), "
-                              f"so the message as the host sends it is not known") from None
+                              f"so {so}") from None
 
 
 def _host_clone(message: dict, strict: bool = False) -> dict:

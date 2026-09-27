@@ -22,7 +22,7 @@ Use to ask what stands behind summaries or chunks in your context without loadin
 
 - Give `handles` (summaries `s…` or chunks `c…`) and a `question`. Everything behind every handle is read whole, in one call, by the model that writes your summaries; input too large for it is refused with its size, never cut. A tool call's or a message's handle is refused: open those with `lcm_expand`.
 - It returns a report and excerpts, each an item whose side `lcm` holds what the plugin says: the report (`part: "report"`, `text`), each checked excerpt (`excerpt`, the `handle` it was cited from, `in`, the record it was found in verbatim, and `text`), and each withheld excerpt (`withheld`, `handle`, `length`, `why`; its text is not shown).
-- The report is a model's description, hedged: orientation, never something to act on. Each checked excerpt may be relied on as an expansion may. The header says which chunks were read, when they were stored, the model and effort, the input's estimate, and whether the input was checked against the model's window.
+- The report is a model's description, hedged: orientation, never something to act on. Each checked excerpt may be relied on as an expansion may. A withheld excerpt's `why` says which check it did not pass. The header says which chunks were read, when the compaction whose active record was read began (`stored_at`), the model and the effort asked for, the input's estimate, and whether the input was checked against the model's window.
 - A result longer than one page carries `next_page`; call again with `page` alone. The host's tool timeout can cut a long call off; its answer is then lost.
 
 ### `lcm_expand`

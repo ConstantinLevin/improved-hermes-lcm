@@ -17,7 +17,7 @@ cannot be read refuses the query; the host's fill of an empty message quoted as 
 never given as content), each labelled with its handle, then the question. Refused before the
 call, with the cause: an image on a wire the plugin has not established, more images than the
 host's converter keeps in one request, an input over the model's input (its window less its
-output cap, by the estimate's worst case, #34 D4; where the model table has no window this is
+output cap, by the estimate times ``estimate_ratio_max``, #34 D4; where the model table has no window this is
 said in the result), a page too small for the result's header.
 
 **How the call is bounded** (the orchestrator's ruling on the revision of OD5/OD6). The host runs
@@ -28,8 +28,10 @@ plain path: no progress hook and no stream deadline are installed (a deadline ti
 retried, re-routed and would quarantine fallback providers in the host), and ``timeout`` is what
 is left of the bound, the per-read timeout. The bound governs the wait for the endpoint's
 limiter slot, the plugin's own retries and the write of a stored result; the host's interrupt
-bit on this thread (``tools.interrupt.is_interrupted``, set when the host abandons the call)
-does too. A call the host abandoned runs to its end and is billed; nothing of it is written.
+bit on this thread (``tools.interrupt.is_interrupted``, set when the host gives the call up or
+asks it to stop) does too. Inside one ``call_llm`` nothing reads the bit: a call the host gave up
+runs to its end, the host's own same-provider retries (each with the whole per-read timeout)
+and its fallback ladder included, each billed; nothing of it is written.
 
 **The reply.** Its content must be exactly one JSON object ``{"report": str, "excerpts": [{"handle":
 str, "text": str}, ...]}``; nothing is stripped or recognised by pattern (#9 Decided). Each
@@ -103,11 +105,12 @@ CONTRACT = ('Reply with one JSON object and nothing else: {"report": "…", "exc
             '"text": "…"}]}')
 NOTE = ("The report is a model's description of what it read, hedged: orientation, not something to "
         "act on. Each excerpt was found verbatim in the record named by \"in\" and may be relied on as "
-        "an expansion may. A withheld excerpt was not found verbatim and is not shown.")
+        "an expansion may. A withheld excerpt did not pass the check its \"why\" names and is not shown.")
 ROUTE_UNVERIFIABLE = (
-    "Which model answered rests on the host's route record; two switches leave none: a "
-    "credential retry the host routes elsewhere (#70) and a fallback it picks before its first "
-    "record that serves the same model id (ask A-33.3).")
+    "Which model answered rests on the host's route record; three switches leave none: a "
+    "credential retry the host routes elsewhere (#70), a fallback it picks before its first "
+    "record that serves the same model id (ask A-33.3), and on Nous a model it substitutes "
+    "after a model-not-found or a credential refresh (its Nous rungs).")
 _GROUP_NOTE = "one of the results of calls the store cannot pair"
 
 
@@ -134,7 +137,8 @@ class _Read:
 
 def _host_timeout() -> Optional[float]:
     """The host's sequential tool timeout as its own function resolves it, strictly."""
-    resolve = _strict_import("sequential tool timeout", "agent.tool_executor", "_resolve_sequential_tool_timeout")
+    resolve = _strict_import("sequential tool timeout", "agent.tool_executor", "_resolve_sequential_tool_timeout",
+                             so="how long the host waits for this call is not known; nothing was sent")
     value = resolve()
     return float(value) if isinstance(value, (int, float)) and value > 0 else None
 
@@ -258,8 +262,8 @@ def parse_reply(content: str) -> tuple[str, list]:
     except ValueError as exc:
         raise refuse(f"{exc}; the reply had {len(content)} characters") from None
     if not isinstance(value, dict) or set(value) != {"report", "excerpts"}:
-        raise refuse(f"its keys are {sorted(value) if isinstance(value, dict) else type(value).__name__}, "
-                     f"not report and excerpts")
+        raise refuse("it is not an object with exactly the keys report and excerpts" if isinstance(value, dict)
+                     else f"it is a JSON {type(value).__name__}, not an object")
     report, excerpts = value["report"], value["excerpts"]
     if not isinstance(report, str) or not report.strip():
         raise refuse("report is not a non-empty string")
@@ -296,7 +300,8 @@ def check_excerpts(found: _Read, excerpts: list) -> list[Item]:
             items.append(withhold("empty"))
             continue
         if "\x00" in text or GREP_SEPARATOR in text:
-            items.append(withhold("holds NUL or U+001F, which no stored string holds"))
+            items.append(withhold("holds NUL or U+001F: the stored text writes a NUL as U+001F and separates "
+                                  "its strings by it, so such a text is never checked"))
             continue
         note = None
         if handle[0] == MESSAGE:
@@ -307,16 +312,24 @@ def check_excerpts(found: _Read, excerpts: list) -> list[Item]:
         else:
             place = next(((record, position) for record, positions in found.calls.items()
                           for position, call in positions.items() if call == handle), None)
-            if place is None or place[0] not in chunk_of:
-                items.append(withhold("not a tool call this query read"))
+            # The call's pairing: of the chunk that holds the call or one of its results (a
+            # result read may belong to a call in a chunk not read; its label names that call).
+            pairing = next((found.pairing[chunk] for chunk in found.chunks
+                            if place in found.pairing[chunk].group or place in found.pairing[chunk].answer),
+                           None) if place is not None else None
+            if pairing is None:
+                items.append(withhold("not a tool call this query read" if place is None or place[0] not in chunk_of
+                                      else "the call has no result on the active record"))
                 continue
-            pairing = found.pairing[chunk_of[place[0]]]
             if place in pairing.group:
                 candidates, note = list(pairing.group[place].results), _GROUP_NOTE
-            elif place in pairing.answer:
-                candidates = [pairing.answer[place]]
             else:
-                items.append(withhold("the call has no result on the active record"))
+                candidates = [pairing.answer[place]]
+            outside = [record for record in candidates if record not in chunk_of]
+            candidates = [record for record in candidates if record in chunk_of]
+            if not candidates:
+                items.append(withhold(f"the call's result ({', '.join(outside)}) lies outside the chunks this query "
+                                      f"read, so it was not searched"))
                 continue
         where = next((record for record in candidates if contained(text, found.texts.get(record, ""))), None)
         if where is None:
@@ -353,12 +366,21 @@ def _precheck_room(read: _Read, header: dict, limit: Any, largest_group: int) ->
                  model=dict(header["model"], finish_reason="content_filter",
                             usage={"prompt_tokens": 9_999_999, "completion_tokens": 9_999_999}))
     groups = ", ".join(["m" + "x" * 8] * max(1, largest_group))
+    # Every "why" check_excerpts can write, each at its longest; the longest one is measured
+    # (a withheld item has no text to cut into pieces).
+    whys = ["not the handle of a tool call (t…) or a message (m…)",
+            "holds NUL or U+001F: the stored text writes a NUL as U+001F and separates its strings by it, so "
+            "such a text is never checked",
+            "not a message this query read", "not a tool call this query read",
+            "the call has no result on the active record",
+            f"the call's result ({groups}) lies outside the chunks this query read, so it was not searched",
+            f"not found verbatim in {groups}"]
     candidates = [
         Item({"part": "report"}, plugin={"text": "x"}),
         Item({"excerpt": 9_999_999, "handle": "t" + "x" * 8, "in": "m" + "x" * 8, "note": _GROUP_NOTE},
              plugin={"text": "x"}),
         Item({"withheld": 9_999_999, "handle": "t" + "x" * 8, "length": 9_999_999,
-              "why": f"not found verbatim in {groups}"}),
+              "why": max(whys, key=lambda why: len(json.dumps(why)))}),
     ]
     target = Target(worst, candidates)
     builder = expansion.PageBuilder(target, limit=limit, token_state=_token_state("x" * 36, "q" + "x" * 8, target))
@@ -384,8 +406,8 @@ def _serve_stored(engine: Any, session: str, state: dict, limit: Any) -> Any:
         raise ExpansionError("page is a token of another session's query")
     target = _target(body)
     if expansion.target_identity(target) != state["r"]:
-        raise ExpansionError("the stored query result renders differently since page 1 (code that changed); ask "
-                             "the question again")
+        raise ExpansionError("the stored query result renders differently than when page 1 was served; ask the "
+                             "question again")
     return expansion.serve_page(target, state, _token_state(store_uuid, state["k"], target), limit,
                                 found="what this query returned")
 
@@ -428,7 +450,8 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
     limit = expansion.host_page_limits(engine, TOOL, messages)
     timeout = _host_timeout()
     bound = entry + timeout if timeout is not None else None
-    interrupted = _strict_import("tool interrupt bit", "tools.interrupt", "is_interrupted")
+    interrupted = _strict_import("tool interrupt bit", "tools.interrupt", "is_interrupted",
+                                 so="whether the host asked this call to stop cannot be known; nothing was sent")
     records: RecordStore = engine._records
     with engine._route_scope():
         settings, why_not = engine._summariser_settings()
@@ -452,8 +475,9 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
         image_limit = wire_image_limit(wire)
         if image_limit is not None and images > image_limit:
             raise ExpansionError(f"what the handles hold carries {images} images, more than the {image_limit} the "
-                                 f"host's converter for {route.describe()} keeps in one request: the rest would be "
-                                 f"removed unseen; ask over fewer handles")
+                                 f"host's converter for {route.describe()} keeps in one request (beyond it the host "
+                                 f"retires images of earlier tool results): it cannot be shown that the model "
+                                 f"receives every image; ask over fewer handles")
         estimator = Estimator(image_model=route.target_model, image_provider=route.target_provider,
                               reasoning_sent=wire.needs_reasoning_echo)
         estimate = estimator.messages(messages_in)
@@ -464,12 +488,14 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
             if provider_tokens > room:
                 raise ExpansionError(
                     f"the input would reach {route.describe()} as about {provider_tokens} provider tokens ("
-                    f"{estimate.tokens} by the plugin's estimate, its characters / 4 times {worst}, the estimate's "
-                    f"worst case observed, #34 D4; {estimate.label()}), more than it reads in one call "
+                    f"{estimate.tokens} by the plugin's estimate, its characters / 4 times {worst}, the configured "
+                    f"estimate_ratio_max, #34 D4; {estimate.label()}), more than it reads in one call "
                     f"({facts.context_window} window less {facts.output_cap or 0} output; {facts.basis}); nothing "
                     f"was cut and nothing was sent: ask over fewer handles")
-            window = (f"checked: about {provider_tokens} provider tokens by the estimate's worst case against "
-                      f"{room} ({facts.basis})")
+            uncounted = (f"; {estimate.uncounted_images} image(s) the estimate could not count are not in it"
+                         if estimate.uncounted_images else "")
+            window = (f"checked: about {provider_tokens} provider tokens by estimate_ratio_max {worst} against "
+                      f"{room} ({facts.basis}){uncounted}")
         else:
             window = (f"not known: the model table has no window for {route.target_provider}/{route.target_model}, "
                       f"so the input was not checked against it; the provider's refusal is the only bound")
@@ -492,7 +518,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
                             or [1])
         _precheck_room(found, header, limit, largest_group)
         if interrupted():
-            raise ExpansionError("the host has abandoned this tool call (its interrupt bit is set); nothing was sent")
+            raise ExpansionError("the host asked this tool call to stop (its interrupt bit is set); nothing was sent")
         if bound is not None and time.monotonic() >= bound:
             raise ExpansionError("the host's tool timeout has passed; nothing was sent")
 
@@ -503,7 +529,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
             return not interrupted() and (bound is None or time.monotonic() < bound)
 
         def abandoned(during: str) -> SummaryFailure:
-            why = ("the host abandoned this tool call (its interrupt bit is set)" if interrupted()
+            why = ("the host asked this tool call to stop (its interrupt bit is set)" if interrupted()
                    else f"the host's tool timeout ({timeout} s) passed")
             return SummaryFailure("the call was given up", transient=False, kind="endpoint",
                                   detail=f"{why} {during}")
@@ -546,6 +572,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
     header["excerpts_withheld"] = sum(1 for item in checked if "withheld" in item.annotations)
     body = _body(header, items)
     target = _target(body)
+
     def page_one_as(report_id: str) -> str:
         return expansion.serve_page(target, None, _token_state(found.store_uuid, report_id, target), limit,
                                     found="what this query returned")
@@ -555,7 +582,8 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
     if json.loads(page_one).get("next_page") is None:
         return page_one
     if interrupted():
-        raise ExpansionError("the host abandoned this tool call before its result was stored; nothing was stored")
+        raise ExpansionError("the host asked this tool call to stop (its interrupt bit is set) before its result, "
+                             "which needs more than one page, was stored; nothing was stored or shown")
     for _ in range(_HANDLE_DRAWS):
         try:
             stored = records.write_query_report(report_id=report_id, session=session, question=question, body=body,
