@@ -335,8 +335,10 @@ def decode_token(token: Any) -> dict:
     if not isinstance(state, dict) or not _plain_int(state.get("v")):
         raise ExpansionError("page is not a next_page token of these tools")
     if 1 <= state["v"] < TOKEN_VERSION:
-        raise ExpansionError("page is a token of an earlier version of these tools; start again from the handle, "
-                             "without page")
+        # A query's result has no handle to start again from: its question is asked again.
+        again = ("ask the question again, without page" if state.get("t") == "lcm_query"
+                 else "start again from the handle, without page")
+        raise ExpansionError(f"page is a token of an earlier version of these tools; {again}")
     if state["v"] != TOKEN_VERSION:
         raise ExpansionError("page is not a next_page token of these tools")
     # Every field, by type and range: a garbled token is refused with what is wrong in it.

@@ -6,7 +6,7 @@ Compacted summaries are recall cues, not proof of exact wording or values. If ne
 
 Use the narrowest bounded route that fits the question:
 
-- Current compacted conversation: start with `lcm_grep`, then `lcm_query` when precise recovery or synthesis is required.
+- Current compacted conversation: start with `lcm_grep`, then `lcm_query` when precise recovery is required.
 
 Treat `lcm_expand` as known-handle drill-down, not broad discovery.
 

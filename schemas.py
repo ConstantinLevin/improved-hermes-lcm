@@ -134,15 +134,20 @@ LCM_QUERY = {
     "name": "lcm_query",
     "description": (
         "Ask a question about what stands behind summaries or chunks in your context, without loading it: "
-        "give their handles (s… or c…) and the question. Everything behind every handle is read whole, in one "
-        "call, by the model that writes your summaries; input too large for it is refused with its size, never "
-        "cut. It returns a report and excerpts. The report is a model's description, hedged: orientation, "
-        "never something to act on; it names the handles it draws on, which lcm_expand opens. Each excerpt was "
-        "found verbatim in the record named by \"in\" and may be relied on as an expansion may; an excerpt not "
-        "found verbatim is withheld and named. A result longer than one page carries next_page: call again "
-        "with page=next_page alone. The host's tool timeout can cut a long call off; its answer is then lost, "
-        "and the call can run on past it: the host retries a failed read on the same provider (by default twice), "
-        "each retry allowed as long as the first read, and may then try its fallbacks, each billed."
+        "give their handles (s… or c…) and the question. Everything behind every handle is given, in one call, to "
+        "the model that writes your summaries, each record as it was; where that cannot be shown (the input is "
+        "larger than the model's window where the plugin knows the window, or the host would not send a record "
+        "as it is stored), the query is refused with the cause, and nothing is ever cut. It returns a report and "
+        "excerpts. The report is a model's description, hedged: orientation, never something to act on; the "
+        "model is asked to name the handles it draws on, which lcm_expand opens. Each excerpt was found "
+        "verbatim in the record named by \"in\" and may be relied on as an expansion may; an excerpt not found "
+        "verbatim is withheld and named. A result longer than one page carries next_page: call again with "
+        "page=next_page alone. The query calls its model once and tries nothing again: a failed call is first "
+        "handled by the host's own recovery, and the error names what that recovery can have changed on the "
+        "route in use; call again if you want to. If the host stops waiting for this call (its tool timeout, or "
+        "you are interrupted), the query stops too and its answer is lost; on some routes the model's request "
+        "still runs to its end and is billed: every result's header says under call what happens on the route "
+        "in use."
     ),
     "parameters": {
         "type": "object",

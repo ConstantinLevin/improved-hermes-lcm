@@ -80,6 +80,10 @@ READABLE_REASONING_LABEL = "[Reasoning the provider returned with this message, 
 CLOSING_REQUEST = "Summarize the conversation above, as the system instructions say."
 _ONLY_WITHHELD_REASONING = ("[This message carried only reasoning the summariser is not given: "
                             "encrypted, and its producer is not known]")
+# The strict projection's words (the query, #19): its model is the summariser's, and its
+# labels name that model as "this model", never as the summariser.
+_ONLY_WITHHELD_REASONING_STRICT = ("[This message carried only reasoning this model is not given: "
+                                   "encrypted, and its producer is not known]")
 
 
 @dataclass(frozen=True)
@@ -175,11 +179,18 @@ def wire_facts(provider: str, model: str, base_url: str, api_mode: str,
     called, and one that cannot be read raises ``HostUnavailable`` naming it; the
     summariser's call keeps its three fallbacks until #72 is worked."""
     if strict:
-        echo = bool(_strict_import("reasoning-echo test", "agent.message_sanitization", "needs_reasoning_echo")(
+        # Each names the fact that cannot be known without it; nothing is sent either way.
+        echo = bool(_strict_import(
+            "reasoning-echo test", "agent.message_sanitization", "needs_reasoning_echo",
+            so="whether the host sends reasoning_content to this route is not known; nothing was sent")(
             provider, model, base_url))
-        mode = str(_strict_import("API mode canonicalisation", "hermes_cli.config_providers", "_canonical_api_mode")(
+        mode = str(_strict_import(
+            "API mode canonicalisation", "hermes_cli.config_providers", "_canonical_api_mode",
+            so="the route's API mode as the host reads it is not known; nothing was sent")(
             str(api_mode or ""))).lower()
-        dispatched = str(_strict_import("provider normalisation", "agent.auxiliary_client", "_normalize_aux_provider")(
+        dispatched = str(_strict_import(
+            "provider normalisation", "agent.auxiliary_client", "_normalize_aux_provider",
+            so="the route's provider as the host dispatches it is not known; nothing was sent")(
             provider))
         anthropic = mode == "anthropic_messages" or (dispatched == "anthropic" and mode in ("", "anthropic_messages"))
         return WireFacts(reads_images=reads_images, needs_reasoning_echo=echo, anthropic_converter=anthropic)
@@ -325,6 +336,9 @@ _NOT_READ = "not shown to this summariser, which does not read images"
 # The orchestrator's ruling on #8b: a summariser the model table has no row for is not
 # said not to read images; its images are not sent, and it is said that it is not known.
 _NOT_KNOWN = "image not sent: whether this summariser reads images is unknown"
+# The strict projection's words (the query's model, #19).
+_NOT_READ_STRICT = "not shown to this model, which does not read images"
+_NOT_KNOWN_STRICT = "image not sent: whether this model reads images is unknown"
 _EVICTED = "left out of this call: the host's Anthropic converter drops it for its per-request image limit"
 
 
@@ -459,8 +473,47 @@ def _has_payload(message: dict) -> bool:
 FILL_NOTE_LABEL = "[The host sends this empty message to the provider with its own stand-in as content:]"
 
 
+def _json_kind(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _content_as_given(content: Any) -> Any:
+    """The strict projection's content for a stored value that is none of the shapes a
+    message's content has on the wire (a string, None, a list of parts): the query (#19)
+    gives every stored value to its model as what it was, or says how it shows it.
+
+    - The host's ``_multimodal`` envelope (the plugin's one rule, ``content_parts``): its
+      parts as the content, so that its images go under the image rules and are counted,
+      and every other key of the envelope (its ``text_summary`` among them) in a labelled
+      part as JSON.
+    - Any other value (an object, a number, a boolean): one labelled part holding its JSON.
+
+    A string, None or a list is returned as it is."""
+    if content is None or isinstance(content, (str, list)):
+        return content
+    parts = content_parts(content)
+    if parts is not None and isinstance(content, dict):
+        rest = {key: value for key, value in content.items() if key not in ("_multimodal", "content")}
+        shown = list(parts)
+        if rest:
+            shown.append({"type": "text", "text": (
+                "[The rest of this stored multimodal envelope, shown as its JSON by the query:]\n"
+                + json.dumps(rest, ensure_ascii=False))})
+        return shown
+    return [{"type": "text", "text": (
+        f"[The stored content is a JSON {_json_kind(content)}, shown as its JSON by the query:]\n"
+        + json.dumps(content, ensure_ascii=False))}]
+
+
 def summariser_message(raw: dict, record: str, facts: WireFacts,
-                       withheld: Optional[dict[str, int]] = None, *, strict: bool = False) -> dict:
+                       withheld: Optional[dict[str, int]] = None, *, strict: bool = False,
+                       added: Optional[list] = None) -> dict:
     """One record's message as the summariser receives it (see the module docstring).
     The encrypted items withheld from it are added to ``withheld`` by kind.
 
@@ -469,7 +522,11 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
     be read), and the host's fill of an empty non-final message is never given as the
     message's content: the fill is asked on the host's own row before any step of the
     plugin's (``host_fill_text``, A10), the content stays as stored, and a labelled part
-    quotes the host's stand-in."""
+    quotes the host's stand-in.
+
+    ``added`` (the query's wire check, #19 OD-G) receives the text of every part this
+    projection adds beside the stored content: image placeholders, the readable-reasoning
+    part, the malformed-arguments parts, the fill note, the withheld-reasoning text."""
     fill = None
     if strict:
         row = _row_before_fill(raw, needs_echo=facts.needs_reasoning_echo, strict=True)
@@ -477,26 +534,41 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
         message = copy.deepcopy(row)
         message.pop("_length_continuation_fragment", None)
         message.pop("_length_continuation_nudge", None)
+        if "content" in message:
+            message["content"] = _content_as_given(message["content"])
     else:
         message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
     withheld_here = _withhold_encrypted(message)
     for kind, count in withheld_here.items():
         if withheld is not None:
             withheld[kind] = withheld.get(kind, 0) + count
+    stored_parts = {id(part) for part in (content_parts(message.get("content")) or [])}
     if facts.reads_images is None:
-        _replace_images_in_message(message, record, _NOT_KNOWN)
+        _replace_images_in_message(message, record, _NOT_KNOWN_STRICT if strict else _NOT_KNOWN)
     elif not facts.reads_images:
-        _replace_images_in_message(message, record, _NOT_READ)
+        _replace_images_in_message(message, record, _NOT_READ_STRICT if strict else _NOT_READ)
+    if added is not None:
+        added.extend(part["text"] for part in (content_parts(message.get("content")) or [])
+                     if id(part) not in stored_parts and isinstance(part, dict) and isinstance(part.get("text"), str))
     if message.get("role") == "assistant":
         readable = _readable_reasoning(raw)
         before = [{"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{readable}"}] if readable else []
-        _add_parts(message, before, _malformed_argument_parts(message))
+        after = _malformed_argument_parts(message)
+        _add_parts(message, before, after)
+        if added is not None:
+            added.extend(part["text"] for part in before + after)
         # Strictly, the words "carried only reasoning … withheld" are said only of a message
         # something was withheld from; an empty message is otherwise quoted by the fill note.
         if not _has_payload(message) and (withheld_here or not strict):
-            message["content"] = [{"type": "text", "text": _ONLY_WITHHELD_REASONING}]
+            only = _ONLY_WITHHELD_REASONING_STRICT if strict else _ONLY_WITHHELD_REASONING
+            message["content"] = [{"type": "text", "text": only}]
+            if added is not None:
+                added.append(only)
     if fill is not None:
-        _add_parts(message, [{"type": "text", "text": f"{FILL_NOTE_LABEL} {json.dumps(fill, ensure_ascii=False)}"}], [])
+        note = f"{FILL_NOTE_LABEL} {json.dumps(fill, ensure_ascii=False)}"
+        _add_parts(message, [{"type": "text", "text": note}], [])
+        if added is not None:
+            added.append(note)
     return message
 
 

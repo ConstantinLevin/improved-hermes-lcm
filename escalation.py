@@ -137,6 +137,12 @@ class SummariserRoute:
     target_api_mode: str = ""
     target_client: str = ""
     target_problem: str = ""
+    # The client object the host's resolution returned, and the provider the host's request
+    # is made under (``_prepare_aux_request``: the effective provider, else the resolved one),
+    # kept as they are so that the host's own functions can be asked about them (the query's
+    # route clauses and its wire check, #19 OD-F, OD-G): never compared, never shown.
+    target_client_object: Any = field(default=None, compare=False, repr=False)
+    target_request_provider: str = field(default="", compare=False, repr=False)
 
     def table_provider(self) -> str:
         """The provider the model table's route rows are keyed on: the target's."""
@@ -179,9 +185,10 @@ def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mo
     target, problem = _resolve_route_target(route)
     if target is None:
         return replace(route, target_problem=problem)
-    target_provider, target_model, target_base_url, target_api_mode, target_client = target
+    target_provider, target_model, target_base_url, target_api_mode, target_client, client, request_provider = target
     return replace(route, target_provider=target_provider, target_model=target_model,
-                   target_base_url=target_base_url, target_api_mode=target_api_mode, target_client=target_client)
+                   target_base_url=target_base_url, target_api_mode=target_api_mode, target_client=target_client,
+                   target_client_object=client, target_request_provider=request_provider)
 
 
 def _client_wire(client: Any) -> str:
@@ -204,9 +211,10 @@ def _client_wire(client: Any) -> str:
     return ""
 
 
-def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, str, str, str, str]], str]:
+def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, str, str, str, str, Any, str]], str]:
     """The route the host takes for the session's own route: (provider label, model,
-    endpoint, wire, client class), from the host's final client resolution, the same
+    endpoint, wire, client class, the client object, the provider its request is made
+    under), from the host's final client resolution, the same
     ``call_llm`` performs, without a request (the orchestrator's ruling on the Codex
     review of e229fd0), read at Hermes origin/main d0288be5b3 (agent/auxiliary_client.py):
     ``call_llm`` → ``_prepare_aux_request`` (7305) → ``_resolve_task_provider_model`` (6072;
@@ -265,7 +273,7 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
         return None, (f"the session route is not available; the host would fall back to {label}/{model} (the "
                       f"session's route is on {own_label})")
     return (label, model, str(getattr(client, "base_url", "") or ""), _client_wire(client),
-            type(client).__name__), ""
+            type(client).__name__, client, str(effective_provider or resolved_provider or "")), ""
 
 
 def _host_local_server_aliases() -> Optional[frozenset]:
@@ -629,42 +637,47 @@ def check_route_records(route: SummariserRoute, routes: list[tuple[str, str]]) -
       through another model under the same label;
     - more than one record, where the label names no endpoint (custom, a local server):
       a fallback under the same label cannot be told from the session's route."""
+    # The words name the model the call asked for, never "the summariser": the query (#19)
+    # makes this call too, on the summariser's model.
     if not routes:
         raise SummaryFailure("reply on an unknown route", transient=False, kind="route",
-                             detail="the host recorded no route in route_info (#33 D9)")
+                             detail="the host recorded no route for this call in route_info")
     auto = next((record for record in routes if str(record[0] or "").strip().lower() == "auto"), None)
     if auto is not None:
         raise SummaryFailure(
             "reply on a route the host recorded as 'auto'", transient=False, kind="route",
-            detail=f"route_info names auto/{auto[1] or '?'}, which names no provider: the host's Nous refresh "
-                   f"(_refresh_nous_auxiliary_client) stores a client without the effective-provider tag, so the "
-                   f"route that answered is not known; the summariser is {route.describe()} (#33 D9)",
+            detail=f"route_info names auto/{auto[1] or '?'}, which names no provider, so the route that answered "
+                   f"is not known (one host path that records it so is its Nous refresh, "
+                   f"_refresh_nous_auxiliary_client); the model asked for is {route.describe()}",
         )
     for record in routes:
         if not _same_provider_label(route, record[0]):
             raise SummaryFailure(
                 "reply on another provider's route", transient=False, kind="route",
-                detail=f"route_info names {record[0] or '?'}/{record[1] or '?'}; the summariser is "
-                       f"{route.describe()} (#33 D9)",
+                detail=f"route_info names {record[0] or '?'}/{record[1] or '?'}; the model asked for is "
+                       f"{route.describe()}",
             )
         if not _same_model(route, record[1]):
             raise SummaryFailure(
-                "the host routed the summariser's call through another model", transient=False, kind="route",
+                "the host recorded another model for this call", transient=False, kind="route",
                 detail=f"route_info names {record[0] or '?'}/{record[1] or '?'} among {len(routes)} record(s); the "
-                       f"summariser is {route.describe()} (#33 D9)",
+                       f"model asked for is {route.describe()}",
             )
     answered = routes[-1]
     if len(routes) > 1 and not _session_route_answered(route, answered):
         resolved = routes[0]
         # The host records the route once when it plans the call, and again before each
-        # fallback candidate (``_record_route_info``, agent/auxiliary_client.py at Hermes
-        # 916e1688ba; its same-provider transient retries record nothing), so a second
-        # record means a fallback candidate answered.
+        # fallback candidate (``_record_route_info``, agent/auxiliary_client.py 7349 and 7746
+        # at Hermes 375930d089; its same-provider transient retries record nothing), so a
+        # second record means a fallback candidate was tried. Every record passed the label
+        # and model checks above: what is not known is which endpoint answered.
         raise SummaryFailure(
-            "reply from another model", transient=False, kind="route",
-            detail=f"the host fell back and its route_info names {answered[0] or '?'}/{answered[1] or '?'} as the "
-                   f"route that answered; the summariser is {route.describe()}, which the host resolved as "
-                   f"{resolved[0]}/{resolved[1]} (#33 D9)",
+            "reply after the host tried a fallback on a route that names no endpoint", transient=False,
+            kind="route",
+            detail=f"the host recorded {len(routes)} routes for this call, the last {answered[0] or '?'}/"
+                   f"{answered[1] or '?'}, first resolved as {resolved[0]}/{resolved[1]}; {answered[0] or '?'} "
+                   f"names no endpoint in route_info, so whether the session's own endpoint answered is not "
+                   f"known; the model asked for is {route.describe()}",
         )
 
 
@@ -694,14 +707,12 @@ class CallPath:
 def _call_with_retries(
     messages: list[dict[str, Any]],
     *,
-    source: Optional[Estimate],
+    source: Estimate,
     settings: CallSettings,
     path: CallPath,
-    usage: Optional[dict] = None,
 ) -> tuple[str, str]:
     """One level: transient failures retried while the deadline allows; a reply that
-    does not shrink its source is a non-transient failure. ``source`` None (the query,
-    #19): no reply is measured against a source. ``usage`` receives the provider's counts."""
+    does not shrink its source is a non-transient failure."""
     backoff = _BACKOFF_FIRST_S
     retries = 0
     while True:
@@ -714,7 +725,7 @@ def _call_with_retries(
                         raise SummaryFailure("summariser call not made, no time left before the host's deadline",
                                              transient=True, kind="endpoint")
                 try:
-                    content, finish_reason = _call_once(messages, settings, timeout, usage)
+                    content, finish_reason = _call_once(messages, settings, timeout)
                 except SummaryFailure:
                     raise
                 except Exception as exc:
@@ -753,8 +764,6 @@ def _call_with_retries(
             continue
         # Both sides by the plugin's estimate (R6); the reply is text, the source may
         # hold images the estimate could not count, and the numbers say so.
-        if source is None:
-            return content, finish_reason
         reply_tokens = count_tokens(content)
         if reply_tokens >= source.tokens:
             raise SummaryFailure("reply not shorter than its source", transient=False, kind="reply",
