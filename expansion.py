@@ -1115,8 +1115,16 @@ def canonical_image_part(part: dict) -> tuple[Optional[dict], str]:
                 said = f"whose source is {host_pairing.json_kind(source)}, not an object"
             elif "type" not in source:
                 said = "whose source object has no type"
+            elif source["type"] == "base64":
+                said = ('whose source of type "base64" has no data' if "data" not in source else
+                        f'whose source of type "base64" has data that is {host_pairing.json_kind(source["data"])}, '
+                        f"not a string")
+            elif source["type"] == "url":
+                said = ('whose source of type "url" has no url' if "url" not in source else
+                        f'whose source of type "url" has a url that is {host_pairing.json_kind(source["url"])}, '
+                        f"not a string")
             else:
-                said = f"whose source has type {host_pairing.id_text(source['type'])}"
+                said = f'whose source has type {host_pairing.id_text(source["type"])}, neither "base64" nor "url"'
             return None, f"stored as an image block {said}, which gives no URL"
     else:
         return None, f"stored as a part of type {kind!r}"
