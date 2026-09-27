@@ -140,7 +140,9 @@ LCM_QUERY = {
         "never something to act on; it names the handles it draws on, which lcm_expand opens. Each excerpt was "
         "found verbatim in the record named by \"in\" and may be relied on as an expansion may; an excerpt not "
         "found verbatim is withheld and named. A result longer than one page carries next_page: call again "
-        "with page=next_page alone. The host's tool timeout can cut a long call off; its answer is then lost."
+        "with page=next_page alone. The host's tool timeout can cut a long call off; its answer is then lost, "
+        "and the call can run on past it: the host retries a failed read on the same provider (by default twice), "
+        "each retry allowed as long as the first read, and may then try its fallbacks, each billed."
     ),
     "parameters": {
         "type": "object",
