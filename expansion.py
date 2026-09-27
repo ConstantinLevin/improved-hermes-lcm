@@ -871,8 +871,9 @@ def _piece(item: Item, path: Path, *, value: Any = None, text: Optional[str] = N
 
 # An image is identified by its content (LEARNINGSFÜRPLÄNE A9): the canonical part as JSON
 # with sorted keys. Whether the session's route carries it is decided once per call and per
-# identity, when the item is built, so the token's hash covers it (the plan of PR B, §2).
-# Whether the request has room for it is decided per page and stated on the page.
+# identity, when the item is built, so the token's hash covers it (the plan of PR B, §2). So
+# is whether a request of this call has room for any image (the guard, the host's limits:
+# ``Route.room``); how many images a page holds is the page's (``PageBuilder.fits``).
 
 
 def _host_image_helpers() -> tuple[Callable[[Any], bool], Callable[[dict], tuple]]:
