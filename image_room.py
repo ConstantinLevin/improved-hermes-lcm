@@ -125,10 +125,10 @@ def host_halt(agent: Optional[Any], why: str = "no running turn was bound") -> t
 
 # --- The host's commit: the envelope's content list, or its text summary ------------------------
 
-COMMIT_UNREAD = ("whether the host sends the images of this page or its text summary also depends on the models the "
-                 "running agent learned this session to reject images in tool results (its "
-                 "_no_list_tool_content_models), which could not be read ({why}); the store keeps every image on this "
-                 "page")
+COMMIT_UNREAD = ("whether the images of this page reach the model also depends on the models the running agent learned "
+                 "this session to reject images in tool results (its _no_list_tool_content_models, read at the host's "
+                 "commit) or image content at all (its _image_rejecting_models, read when the host sends its next "
+                 "request), which could not be read ({why}); the store keeps every image on this page")
 _PROBE_IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
 
 
@@ -137,10 +137,11 @@ def host_commit(tool_name: str, values: dict, agent: Optional[Any], why: str = "
     """Whether the host's commit of this call's result passes an image page's content list to
     the model or replaces it with its ``text_summary`` (tool_executor.py:1125,
     ``_tool_result_content_for_active_model``, vision_message_prep.py:207-254 at Hermes
-    fbb06142ef), asked of the host's own method on an envelope with one image. With a bound
-    agent, on that agent (its provider, model, config and ``_no_list_tool_content_models``);
-    without one, on the host's mixin carrying the route's provider and model, and the agent's
-    set is said unread. Returns (why no image of this call reaches the model, "" where the
+    fbb06142ef), asked of the host's own method on an envelope with one image, and, where it
+    passes, whether the bound agent's next request strips images for this model
+    (``_image_rejecting_models``). With a bound agent, on that agent (its provider, model,
+    config and both learned sets); without one, on the host's mixin carrying the route's
+    provider and model, and the agent's two sets are said unread. Returns (why no image of this call reaches the model, "" where the
     content list passes; why the answer rests on something unread, else ""). The cause is
     named from the host's own inputs, in the method's order, each asked on its own."""
     probe = {"_multimodal": True, "content": [{"type": "text", "text": "."}, dict(_PROBE_IMAGE)], "text_summary": "."}
@@ -162,7 +163,22 @@ def host_commit(tool_name: str, values: dict, agent: Optional[Any], why: str = "
                     f"_tool_result_content_for_active_model raised {type(exc).__name__} ({exc}); the store keeps "
                     f"every image on this page")
     if passed:
-        return "", unread
+        if agent is None:
+            return "", unread
+        # The next request of the bound agent: a model the agent learned rejects image content
+        # gets text only (``strip_images_for_rejecting_model``, message_sanitization.py:420-431,
+        # called at turn_api_request.py:117), keyed as the host keys it.
+        try:
+            key = _host("agent.vision_message_prep", "_provider_model_key")(agent)
+            rejecting = agent._image_rejecting_models
+        except (RoomUnavailable, AttributeError) as exc:
+            return "", (f"whether the host's next request strips this page's images could not be read: reading the "
+                        f"bound agent's _image_rejecting_models raised {type(exc).__name__} ({exc}); the store keeps "
+                        f"every image on this page")
+        if key in rejecting:
+            return (f"the host sends its next request to {key[0]}/{key[1]} as text only: the running agent learned "
+                    f"this session that it rejects image content"), ""
+        return "", ""
     provider = (getattr(subject, "provider", "") or "").strip()
     model = (getattr(subject, "model", "") or "").strip()
     who = f"{provider}/{model}"
