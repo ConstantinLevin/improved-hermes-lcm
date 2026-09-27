@@ -1065,6 +1065,7 @@ class LCMEngine(
             if messages:
                 step = "settling the list the host handed over"
                 self._bind_from_list(messages)
+            step = "choosing the tool"
             handlers = {
                 "lcm_grep": lcm_tools.lcm_grep,
                 "lcm_expand": lcm_tools.lcm_expand,
@@ -1083,7 +1084,9 @@ class LCMEngine(
             # The final string (or the _multimodal envelope, as it is): what a page was
             # measured as (``results.final_result``, #18).
             step = f"finishing the result of {name}"
-            return final_result(result)
+            # The label of estimates: the keys the tool declares it writes them under, never
+            # found by walking the result (``lcm_tools.ESTIMATES``, #78).
+            return final_result(result, lcm_tools.ESTIMATES.get(name, ()))
         except Exception as exc:
             logger.warning("LCM tool %s failed while %s", name, step, exc_info=True)
             return json.dumps({"error": f"LCM's {name} failed while {step}: {type(exc).__name__}: {exc}"},
@@ -1124,8 +1127,16 @@ class LCMEngine(
         return identity
 
     def get_status(self) -> Dict[str, Any]:
+        """The host's own status fields as its base class computes them (its clamped
+        ``last_prompt_tokens`` among them), untouched, and every field of the plugin's under
+        the one key ``lcm`` (#78, LEARNINGSFÜRPLÄNE A12): no plugin key overwrites a host key
+        of the same name, now or when the host adds one."""
         self._check_host_native_compaction()  # the current value of the host's switch
-        status = super().get_status()
+        base = super().get_status()
+        if "lcm" in base:
+            raise RuntimeError("the host's status dict carries a key named lcm, the plugin's own key")
+        status: Dict[str, Any] = {}
+        base["lcm"] = status
         status.update({
             "compression_count": self.compression_count,
             "last_prompt_tokens": self.last_prompt_tokens,
@@ -1182,7 +1193,7 @@ class LCMEngine(
             status["session_platform"] = self.current_session_platform
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["conversation_id"] = conversation_id
-        return status
+        return base
 
     def update_model(self, model: str, context_length: int,
                      base_url: str = "", api_key: str = "",

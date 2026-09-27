@@ -41,7 +41,7 @@ def _help_text(error: str | None = None) -> str:
 
 
 def _status_text(engine) -> str:
-    status = engine.get_status()
+    status = engine.get_status()["lcm"]           # the plugin's own fields (#78: under ``lcm``)
     db_path = Path(engine._store.db_path)
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0

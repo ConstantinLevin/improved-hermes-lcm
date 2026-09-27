@@ -10,25 +10,15 @@ from typing import Any
 
 from .tokens import ESTIMATE_LABEL
 
-# The keys under which the tools show the plugin's own estimate (the views' token
-# columns, derived from records.est_tokens and derivations.est_tokens, and their sums).
-# The host's own counts (last_prompt_tokens and the like) are not estimates and are not
-# labelled. Beside every such count that can hold images stands the number of images
-# its estimate left uncounted (records.est_uncounted_images and its sums, #35).
-_ESTIMATE_KEYS = frozenset({
-    "token_count", "source_token_count", "est_tokens", "tokens", "source_tokens", "token_estimate",
-    "estimated_tokens", "effective_fresh_tail_tokens", "total_tokens", "total_source_tokens",
-    "total_summary_tokens",
-})
+# The label of a result that holds the plugin's own estimates (the views' token columns,
+# derived from records.est_tokens and derivations.est_tokens, and their sums). Which keys
+# hold them is declared by the tool that wrote them (``tools.ESTIMATES``, #78, A12): never
+# found by walking the result, which can hold the host's data under any key (a stored
+# message's ``token_count`` is a host column). The host's own counts (last_prompt_tokens
+# and the like) are not estimates and are never declared. Beside every such count that can
+# hold images stands the number of images its estimate left uncounted
+# (records.est_uncounted_images and its sums, #35).
 _UNCOUNTED_NOTE = "; beside each count that can hold images, the images it left uncounted (*uncounted_images)"
-
-
-def _has_token_count(value: Any) -> bool:
-    if isinstance(value, dict):
-        return any(k in _ESTIMATE_KEYS or _has_token_count(v) for k, v in value.items())
-    if isinstance(value, list):
-        return any(_has_token_count(v) for v in value)
-    return False
 
 
 def is_envelope(value: Any) -> bool:
@@ -41,10 +31,18 @@ def is_envelope(value: Any) -> bool:
     return bool(_is_multimodal_tool_result(value))
 
 
-def final_result(result: Any) -> Any:
+def estimate_label(estimates: tuple) -> str:
+    """The label of the estimates a tool declares it writes (``tools.ESTIMATES``): the keys as
+    declared, where the result holds them; nothing is looked up in the result."""
+    return (f"{ESTIMATE_LABEL}: the counts under the keys {', '.join(estimates)}, where this result holds them"
+            f"{_UNCOUNTED_NOTE}")
+
+
+def final_result(result: Any, estimates: tuple = ()) -> Any:
     """The tool result as the engine returns it: an envelope passes as it is; a payload (a
-    dict) or a JSON string becomes the final string, with the label its estimated token
-    counts carry (#21) at the top of the object. A string that is not a JSON object passes
+    dict) or a JSON string becomes the final string. Where the tool that wrote it declares
+    the keys that hold its estimates (``estimates``), the label names them at the top of the
+    object (#21, #78); nothing else adds a label. A string that is not a JSON object passes
     unchanged. Idempotent."""
     if is_envelope(result):
         return result
@@ -56,8 +54,8 @@ def final_result(result: Any) -> Any:
             return result
     if not isinstance(payload, dict):
         return result if isinstance(result, str) else json.dumps(payload, ensure_ascii=False)
-    if _has_token_count(payload) and "token_counts" not in payload:
-        payload = {"token_counts": ESTIMATE_LABEL + _UNCOUNTED_NOTE, **payload}
+    if estimates and "token_counts" not in payload and "error" not in payload:
+        payload = {"token_counts": estimate_label(estimates), **payload}
     elif isinstance(result, str):
         return result
     return json.dumps(payload, ensure_ascii=False)

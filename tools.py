@@ -15,12 +15,30 @@ from .db_bootstrap import inspect_lcm_schema_health
 from .message_content import content_parts, is_image_part
 from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
+from .results import estimate_label
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
 
 
 logger = logging.getLogger(__name__)
+
+# The keys under which each tool writes the plugin's own estimates, declared by the tool that
+# writes them (#78, A12: ``results.final_result`` names them, and never walks a result for
+# key names, since a result can hold the host's data under any key). lcm_expand and lcm_grep
+# write none: their pages hold the host's stored messages, never an estimate. Nor does
+# lcm_expand_query: its estimates go into the context it sends its model, never into its
+# result (#82). Each tool below names only keys its result can hold; each has keys its result
+# holds only in some states, so the label says "where this result holds them".
+ESTIMATES = {
+    "lcm_inspect": ("token_estimate", "token_count", "source_token_count", "estimated_tokens",
+                    "effective_fresh_tail_tokens", "total_tokens", "total_source_tokens", "tokens", "source_tokens"),
+    "lcm_status": ("estimated_tokens", "total_tokens", "tokens", "source_tokens"),
+    "lcm_doctor": ("token_count", "source_token_count", "total_source_tokens", "total_summary_tokens"),
+}
+
+# What ``_require_engine`` finding no engine means, and nothing more (#78, A11).
+NO_ENGINE = "this call of the tool carried no engine"
 
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
@@ -106,7 +124,11 @@ def _bound_operator_strings(value: Any) -> tuple[Any, int]:
 
 
 def _bounded_inspect_json(response: dict[str, Any]) -> str:
-    """Serialize ``lcm_inspect`` under one final response-size invariant."""
+    """Serialize ``lcm_inspect`` under one final response-size invariant. The estimate label
+    is part of what is bounded (#78: it is added here, so the size stated is the size sent;
+    ``results.final_result`` adds none where ``token_counts`` stands)."""
+    if "error" not in response:
+        response = {"token_counts": estimate_label(ESTIMATES["lcm_inspect"]), **response}
     payload, truncated_fields = _bound_operator_strings(response)
     total_truncated_fields = truncated_fields
     payload["char_limit"] = _LCM_INSPECT_MAX_RESPONSE_CHARS
@@ -121,6 +143,7 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
     # top-level sections in a deterministic priority order.  Never cut encoded
     # JSON mid-token; omitted sections are reported explicitly.
     priority = [
+        "token_counts",
         "read_only",
         "session_id",
         "conversation_id",
@@ -679,7 +702,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> Any:
     threshold."""
     engine = _require_engine(kwargs)
     if engine is None:
-        return json.dumps({"error": "LCM engine not initialized"})
+        return json.dumps({"error": NO_ENGINE})
     try:
         return grep_tool.grep(engine, args, messages=kwargs.get("messages"))
     except expansion.ExpansionError as exc:
@@ -703,7 +726,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> Any:
     image; either way at most the host's spill threshold."""
     engine = _require_engine(kwargs)
     if engine is None:
-        return json.dumps({"error": "LCM engine not initialized"})
+        return json.dumps({"error": NO_ENGINE})
     removed = [name for name in _LCM_EXPAND_REMOVED_ARGUMENTS if name in args]
     if removed:
         return json.dumps({
@@ -774,7 +797,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     handles. The query itself is #19's and is rebuilt there."""
     engine = _require_engine(kwargs)
     if engine is None:
-        return json.dumps({"error": "LCM engine not initialized"})
+        return json.dumps({"error": NO_ENGINE})
     if "node_ids" in args:
         return json.dumps({"error": "lcm_expand_query no longer accepts node_ids; give the summaries' handles "
                                     "as handles"})
@@ -1134,7 +1157,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     """Return a read-only metadata inventory of the current LCM session."""
     engine = _require_engine(kwargs)
     if engine is None:
-        return json.dumps({"error": "LCM engine not initialized"})
+        return json.dumps({"error": NO_ENGINE})
 
     raw_limit_arg = args.get("limit", _LCM_INSPECT_DEFAULT_LIMIT)
     parsed_limit, limit_error = _parse_strict_int(raw_limit_arg, "limit")
@@ -1148,14 +1171,14 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     session_id = engine.current_session_id
     conversation_id = engine.current_conversation_id
     if not session_id:
-        full_status = engine.get_status()
+        full_status = engine.get_status()["lcm"]
         return _bounded_inspect_json({
             "error": "No active session",
             "read_only": True,
             "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
         })
 
-    full_status = engine.get_status()
+    full_status = engine.get_status()["lcm"]
     runtime_identity = full_status.get("runtime_identity") or engine.get_runtime_identity()
 
     store_totals_row = engine._store.connection.execute(
@@ -1277,7 +1300,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     """Quick health overview of the LCM engine for the current session."""
     engine = _require_engine(kwargs)
     if engine is None:
-        return json.dumps({"error": "LCM engine not initialized"})
+        return json.dumps({"error": NO_ENGINE})
 
     session_id = engine.current_session_id
     if not session_id:
@@ -1298,7 +1321,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     total_source_tokens = sum(d["source_tokens"] for d in depths.values())
     total_dag_nodes = sum(d["count"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
-    full_status = engine.get_status()
+    full_status = engine.get_status()["lcm"]
     source_lineage = full_status.get("source_lineage")
     runtime_identity = full_status.get("runtime_identity")
     config_sources = full_status.get("config_sources") or {}
@@ -1372,7 +1395,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     """Run diagnostics on the LCM database and configuration."""
     engine = _require_engine(kwargs)
     if engine is None:
-        return json.dumps({"error": "LCM engine not initialized"})
+        return json.dumps({"error": NO_ENGINE})
 
     checks: list[dict] = []
     session_id = engine.current_session_id
