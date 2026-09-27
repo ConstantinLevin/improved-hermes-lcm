@@ -26,9 +26,11 @@ logger = logging.getLogger(__name__)
 # The keys under which each tool writes the plugin's own estimates, declared by the tool that
 # writes them (#78, A12: ``results.final_result`` names them, and never walks a result for
 # key names, since a result can hold the host's data under any key). lcm_expand and lcm_grep
-# write none: their pages hold the host's stored messages, never an estimate.
+# write none: their pages hold the host's stored messages, never an estimate. Nor does
+# lcm_expand_query: its estimates go into the context it sends its model, never into its
+# result (#82). Each tool below names only keys its result can hold; each has keys its result
+# holds only in some states, so the label says "where this result holds them".
 ESTIMATES = {
-    "lcm_expand_query": ("token_count", "source_token_count"),
     "lcm_inspect": ("token_estimate", "token_count", "source_token_count", "estimated_tokens",
                     "effective_fresh_tail_tokens", "total_tokens", "total_source_tokens", "tokens", "source_tokens"),
     "lcm_status": ("estimated_tokens", "total_tokens", "tokens", "source_tokens"),

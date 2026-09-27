@@ -143,9 +143,11 @@ _UNANSWERED = {
     "alias": ("result {result} of this call's block carries {alias}, another spelling of this call's host id, not the "
               "id itself; the store pairs by the id and does not pair them"),
 }
-# A call on a message the pairing does not read as a block's calls: not an assistant message.
-NOT_ASSISTANT = ("this call's message is not an assistant message; the store pairs results only with the calls of "
-                 "an assistant message, so no result is paired with it")
+# A call on a stored message whose role is not "assistant" (the only such calls a page shows:
+# an assistant message shows calls only for a non-empty tool_calls list, which the pairing
+# reads whole): its role as stored, and the store's rule.
+NOT_ASSISTANT = ("this call's message {role}, not \"assistant\"; the store pairs results only with the calls of an "
+                 "assistant message, so no result is paired with it")
 _ALIAS_STATE = "this call's {key} is {state}"
 _STRAY = {
     "unknown": "no call of assistant message {head}, which opens this result's block, has its host id {id} in any "
@@ -194,6 +196,8 @@ def _state(value: Any) -> str:
         return "null, which cannot pair"
     if state == "empty":
         return f"blank ({text}), which cannot pair"
+    if state == "nonfinite":
+        return f"{text}, which is not a JSON value and cannot pair"
     if state == "structured":
         return f"{text}, which is not a string, a number or a boolean and cannot pair"
     return text
@@ -201,9 +205,8 @@ def _state(value: Any) -> str:
 
 def _member_said(position: int, call: Any) -> str:
     """One call of a group as its note lists it: its host id in whatever state it is stored,
-    and each alias of it that never pairs."""
-    if not isinstance(call, dict):
-        return f"call {position + 1}: {host_pairing.id_text(call)}, not an object"
+    and each alias of it that never pairs. A member is always an object: a call that is not
+    one has no spelling (``pairing._aliases``) and joins no group."""
     said = [f"host id {_state(call['id'])}" if "id" in call else 'no "id"']
     said += [f"{key} {_state(call[key])}" for key in host_pairing.ID_KEYS[1:]
              if key in call and host_pairing.unpairable(call[key])]
@@ -225,7 +228,7 @@ def _group_note(group: host_pairing.Group) -> str:
 
 def _aliases_said(call: Any) -> list:
     """Each alias of a call outside a group (its ``call_id``, ``response_item_id``) that never
-    pairs: null, blank, a list or an object (#82). Its ``id`` is said by the cause."""
+    pairs: not a scalar (``pairing.id_state``, #82). Its ``id`` is said by the cause."""
     if not isinstance(call, dict):
         return []
     return [_ALIAS_STATE.format(key=key, state=_state(call[key])) for key in host_pairing.ID_KEYS[1:]
@@ -329,7 +332,7 @@ def calls_in_current_message(messages: Any) -> tuple[Optional[int], str]:
     assistant message has no ``tool_calls``, or not a list, or an empty one."""
     if not isinstance(messages, list):
         return None, (f"the messages argument of this call of the tool is not a list but {type(messages).__name__} "
-                      f"(NoneType where the host passed none or null)")
+                      f"(NoneType where the call carried no messages argument or carried None)")
     for message in reversed(messages):
         if isinstance(message, dict) and message.get("role") == "assistant":
             if "tool_calls" not in message:
@@ -674,18 +677,21 @@ def _as_sent(raw: dict, route: "Route", *, raw_form: bool) -> tuple[dict, Option
     return message, note
 
 
-def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> list:
-    """The note of one call: its group's (rule 2), or why no result of its block pairs with it,
-    each cause as the pairing states it (#78, #82): no id; a null, blank or structured id; an
-    alias of it on a result of its block; none of its block carries its id; and every alias of
-    it that never pairs (``_aliases_said``), for a paired call too."""
+def _call_notes(found: host_pairing.Pairing, handle: str, position: int, raw: Any) -> list:
+    """The note of one call of the stored message ``raw``: where its role is not "assistant",
+    that; else its group's (rule 2), or why no result of its block pairs with it, each cause as
+    the pairing states it (#78, #82): not an object; no id; an id that cannot pair; an alias
+    of it on a result of its block; none of its block carries its id; and every alias of it
+    that never pairs (``_aliases_said``), for a paired call too. An assistant message whose
+    calls a page shows has a non-empty ``tool_calls`` list and opens its block, so the pairing
+    holds every one of its calls."""
+    if not (isinstance(raw, dict) and raw.get("role") == "assistant"):
+        role = (f"has role {host_pairing.id_text(raw['role'])}" if isinstance(raw, dict) and "role" in raw
+                else "has no role")
+        return [NOT_ASSISTANT.format(role=role)]
     key = (handle, position)
     if key in found.group:
         return [_group_note(found.group[key])]
-    if key not in found.calls:
-        # The pairing read no call here: the message does not open its block as an assistant
-        # message with a list of calls (the review of c068d88: said as that, never NO_RESULT).
-        return [NOT_ASSISTANT]
     also = _aliases_said(found.calls[key])
     if key in found.answer:
         return also
@@ -742,7 +748,7 @@ def _message_item(handle: str, raw: dict, calls: dict[int, str], found: host_pai
         said = []
         for position, call in enumerate(tool_calls):
             entry: dict = {"handle": calls.get(position)}
-            notes = _call_notes(found, handle, position)
+            notes = _call_notes(found, handle, position, raw)
             key = (handle, position)
             if key in found.group:
                 entry["result_in"] = list(found.group[key].results)     # listed, attributed to none
@@ -919,7 +925,7 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
         if resolved.name is None:
             header["name_note"] = call_named(resolved)     # the step, never "no name" (#78)
         found = order.pairing(store, [record])
-        notes = _call_notes(found, record, position)
+        notes = _call_notes(found, record, position, store.records_raw([record]).get(record))
         if notes:
             header["note"] = "; ".join(notes)
         group = found.group.get((record, position))

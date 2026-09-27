@@ -20,7 +20,8 @@ stored records alone:
    ``response_item_id``, and each non-blank part of a composite ``a|b`` of any of them)
    include another call's ``id``, those
    calls form one group, with every result of the block whose id is one of the group's
-   spellings; so does a single call that two or more results of the block name. Every call
+   spellings, where there is one (with none, each call's fact is its own, rule 3); so does a
+   single call that two or more results of the block name. Every call
    and every result of the group carries one note saying that the store cannot tell which
    result answered which call; every result of the group is listed under each of its
    calls, and nothing is attributed.
@@ -32,11 +33,12 @@ the only way an id is shown. A stored id can be any JSON value (LEARNINGSFÜRPL�
 domain axis). Two ids are the same iff both are scalars (``id_state``: a non-blank string, a
 number, a boolean) of the same JSON type with the same value: strings exactly, numbers by
 value (``1`` is ``1.0``, JSON's own equality of numbers), booleans as booleans, never as
-numbers. A null, blank, list or object id never pairs (``unpairable``); any other string
+numbers. A null, blank, array or object id never pairs (``unpairable``), nor does a NaN,
+Infinity or -Infinity, which is no JSON value and equals nothing by value; any other string
 is an ordinary id, compared exactly, whatever it holds. Since the item's ``message`` shows
 no host id (the handle replaces it), the note is the only place such an id shows, and it
 names each, its state and that it cannot pair: a call's id and aliases, a result's id,
-every member call's of a group. No id is ever hashed. The host pairs only non-blank
+every member call's of a group. The pairing hashes no id. The host pairs only non-blank
 strings, stripped and split at ``|`` (agent/message_sanitization.py:496-515 at Hermes
 fbb06142ef); where a stored id is not a string, or carries whitespace, the store's pairing
 is the store's, and the notes say what the store holds. Pairing (rule 1) is exact scalar
@@ -53,6 +55,7 @@ reproduce them.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -78,8 +81,8 @@ class Pairing:
     # (assistant record, position) or result record -> its Group
     group: dict = field(default_factory=dict)
     # result record -> (why, its id, detail): a result that belongs to no call, and the block's
-    # fact that says why: "no_id" (it carries no ``tool_call_id``); "unpairable" (its id is null,
-    # blank, a list or an object: ``id_state``); "no_calls" (``detail`` is (the block's opening
+    # fact that says why: "no_id" (it carries no ``tool_call_id``); "unpairable" (its id is not
+    # a scalar: ``id_state``); "no_calls" (``detail`` is (the block's opening
     # record, what its check found, a detail): ``_head_fact``); "alias" (``detail`` is (the
     # block's opening assistant record, the position of the call whose other spelling its id
     # is)); "unknown" (``detail`` is the block's opening assistant record, no call of which has
@@ -88,7 +91,7 @@ class Pairing:
     # (assistant record, position) -> (why, detail): a call no result of its block pairs with,
     # and why, from the block: "not_object" (the call is not an object; ``detail`` its JSON
     # kind); "no_id" (the call has no ``id`` key); "unpairable" (its id,
-    # ``detail``, is null, blank, a list or an object: ``id_state``); "alias" (result
+    # ``detail``, is not a scalar: ``id_state``); "alias" (result
     # ``detail[0]`` of the block carries the call's alias ``detail[1]``, not its id); "none"
     # (no result of the block carries its id or an alias of it)
     unanswered: dict = field(default_factory=dict)
@@ -104,11 +107,15 @@ def id_state(value: Any) -> str:
     """What a stored host id is, over its whole domain (#82, LEARNINGSFÜRPLÄNE A2 on the domain
     axis: the store takes any JSON value for a call's ``id``, and the pairing reads it):
     "none" (absent or null), "empty" (a string of nothing but whitespace), "scalar" (any other
-    string, a number or a boolean), "structured" (a list, an object)."""
+    string, a finite number or a boolean), "nonfinite" (NaN, Infinity or -Infinity, which the
+    store's JSON reader takes but which are no JSON value: equal to nothing by value, so no
+    id), "structured" (an array, an object)."""
     if value is None:
         return "none"
     if isinstance(value, str):
         return "scalar" if value.strip() else "empty"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "nonfinite"
     if isinstance(value, (bool, int, float)):
         return "scalar"
     return "structured"
@@ -141,7 +148,8 @@ ID_KEYS = ("id", "call_id", "response_item_id")     # a call's host ids: its id,
 
 def unpairable(value: Any) -> bool:
     """Whether a stored id, present, is one that never pairs: not a scalar (``id_state``:
-    null, blank, a list or an object). The complement of what ``same_id`` compares."""
+    null, blank, a non-finite number, an array or an object). The complement of what
+    ``same_id`` compares."""
     return id_state(value) != "scalar"
 
 
@@ -155,7 +163,8 @@ def _merge(spellings: list, more: list) -> list:
 def _aliases(call: Any) -> list:
     """A call's own spellings, in order: its ``id``, ``call_id`` and ``response_item_id``
     where each is a scalar, and each non-blank part of a composite ``a|b`` string of any of
-    them; distinct by ``same_id``. A null, blank, list or object id is no spelling."""
+    them; distinct by ``same_id``. An id that is not a scalar (``id_state``) is no spelling,
+    and nothing is split from it."""
     found: list = []
     if not isinstance(call, dict):
         return found
@@ -177,17 +186,21 @@ def _joined(ci: Any, cj: Any) -> bool:
     return _holds(_aliases(cj), _id_of(ci)) or _holds(_aliases(ci), _id_of(cj))
 
 
-def _json_kind(value: Any) -> str:
+def json_kind(value: Any) -> str:
+    """A stored value's JSON kind, as a text says it (#82: what the store holds is JSON, so
+    its kinds are JSON's words; a live host argument is said by its Python type instead)."""
     if value is None:
         return "null"
     if isinstance(value, bool):
         return "a boolean"
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"{id_text(value)}, which is not a JSON value"
     if isinstance(value, (int, float)):
         return "a number"
     if isinstance(value, str):
         return "a string"
     if isinstance(value, list):
-        return "a list"
+        return "an array"
     return "an object"
 
 
@@ -204,7 +217,7 @@ def _head_fact(head: Any) -> tuple:
     if "tool_calls" not in head:
         return ("no_key", None)
     if not isinstance(head["tool_calls"], list):
-        return ("not_list", _json_kind(head["tool_calls"]))
+        return ("not_list", json_kind(head["tool_calls"]))
     return ("empty", None)
 
 
@@ -234,7 +247,9 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         members.setdefault(root(i), []).append(i)
 
     claimed: list = []
-    for indexes in members.values():
+    pending = list(members.values())
+    while pending:
+        indexes = pending.pop(0)
         if len(indexes) == 1:
             position, call = calls[indexes[0]]
             call_id = _id_of(call)
@@ -246,7 +261,7 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
                     found.result_of[mine[0]] = (head_record, position)
                     claimed.append(mine[0])
                 elif not isinstance(call, dict):
-                    found.unanswered[(head_record, position)] = ("not_object", _json_kind(call))
+                    found.unanswered[(head_record, position)] = ("not_object", json_kind(call))
                 elif "id" not in call:
                     found.unanswered[(head_record, position)] = ("no_id", None)
                 elif state != "scalar":
@@ -263,6 +278,12 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
             for i in indexes:
                 _merge(spellings, _aliases(calls[i][1]))
             mine = [record for record, raw in results if _holds(spellings, raw.get("tool_call_id"))]
+            if not mine:
+                # No result of the block carries any of their spellings: there is nothing the
+                # store cannot tell, and each call's fact is its own (#82, the review of the
+                # text list: rule 2's note holds only where a result is there to attribute).
+                pending[:0] = [[i] for i in indexes]
+                continue
         group = Group([calls[i][1] for i in indexes], [(head_record, calls[i][0]) for i in indexes], mine,
                       spellings)
         for key in group.calls:

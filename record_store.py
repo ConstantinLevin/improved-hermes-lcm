@@ -38,6 +38,7 @@ from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .inflight import ChunkSummary
 from .message_content import base64_like_strings, describe_image_part, grep_text, image_parts
+from .pairing import json_kind
 from .tokens import Estimator
 
 logger = logging.getLogger(__name__)
@@ -143,20 +144,21 @@ def _call_name(raw: dict, position: int) -> tuple[Optional[str], str]:
     if not 0 <= position < len(calls):
         return None, f"its stored message's tool_calls hold no position {position + 1}"
     call = calls[position]
+    # The stored message is the store's JSON, so a kind is said in JSON's words (#82).
     if not isinstance(call, dict):
-        return None, f"its stored call is not an object but {type(call).__name__}"
+        return None, f"its stored call is not an object but {json_kind(call)}"
     if "function" not in call:
         return None, "its stored call has no function"
     function = call["function"]
     if not isinstance(function, dict):
-        return None, f"its stored call's function is not an object but {type(function).__name__}"
+        return None, f"its stored call's function is not an object but {json_kind(function)}"
     if "name" not in function:
         return None, "its stored call's function has no name"
     name = function["name"]
     if name is None:
         return None, "its stored call's function name is null"
     if not isinstance(name, str):
-        return None, f"its stored call's function name is not a string but {type(name).__name__}"
+        return None, f"its stored call's function name is not a string but {json_kind(name)}"
     if not name:
         return None, "its stored call's function name is empty"
     return name, ""
