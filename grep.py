@@ -17,8 +17,9 @@ record of the scope is read and tested with Python's ``in``, in one snapshot of 
 There is no index: the column read is the one the hit is decided by, so no second copy of it
 exists that could disagree (measured on #76: about 0.1 s for a scope of 39 M characters, 0.6 s
 for 230 M). What came after the last compaction is not in the store: the result says what
-it searched and when the compaction whose return it searched began (``compaction_began_at``:
-the start of that compaction's planning, before any summary or confirmation, #78).
+it searched and the ``began_at`` of the compaction whose return it searched
+(``compaction_began_at``: the time the store wrote that compaction's row, in the transaction
+that wrote its cut, before any summary or confirmation, #78, #82).
 
 **What a result holds**, never the term itself (the host classifies a result as failed when
 its first 500 characters hold the JSON string "error" or "failed", agent/display.py:975-1017
@@ -30,7 +31,7 @@ at Hermes cdcd53c2cd; the page token carries the term):
   show (tool results): an address, never the match; then the chunk's items as expansion
   gives them;
 - where records of the stored fresh tail hold the term, a note with their handles and the
-  time the compaction that returned them began (the tail is no chunk; whether the context
+  ``began_at`` of the compaction that returned them (the tail is no chunk; whether the context
   still holds them the store learns only at the next compaction), in count-only mode too.
 
 A search that fails is an error, never "no hits": whatever reading the store raises (a
@@ -60,19 +61,21 @@ _ARGUMENTS = ("term", "scope", "all", "raw", "page")
 _REMOVED = ("query", "limit", "sort", "role", "time_from", "time_to", "mode", "session_scope", "session_id",
             "source", "conversation_id", "content_scope", "externalized_refs")
 
-COUNT_ONLY = (f"the term lies in this many chunks; from {GREP_COUNT_ONLY_AT} chunks on only the count is returned: "
-              f"narrow the term or the scope, or call again with all=true for every one of them")
+COUNT_ONLY = (f"the term lies in this many chunks; from {GREP_COUNT_ONLY_AT} matching chunks on the chunks are not "
+              f"returned, only their count (records of the fresh tail that hold the term are still named): narrow the "
+              f"term or the scope, or call again with all=true for every one of them")
 TAIL_NOTE = "records of the fresh tail of the latest compaction that took effect hold the term"
 
 
 def nothing_stored(records: RecordStore, session: str) -> str:
     """Why nothing of a session is on its active record (no effective compaction), as the
-    store records it (#78, A11): no compaction of it was attempted; or how many were, and of
-    those how many the host rejected, how many have a return written and are not settled,
-    how many have no return written. Asked of the store, never "yet"."""
+    store records it (#78, A11): the store holds no compaction of it; or how many it holds, and
+    of those how many it records as rejected, how many have a return written and are not
+    settled, how many have no return written. Asked of the store, never "yet"; an attempt that
+    ended before it wrote its row is not in it (#82)."""
     attempted = [int(c) for (c,) in records._q("SELECT compaction_id FROM compactions WHERE session = ?", (session,))]
     if not attempted:
-        return "nothing of this session is stored: no compaction of it was attempted"
+        return "nothing of this session is on the active record: the store holds no compaction of this session"
     rejected = returned = unreturned = 0
     for compaction in attempted:
         cause = records._compaction_cause(compaction, session)
@@ -84,9 +87,9 @@ def nothing_stored(records: RecordStore, session: str) -> str:
             returned += 1
         else:
             unreturned += 1
-    return (f"nothing of this session is on the active record: none of its {len(attempted)} compactions took effect "
-            f"({rejected} rejected by the host, {returned} with a return written and not settled, {unreturned} with no "
-            f"return written)")
+    return (f"nothing of this session is on the active record: none of the {len(attempted)} compactions of it the "
+            f"store holds took effect ({rejected} recorded as rejected, {returned} with a return written and not "
+            f"settled, {unreturned} with no return written)")
 
 
 @dataclass

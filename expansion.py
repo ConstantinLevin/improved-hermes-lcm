@@ -119,14 +119,16 @@ _UNRESOLVED = {
 _KIND_NAME = {"m": "message", "t": "tool call", "c": "chunk", "s": "summary"}
 _UNREACHED = {
     "no_row": "{handle} is unknown in this store: no {kind} has this handle here.",
-    "no_chunk": ("{handle} is a summary in this store, but the store records no chunk it was written from, so it "
-                 "belongs to no session and resolves in none."),
+    # A summary resolves in the one session of the chunks it was written from (``resolve``):
+    # said as that rule, never as the summary's own session, which is not read (#82).
+    "no_chunk": ("{handle} is a summary in this store, but the store records no chunk under it, through its sources "
+                 "or theirs; a summary resolves only in the session of its chunks, so it resolves in none."),
     "session": ("{handle} belongs to another session of this store. A handle resolves only in the session that holds "
-                "it; this session cannot reach another's past."),
-    "sessions": ("{handle} is a summary whose chunks belong to {sessions} sessions of this store, so it belongs to no "
-                 "one session and resolves in none."),
-    "unrecorded_chunks": ("{handle} is a summary whose chunks the store holds no row of, so it belongs to no session "
-                          "and resolves in none."),
+                "it, so it does not resolve here."),
+    "sessions": ("{handle} is a summary whose chunks the store records under {sessions} sessions; a summary resolves "
+                 "only in the one session of its chunks, so it resolves in none."),
+    "unrecorded_chunks": ("{handle} is a summary whose chunks the store holds no row of; a summary resolves only in "
+                          "the session of its chunks, so it resolves in none."),
 }
 
 # Notes on calls and results: facts of the store (``pairing``), never what the host sends.
@@ -135,25 +137,44 @@ _UNREACHED = {
 NO_RESULT = ("no result with this call's host id stands in its block; the store pairs a result only within its "
              "call's block")
 _UNANSWERED = {
-    "no_id": "this call carries no host id, so no result pairs with it",
+    "not_object": "this call is {kind}, not an object, so no result pairs with it",
+    "no_id": 'this call has no "id", so no result pairs with it',
     "unpairable": "this call's host id is {state}, so no result pairs with it",
     "alias": ("result {result} of this call's block carries {alias}, another spelling of this call's host id, not the "
               "id itself; the store pairs by the id and does not pair them"),
 }
-_KEY_SAID = {"id": "host id", "call_id": "call_id", "response_item_id": "response_item_id"}
+# A call on a message the pairing does not read as a block's calls: not an assistant message.
+NOT_ASSISTANT = ("this call's message is not an assistant message; the store pairs results only with the calls of "
+                 "an assistant message, so no result is paired with it")
 _ALIAS_STATE = "this call's {key} is {state}"
 _STRAY = {
-    "unknown": "no call of the message before this result has its host id {id} in any spelling",
+    "unknown": "no call of assistant message {head}, which opens this result's block, has its host id {id} in any "
+               "spelling",
     "no_id": "this result carries no host id, so no call pairs with it",
     "unpairable": "this result's host id is {state}, so no call pairs with it",
-    "no_calls": "this result's block opens with {head}, which holds no tool calls, so no call pairs with it",
-    "alias": ("this result's host id {id} is another spelling of call {position} of the message before it, not that "
-              "call's id; the store pairs by the id and does not pair them"),
+    # the block's opening record as its check found it (``pairing._head_fact``), and no more
+    "no_calls": {
+        "user": "this result's block opens with user message {head}, so no assistant call precedes it in its block",
+        "no_key": ("this result's block opens with assistant message {head}, which has no tool_calls, so no "
+                   "assistant call precedes it in its block"),
+        "not_list": ("this result's block opens with assistant message {head}, whose tool_calls is {kind}, not a list, "
+                     "so no assistant call precedes it in its block"),
+        "empty": ("this result's block opens with assistant message {head}, whose tool_calls list is empty, so no "
+                  "assistant call precedes it in its block"),
+        "none": ("no user or assistant message precedes this result on the active record, so no assistant call "
+                 "precedes it"),
+    },
+    "alias": ("this result's host id {id} is another spelling of call {position} of assistant message {head}, which "
+              "opens its block, not that call's id; the store pairs by the id and does not pair them"),
 }
-_GROUP = ("{k} calls of message {head} and {j} results of its block are joined by the host ids or their other "
-          "spellings {spellings} ({members}); the store cannot tell which result answered which call, and what the "
-          "provider received of them depends on the host's sanitizer and on the session's route, which this plugin "
-          "does not reproduce")
+# Rule 2, as ``_pair_block`` found it: one call whose exact id two or more results of its block
+# carry; or calls joined by an id or another spelling of one, and the results of the block
+# carrying any of their spellings.
+_GROUP_ONE = ("call {n} of message {head} and {j} results of its block carry the host id {id} ({members}); the store "
+              "cannot tell which of the results answered the call")
+_GROUP = ("{k} calls of message {head} share an id or another spelling of one; their ids and other spellings are "
+          "{spellings} ({members}); {j} results of its block carry one of these; the store cannot tell which result "
+          "answered which call")
 _FILL = "the host sends this empty message to the provider with its own stand-in as content: {content}"
 # A later page whose target's identity differs from page 1's (``target_identity``): only that is
 # known, never why.
@@ -183,34 +204,32 @@ def _member_said(position: int, call: Any) -> str:
     and each alias of it that never pairs."""
     if not isinstance(call, dict):
         return f"call {position + 1}: {host_pairing.id_text(call)}, not an object"
-    said = [f"host id {_state(call['id'])}" if "id" in call else "no host id"]
+    said = [f"host id {_state(call['id'])}" if "id" in call else 'no "id"']
     said += [f"{key} {_state(call[key])}" for key in host_pairing.ID_KEYS[1:]
              if key in call and host_pairing.unpairable(call[key])]
     return f"call {position + 1}: " + ", ".join(said)
 
 
 def _group_note(group: host_pairing.Group) -> str:
-    """Rule 2's note: the block (its opening message), every spelling that joined the group,
-    never "the host id" for a spelling that is an alias (#78), and every member call's host id
-    in whatever state it is stored, each as its JSON (#82)."""
+    """Rule 2's note, as ``_pair_block`` found the group (#78; #82, the review of c068d88: the
+    fact, never more): the block (its opening message); for one call, the id its results
+    carry; for joined calls, every id and other spelling of theirs, which the results matched;
+    and every member call's host id in whatever state it is stored, each as its JSON."""
     members = "; ".join(_member_said(position, call) for (_record, position), call in zip(group.calls, group.members))
+    if len(group.calls) == 1:
+        return _GROUP_ONE.format(n=group.calls[0][1] + 1, head=group.calls[0][0], j=len(group.results),
+                                 id=host_pairing.id_text(group.members[0].get("id")), members=members)
     return _GROUP.format(k=len(group.calls), j=len(group.results), head=group.calls[0][0], members=members,
                          spellings=", ".join(host_pairing.id_text(s) for s in group.spellings))
 
 
 def _aliases_said(call: Any) -> list:
-    """Each stored id of a call, outside a group, that never pairs and that the cause does not
-    already say: an alias of it null, blank, a list or an object (#82)."""
+    """Each alias of a call outside a group (its ``call_id``, ``response_item_id``) that never
+    pairs: null, blank, a list or an object (#82). Its ``id`` is said by the cause."""
     if not isinstance(call, dict):
         return []
-    said = []
-    for key in host_pairing.ID_KEYS:
-        if key not in call or not host_pairing.unpairable(call[key]):
-            continue
-        if key == "id" and host_pairing.id_state(call[key]) != "scalar":
-            continue                                           # the cause says it
-        said.append(_ALIAS_STATE.format(key=_KEY_SAID[key], state=_state(call[key])))
-    return said
+    return [_ALIAS_STATE.format(key=key, state=_state(call[key])) for key in host_pairing.ID_KEYS[1:]
+            if key in call and host_pairing.unpairable(call[key])]
 
 
 class ExpansionError(Exception):
@@ -230,7 +249,7 @@ def unresolved_message(resolved: Resolved) -> str:
 def call_named(resolved: Resolved) -> str:
     """A call as a text names it: its tool name, or the step at which its stored call gives
     none (``Resolved.name_why``), never "no name" (#78)."""
-    return resolved.name if resolved.name is not None else f"no tool name: {resolved.name_why}"
+    return resolved.name if resolved.name is not None else f"no string tool name: {resolved.name_why}"
 
 
 def _compaction_said(subject: str, cause: dict) -> str:
@@ -238,7 +257,8 @@ def _compaction_said(subject: str, cause: dict) -> str:
     effect (``RecordStore._compaction_cause``), each state as recorded (#78)."""
     compaction = cause["compaction"]
     if cause["kind"] == "rejected":
-        text = f"{subject} was recorded by compaction {compaction}, which the host rejected ({cause.get('how')})"
+        text = (f"{subject} was recorded by compaction {compaction}, which the store records as rejected "
+                f"({cause.get('how')})")
     elif cause.get("returned"):
         text = (f"{subject} was recorded by compaction {compaction}, whose return the store wrote; the store records no "
                 f"confirmation, adoption or rejection of it")
@@ -247,7 +267,7 @@ def _compaction_said(subject: str, cause: dict) -> str:
         text = (f"{subject} was recorded by compaction {compaction}, for which the store holds no return written"
                 + (f" (its events: {', '.join(events)})" if events else " and no event"))
     if cause.get("never_held"):
-        text += "; no effective compaction's list ever held it"
+        text += "; no effective compaction of this session held it in its list"
     return text + "; it is not on the active record."
 
 
@@ -283,7 +303,11 @@ def _inactive_text(resolved: Resolved) -> str:
                 f"reach it.")
     elif kind == "effective_unheld":
         text = (f"{subject} was recorded by compaction {cause['compaction']}, which took effect, but no effective "
-                f"compaction's list ever held it; it is not on the active record.")
+                f"compaction of this session held it in its list; it is not on the active record.")
+    elif kind == "effective_unreached" and resolved.kind == DERIVATION:
+        # ``resolve`` checked that not every chunk the summary reaches lies under the cover.
+        text = (f"{subject} was recorded by compaction {cause['compaction']}, which took effect, yet not every chunk "
+                f"under it lies under a summary of the session's latest effective return.")
     elif kind == "effective_unreached":
         text = (f"{subject} was recorded by compaction {cause['compaction']}, which took effect, yet the session's "
                 f"latest effective return does not reach it.")
@@ -304,7 +328,8 @@ def calls_in_current_message(messages: Any) -> tuple[Optional[int], str]:
     why, each asked on its own (#78, A11): no list; no assistant message in it; the last
     assistant message has no ``tool_calls``, or not a list, or an empty one."""
     if not isinstance(messages, list):
-        return None, f"the host handed no message list (it handed {type(messages).__name__})"
+        return None, (f"the messages argument of this call of the tool is not a list but {type(messages).__name__} "
+                      f"(NoneType where the host passed none or null)")
     for message in reversed(messages):
         if isinstance(message, dict) and message.get("role") == "assistant":
             if "tool_calls" not in message:
@@ -316,7 +341,7 @@ def calls_in_current_message(messages: Any) -> tuple[Optional[int], str]:
             if not calls:
                 return None, "the last assistant message of the list the host handed holds an empty tool_calls list"
             return len(calls), ""
-    return None, f"the list of {len(messages)} messages the host handed holds no assistant message"
+    return None, f"the list the host handed ({len(messages)} entries) holds no object with role \"assistant\""
 
 
 def host_guardrail_margin(tool_name: str) -> int:
@@ -403,8 +428,9 @@ def host_page_limits(engine: Any, tool_name: str, messages: Any) -> PageLimit:
         threshold = budget.resolve_threshold(tool_name)
         turn_budget = budget.turn_budget
     except Exception as exc:
-        raise ExpansionError(f"the host's _budget_for_agent / resolve_threshold for {tool_name} raised "
-                             f"{type(exc).__name__} ({exc}), so no page size is known") from None
+        raise ExpansionError(f"importing or calling the host's _budget_for_agent (agent.tool_executor) for "
+                             f"{tool_name}, or reading its threshold or turn budget, raised {type(exc).__name__} "
+                             f"({exc}), so no page size is known") from None
     for name, value in (("threshold", threshold), ("turn budget", turn_budget)):
         if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise ExpansionError(f"the host's {name} for {tool_name} is {value!r}, not a size a page can be "
@@ -656,10 +682,16 @@ def _call_notes(found: host_pairing.Pairing, handle: str, position: int) -> list
     key = (handle, position)
     if key in found.group:
         return [_group_note(found.group[key])]
-    also = _aliases_said(found.calls.get(key))
+    if key not in found.calls:
+        # The pairing read no call here: the message does not open its block as an assistant
+        # message with a list of calls (the review of c068d88: said as that, never NO_RESULT).
+        return [NOT_ASSISTANT]
+    also = _aliases_said(found.calls[key])
     if key in found.answer:
         return also
-    why, detail = found.unanswered.get(key, ("none", None))
+    why, detail = found.unanswered[key]
+    if why == "not_object":
+        return [_UNANSWERED["not_object"].format(kind=detail)]
     if why == "no_id":
         return [_UNANSWERED["no_id"]] + also
     if why == "unpairable":
@@ -675,8 +707,13 @@ def _result_notes(found: host_pairing.Pairing, handle: str) -> list:
         return [_group_note(found.group[handle])]
     if handle in found.stray:
         why, call_id, detail = found.stray[handle]
-        return [_STRAY[why].format(id=host_pairing.id_text(call_id), state=_state(call_id), head=detail,
-                                   position=(detail or 0) + 1 if why == "alias" else None)]
+        if why == "no_calls":
+            head, fact, kind = detail
+            return [_STRAY["no_calls"][fact].format(head=head, kind=kind)]
+        if why == "alias":
+            head, owner = detail
+            return [_STRAY["alias"].format(id=host_pairing.id_text(call_id), head=head, position=owner + 1)]
+        return [_STRAY[why].format(id=host_pairing.id_text(call_id), state=_state(call_id), head=detail)]
     return []
 
 
@@ -880,7 +917,7 @@ def target_for(store: RecordStore, order: Order, resolved: Resolved, *, raw: boo
         record, position = resolved.record, int(resolved.position or 0)
         header = {"handle": handle, "kind": "tool_call", "form": "raw", "name": resolved.name, "call_in": record}
         if resolved.name is None:
-            header["name_note"] = f"no tool name: {resolved.name_why}"     # the step, never "no name" (#78)
+            header["name_note"] = call_named(resolved)     # the step, never "no name" (#78)
         found = order.pairing(store, [record])
         notes = _call_notes(found, record, position)
         if notes:
@@ -1110,16 +1147,19 @@ def route_image_check(route: "Route", tool_name: str = "lcm_expand") -> Callable
         key = json.dumps(part, sort_keys=True, ensure_ascii=False)
         if key not in seen:
             probe = _probe_messages(tool_name, part)
-            # Only the host's converter is inside the try (#78, A11): a failure of the plugin's
-            # own reading of its output is the tool's failure, never said to be the host's.
+            # Only ``image_room.convert_request`` is inside the try (#78, A11): a failure of the
+            # plugin's own reading of its output after it is the tool's failure. It holds the
+            # host's transport, provider profile and converter calls and the plugin's reading of
+            # their output, so its failure is said as that (#82), never as the converter's alone.
             try:
                 wire = convert_request(route, probe)
             except RoomUnavailable as exc:
                 seen[key] = str(exc)
                 return seen[key]
             except Exception as exc:
-                seen[key] = (f"the host's converter for this session's route ({route_name(route)}) raised "
-                             f"{type(exc).__name__} on this image ({exc})")
+                seen[key] = (f"converting a probe request holding this image for this session's route "
+                             f"({route_name(route)}) with the host's transport, provider profile and converter, and "
+                             f"this plugin's reading of their output, raised {type(exc).__name__} ({exc})")
                 return seen[key]
             try:
                 found, broken = wire_result(wire, probe, 0)

@@ -79,12 +79,15 @@ class Pairing:
     group: dict = field(default_factory=dict)
     # result record -> (why, its id, detail): a result that belongs to no call, and the block's
     # fact that says why: "no_id" (it carries no ``tool_call_id``); "unpairable" (its id is null,
-    # blank, a list or an object: ``id_state``); "no_calls" (its block opens with ``detail``, a
-    # message holding no calls); "alias" (its id is another spelling of call ``detail`` of the
-    # block, not that call's id); "unknown" (no call of the block has its id in any spelling)
+    # blank, a list or an object: ``id_state``); "no_calls" (``detail`` is (the block's opening
+    # record, what its check found, a detail): ``_head_fact``); "alias" (``detail`` is (the
+    # block's opening assistant record, the position of the call whose other spelling its id
+    # is)); "unknown" (``detail`` is the block's opening assistant record, no call of which has
+    # its id in any spelling)
     stray: dict = field(default_factory=dict)
     # (assistant record, position) -> (why, detail): a call no result of its block pairs with,
-    # and why, from the block: "no_id" (the call carries no ``id``); "unpairable" (its id,
+    # and why, from the block: "not_object" (the call is not an object; ``detail`` its JSON
+    # kind); "no_id" (the call has no ``id`` key); "unpairable" (its id,
     # ``detail``, is null, blank, a list or an object: ``id_state``); "alias" (result
     # ``detail[0]`` of the block carries the call's alias ``detail[1]``, not its id); "none"
     # (no result of the block carries its id or an alias of it)
@@ -174,6 +177,37 @@ def _joined(ci: Any, cj: Any) -> bool:
     return _holds(_aliases(cj), _id_of(ci)) or _holds(_aliases(ci), _id_of(cj))
 
 
+def _json_kind(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, list):
+        return "a list"
+    return "an object"
+
+
+def _head_fact(head: Any) -> tuple:
+    """What the check of a block's opening record established, where it found no calls
+    (#82, the review of c068d88: the fact, never more): "user" (a user message; what it
+    carries is not read); "no_key" / "not_list" (an assistant message with no ``tool_calls``,
+    or one that is not a list: its JSON kind); "empty" (an empty list); "none" (the block
+    opens with no user or assistant message: none stands before it on the active record)."""
+    if not (isinstance(head, dict) and head.get("role") in ("assistant", "user")):
+        return ("none", None)
+    if head["role"] == "user":
+        return ("user", None)
+    if "tool_calls" not in head:
+        return ("no_key", None)
+    if not isinstance(head["tool_calls"], list):
+        return ("not_list", _json_kind(head["tool_calls"]))
+    return ("empty", None)
+
+
 def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
     head_record, head = block[0]
     calls: list = []
@@ -211,7 +245,9 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
                     found.answer[(head_record, position)] = mine[0]
                     found.result_of[mine[0]] = (head_record, position)
                     claimed.append(mine[0])
-                elif not (isinstance(call, dict) and "id" in call):
+                elif not isinstance(call, dict):
+                    found.unanswered[(head_record, position)] = ("not_object", _json_kind(call))
+                elif "id" not in call:
                     found.unanswered[(head_record, position)] = ("no_id", None)
                 elif state != "scalar":
                     found.unanswered[(head_record, position)] = ("unpairable", call_id)
@@ -244,10 +280,11 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         elif id_state(call_id) != "scalar":
             found.stray[record] = ("unpairable", call_id, None)
         elif not calls:
-            found.stray[record] = ("no_calls", call_id, head_record)
+            found.stray[record] = ("no_calls", call_id, (head_record,) + _head_fact(head))
         else:
             owner = next((position for position, call in calls if _holds(_aliases(call), call_id)), None)
-            found.stray[record] = ("alias", call_id, owner) if owner is not None else ("unknown", call_id, None)
+            found.stray[record] = (("alias", call_id, (head_record, owner)) if owner is not None
+                                   else ("unknown", call_id, head_record))
 
 
 def _opens_block(message: Any) -> bool:
