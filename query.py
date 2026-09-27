@@ -13,8 +13,9 @@ each; a tool call's or a message's handle is refused with a pointer to ``lcm_exp
 effort (``_summariser_settings``), through the host's ``call_llm``: the query's instructions,
 then every record as the summariser receives it, strictly (``summariser_message(strict=True)``:
 a host function that cannot be read refuses the query; the host's fill of an empty message
-quoted as a labelled part; a stored content of no wire shape given as what it was, labelled),
-then the question. Every user and agent message carries a label naming its handle; an agent
+quoted as a labelled part; a stored content of no wire shape given as what it was, labelled;
+the host's replay carriers of a message's text not sent, so that the stored content with the
+plugin's parts is what the model reads), then the question. Every user and agent message carries a label naming its handle; an agent
 message's label also names its tool calls' handles and the records that hold their results.
 A tool result carries no label of the plugin's: the host's converters send a tool result whose
 content is a list of parts as JSON text on some wires (#19 OD-D). Refused before the call,
@@ -24,8 +25,9 @@ with the cause:
 - more images than the host's converter keeps in one request;
 - an input over the model's input (its window less its output cap, by the estimate times
   ``estimate_ratio_max``, #34 D4; where the model table has no window this is said);
-- a record the host's own converter for the route's wire would not give the model as it
-  was (the wire check, OD-G: the host's converter is run over a copy of the input);
+- anything the query gives its model that the host's own converter for the route's wire
+  would not deliver, or a replay carrier holding text the content does not (the wire check,
+  OD-G as ruled: the host's converter is run over a copy of the input; no loss is accepted);
 - a page too small for the result's header.
 
 **How the call is made** (the orchestrator's rulings OD-A, OD-B, OD-C on #83, 2026-09-27).
@@ -75,6 +77,7 @@ from .message_content import GREP_SEPARATOR, content_parts, image_media_type, is
 from .model_table import lookup as lookup_model
 from .record_store import HANDLE_RE, RecordStore
 from .summariser_input import (
+    TEXT_REPLAY_CARRIERS,
     HostUnavailable,
     _add_parts,
     _strict_import,
@@ -120,6 +123,23 @@ _IF_THE_HOST_STOPS_WAITING = {
                            "only while a progress hook is active, and the query installs none)"),
     "codex_responses": ("the query stops at once and nothing is re-sent, re-routed or stored; the host closes the "
                         "model's stream on its next event"),
+}
+
+# What the header says of the host's replay carriers of a message's text on each wire (the
+# strict projection sends none of them, ``summariser_input.summariser_message``; Hermes
+# 375930d089: the Codex converter replays an assistant from ``codex_message_items`` and ignores
+# its content, agent/codex_responses_adapter.py 624-630; the Anthropic converter does the same
+# with ``anthropic_content_blocks``, agent/anthropic_message_convert.py 393-397; the Chat
+# Completions transport strips every carrier, agent/transports/chat_completions.py 36-39).
+_CARRIERS_SAID = {
+    "codex_responses": lambda n: (f"{n} record(s) carry the host's stored replay items of their text "
+                                  f"(codex_message_items), which the host would send in place of the content; the "
+                                  f"query does not send them: the stored content is what the model reads"),
+    "anthropic_messages": lambda n: (f"{n} record(s) carry the host's stored ordered blocks (anthropic_content_blocks), "
+                                     f"from which the host would rebuild the message in place of its content; the "
+                                     f"query does not send them: the stored content is what the model reads"),
+    "chat_completions": lambda n: (f"{n} record(s) carry a replay carrier of their text; on this route the host sends "
+                                   f"none, and neither does the query: the stored content is what the model reads"),
 }
 
 # --- The words (interim until #10: the owner's, tried on real spans) ----------------------
@@ -267,12 +287,37 @@ class _Sent:
     added: list
 
 
+def _carrier_texts(raw: dict) -> list[str]:
+    """The texts a stored replay carrier of the message holds (``TEXT_REPLAY_CARRIERS``, as the
+    host stores them: Codex message items with ``output_text`` parts, Anthropic text blocks,
+    Bedrock ``text`` blocks)."""
+    texts: list[str] = []
+    for item in raw.get("codex_message_items") or [] if isinstance(raw.get("codex_message_items"), list) else []:
+        for part in (item.get("content") or []) if isinstance(item, dict) and isinstance(item.get("content"),
+                                                                                           list) else []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
+                texts.append(part["text"])
+    for key in ("anthropic_content_blocks", "bedrock_content_blocks"):
+        blocks = raw.get(key)
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str) or not block["text"].strip():
+                continue
+            if key == "bedrock_content_blocks" or block.get("type") == "text":
+                texts.append(block["text"])
+    return texts
+
+
 def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict) -> tuple[list[dict], list[_Sent]]:
     """The call's messages, and per record what was given. ``stats["images_not_sent"]`` counts
     the stored image parts (by structure) the model is not given (it does not read images, or
-    that is not known, or the host's sidecar replaced the content)."""
+    that is not known, or the host's sidecar replaced the content); ``stats["carriers"]``
+    counts the records whose stored replay carrier is not sent (``summariser_message`` gives
+    the stored content instead). A carrier holding a text the stored content does not carry
+    refuses the query, naming the record: the model would not read that text."""
     sent: list[_Sent] = []
     stats.setdefault("images_not_sent", 0)
+    stats.setdefault("carriers", 0)
+    uncarried: list[str] = []
     for chunk in found.chunks:
         labels: dict[int, str] = {}
         strays: dict[int, list[str]] = {}
@@ -284,6 +329,13 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict) 
             message = summariser_message(raw, record, wire, withheld, strict=True, added=added)
             stored = sum(1 for part in (content_parts(raw.get("content")) or []) if is_image_part(part))
             stats["images_not_sent"] += max(0, stored - image_count(message))
+            if any(isinstance(raw.get(key), list) and raw[key] for key in TEXT_REPLAY_CARRIERS):
+                stats["carriers"] += 1
+                given = "\n".join(_message_texts(message))
+                missing = [text for text in _carrier_texts(raw) if text not in given]
+                if missing:
+                    uncarried.append(f"{record} ({len(missing)} text(s) of its stored replay carrier that its content "
+                                     f"does not hold)")
             if raw.get("role") == "tool":
                 # No label of the plugin's inside a tool result (OD-D): its call's label names it;
                 # a result the store pairs with no call is named in the label before it.
@@ -304,6 +356,11 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict) 
             entry = sent[base + index]
             _add_parts(entry.message, [{"type": "text", "text": label}], [])
             entry.label = label
+    if uncarried:
+        raise ExpansionError(
+            f"the query gives its model each message's stored content, never the host's replay carrier of its text, "
+            f"and these records' carriers hold text their content does not: {' | '.join(uncarried)}; the model would "
+            f"not read it, so nothing was sent: ask over other handles")
     closing = f"Question:\n{question}\n\n{CONTRACT}"
     messages = ([{"role": "system", "content": INSTRUCTIONS}] + [entry.message for entry in sent]
                 + [{"role": "user", "content": closing}])
@@ -416,11 +473,13 @@ def _message_texts(message: dict) -> list[str]:
             if isinstance(part, dict) and isinstance(part.get("text"), str)]
 
 
-def _wire_check(route: Any, messages: list[dict], sent: list[_Sent]) -> list[dict]:
-    """Every record the host's converter would not give the model as it was (OD-G). A stored
-    text or tool call that does not reach the model, or fewer images than were given, refuses
-    the query, naming each record; the query's label or a part the projection added beside the
-    stored content that does not reach the model is returned, per record, for the header.
+def _wire_check(route: Any, messages: list[dict], sent: list[_Sent]) -> None:
+    """Every record the host's converter would not give the model as the query gives it
+    (OD-G, as ruled on #83): anything the query gives its model that the wire would not
+    deliver refuses the query, naming the record and what would be lost: a stored text, a
+    stored tool call's arguments, an image, the query's label, or a part the projection adds
+    beside the stored content (readable reasoning, the fill note, a malformed-arguments part,
+    an image placeholder). There is no accepted loss to state.
 
     The check: a text reaches the model when a text value of the converted payload equals it
     (the Anthropic converter never joins two texts into one, anthropic_message_convert.py
@@ -432,20 +491,18 @@ def _wire_check(route: Any, messages: list[dict], sent: list[_Sent]) -> list[dic
     payload = _payload_for_wire(route, messages)
     texts, images, calls = _payload_facts(payload)
     refused: list[str] = []
-    beside: list[dict] = []
     for entry in sent:
         added = set(entry.added)
-        missing_stored = []
-        missing_beside = []
+        lost = []
         for index, text in enumerate(_message_texts(entry.message)):
             if not text.strip() or text in texts:
                 continue
             if text == entry.label:
-                missing_beside.append("the query's label")
+                lost.append("the query's label")
             elif text in added:
-                missing_beside.append(f"the query's part {index + 1} ({text.split(']', 1)[0]}])")
+                lost.append(f"the query's part {index + 1} ({text.split(']', 1)[0]}])")
             else:
-                missing_stored.append(f"text part {index + 1}")
+                lost.append(f"stored text part {index + 1}")
         for position, call in enumerate(entry.message.get("tool_calls") or []):
             function = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else {}
             stored_arguments = function.get("arguments")
@@ -453,20 +510,17 @@ def _wire_check(route: Any, messages: list[dict], sent: list[_Sent]) -> list[dic
             if isinstance(stored_arguments, str) and arguments is stored_arguments:
                 continue  # not valid JSON: the stored string is given in a labelled part, checked above
             if arguments not in calls:
-                missing_stored.append(f"tool call {position + 1} ({function.get('name') or '?'})")
-        if missing_stored:
-            refused.append(f"{entry.record}: {', '.join(missing_stored)}")
-        if missing_beside:
-            beside.append({"record": entry.record, "not_sent": missing_beside})
+                lost.append(f"tool call {position + 1} ({function.get('name') or '?'})")
+        if lost:
+            refused.append(f"{entry.record}: {', '.join(lost)}")
     given = sum(image_count(message) for message in messages)
     if images < given:
         refused.append(f"{images} of the {given} images given")
     if refused:
         raise ExpansionError(
             f"the host's converter for {route.describe()} ({route.target_api_mode}) would not give the query's model "
-            f"these records as they are stored: {' | '.join(refused)}; it cannot be shown that the model receives "
-            f"them, so nothing was sent: ask over other handles")
-    return beside
+            f"these records as the query gives them: {' | '.join(refused)}; it cannot be shown that the model "
+            f"receives them, so nothing was sent: ask over other handles")
 
 
 def _svg_images(messages: list[dict]) -> int:
@@ -845,7 +899,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
         else:
             window = (f"not known: the model table has no window for {route.target_provider}/{route.target_model}, "
                       f"so the input was not checked against it; the provider's refusal is the only bound")
-        beside = _wire_check(route, messages_in, sent)
+        _wire_check(route, messages_in, sent)
         route_facts = _route_facts(route)
         endpoint = endpoint_key(route.target_provider, route.target_base_url)
         limiter, slots = limiter_for(endpoint), engine._calls_in_flight_limit(endpoint)
@@ -860,7 +914,10 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
             "input": {"est_tokens": estimate.tokens, "uncounted_images": estimate.uncounted_images,
                       "images_not_sent": stats["images_not_sent"],
                       "encrypted_withheld": dict(sorted(withheld.items())), "window": window,
-                      "not_sent_by_the_wire": beside},
+                      "wire": (f"the host's converter for this route ({route.target_api_mode}) was run over the "
+                               f"query's messages before the call, and gives the model every text, tool call and "
+                               f"image the query gives it"),
+                      "text_carriers": _CARRIERS_SAID[route.target_api_mode](stats["carriers"])},
             "call": {
                 "timeout": timeout,
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",

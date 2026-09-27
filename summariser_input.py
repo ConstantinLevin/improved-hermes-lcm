@@ -314,6 +314,9 @@ def _keep(message: dict, key: str, drop) -> int:
 # The kinds of encrypted reasoning, by the host field that carries them; the model
 # table's ``encrypted_reasoning`` column names the same kinds (#8, 9.6).
 ENCRYPTED_KINDS = ("reasoning_details", "codex_reasoning_items", "anthropic_content_blocks", "bedrock_content_blocks")
+# The host's stored carriers from which its converters replay a message's text instead of
+# reading ``content`` (the strict projection sends none of them, ``summariser_message``).
+TEXT_REPLAY_CARRIERS = ("codex_message_items", "anthropic_content_blocks", "bedrock_content_blocks")
 
 
 def _withhold_encrypted(message: dict) -> dict[str, int]:
@@ -522,7 +525,8 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
     be read), and the host's fill of an empty non-final message is never given as the
     message's content: the fill is asked on the host's own row before any step of the
     plugin's (``host_fill_text``, A10), the content stays as stored, and a labelled part
-    quotes the host's stand-in.
+    quotes the host's stand-in. The host's replay carriers of the message's text
+    (``TEXT_REPLAY_CARRIERS``) are not sent: the stored content is what the model reads.
 
     ``added`` (the query's wire check, #19 OD-G) receives the text of every part this
     projection adds beside the stored content: image placeholders, the readable-reasoning
@@ -542,6 +546,16 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
     for kind, count in withheld_here.items():
         if withheld is not None:
             withheld[kind] = withheld.get(kind, 0) + count
+    if strict:
+        # The host's replay carriers of a message's text: where one is present, the host's
+        # converter rebuilds the message from it and never reads ``content`` (Hermes 375930d089:
+        # the Codex converter, agent/codex_responses_adapter.py 624-630; the Anthropic
+        # converter, agent/anthropic_message_convert.py 393-397; Bedrock's, bedrock_adapter.py
+        # 749-751), so a part the plugin puts into ``content`` would never reach the model.
+        # The strict projection gives the stored content instead (the orchestrator's ruling on
+        # #83 OD-G); its encrypted items were withheld and counted above.
+        for carrier in TEXT_REPLAY_CARRIERS:
+            message.pop(carrier, None)
     stored_parts = {id(part) for part in (content_parts(message.get("content")) or [])}
     if facts.reads_images is None:
         _replace_images_in_message(message, record, _NOT_KNOWN_STRICT if strict else _NOT_KNOWN)
