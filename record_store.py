@@ -34,9 +34,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from .db_bootstrap import close_connection, open_store
+from .db_bootstrap import SQLITE_BUSY_TIMEOUT_MS, close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
-from .inflight import ChunkSummary
+from .inflight import _POLL_S, ChunkSummary
 from .message_content import base64_like_strings, describe_image_part, grep_text, image_parts
 from .tokens import Estimator
 
@@ -87,6 +87,11 @@ def _warn_media(handle: str, message: dict) -> None:
 
 
 HANDLE_RE = re.compile(r"[mtcs][a-z2-7]{8}")
+
+
+class WriteFenced(Exception):
+    """A fenced write's fence tripped: nothing of the transaction was committed
+    (``RecordStore._fenced_tx``)."""
 
 
 @dataclass(frozen=True)
@@ -242,6 +247,62 @@ class RecordStore:
             finally:
                 self._tx_depth = 0
             self._flush_events()
+
+    @contextlib.contextmanager
+    def _fenced_tx(self, fence: Callable[[], bool]):
+        """One short write transaction that commits nothing once ``fence()`` is true (the
+        query's result, #19; plan §6.2 on PR #83). Every wait is fenced: the helper's lock is
+        taken in slices of ``_POLL_S`` with the fence asked between them; the connection's busy
+        timeout is 0 for the transaction's duration, so that ``BEGIN IMMEDIATE`` and ``COMMIT``
+        return SQLITE_BUSY at once and are retried here, the fence asked before each try, within
+        the store's own busy timeout (in rollback-journal mode a COMMIT waits for readers' shared
+        locks and, after SQLITE_BUSY, "the transaction remains active and the COMMIT can be
+        retried", sqlite.org lang_transaction.html §2.3); the fence is asked again after the
+        body. A fence that trips rolls the transaction back (which also releases the PENDING
+        lock a waiting COMMIT holds) and raises ``WriteFenced``. What it cannot close: the
+        COMMIT's own execution once its last try has begun. Never nested in another
+        transaction of this helper. Events pending from other callers are flushed after the
+        commit, unfenced, as ``_tx`` does."""
+        def check() -> None:
+            if fence():
+                raise WriteFenced()
+        deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000.0
+
+        def retried(statement: str) -> None:
+            while True:
+                check()
+                try:
+                    conn.execute(statement)
+                    return
+                except sqlite3.OperationalError as exc:
+                    busy = getattr(exc, "sqlite_errorcode", None)
+                    if busy is None or (busy & 0xFF) != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                        raise
+                time.sleep(max(0.0, min(_POLL_S, deadline - time.monotonic())))
+        while not self._lock.acquire(timeout=_POLL_S):
+            check()
+        try:
+            if self._tx_depth or self._read_depth:
+                raise RuntimeError("a fenced transaction cannot be nested in an open one of this helper")
+            conn = self._conn
+            check()
+            conn.execute("PRAGMA busy_timeout = 0")
+            try:
+                retried("BEGIN IMMEDIATE")
+                self._tx_depth = 1
+                try:
+                    yield conn
+                    retried("COMMIT")
+                except BaseException:
+                    self._rollback(conn)
+                    raise
+                finally:
+                    self._tx_depth = 0
+            finally:
+                conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+            self._flush_events()
+        finally:
+            self._lock.release()
 
     def transaction(self):
         """One write transaction, or a savepoint inside an open one (``_tx``)."""
@@ -957,26 +1018,16 @@ class RecordStore:
                 f"SELECT handle, raw FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
         return found
 
-    def records_text(self, records: Sequence[str]) -> dict[str, str]:
-        """record -> its ``text`` as stored (what grep searches, ``message_content.grep_text``
-        at the time the record was written); the query's excerpt check reads this column, never
-        a recomputation (#19)."""
-        wanted = [r for r in dict.fromkeys(records) if r]
-        found: dict[str, str] = {}
-        for start in range(0, len(wanted), 500):
-            part = wanted[start:start + 500]
-            found.update({str(h): str(text) for h, text in self._q(
-                f"SELECT handle, text FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
-        return found
 
     # --- The query's stored results (#19 D3) -----------------------------------------
 
     def write_query_report(self, *, report_id: str, session: str, question: str, body: str,
                            model: Optional[str], provider: Optional[str], effort: Optional[str],
-                           finish_reason: Optional[str]) -> bool:
-        """One query's checked result, written once, in one short transaction. False, and
-        nothing written, when the report id is already taken."""
-        with self._tx() as conn:
+                           finish_reason: Optional[str], fence: Callable[[], bool]) -> bool:
+        """One query's checked result, written once, in one short fenced transaction
+        (``_fenced_tx``: once ``fence()`` is true nothing is committed and ``WriteFenced`` is
+        raised). False, and nothing written, when the report id is already taken."""
+        with self._fenced_tx(fence) as conn:
             if conn.execute("SELECT 1 FROM query_reports WHERE id = ?", (report_id,)).fetchone():
                 return False
             conn.execute(

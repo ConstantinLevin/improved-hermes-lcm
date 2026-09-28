@@ -486,103 +486,463 @@ def _json_kind(value: Any) -> str:
     return type(value).__name__
 
 
-def _content_as_given(content: Any) -> Any:
-    """The strict projection's content for a stored value that is none of the shapes a
-    message's content has on the wire (a string, None, a list of parts): the query (#19)
-    gives every stored value to its model as what it was, or says how it shows it.
+# --- The strict projection's closed domain (the query, #19, PR #83 plan §4-§5) -------------
+#
+# What the query gives its model of a record is closed: a content that is a string, None, or a
+# list of text parts and image parts; tool calls of the shape the host writes; readable
+# reasoning as labelled text parts. Every other value is given as a labelled rendering of its
+# JSON (the orchestrator's ruling OD-E, one level down), refused by name, or withheld and
+# counted. ``given`` receives every string the query gives from the record, with its path in
+# the record as expansion shows it and its standing, so that an excerpt can be checked against
+# the field it was drawn from (plan §2).
 
-    - The host's ``_multimodal`` envelope (the plugin's one rule, ``content_parts``): its
-      parts as the content, so that its images go under the image rules and are counted,
-      and every other key of the envelope (its ``text_summary`` among them) in a labelled
-      part as JSON.
-    - Any other value (an object, a number, a boolean): one labelled part holding its JSON.
+GIVEN_CONTENT, GIVEN_RESULT, GIVEN_CALL, GIVEN_REASONING = "content", "result", "call", "reasoning"
 
-    A string, None or a list is returned as it is."""
-    if content is None or isinstance(content, (str, list)):
+# The keys the projection reads as the record's transcript; every other key is either the
+# host's own bookkeeping (``_host_metadata_keys``) or unknown, and then given as labelled JSON
+# (ruling OD-3a).
+_TRANSCRIPT_KEYS = frozenset({
+    "role", "content", "tool_calls", "tool_call_id", "reasoning", "reasoning_content", "reasoning_details",
+    "codex_reasoning_items", "codex_message_items", "anthropic_content_blocks", "bedrock_content_blocks",
+    "_anthropic_content_blocks", "api_content",
+})
+# The fields a ``reasoning_details`` entry or a Codex reasoning item holds readable text in, as
+# the host reads them (agent/agent_runtime_helpers.py ``_extract_reasoning`` 1376-1378, and
+# agent/codex_responses_adapter.py 1023-1027, 1080-1083, at Hermes 375930d089).
+_READABLE_DETAIL_KEYS = ("summary", "thinking", "content", "text")
+
+
+def _host_metadata_keys() -> frozenset:
+    """The keys the host writes on a message as its own bookkeeping, from the host's own
+    constants at run time (ruling OD-3a): the session schema's columns
+    (``hermes_state_messages._MESSAGE_SCHEMA_KEYS``), the message core keys
+    (``agent.message_sanitization._MESSAGE_CORE_KEYS``, ``name`` among them), the keys the Chat
+    Completions transport strips (``_STRIP_MSG_KEYS``) and the persistence-only fields; and
+    every key that begins with an underscore, which the host strips from every wire."""
+    so = "which of a message's keys are the host's own bookkeeping is not known; nothing was sent"
+    schema = _strict_import("session schema keys", "hermes_state_messages", "_MESSAGE_SCHEMA_KEYS", so=so)
+    core = _strict_import("message core keys", "agent.message_sanitization", "_MESSAGE_CORE_KEYS", so=so)
+    strip = _strict_import("Chat Completions strip keys", "agent.transports.chat_completions", "_STRIP_MSG_KEYS",
+                           so=so)
+    persistence = _strict_import("persistence fields", "agent.message_metadata", "PERSISTENCE_ONLY_MESSAGE_FIELDS",
+                                 so=so)
+    return frozenset(schema) | frozenset(core) | frozenset(strip) | frozenset(persistence)
+
+
+def _leaves(value: Any, path: tuple) -> Iterable[tuple[tuple, str]]:
+    """Every string of a value, with its path; a number or a boolean as its JSON text."""
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, bool) or isinstance(value, (int, float)):
+        yield path, json.dumps(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _leaves(item, path + (key,))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _leaves(item, path + (index,))
+
+
+@dataclass
+class Given:
+    """What the strict projection gives of one record beside the message: every string with
+    its path and standing (``values``), every text part the query added (``added``), the
+    record's problems that refuse the query (``problems``), and counts for the header."""
+
+    values: list
+    added: list
+    problems: list
+    reasoning_parts: int = 0
+
+
+def _json_part(label: str, value: Any, path: tuple, standing: str, given: Given) -> dict:
+    part = {"type": "text", "text": f"{label}\n{json.dumps(value, ensure_ascii=False)}"}
+    given.added.append(part["text"])
+    given.values.extend((leaf_path, text, standing) for leaf_path, text in _leaves(value, path))
+    return part
+
+
+def _canonical_parts(parts: list, prefix: tuple, standing: str, given: Given) -> list:
+    """A list content's members, each a text part, an image part, or a labelled part holding
+    the member's JSON (plan §4.2)."""
+    shown = []
+    for index, part in enumerate(parts):
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+            shown.append(part)
+            given.values.append((prefix + (index, "text"), part["text"], standing))
+        elif is_image_part(part):
+            shown.append(part)
+        else:
+            shown.append(_json_part(f"[Member {index + 1} of the stored content is not a text or image part; shown "
+                                    f"as its JSON by the query:]", part, prefix + (index,), standing, given))
+    return shown
+
+
+def _canonical_content(content: Any, standing: str, given: Given) -> Any:
+    """The strict projection's content (plan §4.2): a string or None as stored; a list as its
+    canonical members; the host's ``_multimodal`` envelope as its parts, its other keys in a
+    labelled part; any other value (an object, a number, a boolean) as one labelled part
+    holding its JSON (ruling OD-E)."""
+    base = ("message", "content")
+    if content is None:
+        return None
+    if isinstance(content, str):
+        given.values.append((base, content, standing))
         return content
+    if isinstance(content, list):
+        return _canonical_parts(content, base, standing, given)
     parts = content_parts(content)
     if parts is not None and isinstance(content, dict):
+        shown = _canonical_parts(parts, base + ("content",), standing, given)
         rest = {key: value for key, value in content.items() if key not in ("_multimodal", "content")}
-        shown = list(parts)
         if rest:
-            shown.append({"type": "text", "text": (
-                "[The rest of this stored multimodal envelope, shown as its JSON by the query:]\n"
-                + json.dumps(rest, ensure_ascii=False))})
+            shown.append(_json_part("[The rest of this stored multimodal envelope, shown as its JSON by the query:]",
+                                    rest, base, standing, given))
         return shown
-    return [{"type": "text", "text": (
-        f"[The stored content is a JSON {_json_kind(content)}, shown as its JSON by the query:]\n"
-        + json.dumps(content, ensure_ascii=False))}]
+    return [_json_part(f"[The stored content is a JSON {_json_kind(content)}, shown as its JSON by the query:]",
+                       content, base, standing, given)]
 
 
-def summariser_message(raw: dict, record: str, facts: WireFacts,
-                       withheld: Optional[dict[str, int]] = None, *, strict: bool = False,
-                       added: Optional[list] = None) -> dict:
-    """One record's message as the summariser receives it (see the module docstring).
-    The encrypted items withheld from it are added to ``withheld`` by kind.
-
-    ``strict`` (the query, #19; the summariser's call site moves to it with #72/#73):
-    every host function is called strictly (``HostUnavailable`` names the one that cannot
-    be read), and the host's fill of an empty non-final message is never given as the
-    message's content: the fill is asked on the host's own row before any step of the
-    plugin's (``host_fill_text``, A10), the content stays as stored, and a labelled part
-    quotes the host's stand-in. The host's replay carriers of the message's text
-    (``TEXT_REPLAY_CARRIERS``) are not sent: the stored content is what the model reads.
-
-    ``added`` (the query's wire check, #19 OD-G) receives the text of every part this
-    projection adds beside the stored content: image placeholders, the readable-reasoning
-    part, the malformed-arguments parts, the fill note, the withheld-reasoning text."""
-    fill = None
-    if strict:
-        row = _row_before_fill(raw, needs_echo=facts.needs_reasoning_echo, strict=True)
-        fill = host_fill_text(row)
-        message = copy.deepcopy(row)
-        message.pop("_length_continuation_fragment", None)
-        message.pop("_length_continuation_nudge", None)
-        if "content" in message:
-            message["content"] = _content_as_given(message["content"])
+def _canonical_calls(message: dict, given: Given) -> list[dict]:
+    """The message's tool calls as the wire can carry them (plan §4.2): a list of calls of
+    the shape the host writes (a dict, a dict ``function`` with a non-blank string ``name``
+    and a string ``arguments``, a non-blank string ``id``). A falsy value is dropped (the host's
+    Anthropic converter raises on ``None``); every other value or call is given as a labelled
+    part holding its JSON, after the content, and is not a call on the wire. Returns those
+    parts."""
+    calls = message.get("tool_calls")
+    base = ("message", "tool_calls")
+    if not calls:
+        message.pop("tool_calls", None)
+        return []
+    if not isinstance(calls, list):
+        message.pop("tool_calls", None)
+        return [_json_part(f"[The stored tool calls are a JSON {_json_kind(calls)}, not a list of calls; shown as "
+                           f"their JSON by the query:]", calls, base, GIVEN_CALL, given)]
+    kept, after = [], []
+    for index, call in enumerate(calls):
+        function = call.get("function") if isinstance(call, dict) else None
+        if (isinstance(function, dict) and isinstance(function.get("name"), str) and function["name"].strip()
+                and isinstance(function.get("arguments"), str) and isinstance(call.get("id"), str)
+                and call["id"].strip()):
+            kept.append(call)
+            given.values.append((base + (index, "function", "name"), function["name"], GIVEN_CALL))
+            given.values.append((base + (index, "function", "arguments"), function["arguments"], GIVEN_CALL))
+        else:
+            after.append(_json_part(f"[Tool call {index + 1} as stored is not a call the wire can carry; shown as "
+                                    f"its JSON by the query:]", call, base + (index,), GIVEN_CALL, given))
+    if kept:
+        message["tool_calls"] = kept
     else:
-        message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
+        message.pop("tool_calls", None)
+    return after
+
+
+def _given_texts(given: Given, standings: tuple) -> list[str]:
+    return [text for _path, text, standing in given.values if standing in standings]
+
+
+def _call_arguments(call: dict) -> tuple[str, Any, bool]:
+    function = call["function"]
+    try:
+        return function["name"], json.loads(function["arguments"]), True
+    except ValueError:
+        return function["name"], None, False
+
+
+def _readable_block(path: tuple, text: Any, readable: list) -> None:
+    if isinstance(text, str) and text.strip():
+        readable.append((path, text))
+
+
+def _readable_strings(value: Any, path: tuple) -> list[tuple[tuple, str]]:
+    """The readable texts under a reasoning field: its non-blank strings, not those under a
+    ``type`` key (a part's kind, not its text)."""
+    return [(leaf, text) for leaf, text in _leaves(value, path)
+            if isinstance(text, str) and leaf[-1] != "type" and text.strip() and not _is_json_scalar(value, leaf, path)]
+
+
+def _is_json_scalar(value: Any, leaf: tuple, path: tuple) -> bool:
+    """Whether the leaf at ``leaf`` is a number or a boolean (``_leaves`` gives those as their
+    JSON text); only strings are readable text."""
+    node = value
+    for step in leaf[len(path):]:
+        node = node[step]
+    return not isinstance(node, str)
+
+
+def _reasoning_and_carriers(raw: dict, message: dict, given: Given, withheld_text: dict) -> tuple[list, list]:
+    """The reasoning fields and replay carriers of a record, faced block by block (plan §5.2).
+    Returns the labelled parts to put before the stored content (readable reasoning) and after
+    it (values the query renders). Readable text held anywhere but the text the query already
+    gives as the record's readable reasoning is given as its own labelled part naming its path
+    (exact containment, ruling OD-4a); a carrier's message text must stand in the given content
+    and a carrier's call must be one of the stored calls, else the record is a problem that
+    refuses the query; an image a carrier holds is given as an image part; an unknown block is
+    given as its JSON. ``withheld_text`` counts, per kind, the signed items whose readable text
+    is given (their signatures are withheld)."""
+    role = raw.get("role")
+    readable: list = []       # (path, text) of readable reasoning held outside the main field
+    before: list = []
+    after: list = []
+    main = readable_reasoning(raw)
+    for key in ("reasoning", "reasoning_content"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            if value.strip() and value != main:
+                readable.append((("message", key), value))
+        elif value is not None:
+            after.append(_json_part(f"[{key} as stored is not text; shown as its JSON by the query:]", value,
+                                    ("message", key), GIVEN_REASONING, given))
+    details = raw.get("reasoning_details")
+    if isinstance(details, list):
+        for index, entry in enumerate(details):
+            if isinstance(entry, dict):
+                texts = [pair for key in _READABLE_DETAIL_KEYS if key in entry
+                         for pair in _readable_strings(entry[key], ("message", "reasoning_details", index, key))]
+                readable.extend(texts)
+                if texts and _signed_or_encrypted_detail(entry):
+                    withheld_text["reasoning_details"] = withheld_text.get("reasoning_details", 0) + 1
+            elif entry is not None:
+                after.append(_json_part(f"[reasoning_details[{index}] as stored is not an entry; shown as its JSON "
+                                        f"by the query:]", entry, ("message", "reasoning_details", index),
+                                        GIVEN_REASONING, given))
+    elif details is not None:
+        after.append(_json_part("[reasoning_details as stored is not a list; shown as its JSON by the query:]",
+                                details, ("message", "reasoning_details"), GIVEN_REASONING, given))
+    items = raw.get("codex_reasoning_items")
+    if isinstance(items, list):
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                if item is not None:
+                    after.append(_json_part(f"[codex_reasoning_items[{index}] as stored is not an item; shown as its "
+                                            f"JSON by the query:]", item, ("message", "codex_reasoning_items", index),
+                                            GIVEN_REASONING, given))
+                continue
+            texts = [pair for key in ("summary", "text", "content") if key in item
+                     for pair in _readable_strings(item[key], ("message", "codex_reasoning_items", index, key))]
+            readable.extend(texts)
+            if texts and item.get("encrypted_content"):
+                withheld_text["codex_reasoning_items"] = withheld_text.get("codex_reasoning_items", 0) + 1
+    # A carrier's message text must stand in what is given as the message's text: its content,
+    # or its readable reasoning (a Codex commentary item's text is the host's ``reasoning``,
+    # agent/codex_responses_adapter.py 1125-1134).
+    content_texts = _given_texts(given, (GIVEN_CONTENT, GIVEN_RESULT)) + ([main] if main else [])
+    calls = [_call_arguments(call) for call in (message.get("tool_calls") or [])]
+
+    def carried(text: str, path: tuple) -> None:
+        if isinstance(text, str) and text.strip() and not any(text in given_text for given_text in content_texts):
+            given.problems.append(f"its replay carrier holds text its content does not ({'.'.join(map(str, path))})")
+
+    def called(name: Any, arguments: Any, path: tuple) -> None:
+        if not any(name == stored_name and (not parsed or arguments == stored_arguments)
+                   for stored_name, stored_arguments, parsed in calls):
+            given.problems.append(f"its replay carrier holds a call its tool calls do not "
+                                  f"({'.'.join(map(str, path))}, {name if isinstance(name, str) else '?'})")
+
+    def image(block: Any, path: tuple) -> None:
+        source = block.get("source") if isinstance(block, dict) else None
+        url = None
+        if isinstance(source, dict) and source.get("type") == "base64" and isinstance(source.get("data"), str):
+            url = f"data:{source.get('media_type') or 'application/octet-stream'};base64,{source['data']}"
+        elif isinstance(source, dict) and isinstance(source.get("url"), str):
+            url = source["url"]
+        if url is None:
+            after.append(_json_part(f"[{'.'.join(map(str, path))} is an image block of no shape the query reads; "
+                                    f"shown as its JSON by the query:]", block, path, GIVEN_CONTENT, given))
+            return
+        label = {"type": "text", "text": f"[An image the provider returned in {'.'.join(map(str, path))}, which the "
+                                         f"stored content does not hold:]"}
+        given.added.append(label["text"])
+        after.extend([label, {"type": "image_url", "image_url": {"url": url}}])
+
+    blocks = raw.get("anthropic_content_blocks")
+    for index, block in enumerate(blocks if isinstance(blocks, list) else []):
+        path = ("message", "anthropic_content_blocks", index)
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "text":
+            carried(block.get("text"), path + ("text",))
+        elif kind == "thinking":
+            _readable_block(path + ("thinking",), block.get("thinking"), readable)
+            if block.get("signature") and isinstance(block.get("thinking"), str) and block["thinking"].strip():
+                withheld_text["anthropic_content_blocks"] = withheld_text.get("anthropic_content_blocks", 0) + 1
+        elif kind == "redacted_thinking":
+            pass                                         # encrypted: withheld and counted (R3)
+        elif kind == "tool_use":
+            called(block.get("name"), block.get("input"), path)
+        elif kind == "image":
+            image(block, path)
+        else:
+            after.append(_json_part(f"[anthropic_content_blocks[{index}] is a block of no type the query knows; shown "
+                                    f"as its JSON by the query:]", block, path, GIVEN_CONTENT, given))
+    blocks = raw.get("bedrock_content_blocks")
+    for index, block in enumerate(blocks if isinstance(blocks, list) else []):
+        path = ("message", "bedrock_content_blocks", index)
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            carried(block["text"], path + ("text",))
+        elif isinstance(block, dict) and isinstance(block.get("reasoningContent"), dict):
+            reasoning = block["reasoningContent"]
+            nested = reasoning.get("reasoningText") if isinstance(reasoning.get("reasoningText"), dict) else {}
+            texts: list = []
+            for key, text in (("text", reasoning.get("text")), ("reasoningText.text", nested.get("text"))):
+                _readable_block(path + ("reasoningContent",) + tuple(key.split(".")), text, texts)
+            readable.extend(texts)
+            if texts and _signed_bedrock_block(block):
+                withheld_text["bedrock_content_blocks"] = withheld_text.get("bedrock_content_blocks", 0) + 1
+        elif isinstance(block, dict) and isinstance(block.get("toolUse"), dict):
+            called(block["toolUse"].get("name"), block["toolUse"].get("input"), path)
+        else:
+            after.append(_json_part(f"[bedrock_content_blocks[{index}] is a block of no shape the query knows; shown "
+                                    f"as its JSON by the query:]", block, path, GIVEN_CONTENT, given))
+    items = raw.get("codex_message_items")
+    for index, item in enumerate(items if isinstance(items, list) else []):
+        path = ("message", "codex_message_items", index)
+        parts = item.get("content") if isinstance(item, dict) and item.get("type") == "message" else None
+        if not isinstance(parts, list):
+            after.append(_json_part(f"[codex_message_items[{index}] is an item of no shape the query knows; shown as "
+                                    f"its JSON by the query:]", item, path, GIVEN_CONTENT, given))
+            continue
+        for number, part in enumerate(parts):
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text") and isinstance(part.get("text"),
+                                                                                                     str):
+                carried(part["text"], path + ("content", number, "text"))
+            else:
+                after.append(_json_part(f"[codex_message_items[{index}].content[{number}] is a part of no shape the "
+                                        f"query knows; shown as its JSON by the query:]", part,
+                                        path + ("content", number), GIVEN_CONTENT, given))
+    stash = raw.get("_anthropic_content_blocks")
+    standing = GIVEN_RESULT if role == "tool" else GIVEN_CONTENT
+    for index, block in enumerate(stash if isinstance(stash, list) else []):
+        path = ("message", "_anthropic_content_blocks", index)
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "text" and isinstance(block.get("text"), str):
+            if block["text"].strip() and not any(block["text"] in text for text in content_texts):
+                part = {"type": "text", "text": f"[A text block the host stashed in _anthropic_content_blocks[{index}]"
+                                                f", which the stored content does not hold:]\n{block['text']}"}
+                given.added.append(part["text"])
+                given.values.append((path + ("text",), block["text"], standing))
+                after.append(part)
+        elif kind == "redacted_thinking":
+            pass                                         # encrypted: withheld and counted (R3)
+        elif kind == "thinking":
+            _readable_block(path + ("thinking",), block.get("thinking"), readable)
+            if block.get("signature") and isinstance(block.get("thinking"), str) and block["thinking"].strip():
+                withheld_text["anthropic_content_blocks"] = withheld_text.get("anthropic_content_blocks", 0) + 1
+        elif kind == "image" or is_image_part(block):
+            if is_image_part(block) and kind != "image":
+                label = {"type": "text", "text": f"[An image the host stashed in _anthropic_content_blocks[{index}]:]"}
+                given.added.append(label["text"])
+                after.extend([label, block])
+            else:
+                image(block, path)
+        elif block is not None:
+            after.append(_json_part(f"[_anthropic_content_blocks[{index}] is a block of no type the query knows; shown "
+                                    f"as its JSON by the query:]", block, path, standing, given))
+    if stash is not None and not isinstance(stash, list):
+        after.append(_json_part("[_anthropic_content_blocks as stored is not a list; shown as its JSON by the query:]",
+                                stash, ("message", "_anthropic_content_blocks"), standing, given))
+    # Readable reasoning: the main field, then every other readable text not contained in
+    # what is given as reasoning already (exact containment, ruling OD-4a).
+    shown: list[str] = []
+    if main:
+        before.append({"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{main}"})
+        given.added.append(before[-1]["text"])
+        given.values.append((("lcm", "reasoning") if role == "assistant" else
+                             ("message", "reasoning" if raw.get("reasoning") == main else "reasoning_content"),
+                             main, GIVEN_REASONING))
+        shown.append(main)
+    for path, text in readable:
+        if any(text in earlier for earlier in shown):
+            continue
+        part = {"type": "text", "text": f"[Readable reasoning the provider returned in {'.'.join(map(str, path))}, "
+                                        f"as stored:]\n{text}"}
+        before.append(part)
+        given.added.append(part["text"])
+        given.values.append((path, text, GIVEN_REASONING))
+        given.reasoning_parts += 1
+        shown.append(text)
+    return before, after
+
+
+def _unknown_keys(message: dict, given: Given) -> list[dict]:
+    """A key that is neither the record's transcript nor the host's bookkeeping is given as a
+    labelled part holding its JSON (ruling OD-3a)."""
+    known = _host_metadata_keys()
+    return [_json_part(f"[The stored key {key!r} is no field the query knows; shown as its JSON by the query:]",
+                       value, ("message", key), GIVEN_CONTENT, given)
+            for key, value in list(message.items())
+            if key not in _TRANSCRIPT_KEYS and key not in known and not str(key).startswith("_")]
+
+
+def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, given: Given) -> dict:
+    """One record's message as the query gives it (plan §4-§5): the host's per-row rules, each
+    host function called strictly, then the closed domain. ``given`` receives what is given of
+    the record; ``withheld`` the encrypted items withheld, by kind, and the signed items whose
+    readable text is given (their signatures only withheld)."""
+    row = _row_before_fill(raw, needs_echo=facts.needs_reasoning_echo, strict=True)
+    fill = host_fill_text(row)
+    message = copy.deepcopy(row)
+    message.pop("_length_continuation_fragment", None)
+    message.pop("_length_continuation_nudge", None)
+    standing = GIVEN_RESULT if raw.get("role") == "tool" else GIVEN_CONTENT
+    if "content" in message:
+        message["content"] = _canonical_content(message["content"], standing, given)
+    call_parts = _canonical_calls(message, given)
+    withheld_text: dict[str, int] = {}
+    before, after = _reasoning_and_carriers(raw, message, given, withheld_text)
+    after = call_parts + after + _unknown_keys(message, given)
     withheld_here = _withhold_encrypted(message)
+    for kind, count in withheld_text.items():
+        withheld_here[kind] = max(0, withheld_here.get(kind, 0) - count)
+        withheld_here[f"{kind}: signatures withheld, their readable text given"] = count
     for kind, count in withheld_here.items():
-        if withheld is not None:
+        if count:
             withheld[kind] = withheld.get(kind, 0) + count
-    if strict:
-        # The host's replay carriers of a message's text: where one is present, the host's
-        # converter rebuilds the message from it and never reads ``content`` (Hermes 375930d089:
-        # the Codex converter, agent/codex_responses_adapter.py 624-630; the Anthropic
-        # converter, agent/anthropic_message_convert.py 393-397; Bedrock's, bedrock_adapter.py
-        # 749-751), so a part the plugin puts into ``content`` would never reach the model.
-        # The strict projection gives the stored content instead (the orchestrator's ruling on
-        # #83 OD-G); its encrypted items were withheld and counted above.
-        for carrier in TEXT_REPLAY_CARRIERS:
-            message.pop(carrier, None)
-    stored_parts = {id(part) for part in (content_parts(message.get("content")) or [])}
-    if facts.reads_images is None:
-        _replace_images_in_message(message, record, _NOT_KNOWN_STRICT if strict else _NOT_KNOWN)
-    elif not facts.reads_images:
-        _replace_images_in_message(message, record, _NOT_READ_STRICT if strict else _NOT_READ)
-    if added is not None:
-        added.extend(part["text"] for part in (content_parts(message.get("content")) or [])
-                     if id(part) not in stored_parts and isinstance(part, dict) and isinstance(part.get("text"), str))
-    if message.get("role") == "assistant":
-        readable = _readable_reasoning(raw)
-        before = [{"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{readable}"}] if readable else []
-        after = _malformed_argument_parts(message)
-        _add_parts(message, before, after)
-        if added is not None:
-            added.extend(part["text"] for part in before + after)
-        # Strictly, the words "carried only reasoning … withheld" are said only of a message
-        # something was withheld from; an empty message is otherwise quoted by the fill note.
-        if not _has_payload(message) and (withheld_here or not strict):
-            only = _ONLY_WITHHELD_REASONING_STRICT if strict else _ONLY_WITHHELD_REASONING
-            message["content"] = [{"type": "text", "text": only}]
-            if added is not None:
-                added.append(only)
+    # The host's replay carriers and the private stash are not sent: the stored content with the
+    # query's parts is what the model reads (ruling OD-G); their encrypted items were withheld
+    # and counted, their other blocks faced above.
+    for carrier in TEXT_REPLAY_CARRIERS + ("_anthropic_content_blocks",):
+        message.pop(carrier, None)
+    malformed = _malformed_argument_parts(message)
+    given.added.extend(part["text"] for part in malformed)
+    _add_parts(message, before, after + malformed)
+    # The image rules, over every image the message now holds (the stored ones and those a
+    # carrier or the stash held): sent where the model reads images, else a placeholder.
+    if not facts.reads_images:
+        present = {id(part) for part in (content_parts(message.get("content")) or [])}
+        _replace_images_in_message(message, record, _NOT_KNOWN_STRICT if facts.reads_images is None
+                                   else _NOT_READ_STRICT)
+        given.added.extend(part["text"] for part in (content_parts(message.get("content")) or [])
+                           if id(part) not in present and isinstance(part, dict) and isinstance(part.get("text"), str))
+    if not _has_payload(message) and any(withheld_here.values()):
+        message["content"] = [{"type": "text", "text": _ONLY_WITHHELD_REASONING_STRICT}]
+        given.added.append(_ONLY_WITHHELD_REASONING_STRICT)
     if fill is not None:
         note = f"{FILL_NOTE_LABEL} {json.dumps(fill, ensure_ascii=False)}"
         _add_parts(message, [{"type": "text", "text": note}], [])
-        if added is not None:
-            added.append(note)
+        given.added.append(note)
+    return message
+
+
+def summariser_message(raw: dict, record: str, facts: WireFacts,
+                       withheld: Optional[dict[str, int]] = None) -> dict:
+    """One record's message as the summariser receives it (see the module docstring).
+    The encrypted items withheld from it are added to ``withheld`` by kind. (The query's
+    strict projection is ``strict_message``.)"""
+    message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
+    for kind, count in _withhold_encrypted(message).items():
+        if withheld is not None:
+            withheld[kind] = withheld.get(kind, 0) + count
+    if facts.reads_images is None:
+        _replace_images_in_message(message, record, _NOT_KNOWN)
+    elif not facts.reads_images:
+        _replace_images_in_message(message, record, _NOT_READ)
+    if message.get("role") == "assistant":
+        readable = _readable_reasoning(raw)
+        before = [{"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{readable}"}] if readable else []
+        _add_parts(message, before, _malformed_argument_parts(message))
+        if not _has_payload(message):
+            message["content"] = [{"type": "text", "text": _ONLY_WITHHELD_REASONING}]
     return message
 
 

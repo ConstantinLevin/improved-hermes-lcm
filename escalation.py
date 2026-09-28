@@ -240,7 +240,8 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
     would fall back to …"."""
     try:
         from agent.auxiliary_client import (  # type: ignore
-            _fallback_provider_from_label, _main_route_target, _normalize_main_runtime, _resolve_call_client)
+            _fallback_provider_from_label, _main_route_target, _normalize_main_runtime, _resolve_call_client,
+            scoped_runtime_main)
     except Exception as exc:
         return None, f"the host's client resolution cannot be read ({type(exc).__name__}: {exc})"
     try:
@@ -257,10 +258,15 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, s
         except Exception as exc:
             return None, f"the host's custom-provider entries cannot be read ({type(exc).__name__}: {exc})"
     try:
-        resolved = _resolve_call_client(
-            None, provider=None, model=None, base_url=None, api_key=None, resolved_provider="auto",
-            resolved_model=None, resolved_base_url=None, resolved_api_key=None, resolved_api_mode=None,
-            main_runtime=route.main_runtime(), async_mode=False)
+        # Under the runtime context ``call_llm`` itself installs (``scoped_runtime_main``, 2777-2785
+        # at Hermes 375930d089, set at 7873), so that the host's resolution reads the same runtime
+        # here as in the call: ``_try_main_provider_route`` resolves without ``main_runtime`` and
+        # reads the context (4602-4605, 4897; #83 plan §3.2).
+        with scoped_runtime_main(route.main_runtime()):
+            resolved = _resolve_call_client(
+                None, provider=None, model=None, base_url=None, api_key=None, resolved_provider="auto",
+                resolved_model=None, resolved_base_url=None, resolved_api_key=None, resolved_api_mode=None,
+                main_runtime=route.main_runtime(), async_mode=False)
         client, final_model, resolved_provider, effective_provider = resolved
     except Exception as exc:
         return None, f"the host cannot route the session's summariser ({type(exc).__name__}: {exc})"

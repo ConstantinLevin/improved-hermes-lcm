@@ -1,6 +1,6 @@
 """The query (#19): a question over the raw behind handles the agent holds, answered by the
 summariser's model in one call, returned as a hedged report and verbatim excerpts, each excerpt
-checked against the store (manifesto, "Looking behind a handle").
+checked against the field of the record it was drawn from (manifesto, "Looking behind a handle").
 
 **What it reads.** One or more handles of summaries (``s``) or chunks (``c``), resolved in the
 caller's plugin session on the active record (``RecordStore.resolve``, the rule expansion and
@@ -11,46 +11,52 @@ each; a tool call's or a message's handle is refused with a pointer to ``lcm_exp
 
 **What the model is given.** One call over one context, on the summariser's route with its
 effort (``_summariser_settings``), through the host's ``call_llm``: the query's instructions,
-then every record as the summariser receives it, strictly (``summariser_message(strict=True)``:
-a host function that cannot be read refuses the query; the host's fill of an empty message
-quoted as a labelled part; a stored content of no wire shape given as what it was, labelled;
-the host's replay carriers of a message's text not sent, so that the stored content with the
-plugin's parts is what the model reads), then the question. Every user and agent message carries a label naming its handle; an agent
-message's label also names its tool calls' handles and the records that hold their results.
-A tool result carries no label of the plugin's: the host's converters send a tool result whose
-content is a list of parts as JSON text on some wires (#19 OD-D). Refused before the call,
-with the cause:
+then every record as the query gives it (``summariser_input.strict_message``: the host's
+per-row rules, each host function called strictly; a content of text and image parts only,
+every other value given as a labelled rendering of its JSON; tool calls of the shape the host
+writes; readable reasoning from every field that holds it; the host's replay carriers not sent,
+their blocks faced one by one; the host's fill of an empty message quoted, never given as the
+message's content), then the question. Every user and agent message carries a label naming its
+handle; an agent message's label also names its tool calls' handles and the records that hold
+their results. A tool result carries no label of the plugin's (#19 OD-D).
 
-- a route whose client wire the plugin has not established (OD-I);
-- more images than the host's converter keeps in one request;
-- an input over the model's input (its window less its output cap, by the estimate times
-  ``estimate_ratio_max``, #34 D4; where the model table has no window this is said);
-- anything the query gives its model that the host's own converter for the route's wire
-  would not deliver, or a replay carrier holding text the content does not (the wire check,
-  OD-G as ruled: the host's converter is run over a copy of the input; no loss is accepted);
-- a page too small for the result's header.
+**Every leg the host can answer on** (#83 plan §3). Before the call the query computes, from the
+host's own functions at Hermes 375930d089, the wires any leg of the host's recovery can send this
+call on: the route's own; Chat Completions where the host's Nous refresh can rebuild the client;
+the refreshed provider's own wires where the host's OAuth refresh can apply. The host's own
+converter for each of them is run over a copy of the input, and the query refuses where one would
+not deliver it. It refuses, naming what, where a leg's wire cannot be known before the call: a
+``fallback_providers`` entry that would answer under this route's own provider and model; a
+credential pool the host can rotate while fallback providers are configured (a rotation's retry
+can answer from one of them with no record, rulings OD-2a); a managed NeMo Relay (OD-2b).
 
-**How the call is made** (the orchestrator's rulings OD-A, OD-B, OD-C on #83, 2026-09-27).
-The host is entered once per dispatch: no failure is retried by the plugin, because every
-retry re-enters the host's recovery, which changes state the plugin cannot see (credential
-benches in auth.json, unhealthy marks, quarantines). The call runs inside the host's
-``aux_interrupt_protection`` with this worker's interrupt bit as its cancel source: when the
-host stops waiting for this tool call, ``call_llm`` raises ``AuxiliaryExplicitCancellation``
-at once and nothing is re-sent, re-routed, rotated or quarantined; what happens to the
-provider's request then depends on the wire and is said in every result's ``call``. The
-``timeout`` passed is an interim value (#22): the host's configured sequential tool timeout,
-else the plugin's own 420 s.
+**Refused before the call**, with the cause: a wire the plugin has not established (OD-I); more
+images than the host's converter keeps in one request; an input over the model's input (its
+window less its output cap, by the estimate times ``estimate_ratio_max``, #34 D4; where the model
+table has no window this is said); a record the query cannot give as it is (a replay carrier that
+holds text or a call its content and calls do not); anything the query gives its model that a
+wire's converter would not deliver, in its place; a page too small for the result's header.
+
+**How the call is made** (rulings OD-A, OD-B, OD-C). The host is entered once per dispatch: no
+failure is retried by the plugin. The call runs inside the host's ``aux_interrupt_protection``
+with this worker's interrupt bit as its cancel source, latched: once the host has asked this
+tool call to stop (its tool timeout, or an interrupt), ``call_llm`` raises
+``AuxiliaryExplicitCancellation`` and the query stops reading; what the host's thread does with
+the provider's request then is said per wire in every result's ``call``. The ``timeout`` passed
+is an interim value (#22): the host's configured sequential tool timeout, else 420 s.
 
 **The reply.** Its content must be exactly one JSON object ``{"report": str, "excerpts": [{"handle":
 str, "text": str}, ...]}``; nothing is stripped or recognised by pattern (#9 Decided). Each
-excerpt is checked by grep's rule: its text, holding neither NUL nor U+001F, is contained in
-``records.text`` as stored of the record its handle names (for a tool call, of one of the
-call's results by the store's pairing). A checked excerpt comes back with its text and the
-record it was found in; one that fails is named and withheld, without its text.
+excerpt is accepted only where its text is contained in one of the strings the query gave its
+model from the record its handle names (for a tool call, from one of the call's results by the
+store's pairing), and the result names the field it was found in and that field's standing. One
+that fails is named and withheld, without its text.
 
 **Pages.** The result is served by the one page mechanism (``expansion.serve_page``). A result
-that needs a second page is stored once (``query_reports``) before page 1 is returned, and every
-page is cut from that stored body; a result on one page is not stored.
+that needs a second page is stored once (``query_reports``) before page 1 is returned, in a
+transaction that commits nothing once the host has asked this call to stop
+(``RecordStore._fenced_tx``); every page is cut from that stored body; a result on one page is
+not stored.
 
 The words the model and the agent read are interim until #10.
 """
@@ -73,16 +79,21 @@ from .escalation import (SummaryFailure, _call_once, _host_status, _is_transient
 from .expansion import ExpansionError, Item, Target
 from .handles import CHUNK, MESSAGE, TOOL_CALL
 from .inflight import endpoint_key, limiter_for
-from .message_content import GREP_SEPARATOR, content_parts, image_media_type, is_image_part
+from .message_content import content_parts, image_media_type, is_image_part
 from .model_table import lookup as lookup_model
-from .record_store import HANDLE_RE, RecordStore
+from .record_store import HANDLE_RE, RecordStore, WriteFenced
 from .summariser_input import (
+    GIVEN_CALL,
+    GIVEN_CONTENT,
+    GIVEN_REASONING,
+    GIVEN_RESULT,
     TEXT_REPLAY_CARRIERS,
+    Given,
     HostUnavailable,
     _add_parts,
     _strict_import,
     image_count,
-    summariser_message,
+    strict_message,
     wire_facts,
     wire_image_limit,
 )
@@ -109,37 +120,47 @@ _HANDLE_DRAWS = 8
 # starts the host's re-send path.
 INTERIM_TIMEOUT_S = 420.0
 
-# What happens to the provider's request once the host stops waiting for this tool call, per
-# client wire (Hermes 375930d089, agent/auxiliary_client.py ``_run_protected_sync_provider_call``
-# 440-499: the provider callback runs on a daemon thread the host does not stop; the Codex stream
-# guard closes its stream on the next event, 1331-1350; the Anthropic adapter's event hook is
-# installed only while a progress hook is active, 1798, and the query installs none).
-_IF_THE_HOST_STOPS_WAITING = {
-    "chat_completions": ("the query stops at once and nothing is re-sent, re-routed or stored; the model's request "
-                         "runs on to its end on a host thread and is billed (the plain Chat Completions request "
-                         "cannot be stopped)"),
-    "anthropic_messages": ("the query stops at once and nothing is re-sent, re-routed or stored; the model's request "
-                           "runs on to its end on a host thread and is billed (the host closes an Anthropic stream "
-                           "only while a progress hook is active, and the query installs none)"),
-    "codex_responses": ("the query stops at once and nothing is re-sent, re-routed or stored; the host closes the "
-                        "model's stream on its next event"),
+# What happens to the provider's request once the host asks this tool call to stop, per client
+# wire (Hermes 375930d089, agent/auxiliary_client.py ``_run_protected_sync_provider_call``
+# 440-499: the owner raises within 20 ms and nothing closes the provider request, which runs on a
+# daemon thread; a plain Chat Completions request is not streamed; the Anthropic adapter streams
+# internally but checks no cancellation while no progress hook is installed, 1798,
+# anthropic_adapter.py 795-817, and the query installs none; the Codex guard closes the attempt's
+# stream on its next event, 1373-1385, or its watchdog does, 1291-1296; after the cancellation the
+# daemon can still send a credit-limited 402 retry, 6926-6943, and on Anthropic a plain request
+# where the provider refuses the stream, anthropic_adapter.py 843-849). The three wires the plugin
+# has established.
+_IF_THE_HOST_ASKS_THIS_CALL_TO_STOP = {
+    "chat_completions": ("the query stops reading the reply at once and stores nothing; the host's thread keeps the "
+                         "model's request running until its response comes, its read timeout passes or the process "
+                         "ends, and can send one more request of its own (a retry after a credit-limit error)"),
+    "anthropic_messages": ("the query stops reading the reply at once and stores nothing; the host's thread keeps "
+                           "the model's stream running until its end, its read timeout or the end of the process (the "
+                           "host closes an Anthropic stream only while a progress hook is active, and the query "
+                           "installs none), and can send one more request of its own (a retry after a credit-limit "
+                           "error, or a plain request where the provider refuses the stream)"),
+    "codex_responses": ("the query stops reading the reply at once and stores nothing; the host closes the model's "
+                        "stream on its next event, or its watchdog closes it, and its thread can send one more "
+                        "request of its own (a retry after a credit-limit error)"),
 }
+_ESTABLISHED_WIRES = tuple(_IF_THE_HOST_ASKS_THIS_CALL_TO_STOP)
 
-# What the header says of the host's replay carriers of a message's text on each wire (the
-# strict projection sends none of them, ``summariser_input.summariser_message``; Hermes
-# 375930d089: the Codex converter replays an assistant from ``codex_message_items`` and ignores
-# its content, agent/codex_responses_adapter.py 624-630; the Anthropic converter does the same
-# with ``anthropic_content_blocks``, agent/anthropic_message_convert.py 393-397; the Chat
-# Completions transport strips every carrier, agent/transports/chat_completions.py 36-39).
-_CARRIERS_SAID = {
-    "codex_responses": lambda n: (f"{n} record(s) carry the host's stored replay items of their text "
-                                  f"(codex_message_items), which the host would send in place of the content; the "
-                                  f"query does not send them: the stored content is what the model reads"),
-    "anthropic_messages": lambda n: (f"{n} record(s) carry the host's stored ordered blocks (anthropic_content_blocks), "
-                                     f"from which the host would rebuild the message in place of its content; the "
-                                     f"query does not send them: the stored content is what the model reads"),
-    "chat_completions": lambda n: (f"{n} record(s) carry a replay carrier of their text; on this route the host sends "
-                                   f"none, and neither does the query: the stored content is what the model reads"),
+# The wires of the client the host's own resolution builds for each provider it can refresh on
+# an authentication error (``_CREDENTIAL_REFRESHERS``, agent/auxiliary_client.py 3867-3871 at
+# Hermes 375930d089), each read at the branch that builds it: anthropic ``_try_anthropic``, an
+# ``AnthropicAuxiliaryClient`` (3075); openai-codex ``_build_codex_client`` (2960) and xai-oauth
+# ``_build_xai_oauth_aux_client`` (2932), a ``CodexAuxiliaryClient``; copilot through the
+# registry's API-key branch, a plain ``openai.OpenAI`` client or, for a Responses model, the Codex
+# wrapper (5303-5309); vertex a plain ``openai.OpenAI`` client (4832-4855); nous a plain client
+# or, for a model ``nous_api_mode`` puts on the Messages wire, the Anthropic wrapper
+# (5014-5020). A refreshable provider missing here is a wire the plugin has not established.
+_REFRESH_WIRES = {
+    "anthropic": ("anthropic_messages",),
+    "openai-codex": ("codex_responses",),
+    "xai-oauth": ("codex_responses",),
+    "copilot": ("chat_completions", "codex_responses"),
+    "vertex": ("chat_completions",),
+    "nous": ("chat_completions", "anthropic_messages"),
 }
 
 # --- The words (interim until #10: the owner's, tried on real spans) ----------------------
@@ -157,9 +178,13 @@ INSTRUCTIONS = (
 CONTRACT = ('Reply with one JSON object and nothing else: {"report": "…", "excerpts": [{"handle": "…", '
             '"text": "…"}]}')
 NOTE = ("The report is a model's description of what it read, hedged: orientation, not something to "
-        "act on. Each excerpt was found verbatim in the record named by \"in\" and may be relied on as "
-        "an expansion may. A withheld excerpt did not pass the check its \"why\" names and is not shown.")
+        "act on. Each excerpt was found verbatim in the record named by \"in\", in the field named by \"from\". "
+        "One from a message's content or a tool result may be relied on as an expansion may; one from a "
+        "tool call's name or arguments is what was called; one found only in reasoning is the model's "
+        "account of its thinking, and nothing rests on it. A withheld excerpt did not pass the check its "
+        "\"why\" names and is not shown.")
 _GROUP_NOTE = "one of the results of calls the store cannot pair"
+_STANDINGS = (GIVEN_CONTENT, GIVEN_RESULT, GIVEN_CALL, GIVEN_REASONING)
 
 
 def _label_message(record: str) -> str:
@@ -176,10 +201,10 @@ class _Read:
     read: list = field(default_factory=list)            # [{"handle", "chunks"}], as given
     chunks: list = field(default_factory=list)          # every chunk, once, in cover order
     records: dict = field(default_factory=dict)         # chunk -> [(record, raw)]
-    texts: dict = field(default_factory=dict)           # record -> records.text as stored
     under: dict = field(default_factory=dict)           # chunk -> the summary covering it
     pairing: dict = field(default_factory=dict)         # chunk -> pairing.Pairing
     calls: dict = field(default_factory=dict)           # record -> {position: call handle}
+    given: dict = field(default_factory=dict)           # record -> Given (what the query gave of it)
     stored_at: Optional[str] = None
 
 
@@ -243,354 +268,143 @@ def _resolve(records: RecordStore, session: str, handles: list) -> _Read:
             found.pairing[chunk] = order.pairing(records, handles_here)
         answered = [record for chunk in found.chunks for record, _p in found.pairing[chunk].result_of.values()]
         found.calls = records.tool_calls_of(members + answered)
-        found.texts = records.records_text(members)
         began = records.compaction_began_at(cover.compaction)
         found.stored_at = (datetime.fromtimestamp(began, timezone.utc).isoformat(timespec="seconds")
                            if began is not None else None)
     return found
 
 
-# --- The input ---------------------------------------------------------------------------
-
-def _call_results(found: _Read, chunk: str, record: str, position: int) -> str:
-    """Where the result of one call lies, by the store's pairing (``pairing.py``)."""
-    pairing = found.pairing[chunk]
-    place = (record, position)
-    if place in pairing.group:
-        results = ", ".join(pairing.group[place].results)
-        return f"one of results {results} (the store cannot tell which result answers which call)"
-    if place in pairing.answer:
-        return f"result {pairing.answer[place]}"
-    return "no result on the record"
-
-
-def _assistant_label(found: _Read, chunk: str, record: str, raw: dict) -> str:
-    calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
-    if not calls:
-        return _label_message(record)
-    named = []
-    for position, call in enumerate(calls):
-        function = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else {}
-        named.append(f"{found.calls.get(record, {}).get(position)} {function.get('name') or '?'} → "
-                     f"{_call_results(found, chunk, record, position)}")
-    return f"[message {record} · tool calls: {'; '.join(named)}]"
-
-
-@dataclass
-class _Sent:
-    """What the query gives its model of one record: the message, the label the query put on
-    it (None on a tool result), and the texts the projection added beside the stored content."""
-
-    record: str
-    message: dict
-    label: Optional[str]
-    added: list
-
-
-def _carrier_texts(raw: dict) -> list[str]:
-    """The texts a stored replay carrier of the message holds (``TEXT_REPLAY_CARRIERS``, as the
-    host stores them: Codex message items with ``output_text`` parts, Anthropic text blocks,
-    Bedrock ``text`` blocks)."""
-    texts: list[str] = []
-    for item in raw.get("codex_message_items") or [] if isinstance(raw.get("codex_message_items"), list) else []:
-        for part in (item.get("content") or []) if isinstance(item, dict) and isinstance(item.get("content"),
-                                                                                           list) else []:
-            if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
-                texts.append(part["text"])
-    for key in ("anthropic_content_blocks", "bedrock_content_blocks"):
-        blocks = raw.get(key)
-        for block in blocks if isinstance(blocks, list) else []:
-            if not isinstance(block, dict) or not isinstance(block.get("text"), str) or not block["text"].strip():
-                continue
-            if key == "bedrock_content_blocks" or block.get("type") == "text":
-                texts.append(block["text"])
-    return texts
-
-
-def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict) -> tuple[list[dict], list[_Sent]]:
-    """The call's messages, and per record what was given. ``stats["images_not_sent"]`` counts
-    the stored image parts (by structure) the model is not given (it does not read images, or
-    that is not known, or the host's sidecar replaced the content); ``stats["carriers"]``
-    counts the records whose stored replay carrier is not sent (``summariser_message`` gives
-    the stored content instead). A carrier holding a text the stored content does not carry
-    refuses the query, naming the record: the model would not read that text."""
-    sent: list[_Sent] = []
-    stats.setdefault("images_not_sent", 0)
-    stats.setdefault("carriers", 0)
-    uncarried: list[str] = []
-    for chunk in found.chunks:
-        labels: dict[int, str] = {}
-        strays: dict[int, list[str]] = {}
-        last_labelled = None
-        rows = found.records[chunk]
-        base = len(sent)
-        for index, (record, raw) in enumerate(rows):
-            added: list = []
-            message = summariser_message(raw, record, wire, withheld, strict=True, added=added)
-            stored = sum(1 for part in (content_parts(raw.get("content")) or []) if is_image_part(part))
-            stats["images_not_sent"] += max(0, stored - image_count(message))
-            if any(isinstance(raw.get(key), list) and raw[key] for key in TEXT_REPLAY_CARRIERS):
-                stats["carriers"] += 1
-                given = "\n".join(_message_texts(message))
-                missing = [text for text in _carrier_texts(raw) if text not in given]
-                if missing:
-                    uncarried.append(f"{record} ({len(missing)} text(s) of its stored replay carrier that its content "
-                                     f"does not hold)")
-            if raw.get("role") == "tool":
-                # No label of the plugin's inside a tool result (OD-D): its call's label names it;
-                # a result the store pairs with no call is named in the label before it.
-                if record in found.pairing[chunk].stray and last_labelled is not None:
-                    strays.setdefault(last_labelled, []).append(record)
-            else:
-                labels[index] = (_assistant_label(found, chunk, record, raw) if raw.get("role") == "assistant"
-                                 else _label_message(record))
-                last_labelled = index
-            sent.append(_Sent(record, message, None, added))
-        for index, label in labels.items():
-            if index in strays:
-                label = (f"{label[:-1]} · the tool result(s) {', '.join(strays[index])} after it belong to no call "
-                         f"on the record]")
-            if index == 0:
-                under = found.under.get(chunk)
-                label = f"[chunk {chunk}{' — behind summary ' + under if under else ''}] {label}"
-            entry = sent[base + index]
-            _add_parts(entry.message, [{"type": "text", "text": label}], [])
-            entry.label = label
-    if uncarried:
-        raise ExpansionError(
-            f"the query gives its model each message's stored content, never the host's replay carrier of its text, "
-            f"and these records' carriers hold text their content does not: {' | '.join(uncarried)}; the model would "
-            f"not read it, so nothing was sent: ask over other handles")
-    closing = f"Question:\n{question}\n\n{CONTRACT}"
-    messages = ([{"role": "system", "content": INSTRUCTIONS}] + [entry.message for entry in sent]
-                + [{"role": "user", "content": closing}])
-    return messages, sent
-
-
-# --- The wire check (OD-G) --------------------------------------------------------------
-
-def _payload_for_wire(route: Any, messages: list[dict]) -> Any:
-    """What the host's own converter for the route's wire makes of the call's messages, run on
-    a deep copy (the converter can write into dicts it is handed), in the host's order
-    (agent/auxiliary_client.py at Hermes 375930d089): ``_convert_openai_images_to_anthropic``
-    where ``_is_anthropic_compat_endpoint`` holds for the request's provider and the client's
-    endpoint (7367-7370); then per wire:
-
-    - Chat Completions: ``prepare_chat_messages`` (agent/auxiliary_wire.py), key stripping only;
-    - Anthropic Messages: ``build_anthropic_kwargs`` with the adapter's own ``_base_url`` and
-      ``_is_oauth`` (1750-1757; anthropic_adapter.py:614-640), its ``system`` and ``messages``;
-    - Codex Responses: the adapter's own ``_build_responses_kwargs`` (1405-1556), the
-      ``instructions`` and ``input`` of the Responses kwargs it returns.
-
-    Every host function is taken strictly: one that cannot be read refuses the query."""
-    so = "what the model would receive cannot be shown; nothing was sent"
-    client = route.target_client_object
-    base_url = str(getattr(client, "base_url", "") or "")
-    payload = copy.deepcopy(messages)
-    compat = _strict_import("Anthropic-compatible endpoint test", "agent.auxiliary_client",
-                            "_is_anthropic_compat_endpoint", so=so)
-    if compat(route.target_request_provider or "auto", base_url):
-        payload = _strict_import("image-block conversion", "agent.auxiliary_client",
-                                 "_convert_openai_images_to_anthropic", so=so)(payload)
-    wire = route.target_api_mode
-    if wire == "chat_completions":
-        prepare = _strict_import("Chat Completions message preparation", "agent.auxiliary_wire",
-                                 "prepare_chat_messages", so=so)
-        return prepare(client, {"model": route.target_model, "messages": payload})["messages"]
-    adapter = getattr(getattr(client, "chat", None), "completions", None)
-
-    def attribute(name: str, what: str) -> Any:
-        if not hasattr(adapter, name):
-            raise ExpansionError(f"the host's {what} ({type(adapter).__name__}.{name}) cannot be read, so {so}")
-        return getattr(adapter, name)
-    if wire == "anthropic_messages":
-        build = _strict_import("Anthropic request builder", "agent.anthropic_adapter", "build_anthropic_kwargs", so=so)
-        built = build(model=route.target_model, messages=payload, tools=None, max_tokens=None, reasoning_config=None,
-                      is_oauth=attribute("_is_oauth", "Anthropic adapter's OAuth mode"),
-                      base_url=attribute("_base_url", "Anthropic adapter's endpoint"))
-        return {"system": built.get("system"), "messages": built.get("messages")}
-    if wire == "codex_responses":
-        # It returns (the Responses kwargs, the model, the timeout) (1405, 1556, used at 1571).
-        build = attribute("_build_responses_kwargs", "Codex adapter's request builder")
-        built, _model, _timeout = build({"model": route.target_model, "messages": payload})
-        return {"instructions": built.get("instructions"), "input": built.get("input")}
-    raise ExpansionError(f"the host routes the query's model {route.describe()} through a {route.target_client}, "
-                         f"a wire the plugin has not established; {so}")
-
-
-_TEXT_KEYS = ("text", "content", "output", "instructions", "system")
-_IMAGE_TYPES = ("image", "image_url", "input_image")
-
-
-def _arguments(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except ValueError:
-            return value
-    return value
-
-
-def _payload_facts(payload: Any) -> tuple[set, int, list]:
-    """Every text value in the payload (under a text-bearing key), the number of image parts,
-    and every tool call's arguments (Chat Completions and Codex parsed from their JSON,
-    Anthropic as its input). A tool call's arguments are never read as texts."""
-    texts: set = set()
-    images = 0
-    calls: list = []
-
-    def walk(value: Any) -> None:
-        nonlocal images
-        if isinstance(value, dict):
-            kind = value.get("type")
-            if kind in _IMAGE_TYPES:
-                images += 1
-            if kind == "tool_use":
-                calls.append(value.get("input"))
-            elif kind == "function_call":
-                calls.append(_arguments(value.get("arguments")))
-            elif isinstance(value.get("function"), dict) and "arguments" in value["function"]:
-                calls.append(_arguments(value["function"].get("arguments")))
-            for key, item in value.items():
-                if kind == "tool_use" and key == "input":
-                    continue
-                if key in _TEXT_KEYS and isinstance(item, str):
-                    texts.add(item)
-                elif key != "function":
-                    walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-    walk(payload)
-    return texts, images, calls
-
-
-def _message_texts(message: dict) -> list[str]:
-    content = message.get("content")
-    if isinstance(content, str):
-        return [content]
-    return [part["text"] for part in (content if isinstance(content, list) else [])
-            if isinstance(part, dict) and isinstance(part.get("text"), str)]
-
-
-def _wire_check(route: Any, messages: list[dict], sent: list[_Sent]) -> None:
-    """Every record the host's converter would not give the model as the query gives it
-    (OD-G, as ruled on #83): anything the query gives its model that the wire would not
-    deliver refuses the query, naming the record and what would be lost: a stored text, a
-    stored tool call's arguments, an image, the query's label, or a part the projection adds
-    beside the stored content (readable reasoning, the fill note, a malformed-arguments part,
-    an image placeholder). There is no accepted loss to state.
-
-    The check: a text reaches the model when a text value of the converted payload equals it
-    (the Anthropic converter never joins two texts into one, anthropic_message_convert.py
-    ``_concat_content``; the Chat Completions transport touches no content; the Codex converter
-    makes each part its own item part); a tool call when a call in the payload carries its
-    arguments; blank texts are not checked (the converters give their own stand-ins for them).
-    Its limit: equality over all of the payload's texts, not at a position, so a text that
-    also stands unchanged in another record passes."""
-    payload = _payload_for_wire(route, messages)
-    texts, images, calls = _payload_facts(payload)
-    refused: list[str] = []
-    for entry in sent:
-        added = set(entry.added)
-        lost = []
-        for index, text in enumerate(_message_texts(entry.message)):
-            if not text.strip() or text in texts:
-                continue
-            if text == entry.label:
-                lost.append("the query's label")
-            elif text in added:
-                lost.append(f"the query's part {index + 1} ({text.split(']', 1)[0]}])")
-            else:
-                lost.append(f"stored text part {index + 1}")
-        for position, call in enumerate(entry.message.get("tool_calls") or []):
-            function = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else {}
-            stored_arguments = function.get("arguments")
-            arguments = _arguments(stored_arguments)
-            if isinstance(stored_arguments, str) and arguments is stored_arguments:
-                continue  # not valid JSON: the stored string is given in a labelled part, checked above
-            if arguments not in calls:
-                lost.append(f"tool call {position + 1} ({function.get('name') or '?'})")
-        if lost:
-            refused.append(f"{entry.record}: {', '.join(lost)}")
-    given = sum(image_count(message) for message in messages)
-    if images < given:
-        refused.append(f"{images} of the {given} images given")
-    if refused:
-        raise ExpansionError(
-            f"the host's converter for {route.describe()} ({route.target_api_mode}) would not give the query's model "
-            f"these records as the query gives them: {' | '.join(refused)}; it cannot be shown that the model "
-            f"receives them, so nothing was sent: ask over other handles")
-
-
-def _svg_images(messages: list[dict]) -> int:
-    return sum(1 for message in messages for part in (content_parts(message.get("content")) or [])
-               if is_image_part(part) and image_media_type(part) == "image/svg+xml")
-
-
-# --- The route's facts (OD-F) ------------------------------------------------------------
+# --- The route's legs (#83 plan §3) ---------------------------------------------------------
 
 @dataclass
 class _RouteFacts:
     """Facts of the route in use, each read from the host function that decides it."""
 
     pool: Optional[str]                  # ``_recoverable_pool_provider``: the pool the host rotates, if any
-    refresh: Optional[str]               # the OAuth provider the host refreshes on a 401 here, if any
+    refresh: Optional[str]               # the provider the host's OAuth refresh rung refreshes, if it can apply
     nous: bool                           # the host's Nous rungs apply to this client
-    same_label_fallbacks: int            # ``fallback_providers`` entries under the route's own label
-    fallbacks: int                       # every ``fallback_providers`` entry
+    fallbacks: list                      # every ``fallback_providers`` entry, as the host reads the chain
+    wires: dict                          # wire -> why a leg of the host can send the call on it
+    refusals: list                       # the legs whose wire cannot be known before the call
+
+
+def _relay_refusal() -> Optional[str]:
+    """Whether a managed NeMo Relay would carry this call, decided by the host's own state in
+    the host's order (agent/relay_llm.py ``_ManagedAttempt.resolve`` 58-71,
+    ``_current_session_id`` 175-178; agent/relay_runtime.py ``resolve_execution_context``
+    1208-1232), without its one impure branch (``ensure_session``, 1231), which it names instead.
+    Also, whether this tool call itself runs as a managed Relay callback: its thread is then set
+    by the native package and not established, and the query reads the host's stop by this
+    thread's interrupt bit (ruling OD-2b)."""
+    so = "whether a managed NeMo Relay carries this call is not known; nothing was sent"
+    depth = _strict_import("managed Relay callback depth", "agent.relay_runtime", "_MANAGED_CALLBACK_DEPTH", so=so)
+    if depth.get() > 0:
+        return ("this tool call runs as a callback of a managed NeMo Relay, on a thread the plugin cannot establish, "
+                "so whether the host asked it to stop cannot be read; nothing was sent")
+    active_turn = _strict_import("Relay turn", "agent.relay_runtime", "active_turn", so=so)
+    turn = active_turn()
+    session = turn.lease.session_id if turn is not None else None
+    if not session:
+        return None
+    if not _strict_import("Relay instrumentation", "agent.relay_runtime", "relay_instrumentation_enabled", so=so)():
+        return None
+    carried = ("a managed NeMo Relay would carry this call: it can rewrite the request, so what the model receives "
+               "cannot be shown; nothing was sent")
+    turn = active_turn(session)
+    host = turn.lease.live_runtime() if turn is not None else None
+    if host is not None:
+        return carried if host.managed_execution_enabled() else None
+    runtime = _strict_import("Relay runtime", "agent.relay_runtime", "get_runtime", so=so)(create=False)
+    if runtime is None or not runtime.managed_execution_enabled():
+        return None
+    return carried
 
 
 def _route_facts(route: Any) -> _RouteFacts:
-    """Read from the host's own functions (agent/auxiliary_client.py at Hermes 375930d089):
-    ``_recoverable_pool_provider`` (3667-3700), the refresh-host table and ``_provider_for_host``
-    (3637-3653), the Nous test of its recovery ladder (7782-7783), and the main fallback chain
-    as ``_try_main_fallback_chain`` reads it (4468-4471)."""
-    so = "what the host can do on this route without recording it is not known; nothing was sent"
+    """Every leg the host can answer this call on, from the host's own functions
+    (agent/auxiliary_client.py at Hermes 375930d089, #83 plan §3.1): the transient re-sends and
+    the parameter rungs keep the client; the Nous rungs (the client's host is Nous, 7782-7783)
+    rebuild a plain Chat Completions client (5808-5844); the OAuth refresh rung
+    (``_auth_refresh_provider_for_route`` on the client's endpoint and effective provider, not on
+    a Nous client, 7586-7589, and a provider ``_CREDENTIAL_REFRESHERS`` can refresh, 3874-3887)
+    resolves that provider's own client; the pool rotation (``_recoverable_pool_provider``,
+    7610-7617) rebuilds through the auto route, whose step 2 can pick a ``fallback_providers``
+    entry with no record (``_retry_same_provider_sync`` writes none, 3786-3792); the provider
+    fallback walks ``get_fallback_chain(load_config_readonly())`` (4468-4471) and skips no entry
+    under the route's own provider (7721, backend_identity.py 77-118), recording each as
+    ``_fallback_provider_from_label`` of its provider and ``_normalize_resolved_model`` of its
+    model (7746, 4512). ``route_info`` is written at 7349 and 7746 only."""
+    so = "which legs the host can answer this call on is not known; nothing was sent"
+
+    def host(name: str, what: str, module: str = "agent.auxiliary_client") -> Any:
+        return _strict_import(what, module, name, so=so)
     client = route.target_client_object
     base_url = str(getattr(client, "base_url", "") or "")
-    pool = _strict_import("credential-pool provider test", "agent.auxiliary_client", "_recoverable_pool_provider",
-                          so=so)("auto", client, main_runtime=route.main_runtime())
-    provider_for_host = _strict_import("host-to-provider lookup", "agent.auxiliary_client", "_provider_for_host", so=so)
-    refresh_hosts = _strict_import("credential-refresh hosts", "agent.auxiliary_client",
-                                   "_AUTH_REFRESH_PROVIDER_BY_HOST", so=so)
-    host_matches = _strict_import("endpoint host test", "utils", "base_url_host_matches", so=so)
-    load_config = _strict_import("configuration reader", "hermes_cli.config", "load_config_readonly", so=so)
-    chain = _strict_import("fallback chain", "hermes_cli.fallback_config", "get_fallback_chain", so=so)(load_config())
+    wires: dict = {route.target_api_mode: f"the route's own client ({route.target_client})"}
+    refusals: list[str] = []
+    nous = bool(host("base_url_host_matches", "endpoint host test", "utils")(base_url, "inference-api.nousresearch.com"))
+    if nous:
+        wires.setdefault("chat_completions", "the host's Nous refresh rebuilds a plain Chat Completions client "
+                                             "(agent/auxiliary_client.py _refresh_nous_auxiliary_client)")
+    effective = host("_effective_provider_for_client", "effective-provider reader")(client, "")
+    refresh = host("_auth_refresh_provider_for_route", "credential-refresh provider")("auto", base_url, effective)
+    refreshers = host("_CREDENTIAL_REFRESHERS", "credential refreshers")
+    if not refresh or refresh == "auto" or nous or refresh not in refreshers:
+        refresh = None
+    elif refresh not in _REFRESH_WIRES:
+        refusals.append(f"after an authentication error the host can refresh {refresh} and retry on that provider's "
+                        f"own client, a wire the plugin has not established")
+    else:
+        for wire in _REFRESH_WIRES[refresh]:
+            wires.setdefault(wire, f"the host's OAuth refresh of {refresh} after an authentication error retries on "
+                                   f"{refresh}'s own client")
+    pool = host("_recoverable_pool_provider", "credential-pool provider test")("auto", client,
+                                                                             main_runtime=route.main_runtime())
+    chain = host("get_fallback_chain", "fallback chain", "hermes_cli.fallback_config")(
+        host("load_config_readonly", "configuration reader", "hermes_cli.config")())
     entries = [entry for entry in (chain or []) if isinstance(entry, dict)]
-    return _RouteFacts(
-        pool=str(pool) if pool else None,
-        refresh=provider_for_host(base_url, refresh_hosts),
-        nous=(route.target_request_provider == "nous"
-              or bool(host_matches(base_url, "inference-api.nousresearch.com"))),
-        same_label_fallbacks=sum(1 for entry in entries
-                                 if str(entry.get("provider") or "").strip().lower() == route.target_provider),
-        fallbacks=len(entries),
-    )
+    label_of = host("_fallback_provider_from_label", "route label")
+    provider_of = host("_normalize_aux_provider", "provider normalisation")
+    model_of = host("_normalize_resolved_model", "model normalisation")
+    for index, entry in enumerate(entries):
+        provider = str(entry.get("provider") or "").strip()
+        label = str(label_of(provider) or "").strip()
+        if not provider or label.lower() in ("", "auto") or label.lower() != route.target_provider:
+            continue
+        normalised = provider_of(provider)
+        model = str(model_of(str(entry.get("model") or "").strip(), normalised) or "").strip()
+        if normalised == "moa" or model == route.target_model:
+            refusals.append(f"fallback_providers[{index}] ({provider}, {entry.get('model')}) would answer this call "
+                            f"with this route's own record, on a wire that cannot be known before the call")
+    if pool and entries:
+        named = ", ".join(f"fallback_providers[{i}] ({e.get('provider')}, {e.get('model')})"
+                          for i, e in enumerate(entries))
+        refusals.append(f"after a credential error the host can rotate the {pool} credential pool and retry through "
+                        f"its automatic route, which can answer from {named} with no record, on a wire that cannot be "
+                        f"known before the call (ruling OD-2a)")
+    relay = _relay_refusal()
+    if relay:
+        refusals.append(relay)
+    return _RouteFacts(pool=str(pool) if pool else None, refresh=refresh, nous=nous, fallbacks=entries, wires=wires,
+                       refusals=refusals)
 
 
 def _route_unverifiable(facts: _RouteFacts) -> list[str]:
-    """What the host can change about who answers without a new route record, on this route
-    only (Hermes 375930d089: ``route_info`` is written at agent/auxiliary_client.py 7349 and
-    7746 and nowhere else)."""
-    said = []
+    """What the host can change about the request or its credential without a new route record,
+    on this route only (#83 plan §3.2), each clause on the host's own gate."""
+    said = ["after a connection error, a timeout or a server error the host can re-send the request on the same "
+            "route, and where the provider rejects a parameter it can re-send without the temperature, the "
+            "reasoning setting or the output cap, with no new record"]
     if facts.pool:
         said.append(f"after a rate limit, a payment or an authentication error the host can retry once more after "
                     f"rotating the {facts.pool} credential pool, with no new record: which credential answered is "
                     f"not recorded")
     if facts.refresh:
-        said.append(f"after an authentication error the host can refresh the {facts.refresh} credential and retry "
-                    f"with the pool's first available key and endpoint, with no new record")
-    if facts.same_label_fallbacks:
-        said.append(f"{facts.same_label_fallbacks} configured fallback_providers entr(y/ies) name this route's own "
-                    f"provider: after a timeout, rate limit or connection error the host can send the request there "
-                    f"with that entry's own key and endpoint, and if it names the same model its record reads as "
-                    f"this route")
+        said.append(f"after an authentication error the host can refresh the {facts.refresh} credential and retry on "
+                    f"{facts.refresh}'s own endpoint and key, with no new record")
     if facts.nous:
-        said.append("on a model-not-found or credential error the host's Nous rungs can swap the model without a "
-                    "new record")
-    said.append("a managed NeMo Relay, where one is active, can rewrite the request, the model included; the "
-                "plugin cannot see whether one is")
+        said.append("on a model-not-found error the host's Nous rungs can swap the model without a new record")
+    said.append("no managed NeMo Relay carries this call (checked before the call from the host's own state)")
     return said
 
 
@@ -613,8 +427,10 @@ def _recovery(exc: BaseException, facts: _RouteFacts, timeout: float) -> str:
         said.append(f"it re-sent the request to the same provider up to {retries} time(s) (auxiliary.transient_"
                     f"retries), each read allowed {timeout:g} s")
     payment, rate, auth = test("_is_payment_error"), test("_is_rate_limit_error"), test("_is_auth_error")
-    if facts.fallbacks and (payment or rate or test("_is_timeout_error") or test("_is_connection_error")):
-        said.append(f"it may have tried the {facts.fallbacks} configured fallback_providers entr(y/ies), each "
+    # An automatic route walks the fallback chain on every reason of ``_FALLBACK_REASONS``,
+    # authentication and payment included (7386-7395, 7683-7692).
+    if facts.fallbacks and (payment or rate or auth or test("_is_timeout_error") or test("_is_connection_error")):
+        said.append(f"it may have tried the {len(facts.fallbacks)} configured fallback_providers entr(y/ies), each "
                     f"refused by the route check if it answered, and hides one that failed from auxiliary calls in "
                     f"this process for 60 or 600 s")
     if facts.pool and (payment or rate or auth):
@@ -626,6 +442,352 @@ def _recovery(exc: BaseException, facts: _RouteFacts, timeout: float) -> str:
         said.append(f"it may have refreshed the {facts.refresh} credential and dropped this home's cached auxiliary "
                     f"clients")
     return "; ".join(said) if said else "none of its rungs that change state applies to this error"
+
+
+# --- The input ---------------------------------------------------------------------------
+
+def _call_results(found: _Read, chunk: str, record: str, position: int) -> str:
+    """Where the result of one call lies, by the store's pairing (``pairing.py``)."""
+    pairing = found.pairing[chunk]
+    place = (record, position)
+    if place in pairing.group:
+        results = ", ".join(pairing.group[place].results)
+        return f"one of results {results} (the store cannot tell which result answers which call)"
+    if place in pairing.answer:
+        return f"result {pairing.answer[place]}"
+    return "no result on the record"
+
+
+def _assistant_label(found: _Read, chunk: str, record: str, raw: dict, joined: dict) -> str:
+    calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
+    if not calls:
+        return _label_message(record)
+    named = []
+    for position, call in enumerate(calls):
+        function = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else {}
+        where = _call_results(found, chunk, record, position)
+        result = found.pairing[chunk].answer.get((record, position))
+        if result in joined:
+            where += f" (stored as {joined[result]} text parts, given joined by newlines)"
+        named.append(f"{found.calls.get(record, {}).get(position)} {function.get('name') or '?'} → {where}")
+    return f"[message {record} · tool calls: {'; '.join(named)}]"
+
+
+@dataclass
+class _Sent:
+    """What the query gives its model of one record: the message, the label the query put on
+    it (None on a tool result), and what it gave of the record (``Given``)."""
+
+    record: str
+    message: dict
+    label: Optional[str]
+    given: Given
+
+
+def _joined_tool_content(message: dict) -> Optional[int]:
+    """A tool result stored as a list of text parts only (a real host shape: an engine result
+    without images, agent/vision_message_prep.py 213-215 at Hermes 375930d089), which the host's
+    Anthropic converter sends as the list's escaped JSON (anthropic_message_convert.py 450): the
+    query gives it as its texts joined by newlines, and the calling agent message's label says so
+    (ruling OD-3b). Returns the number of parts joined, or None where the content is not that."""
+    content = message.get("content")
+    if (message.get("role") != "tool" or not isinstance(content, list) or not content
+            or not all(isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)
+                       for p in content)):
+        return None
+    message["content"] = "\n".join(part["text"] for part in content)
+    return len(content)
+
+
+def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
+           joins: bool) -> tuple[list[dict], list[_Sent]]:
+    """The call's messages, and per record what was given. ``stats["images_not_sent"]`` counts
+    the stored image parts (by structure) the model is not given (it does not read images, or
+    that is not known); ``stats["carriers"]`` counts the records whose stored replay carrier is
+    not sent; ``stats["reasoning_parts"]`` the readable reasoning texts given as parts of their
+    own. ``joins``: a wire whose converter serialises a text-only list tool content is among the
+    wires checked (ruling OD-3b). A record the query cannot give as it is refuses the query,
+    naming the record."""
+    sent: list[_Sent] = []
+    for key in ("images_not_sent", "carriers", "reasoning_parts"):
+        stats.setdefault(key, 0)
+    problems: list[str] = []
+    for chunk in found.chunks:
+        labels: dict[int, str] = {}
+        strays: dict[int, list[str]] = {}
+        joined: dict[str, int] = {}
+        last_labelled = None
+        rows = found.records[chunk]
+        base = len(sent)
+        for index, (record, raw) in enumerate(rows):
+            given = Given(values=[], added=[], problems=[])
+            message = strict_message(raw, record, wire, withheld, given)
+            found.given[record] = given
+            stats["reasoning_parts"] += given.reasoning_parts
+            problems.extend(f"{record}: {problem}" for problem in given.problems)
+            stored = sum(1 for part in (content_parts(raw.get("content")) or []) if is_image_part(part))
+            stats["images_not_sent"] += max(0, stored - image_count(message))
+            if any(isinstance(raw.get(key), list) and raw[key] for key in TEXT_REPLAY_CARRIERS):
+                stats["carriers"] += 1
+            if raw.get("role") == "tool":
+                # No label of the plugin's inside a tool result (OD-D): its call's label names it;
+                # a result the store pairs with no call is named in the label before it.
+                if joins:
+                    parts = _joined_tool_content(message)
+                    if parts is not None:
+                        joined[record] = parts
+                if record in found.pairing[chunk].stray and last_labelled is not None:
+                    strays.setdefault(last_labelled, []).append(record)
+            else:
+                last_labelled = index
+                labels[index] = ""
+            sent.append(_Sent(record, message, None, given))
+        for index in labels:
+            record, raw = rows[index]
+            label = (_assistant_label(found, chunk, record, raw, joined) if raw.get("role") == "assistant"
+                     else _label_message(record))
+            if index in strays:
+                named = ", ".join(f"{r}{f' (stored as {joined[r]} text parts, given joined by newlines)' if r in joined else ''}"
+                                  for r in strays[index])
+                label = f"{label[:-1]} · the tool result(s) {named} after it belong to no call on the record]"
+            if index == 0:
+                under = found.under.get(chunk)
+                label = f"[chunk {chunk}{' — behind summary ' + under if under else ''}] {label}"
+            entry = sent[base + index]
+            _add_parts(entry.message, [{"type": "text", "text": label}], [])
+            entry.label = label
+    if problems:
+        raise ExpansionError(
+            f"the query gives its model each message's stored content and calls, never the host's replay carrier, and "
+            f"these records cannot be given as they are: {' | '.join(problems)}; nothing was sent: ask over other "
+            f"handles")
+    closing = f"Question:\n{question}\n\n{CONTRACT}"
+    messages = ([{"role": "system", "content": INSTRUCTIONS}] + [entry.message for entry in sent]
+                + [{"role": "user", "content": closing}])
+    return messages, sent
+
+
+# --- The wire check (OD-G; positional, #83 plan §4.2) -------------------------------------
+
+def _payload_for_wire(route: Any, messages: list[dict], wire: str) -> Any:
+    """What the host's own converter for ``wire`` makes of the call's messages, run on a deep
+    copy (the converter can write into dicts it is handed), in the host's order
+    (agent/auxiliary_client.py at Hermes 375930d089): ``_convert_openai_images_to_anthropic``
+    where ``_is_anthropic_compat_endpoint`` holds for the request's provider and the client's
+    endpoint (7367-7370); then per wire:
+
+    - Chat Completions: ``prepare_chat_messages`` (agent/auxiliary_wire.py) on the route's own
+      client, or, for another leg's plain client, the transport it calls
+      (``ChatCompletionsTransport.convert_messages``);
+    - Anthropic Messages: ``build_anthropic_kwargs`` with the adapter's own ``_base_url`` and
+      ``_is_oauth`` (1750-1757; anthropic_adapter.py:614-640), its ``system`` and ``messages``;
+      for another leg, the refreshed provider's, an OAuth credential. On an OAuth credential the
+      builder renames every replayed tool call by the host's own ``_oauth_wire_namer`` over the
+      request's tools (``mcp__<name>``, two aliases; anthropic_adapter.py 510-541, 544-580,
+      638-640): that is the wire's rendering of the call's name, the one the agent's own context
+      has on that route, not a loss (the orchestrator's ruling on #83, 2026-09-28), and the check
+      compares a given call's name after that function;
+    - Codex Responses: the route's own adapter's ``_build_responses_kwargs`` (1405-1556), the
+      ``instructions`` and ``input`` it returns; for another leg it cannot be run without
+      building a client, and the query refuses.
+
+    Returns the converted payload and the host's function that renames a tool call's name on
+    this wire (``None`` where no converter renames: only the Anthropic builder on an OAuth
+    credential does). Every host function is taken strictly: one that cannot be read refuses the
+    query."""
+    so = "what the model would receive cannot be shown; nothing was sent"
+    client = route.target_client_object
+    base_url = str(getattr(client, "base_url", "") or "")
+    own = wire == route.target_api_mode
+    payload = copy.deepcopy(messages)
+    compat = _strict_import("Anthropic-compatible endpoint test", "agent.auxiliary_client",
+                            "_is_anthropic_compat_endpoint", so=so)
+    if compat(route.target_request_provider or "auto", base_url):
+        payload = _strict_import("image-block conversion", "agent.auxiliary_client",
+                                 "_convert_openai_images_to_anthropic", so=so)(payload)
+    if wire == "chat_completions":
+        if own:
+            prepare = _strict_import("Chat Completions message preparation", "agent.auxiliary_wire",
+                                     "prepare_chat_messages", so=so)
+            return prepare(client, {"model": route.target_model, "messages": payload})["messages"], None
+        transport = _strict_import("Chat Completions transport", "agent.transports.chat_completions",
+                                   "ChatCompletionsTransport", so=so)
+        return transport().convert_messages(payload, model=route.target_model, base_url=base_url), None
+    adapter = getattr(getattr(client, "chat", None), "completions", None)
+
+    def attribute(name: str, what: str) -> Any:
+        if not hasattr(adapter, name):
+            raise ExpansionError(f"the host's {what} ({type(adapter).__name__}.{name}) cannot be read, so {so}")
+        return getattr(adapter, name)
+    if wire == "anthropic_messages":
+        build = _strict_import("Anthropic request builder", "agent.anthropic_adapter", "build_anthropic_kwargs", so=so)
+        if own:
+            is_oauth = attribute("_is_oauth", "Anthropic adapter's OAuth mode")
+            endpoint = attribute("_base_url", "Anthropic adapter's endpoint")
+        else:
+            is_oauth, endpoint = True, base_url
+        built = build(model=route.target_model, messages=payload, tools=None, max_tokens=None, reasoning_config=None,
+                      is_oauth=is_oauth, base_url=endpoint)
+        # The builder's own renamer over the request's tools, none (anthropic_adapter.py 638).
+        namer = (_strict_import("OAuth tool-name renamer", "agent.anthropic_adapter", "_oauth_wire_namer", so=so)([])
+                 if is_oauth else None)
+        return {"system": built.get("system"), "messages": built.get("messages")}, namer
+    if wire == "codex_responses" and own:
+        # It returns (the Responses kwargs, the model, the timeout) (1405, 1556, used at 1571).
+        build = attribute("_build_responses_kwargs", "Codex adapter's request builder")
+        built, _model, _timeout = build({"model": route.target_model, "messages": payload})
+        return {"instructions": built.get("instructions"), "input": built.get("input")}, None
+    raise ExpansionError(f"a leg of the host's recovery for {route.describe()} can send this call on the {wire} wire, "
+                         f"whose converter the query cannot run before the call without building a client; {so}")
+
+
+def _arguments(value: Any) -> tuple[Any, bool]:
+    """A tool call's arguments as the model reads them: parsed where they are JSON text."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value), True
+        except ValueError:
+            return value, False
+    return value, True
+
+
+# A token is (kind, value, who, what): kind "text", "image" or "call"; a call's value is
+# (name, arguments, whether the arguments are compared).
+
+def _given_tokens(messages: list[dict], sent: list[_Sent]) -> list[tuple]:
+    """Every text, image and tool call the query gives its model, in document order."""
+    tokens: list[tuple] = []
+    for index, message in enumerate(messages):
+        if index == 0:
+            who, entry = "the query's instructions", None
+        elif index == len(messages) - 1:
+            who, entry = "the question", None
+        else:
+            entry = sent[index - 1]
+            who = entry.record
+        content = message.get("content")
+        parts = [{"type": "text", "text": content}] if isinstance(content, str) else (
+            content if isinstance(content, list) else [])
+        for number, part in enumerate(parts, start=1):
+            if is_image_part(part):
+                tokens.append(("image", None, who, f"image part {number}"))
+            elif isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
+                text = part["text"]
+                what = ("the query's label" if entry is not None and text == entry.label
+                        else f"the query's part {number} ({text.split(']', 1)[0]}])"
+                        if entry is not None and text in entry.given.added
+                        else "its text" if entry is None else f"stored text part {number}")
+                tokens.append(("text", text, who, what))
+        for number, call in enumerate(message.get("tool_calls") or [], start=1):
+            function = call["function"]
+            arguments, compared = _arguments(function["arguments"])
+            tokens.append(("call", (function["name"], arguments, compared), who,
+                           f"tool call {number} ({function['name']})"))
+    return tokens
+
+
+def _payload_tokens(wire: str, payload: Any) -> list[tuple]:
+    """Every text, image and tool call of a converted payload, in document order, read at the
+    key paths each converter writes (#83 plan §4.2; Hermes 375930d089)."""
+    tokens: list[tuple] = []
+
+    def parts(value: Any, text_types: tuple, image_types: tuple) -> None:
+        if isinstance(value, str):
+            tokens.append(("text", value))
+            return
+        for part in value if isinstance(value, list) else []:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind in image_types:
+                tokens.append(("image", None))
+            elif kind in text_types and isinstance(part.get("text"), str):
+                tokens.append(("text", part["text"]))
+            elif kind == "tool_use":
+                tokens.append(("call", (part.get("name"), part.get("input"))))
+            elif kind == "tool_result":
+                parts(part.get("content"), text_types, image_types)
+    if wire == "chat_completions":
+        for message in payload if isinstance(payload, list) else []:
+            if not isinstance(message, dict):
+                continue
+            parts(message.get("content"), ("text", "input_text", "output_text"), ("image_url", "input_image", "image"))
+            for call in message.get("tool_calls") or [] if isinstance(message.get("tool_calls"), list) else []:
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict):
+                    tokens.append(("call", (function.get("name"), _arguments(function.get("arguments"))[0])))
+    elif wire == "anthropic_messages":
+        parts(payload.get("system"), ("text",), ())
+        for message in payload.get("messages") or []:
+            parts(message.get("content") if isinstance(message, dict) else None, ("text",), ("image",))
+    elif wire == "codex_responses":
+        parts(payload.get("instructions"), (), ())
+        for item in payload.get("input") or []:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type")
+            if kind == "function_call":
+                tokens.append(("call", (item.get("name"), _arguments(item.get("arguments"))[0])))
+            elif kind == "function_call_output":
+                parts(item.get("output"), ("input_text", "output_text", "text"), ("input_image",))
+            elif "role" in item:
+                parts(item.get("content"), ("input_text", "output_text", "text"), ("input_image",))
+    return tokens
+
+
+def _matches(given: tuple, token: tuple, namer: Any = None) -> bool:
+    if given[0] != token[0]:
+        return False
+    if given[0] == "text":
+        return given[1] == token[1]
+    if given[0] == "image":
+        return True
+    name, arguments, compared = given[1]
+    return token[1][0] == (namer(name) if namer else name) and (not compared or token[1][1] == arguments)
+
+
+def _wire_check(route: Any, messages: list[dict], sent: list[_Sent], wires: dict) -> dict:
+    """Every value the query gives its model must reach it on every wire a leg of the host can
+    send the call on, in its place (OD-G as ruled; #83 plan §3-§4): the given texts, images and
+    tool calls, in document order, must stand in the converter's output in that order. The
+    per-record labels are unique by construction, so a value lost on the wire cannot be matched by
+    an equal value of another record. Blank texts are not checked (the converters give their own
+    stand-ins for them); what a converter adds is not loss. A tool call's name is compared after
+    the host's own renamer where the wire renames (the Anthropic builder on an OAuth credential;
+    the orchestrator's ruling on #83, 2026-09-28). Returns, per wire, what the header says of such
+    a renaming."""
+    given = _given_tokens(messages, sent)
+    refused: list[str] = []
+    said: dict = {}
+    for wire in wires:
+        converted, namer = _payload_for_wire(route, messages, wire)
+        payload = _payload_tokens(wire, converted)
+        if namer is not None and any(token[0] == "call" for token in given):
+            said[wire] = ("the host sends the tool calls on this wire under its OAuth wire names (mcp__<name>, two "
+                          "aliases), as the agent's own context on this route has them; the labels name each call "
+                          "as stored")
+        position, lost = 0, {}
+        for token in given:
+            found = next((index for index in range(position, len(payload))
+                          if _matches(token, payload[index], namer)), None)
+            if found is None:
+                lost.setdefault(token[2], []).append(token[3])
+            else:
+                position = found + 1
+        if lost:
+            refused.append(f"{wire} ({wires[wire]}): " + " | ".join(f"{who}: {', '.join(what)}"
+                                                                  for who, what in lost.items()))
+    if refused:
+        raise ExpansionError(
+            f"the host's converter would not give the query's model these records as the query gives them, in their "
+            f"place, on a wire the host can send this call on: {' || '.join(refused)}; it cannot be shown that the "
+            f"model receives them, so nothing was sent: ask over other handles")
+    return said
+
+
+def _svg_images(messages: list[dict]) -> int:
+    return sum(1 for message in messages for part in (content_parts(message.get("content")) or [])
+               if is_image_part(part) and image_media_type(part) == "image/svg+xml")
 
 
 # --- The reply and the check --------------------------------------------------------------
@@ -655,15 +817,21 @@ def parse_reply(content: str) -> tuple[str, list]:
     return report, excerpts
 
 
-def contained(text: str, stored: str) -> bool:
-    """Grep's rule (``grep.check_term``, ``RecordStore.grep_hits``): exact containment in the
-    stored text, whose strings U+001F separates; a text holding NUL or U+001F never matches."""
-    return bool(text) and "\x00" not in text and GREP_SEPARATOR not in text and text in stored
+def _found_in(text: str, given: Given) -> list[dict]:
+    """Where an excerpt stands among what the query gave of one record: the first path, in the
+    order the query gave them, of each standing it is found in (#83 plan §2.2; a rule about
+    what is said, so that the annotation is bounded)."""
+    first: dict[str, list] = {}
+    for path, value, standing in given.values:
+        if standing not in first and text in value:
+            first[standing] = list(path)
+    return [{"path": first[standing], "is": standing} for standing in _STANDINGS if standing in first]
 
 
 def check_excerpts(found: _Read, excerpts: list) -> list[Item]:
-    """Each excerpt, in the order given: checked (its text and the record it was found in) or
-    withheld (named, its length, why; never its text)."""
+    """Each excerpt, in the order given: checked (its text, the record it was found in and the
+    field it was found in, with that field's standing) or withheld (named, its length, why; never
+    its text)."""
     chunk_of = {record: chunk for chunk in found.chunks for record, _raw in found.records[chunk]}
     items: list[Item] = []
     for number, excerpt in enumerate(excerpts, start=1):
@@ -677,10 +845,6 @@ def check_excerpts(found: _Read, excerpts: list) -> list[Item]:
             continue
         if not text:
             items.append(withhold("empty"))
-            continue
-        if "\x00" in text or GREP_SEPARATOR in text:
-            items.append(withhold("holds NUL or U+001F: the stored text writes a NUL as U+001F and separates "
-                                  "its strings by it, so such a text is never checked"))
             continue
         note = None
         if handle[0] == MESSAGE:
@@ -710,11 +874,12 @@ def check_excerpts(found: _Read, excerpts: list) -> list[Item]:
                 items.append(withhold(f"the call's result ({', '.join(outside)}) lies outside the chunks this query "
                                       f"read, so it was not searched"))
                 continue
-        where = next((record for record in candidates if contained(text, found.texts.get(record, ""))), None)
+        where, fields = next(((record, _found_in(text, found.given[record])) for record in candidates
+                              if _found_in(text, found.given[record])), (None, []))
         if where is None:
-            items.append(withhold(f"not found verbatim in {', '.join(candidates)}"))
+            items.append(withhold(f"not found verbatim in what the query gave of {', '.join(candidates)}"))
             continue
-        said = {"excerpt": number, "handle": handle, "in": where}
+        said = {"excerpt": number, "handle": handle, "in": where, "from": fields}
         if note:
             said["note"] = note
         items.append(Item(said, plugin={"text": text}))
@@ -738,6 +903,13 @@ def _token_state(store_uuid: str, report_id: str, target: Target) -> dict:
             "r": expansion.target_identity(target)}
 
 
+def _longest_path(found: _Read) -> list:
+    """The longest path a given value of the records read carries (the ``from`` annotation's
+    worst case, #83 plan §2.2)."""
+    return max((list(path) for given in found.given.values() for path, _t, _s in given.values),
+               key=lambda path: len(json.dumps(path, ensure_ascii=False)), default=["message", "content"])
+
+
 def _precheck_room(read: _Read, header: dict, limit: Any, largest_group: int) -> None:
     """A page must hold the header at its longest and one piece of one character of the
     largest annotation set, before the model is paid (B14)."""
@@ -748,16 +920,16 @@ def _precheck_room(read: _Read, header: dict, limit: Any, largest_group: int) ->
     groups = ", ".join(["m" + "x" * 8] * max(1, largest_group))
     # Every "why" check_excerpts can write, each at its longest; the longest one is measured
     # (a withheld item has no text to cut into pieces).
-    whys = ["not the handle of a tool call (t…) or a message (m…)",
-            "holds NUL or U+001F: the stored text writes a NUL as U+001F and separates its strings by it, so "
-            "such a text is never checked",
+    whys = ["not the handle of a tool call (t…) or a message (m…)", "empty",
             "not a message this query read", "not a tool call this query read",
             "the call has no result on the active record",
             f"the call's result ({groups}) lies outside the chunks this query read, so it was not searched",
-            f"not found verbatim in {groups}"]
+            f"not found verbatim in what the query gave of {groups}"]
+    path = _longest_path(read)
     candidates = [
         Item({"part": "report"}, plugin={"text": "x"}),
-        Item({"excerpt": 9_999_999, "handle": "t" + "x" * 8, "in": "m" + "x" * 8, "note": _GROUP_NOTE},
+        Item({"excerpt": 9_999_999, "handle": "t" + "x" * 8, "in": "m" + "x" * 8,
+              "from": [{"path": path, "is": standing} for standing in _STANDINGS], "note": _GROUP_NOTE},
              plugin={"text": "x"}),
         Item({"withheld": 9_999_999, "handle": "t" + "x" * 8, "length": 9_999_999,
               "why": max(whys, key=lambda why: len(json.dumps(why)))}),
@@ -830,16 +1002,22 @@ def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
 def _ask(engine: Any, session: str, handles: list, question: str, *, messages: Any) -> Any:
     limit = expansion.host_page_limits(engine, TOOL, messages)
     timeout, timeout_source = _call_timeout()
-    # The host sets the interrupt bit on this worker's thread when it stops waiting for the
-    # tool call (its tool timeout, or a stop); the check reads that thread by its id, because
-    # the host also calls it from the daemon thread that runs the provider call
-    # (agent/auxiliary_client.py 476; tools/interrupt.py 61-71).
+    # The host sets the interrupt bit on this worker's thread when it asks the tool call to stop
+    # (its tool timeout, after it stopped waiting; an interrupt, while it still waits its 3 s
+    # grace), and clears the bit of every tracked worker at the end of the turn
+    # (agent/tool_executor.py 870-976, agent/interrupt_control.py 199, 221-248 at Hermes
+    # 375930d089). The check reads this thread by its id, because the host also calls it from the
+    # daemon thread that runs the provider call (agent/auxiliary_client.py 476; tools/interrupt.py
+    # 61-71), and it latches: once seen, the stop holds for the rest of this call.
     worker = threading.get_ident()
     thread_interrupted = _strict_import("tool interrupt bit", "tools.interrupt", "is_thread_interrupted",
                                         so="whether the host asked this call to stop cannot be known; nothing was sent")
+    stopped = threading.Event()
 
     def interrupted() -> bool:
-        return bool(thread_interrupted(worker))
+        if not stopped.is_set() and thread_interrupted(worker):
+            stopped.set()
+        return stopped.is_set()
     cancellation = "the host's stop of this call cannot be acted on; nothing was sent"
     protection = _strict_import("auxiliary cancellation", "agent.auxiliary_client", "aux_interrupt_protection",
                                 so=cancellation)
@@ -854,19 +1032,28 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
         if settings is None:
             raise ExpansionError(f"the query's model is the summariser's, and there is none: {why_not}")
         route = settings.route
-        if route.target_api_mode not in _IF_THE_HOST_STOPS_WAITING:
+        if route.target_api_mode not in _ESTABLISHED_WIRES:
             # OD-I: on a wire the plugin has not established, what the model receives cannot be
             # shown, for text as for images.
             raise ExpansionError(f"the host routes the query's model {route.describe()} through a "
                                  f"{route.target_client}, a wire the plugin has not established: it cannot be shown "
                                  f"what the model receives; nothing was sent")
+        route_facts = _route_facts(route)
+        if route_facts.refusals:
+            raise ExpansionError(f"the host can answer this call on a leg whose wire the query cannot know before the "
+                                 f"call: {' | '.join(route_facts.refusals)}; nothing was sent")
+        unestablished = [wire for wire in route_facts.wires if wire not in _ESTABLISHED_WIRES]
+        if unestablished:
+            raise ExpansionError(f"a leg of the host's recovery can send this call on a wire the plugin has not "
+                                 f"established ({', '.join(unestablished)}); nothing was sent")
         facts = lookup_model(route.target_model, route.target_provider)
         wire = wire_facts(route.target_provider, route.target_model, route.target_base_url, route.target_api_mode,
                           reads_images=facts.reads_images if facts is not None else None, strict=True)
         found = _resolve(records, session, handles)
         withheld: dict[str, int] = {}
         stats: dict = {}
-        messages_in, sent = _input(found, question, wire, withheld, stats)
+        messages_in, sent = _input(found, question, wire, withheld, stats,
+                                   joins="anthropic_messages" in route_facts.wires)
 
         # The checks before the call; each a refusal, no call made.
         images = sum(image_count(m) for m in messages_in[1:-1])
@@ -899,8 +1086,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
         else:
             window = (f"not known: the model table has no window for {route.target_provider}/{route.target_model}, "
                       f"so the input was not checked against it; the provider's refusal is the only bound")
-        _wire_check(route, messages_in, sent)
-        route_facts = _route_facts(route)
+        renamed = _wire_check(route, messages_in, sent, route_facts.wires)
         endpoint = endpoint_key(route.target_provider, route.target_base_url)
         limiter, slots = limiter_for(endpoint), engine._calls_in_flight_limit(endpoint)
         header = {
@@ -914,18 +1100,27 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
             "input": {"est_tokens": estimate.tokens, "uncounted_images": estimate.uncounted_images,
                       "images_not_sent": stats["images_not_sent"],
                       "encrypted_withheld": dict(sorted(withheld.items())), "window": window,
-                      "wire": (f"the host's converter for this route ({route.target_api_mode}) was run over the "
-                               f"query's messages before the call, and gives the model every text, tool call and "
-                               f"image the query gives it"),
-                      "text_carriers": _CARRIERS_SAID[route.target_api_mode](stats["carriers"])},
+                      "wire": [f"{name}: {why}; the host's converter for it was run over the query's messages before "
+                               f"the call and gives the model every text, tool call and image the query gives it, in "
+                               f"its place{'; ' + renamed[name] if name in renamed else ''}"
+                               for name, why in route_facts.wires.items()],
+                      "text_carriers": (f"{stats['carriers']} record(s) carry a host replay carrier of their text; the "
+                                        f"query does not send it: the stored content is what the model reads, each "
+                                        f"carrier block checked against it, given as readable reasoning or as its "
+                                        f"JSON, or withheld as encrypted and counted"),
+                      "reasoning_given_apart": (f"{stats['reasoning_parts']} readable reasoning text(s) held in another "
+                                                f"field than the message's reasoning, and not contained in it "
+                                                f"verbatim, were given as labelled parts of their own; one that "
+                                                f"differs from the reasoning only in its separators is given twice")},
             "call": {
                 "timeout": timeout,
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",
-                "if_the_host_stops_waiting": _IF_THE_HOST_STOPS_WAITING[route.target_api_mode],
-                "entered_the_host": "once; the query retries no failure (the host's own recovery runs inside the "
-                                    "call)",
+                "if_the_host_asks_this_call_to_stop": _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[route.target_api_mode],
+                "entered_the_host": ("once; the query retries no failure (the host's own recovery runs inside the "
+                                     "call, and one entry can send several provider requests: its re-sends, rungs "
+                                     "and fallbacks)"),
                 "limiter": (f"one of the {slots} slots of the plugin's limiter for {endpoint}, held until the query "
-                            f"stops waiting; a request the host keeps running after that is not counted in it"),
+                            f"stops reading; a request the host keeps running after that is not counted in it"),
             },
             "route_unverifiable": _route_unverifiable(route_facts),
             "excerpts_checked": 0,
@@ -951,9 +1146,9 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
                 content, finish_reason = _call_once(messages_in, settings, timeout, usage)
             report, excerpts = parse_reply(content)
         except cancelled:
-            logger.warning("LCM's query was stopped: the host stopped waiting for lcm_query on %s", route.describe())
-            raise ExpansionError(f"the host stopped waiting for this tool call (its interrupt bit is set): "
-                                 f"{_IF_THE_HOST_STOPS_WAITING[route.target_api_mode]}") from None
+            logger.warning("LCM's query was stopped: the host asked lcm_query on %s to stop", route.describe())
+            raise ExpansionError("the host asked this tool call to stop (its interrupt bit is set); the model's reply "
+                                 "was not read, and nothing was stored") from None
         except SummaryFailure as failure:
             text = settings.scrub(str(failure))
             logger.warning("LCM's query got no answer: %s", text)
@@ -994,20 +1189,28 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
     page_one = page_one_as(report_id)
     if json.loads(page_one).get("next_page") is None:
         return page_one
-    if interrupted():
-        raise ExpansionError("the host asked this tool call to stop (its interrupt bit is set) before its result, "
-                             "which needs more than one page, was stored; nothing was stored or shown")
+    unstored = ("the host asked this tool call to stop (its interrupt bit is set) before its result, which needs more "
+                "than one page, could be stored; nothing was stored or shown")
     for _ in range(_HANDLE_DRAWS):
         try:
             stored = records.write_query_report(report_id=report_id, session=session, question=question, body=body,
                                                 model=route.target_model, provider=route.provenance_provider(),
-                                                effort=settings.effort, finish_reason=finish_reason)
+                                                effort=settings.effort, finish_reason=finish_reason,
+                                                fence=interrupted)
+        except WriteFenced:
+            logger.warning("LCM's query result was not stored: the host asked lcm_query to stop meanwhile")
+            raise ExpansionError(unstored) from None
         except Exception as exc:  # a lock past the busy timeout, a store closed meanwhile
-            try:
-                records.event("query_report_unstored", session=session,
-                              detail={"chars": len(body), "error": f"{type(exc).__name__}: {exc}"})
-            except Exception:
-                pass
+            if interrupted():
+                # The host asked this call to stop: its failure is logged, not stored.
+                logger.warning("LCM could not store a query result of %d characters (%s: %s), and the host asked "
+                               "lcm_query to stop meanwhile", len(body), type(exc).__name__, exc)
+            else:
+                try:
+                    records.event("query_report_unstored", session=session,
+                                  detail={"chars": len(body), "error": f"{type(exc).__name__}: {exc}"})
+                except Exception:
+                    pass
             raise ExpansionError(f"the query's result of {len(body)} characters needs more than one page and could "
                                  f"not be stored for its pages ({type(exc).__name__}: {exc}); nothing of it is "
                                  f"shown") from None
