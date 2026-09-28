@@ -73,8 +73,11 @@ is an interim value (#22): the host's configured sequential tool timeout, else 4
 str, "text": str}, ...]}``; nothing is stripped or recognised by pattern (#9 Decided). Each
 excerpt is accepted only where its text is contained in one of the strings the query gave its
 model from the record its handle names (for a tool call, from the results its label names, the
-one pairing fact the query asserts), and the result names the field it was found in and that
-field's standing. One that fails is named and withheld, without its text.
+one pairing fact the query asserts), and the result names each field it was found in and that
+field's standing: a claim about origin that only the host's writer of the field settles
+(``query_input._standing``, the one place; M-STANDING): content, result, call and reasoning where
+a writer settles it; sidecar, carrier and stored where none does, the value given all the same and
+the NOTE saying what each is. One that fails is named and withheld, without its text.
 
 **Pages.** The result is served by the one page mechanism (``expansion.serve_page``). A result
 that needs a second page is stored once (``query_reports``) before page 1 is returned, in a
@@ -112,9 +115,12 @@ from .model_table import lookup as lookup_model
 from .record_store import HANDLE_RE, ReadFenced, RecordStore, WriteFenced
 from .query_input import (
     GIVEN_CALL,
+    GIVEN_CARRIER,
     GIVEN_CONTENT,
     GIVEN_REASONING,
     GIVEN_RESULT,
+    GIVEN_SIDECAR,
+    GIVEN_STORED,
     LABEL,
     RENDERED,
     REPLACED,
@@ -333,18 +339,30 @@ INSTRUCTIONS = (
 CONTRACT = ('Reply with one JSON object and nothing else: {"report": "…", "excerpts": [{"handle": "…", '
             '"text": "…"}]}')
 NOTE = ("The report is a model's description of what it read, hedged: orientation, not something to "
-        "act on. Each excerpt was found verbatim in the record named by \"in\", in the field named by \"from\". "
-        "One from a message's content, a tool result, or another stored value of the record that is neither "
-        "reasoning nor a call (its path names it) may be relied on as an expansion may; one from a "
-        "tool call's name or arguments (cited by the handle of the message that made the call) is what was "
-        "called; one found only in reasoning is the model's "
-        "account of its thinking, and nothing rests on it. A withheld excerpt did not pass the check its "
-        "\"why\" names and is not shown.")
+        "act on. Each excerpt was found verbatim in the record named by \"in\", in the fields named by \"from\" "
+        "(each a path as lcm_expand shows the record, with that field's standing \"is\", a claim about where the "
+        "text came from that only the host's writer of the field settles). content: the message's content as the "
+        "host stored it; result: a tool result; either may be relied on as an expansion may. call: a tool call's "
+        "name or arguments (cited by the handle of the message that made the call), what was called. reasoning: "
+        "the model's account of its thinking, on which nothing rests. sidecar: the text the host sent to the model "
+        "in place of the message's stored content (api_content), which the host writes on an agent message from "
+        "the model's reasoning when its reply had no content (then the same excerpt is also found in reasoning), "
+        "from a hook's output, or as its own interruption placeholder, and on a user message from the user's text "
+        "with what the host injected; which of these, the host does not record. carrier: a text stored in the "
+        "host's replay carrier of the message, or in its stash of a tool result's blocks, which the message's "
+        "content does not hold: the model's output as the provider handed it over before the host stripped it, so "
+        "reasoning the host stripped, a tool call the model wrote as text, or content the host altered "
+        "(whitespace, a masked secret, a non-text part); which, the host does not record. stored: a value under "
+        "a key no producer of this host writes on this message's role. An excerpt found only in sidecar, carrier "
+        "or stored fields is verbatim what the store holds there, and nothing rests on it as the message's "
+        "content. A withheld excerpt did not pass the check its \"why\" names and is not shown.")
 _GROUP_NOTE = "one of the results of calls the store cannot pair"
 _NOT_A_CALL_GIVEN = "not a tool call the query gave as a call"
 _NO_RESULT_NAMED = ("the query named no result for this call (see its label); a tool result is cited by its own "
                     "handle (m…)")
-_STANDINGS = (GIVEN_CONTENT, GIVEN_RESULT, GIVEN_CALL, GIVEN_REASONING)
+# The order ``from`` lists a found excerpt's standings in (M-STANDING): the four a writer settles, then the three
+# no writer settles.
+_STANDINGS = (GIVEN_CONTENT, GIVEN_RESULT, GIVEN_CALL, GIVEN_REASONING, GIVEN_SIDECAR, GIVEN_CARRIER, GIVEN_STORED)
 
 
 def _label_message(record: str) -> str:
@@ -986,8 +1004,15 @@ def _labels(found: _Read, joined: dict, pairs: dict, as_calls: set, as_user: set
             if not (isinstance(role, str) and role in ("user", "assistant")):
                 label = f"{label[:-1]} · stored {stored_role_text(raw)}; given here as a user message]"
             content = raw.get("content")
-            # Wherever the stored content carries something and is not the sidecar's text (a stored
-            # list, images included, is never equal to the text the host sends).
+            # A message whose content the host's sidecar replaces says so (M-STANDING): where the stored
+            # content carries nothing, the host sent the sidecar in place of an empty content (an agent
+            # message's promoted reasoning, a hook's output or the host's interruption placeholder,
+            # turn_final_response.py 225/276-277/346, turn_api_call.py 200-203, conversation_loop.py 348
+            # at Hermes 375930d089); where it carries something and is not the sidecar's text (a stored
+            # list, images included, is never equal to the text the host sends), the stored content is
+            # not given here.
+            if sidecar_sent(raw) and carries_nothing(content):
+                label = f"{label[:-1]} · the host sent the text of api_content in place of its empty content, which is given]"
             if sidecar_sent(raw) and not carries_nothing(content) and content != raw.get("api_content"):
                 given_or_blank = "which is given" if not carries_nothing(raw.get("api_content")) else "which is blank"
                 label = (f"{label[:-1]} · its stored content is not given here: the host sent the text of api_content "

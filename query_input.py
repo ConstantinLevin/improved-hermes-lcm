@@ -54,8 +54,27 @@ from .message_content import content_parts, image_media_type, is_image_part, rea
 from .summariser_input import (HostUnavailable, WireFacts, _image_placeholder, _row_before_fill, _strict_import,
                                host_fill_text)
 
-# The standing of a value the query gives: what the agent may rest on an excerpt found in it.
+# The standing of a value the query gives: a claim about its origin, which only the writer of the
+# field settles (PLAN-19 re-derived, M-STANDING; Hermes 375930d089). Four the host's writers
+# settle: the message's content as stored (chat_completion_helpers.py 1608-1619, 1675; the codex
+# projector verbatim, codex_event_projector.py 69-78), a tool result, a call's name and arguments
+# (1622-1663; a carrier's tool_use/toolUse block, transports/anthropic.py 305-306, bedrock_adapter.py
+# toolUse), the readable reasoning (agent_runtime_helpers.py 1362-1395; a carrier's thinking,
+# reasoningText and summary texts; a codex message item the host stamps as a commentary or analysis
+# phase, codex_responses_adapter.py 1125-1139). Three no writer settles, each named by what it is
+# and given all the same: ``sidecar``, the text the host sends in place of a message's stored
+# content (``api_content``; on an agent message from the model's reasoning when its reply had no
+# content, turn_final_response.py 225/276-277/346, from a hook's output, 346, or its own
+# interruption placeholder, turn_api_call.py 200-203, conversation_loop.py 348; on a user message
+# the user's text with what the host injected, turn_context.py 888-932, session_persistence.py
+# 192-231, conversation_loop.py 355, turn_facade_lease.py 343; no producer recorded); ``carrier``,
+# a text a replay carrier or the stash holds that the content does not (the carriers keep the
+# provider's text before the host's strip, redaction and flattening, whose classes the carrier does
+# not record, transports/anthropic.py 65-106, bedrock_adapter.py 879-899, codex_responses_adapter.py
+# 1124-1139; the stash has no writer at this host); ``stored``, a value under a key no producer of
+# this host writes on the message's role.
 GIVEN_CONTENT, GIVEN_RESULT, GIVEN_CALL, GIVEN_REASONING = "content", "result", "call", "reasoning"
+GIVEN_SIDECAR, GIVEN_CARRIER, GIVEN_STORED = "sidecar", "carrier", "stored"
 
 # Where a part of the message's content came from, recorded where the part is made: a stored
 # content part kept as it is; a stored content member, or the stored content itself, given as its
@@ -477,6 +496,9 @@ def _images_in(value: Any, path: tuple) -> int:
 CONTENT, CALL, CALL_VALUE, REASONING, CARRIER, STORED_KIND = (
     "content", "call", "call value", "reasoning", "carrier", "stored")
 _CALL_DICT, _FUNCTION, _TOOL_USE = "call dict", "function", "tool use"
+# The sidecar's kind: the ``api_content`` string the host sends in place of the content (``sidecar_sent``),
+# walked as content (its members, an envelope) but standing as the sidecar (M-STANDING).
+SIDECAR = "sidecar"
 
 # The host's opaque vocabulary (PLAN-83g §3.1; Hermes 375930d089, reader RH1 Q2): the keys under
 # which the host keeps replay material no other model can read, at its own places —
@@ -516,13 +538,24 @@ def _withholds(key: Any, kind: str) -> bool:
 
 
 def _standing(kind: str, base: str) -> str:
-    """M2: a value's standing is its kind's (PLAN-83g §3.2): reasoning → reasoning; a call or its
-    values → call; content, a carrier's value of no other kind and an unknown key → the record's
-    own (content, or result on a tool row; ruling OD-F2)."""
+    """M2, re-derived (M-STANDING): the one place a value's standing is decided, from the kind of the
+    field it stands in, so that an origin no writer settles is never told as content or result. A
+    value of a record whose base is ``stored`` (a field stored on a role whose domain lacks it, M4)
+    is stored whatever its kind; reasoning → reasoning; a call or its values → call; a carrier's
+    value → carrier; an unknown key or a non-string sidecar → stored; the sidecar → sidecar;
+    content → the record's own (content, or result on a tool row; ruling OD-F2)."""
+    if base == GIVEN_STORED:
+        return GIVEN_STORED
     if kind == REASONING:
         return GIVEN_REASONING
     if kind in _CALL_KINDS:
         return GIVEN_CALL
+    if kind == CARRIER:
+        return GIVEN_CARRIER
+    if kind == STORED_KIND:
+        return GIVEN_STORED
+    if kind == SIDECAR:
+        return GIVEN_SIDECAR
     return base
 
 
@@ -817,31 +850,40 @@ class _Record:
             return False
         return self.not_text(value, path, REASONING)
 
-    def carried(self, value: Any, path: tuple) -> bool:
-        """A replay carrier's message text stands in what is given of the message (its content, or its
-        main readable reasoning: a Codex commentary item's text is the host's ``reasoning``,
-        codex_responses_adapter.py 1125-1134), or it is given as a labelled part of its own, on every
-        message and every wire (M-CARRIER, PLAN-19 §2.5): the query sends no carrier (ruling OD-G), so
-        the part is what carries a text only the carrier holds; standing the record's."""
+    def carried(self, value: Any, path: tuple, standing: Optional[str] = None) -> bool:
+        """A replay carrier's message text stands in what is given of the message (its content, the
+        sidecar the host sends in its place, or its main readable reasoning), or it is given as a
+        labelled part of its own, on every message and every wire (M-CARRIER, PLAN-19 §2.5): the query
+        sends no carrier (ruling OD-G), so the part is what carries a text only the carrier holds. Its
+        standing (M-STANDING): ``carrier``, since the carriers keep the provider's text before the
+        host's strip, redaction and flattening and record which class a residue is nowhere; a codex
+        message item the host stamped as a commentary or analysis phase passes ``reasoning``, the
+        writer's own stamp (``_codex_message_items``); on a foreign record ``stored``."""
         if not isinstance(value, str):
             return self.not_text(value, path, CARRIER)
         if any(value in text for text in self.content_texts):
             return False
-        self.given.values.append((path, value, self.standing))
+        standing = _standing(REASONING if standing == GIVEN_REASONING else CARRIER, self.standing)
+        self.given.values.append((path, value, standing))
         where = ", where the host writes no such field," if self.foreign else ""
+        holds = ("which its content and its readable reasoning do not hold" if standing == GIVEN_REASONING
+                 else "which its content does not hold")
+        stamped = (" (a message item the host stamped as a commentary or analysis phase, which it routes to the "
+                   "reasoning channel, codex_responses_adapter.py 1125-1134)" if standing == GIVEN_REASONING else "")
         self.after.append(self.given.made({"type": "text", "text": (
-            f"[A text stored in {_path_text(path)} on this message{where} which its content does not hold:]\n{value}")},
+            f"[A text stored in {_path_text(path)} on this message{where} {holds}{stamped}:]\n{value}")},
             FIELD, path))
         return False
 
     def stashed(self, value: Any, path: tuple) -> bool:
-        """The host's Anthropic converter replaces a tool result's content with its stash, so a
-        stashed text the content lacks is given as its own part, with the record's standing (a result
-        on a stored tool result; the stored role's elsewhere, PLAN-19 §2.8)."""
+        """The host's Anthropic converter sends a tool result's stash after its content, so a stashed
+        text the content lacks is given as its own part. Its standing (M-STANDING): ``carrier``, since
+        no writer of this host fills the stash (anthropic_message_convert.py 431-450 reads it; nothing
+        writes it at 375930d089); on a foreign record ``stored``."""
         if not isinstance(value, str):
-            return self.not_text(value, path, CARRIER, self.standing)
+            return self.not_text(value, path, CARRIER)
         if not any(value in text for text in self.content_texts):
-            self.given.values.append((path, value, self.standing))
+            self.given.values.append((path, value, _standing(CARRIER, self.standing)))
             what = (f"[A text stored in {_path_text(path)} on this message, where the host writes no such field, which "
                     f"its content does not hold:]" if self.foreign else
                     f"[A text block stored in {_path_text(path)}, which the stored content does not hold:]")
@@ -870,10 +912,13 @@ class _Record:
                                  f"JSON by the query:]", values, path, _TOOL_USE)
         return self.keys(block, table, path, CALL, skip=("name", "input")) or withheld
 
-    def keys(self, container: dict, table: dict, path: tuple, other: str, *, skip: tuple = ()) -> bool:
+    def keys(self, container: dict, table: dict, path: tuple, other: str, *, skip: tuple = (),
+             text_standing: Optional[str] = None) -> bool:
         """Every key of an entry or block by its class; ``other``: the kind (table T) of every key
-        the table does not name. Returns whether opaque material that carries something was
-        withheld, at this level or inside a key given as JSON."""
+        the table does not name; ``text_standing``: the standing a message text of this container
+        passes to ``carried`` where the writer stamped it (a codex commentary item). Returns whether
+        opaque material that carries something was withheld, at this level or inside a key given
+        as JSON."""
         withheld = False
         for key, value in container.items():
             if key in skip or carries_nothing(value):
@@ -887,7 +932,7 @@ class _Record:
             elif cls == READABLE:
                 withheld = self.readable_text(value, where) or withheld
             elif cls == MESSAGE_TEXT:
-                withheld = self.carried(value, where) or withheld
+                withheld = self.carried(value, where, text_standing) or withheld
             elif cls == STASH_TEXT:
                 withheld = self.stashed(value, where) or withheld
             elif cls == CITED:
@@ -1072,10 +1117,22 @@ def _bedrock_blocks(value: Any, face: _Record) -> None:
             face.count(field_)
 
 
+def _codex_commentary(item: dict) -> bool:
+    """The host's own predicate on a codex message item's ``phase`` stamp (codex_responses_adapter.py
+    1125-1134 at Hermes 375930d089: ``normalized_phase = _lower_or_none(getattr(item, "phase", None))``,
+    ``is_commentary_phase = normalized_phase in {"commentary", "analysis"}``; the stamp written at
+    1136-1139 is that normalised value), mirrored line for line with the host's own normaliser: a
+    commentary or analysis item's text the host routes to its reasoning channel."""
+    lower_or_none = _strict_import("codex phase normaliser", "agent.codex_responses_adapter", "_lower_or_none")
+    return lower_or_none(item.get("phase")) in {"commentary", "analysis"}
+
+
 def _codex_message_items(value: Any, face: _Record) -> None:
     """``codex_message_items``: message items of one ``output_text`` part (T7; the host's replay
     reads only such parts, codex_responses_adapter.py 457, so an image part there was never an image
-    to any converter: ruling OD-E1); any other item or part is the carrier's (T8)."""
+    to any converter: ruling OD-E1); any other item or part is the carrier's (T8). A part's text of an
+    item the host stamped as a commentary or analysis phase has the standing reasoning, the writer's
+    own stamp (``_codex_commentary``); any other phase, absent or unknown, carrier (M-STANDING)."""
     field_ = "codex_message_items"
     for path, item in face.members(field_, value, CARRIER):
         parts = item.get("content")
@@ -1085,12 +1142,14 @@ def _codex_message_items(value: Any, face: _Record) -> None:
                                  f"query:]", item, path, CARRIER)
         else:
             withheld = face.keys(item, _CLASSES[(field_, "item")], path, CARRIER, skip=("content",))
+            text_standing = GIVEN_REASONING if _codex_commentary(item) else None
             for number, part in enumerate(parts):
                 where = path + ("content", number)
                 if carries_nothing(part):
                     continue
                 if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
-                    withheld = face.keys(part, _CLASSES[(field_, "part")], where, CARRIER) or withheld
+                    withheld = face.keys(part, _CLASSES[(field_, "part")], where, CARRIER,
+                                         text_standing=text_standing) or withheld
                 else:
                     withheld = face.json(f"[{_path_text(where)} is a part of no shape the query knows; shown as its "
                                          f"JSON by the query:]", part, where, CARRIER) or withheld
@@ -1137,8 +1196,9 @@ def _tool_calls(value: Any, face: _Record, calls_given: Optional[set] = None,
         function = call["function"]
         kept.append((index, {"id": call["id"], "type": "function",
                              "function": {"name": function["name"], "arguments": function["arguments"]}}))
-        face.given.values.append((path + ("function", "name"), function["name"], GIVEN_CALL))
-        face.given.values.append((path + ("function", "arguments"), function["arguments"], GIVEN_CALL))
+        face.given.values.append((path + ("function", "name"), function["name"], _standing(CALL_VALUE, face.standing)))
+        face.given.values.append((path + ("function", "arguments"), function["arguments"],
+                                  _standing(CALL_VALUE, face.standing)))
         withheld = False
         kind = call.get("type")
         if not carries_nothing(kind) and kind != "function":
@@ -1211,7 +1271,10 @@ def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> Non
     """A transcript field stored on a role whose domain lacks it, walked by its own walker (M4,
     ruling OD-F5): the row decides only that its outputs are given as parts, never placed on the
     wire; the first part says where it is stored."""
-    sub = _Record(face.record, face.given, face.standing, face.opaque, content_texts=face.content_texts,
+    # Every value of a foreign field stands as ``stored`` (M-STANDING): no producer of this host writes
+    # the field on this role, so no writer settles what it holds; ``_standing`` returns the base for
+    # every kind, and ``carried``, ``stashed`` and ``_readable_parts`` take it from the record.
+    sub = _Record(face.record, face.given, GIVEN_STORED, face.opaque, content_texts=face.content_texts,
                   foreign=True, role_text=face.role_text)
     path = ("message", key)
     if key in ("reasoning", "reasoning_content"):
@@ -1240,14 +1303,14 @@ def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> Non
                       _CALL_DICT if isinstance(value, dict) else CALL):
             sub.count("tool_calls")
     elif key == "api_content":
-        withheld_units = sub.not_text(value, path, CONTENT)
+        withheld_units = sub.not_text(value, path, STORED_KIND)
         if withheld_units:
             sub.count("api_content", withheld_units)      # per member of a list (ruling D-6)
     elif sub.json(f"[{_path_text(path)} as stored; shown as its JSON by the query:]", value, path, STORED_KIND):
         # tool_call_id, name: the wire's pairing key and the host's bookkeeping, stored where the host
         # writes neither; given as they are stored, what the vocabulary names inside withheld and counted.
         sub.count(key)
-    readable = _readable_parts(sub.readable, face.given, shown)
+    readable = _readable_parts(sub.readable, face.given, shown, GIVEN_STORED)
     if not (readable or sub.after):
         return
     label = face.given.made({"type": "text", "text": (f"[{_path_text(path)} is stored on this message "
@@ -1256,16 +1319,19 @@ def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> Non
     face.after.extend([label] + readable + sub.after)
 
 
-def _readable_parts(readable: list, given: Given, shown: list) -> list[dict]:
+def _readable_parts(readable: list, given: Given, shown: list, base: str = GIVEN_CONTENT) -> list[dict]:
     """Readable reasoning texts as labelled parts, each unless it carries nothing or is contained
-    verbatim in the message's reasoning or an earlier such part (exact containment, ruling OD-4a)."""
+    verbatim in the message's reasoning or an earlier such part (exact containment, ruling OD-4a).
+    Their standing is ``_standing``'s for the reasoning kind over the record's ``base``: reasoning on
+    the record's own reasoning fields and carriers (their writers settle it); stored on a foreign
+    record, where the host writes no such field (M-STANDING)."""
     parts = []
     for path, text in readable:
         if carries_nothing(text) or any(text in earlier for earlier in shown):
             continue
         parts.append(given.made({"type": "text", "text": f"[Readable reasoning stored in {_path_text(path)}:]\n{text}"},
                                 FIELD, path))
-        given.values.append((path, text, GIVEN_REASONING))
+        given.values.append((path, text, _standing(REASONING, base)))
         given.reasoning_parts += 1
         shown.append(text)
     return parts
@@ -1297,7 +1363,11 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     message: dict = {"role": role}
     face = _Record(record, given, standing, {}, compares_calls="tool_calls" in domain, role_text=stored_role_text(raw))
     if "content" in row:
-        message["content"] = _canonical_content(row["content"], standing, given, face)
+        # Where the host sends the sidecar in place of the content (``_row_before_fill`` put it under
+        # ``content``, as ``lcm_expand`` shows it), what stands there is the sidecar, whose origin no
+        # writer of the host records: standing ``sidecar`` (M-STANDING), at the path expansion shows.
+        message["content"] = _canonical_content(row["content"], _standing(SIDECAR if sidecar_sent(raw) else CONTENT,
+                                                                          standing), given, face)
     if face.withheld_content:
         face.count("content", face.withheld_content)
     if sidecar_sent(raw) and not carries_nothing(raw.get("content")):
@@ -1320,8 +1390,10 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     if "tool_call_id" in domain and "tool_call_id" in raw and not as_user:
         message["tool_call_id"] = raw["tool_call_id"]      # the wire's pairing key, as stored
     main = readable_reasoning(raw) if "reasoning" in domain else None
+    # What the model reads as the message's content: the content, a tool result, or the sidecar the
+    # host sends in the content's place; a carrier text contained in it is not given again.
     face.content_texts = [text for _path, text, standing_ in given.values
-                          if standing_ in (GIVEN_CONTENT, GIVEN_RESULT)] + ([main] if main else [])
+                          if standing_ in (GIVEN_CONTENT, GIVEN_RESULT, GIVEN_SIDECAR)] + ([main] if main else [])
     if "reasoning" in domain:
         for key in ("reasoning", "reasoning_content"):
             value = raw.get(key)
@@ -1340,8 +1412,9 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
         face.stash_site = stash_sent(row.get("content"))
         _anthropic_blocks(STASH, raw.get(STASH), face)
     if "api_content" in domain and not sidecar_sent(raw):
-        # T13: a sidecar that is not a string is content, given as its JSON.
-        withheld_units = face.not_text(raw.get("api_content"), ("message", "api_content"), CONTENT)
+        # T13: a sidecar that is not a string is given as its JSON; no writer of this host puts one
+        # there (every sidecar writer writes a string), so it stands as ``stored`` (M-STANDING).
+        withheld_units = face.not_text(raw.get("api_content"), ("message", "api_content"), STORED_KIND)
         if withheld_units:
             face.count("api_content", withheld_units)      # per member of a list (ruling D-6)
     # Readable reasoning: the message's reasoning first, then every other readable text not
@@ -1353,7 +1426,7 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
         before.append(given.made({"type": "text", "text": f"[Readable reasoning stored in "
                                                           f"{_path_text(('message', field_))}:]\n{main}"}, FIELD,
                                  ("message", field_)))
-        given.values.append((("lcm", "reasoning"), main, GIVEN_REASONING))
+        given.values.append((("lcm", "reasoning"), main, _standing(REASONING, standing)))
         shown.append(main)
     before.extend(_readable_parts(face.readable, given, shown))
     known = _host_metadata_keys()
