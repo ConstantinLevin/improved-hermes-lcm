@@ -1,35 +1,41 @@
-"""What the query gives its model of one stored record (#19, PR #83; PLAN-83d, PLAN-83e).
+"""What the query gives its model of one stored record (#19, PR #83; PLAN-83d, PLAN-83e, PLAN-83g).
 
 The query's description states a rule to the agent: each stored message is given as its role,
-content, tool calls and readable reasoning; any stored value that cannot be given in that shape
-is given as labelled JSON in its place; an image the model is not given is replaced by a
-placeholder that says so; signed or encrypted material is withheld and counted; the host's
-bookkeeping keys and a replay carrier's metadata are not given; null, empty and blank values
-carry nothing and are not given as parts. Each clause is made true here by one mechanism every
-record passes through, never by a sentence applied at each site by hand:
+content, tool calls and readable reasoning; any other stored value is given as labelled JSON; an
+image the model is not given as an image is replaced by a placeholder that says so, or named where
+it stood and counted; material the host treats as opaque replay is withheld and counted wherever it
+is stored outside the transcript's own content, tool-call arguments and tool results; the host's
+bookkeeping keys and a replay carrier's metadata are not given; null, empty and blank values carry
+nothing and are not given as parts. Each clause is made true here by one mechanism every record
+passes through, never by a sentence applied at each site by hand:
 
 - ``carries_nothing`` is the one test of "carries nothing", asked at every place the query
   decides whether and how to give a stored value (a key, a member of a list it walks, a key of
   an entry or block it classifies); inside a value given as JSON nothing is removed, since the
-  JSON is the stored value;
-- ``_render`` is the only place a stored value becomes labelled JSON, and it faces every
-  structural image part inside the value (PLAN-83e §3, ruling OD-E1): where it stood in the
-  stored content, which the agent's model was shown, it is lifted out and given as an image
-  under the image rules; anywhere else no converter ever read it as an image, and it is named
-  and counted, not given;
+  JSON is the stored value; a content that carries nothing is given as "" (PLAN-83g §3.6);
+- ``_render`` is the only place a stored value becomes labelled JSON, and it walks the value
+  carrying the kind of the stored field it came from (M1, PLAN-83g §3.1): the kind changes only
+  where table T says (``_step``), a value under a key of the host's opaque vocabulary is withheld
+  in every kind but the transcript's own content and a call's name and arguments, and every leaf
+  is recorded with the standing its kind gives it (M2);
+- ``_image_outcome`` is the one function that decides every image the query meets (M3): given
+  as an image, replaced by a placeholder, named where it stood (a field the query does not give as
+  an image, or a shape it cannot give as one), each marker or label written from that decision;
 - one key classification (``_CLASSES``), read by one walker per stored field, faces every key of
   every entry of every reasoning field and every block of every replay carrier, and of every
-  stored tool call (PLAN-83e §4);
+  stored tool call (PLAN-83e §4); a field stored on a role whose domain lacks it is walked by its
+  own walker, its outputs given as parts (M4);
 - the message sent is built positively from the stored role's domain (``strict_message``,
   PLAN-83e §5): role, content, tool calls on an agent message, the call id on a tool result, and
   ``reasoning_content`` as the host's echo policy leaves it; every other stored key is given as
   a part, withheld and counted, or the host's bookkeeping;
 - every part of the content is recorded with its origin where it is made (``Given``), so that
   what a label says about a part comes from how the part was made, and the query asserts that
-  every part has one (``unrecorded_parts``).
+  every part has one (``unrecorded_parts``); a stored place and a stored role are each written one
+  way (``_path_text``, ``stored_role_text``, M5).
 
-Host facts at Hermes 375930d089 (PR #83, PLAN-83e §0: readers H1-H4 and the host's own lines
-named where they are used).
+Host facts at Hermes 375930d089 (PR #83, PLAN-83e §0, PLAN-83g §0: the readers and the host's own
+lines named where they are used).
 """
 
 from __future__ import annotations
@@ -180,7 +186,8 @@ def blank(value: Any) -> bool:
 
 
 def _path_text(path: tuple) -> str:
-    """A stored path as the query's labels write it: ``reasoning_details[0].summary``."""
+    """A stored path as the query's labels write it, the one renderer of a stored place (M5):
+    ``reasoning_details[0].summary``."""
     steps = list(path[1:] if path and path[0] == "message" else path)
     text = ""
     for step in steps:
@@ -188,22 +195,35 @@ def _path_text(path: tuple) -> str:
     return text or "message"
 
 
+def stored_role_text(raw: dict) -> str:
+    """The stored role as every label of the query says it, one way (M5, PLAN-83g §3.5):
+    ``with role "system"``, ``with role null``, or ``with no role`` where the key is absent."""
+    if "role" not in raw:
+        return "with no role"
+    return f"with role {json.dumps(raw['role'], ensure_ascii=False)}"
+
+
 @dataclass
 class Given:
     """What the query gives of one record beside the message: every string with its path and
     standing (``values``); the record's problems that refuse the query (``problems``); the origin
     of every part of the message's content, recorded where the part is made, with the stored path
-    it came from and, for a placeholder, the origin of what it replaced (``origins``); the paths
-    of image parts no converter ever read as images, which are named and not given
-    (``images_not_given``); counts for the header."""
+    it came from and, for a placeholder, the origin of what it replaced (``origins``); the images
+    of what the record holds that are not given as images, per class (M3, PLAN-83g §3.3); counts
+    for the header."""
 
     values: list = field(default_factory=list)
     problems: list = field(default_factory=list)
     origins: dict = field(default_factory=dict)       # id(part) -> (part, origin, path, was)
-    images_not_given: list = field(default_factory=list)
+    images_replaced: int = 0                          # replaced by a placeholder that says so
+    images_elsewhere: list = field(default_factory=list)     # paths: a field the query does not give as an image
+    images_ungivable: list = field(default_factory=list)     # paths: a shape the query cannot give as an image
+    images_behind_sidecar: int = 0                    # in a stored content the host sends api_content in place of
     reasoning_parts: int = 0
     lifted: int = 0
     joined: bool = False      # the content was joined into one string by the query (``query._join``)
+    record: str = ""
+    reads_images: Optional[bool] = None
 
     def made(self, part: dict, origin: str, path: tuple = (), was: Optional[str] = None) -> dict:
         self.origins[id(part)] = (part, origin, path, was)
@@ -222,6 +242,12 @@ class Given:
         entry = self._entry(part)
         return entry[3] if entry is not None else None
 
+    @property
+    def images_not_sent(self) -> int:
+        """The four classes of M3, each image counted in exactly one (``images_not_sent_is``)."""
+        return (self.images_replaced + len(self.images_elsewhere) + len(self.images_ungivable)
+                + self.images_behind_sidecar)
+
 
 def unrecorded_parts(message: dict, given: Given) -> int:
     """How many parts of the message's content have no recorded origin (the query refuses a
@@ -231,25 +257,11 @@ def unrecorded_parts(message: dict, given: Given) -> int:
 
 
 class _Marker(str):
-    """A text the query puts inside a value given as JSON in place of an image part; not a
-    value of the record."""
+    """A text the query puts inside a value given as JSON in place of an image's payload or of a
+    withheld value; not a value of the record."""
 
 
-def _leaves(value: Any, path: tuple) -> Iterable[tuple[tuple, str]]:
-    """Every string of a value, with its path; a number or a boolean as its JSON text."""
-    if isinstance(value, _Marker):
-        return
-    if isinstance(value, str):
-        yield path, value
-    elif isinstance(value, bool) or isinstance(value, (int, float)):
-        yield path, json.dumps(value)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield from _leaves(item, path + (key,))
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            yield from _leaves(item, path + (index,))
-
+# --- M3: one image function (PLAN-83g §3.3) ---------------------------------------------------
 
 def image_part(part: Any) -> bool:
     """An image part by structure (``message_content.is_image_part``, the union of the host's
@@ -258,73 +270,259 @@ def image_part(part: Any) -> bool:
     return isinstance(part, dict) and isinstance(part.get("type"), str) and is_image_part(part)
 
 
-def _as_image(block: Any) -> Optional[dict]:
-    """The image part the wire carries for a stored image block: an ``image_url`` or
-    ``input_image`` part as stored; an Anthropic ``image`` block with a base64 source of a known
-    media type, or a URL source, as the ``image_url`` part it holds; None where the block holds
-    no image the query can give as one."""
-    if not image_part(block):
-        return None
-    if block["type"] != "image":
-        return block
-    source = block.get("source")
-    if not isinstance(source, dict):
-        return None
-    if source.get("type") == "base64" and not carries_nothing(source.get("data")) and isinstance(
-            source.get("data"), str) and isinstance(source.get("media_type"), str) and source["media_type"].strip():
-        return {"type": "image_url", "image_url": {"url": f"data:{source['media_type']};base64,{source['data']}"}}
-    if isinstance(source.get("url"), str) and source["url"].strip():
-        return {"type": "image_url", "image_url": {"url": source["url"]}}
+# The keys of an image part that make its image, per type; every other key of the part is given as
+# its JSON beside the image (``cache_control`` is the host's cache marker, bookkeeping).
+_IMAGE_KEYS = {"image_url": ("type", "image_url"), "input_image": ("type", "image_url", "detail"),
+               "image": ("type", "source")}
+
+
+def _url_of(value: Any) -> Optional[str]:
+    """An ``image_url`` value's URL: a non-blank string, or a dict with a non-blank string ``url``."""
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, dict) and isinstance(value.get("url"), str) and value["url"].strip():
+        return value["url"]
     return None
 
 
-def _give_image(block: Any, path: tuple, given: Given, origin: str, label: Optional[str] = None) -> list[dict]:
-    """An image block given as an image part (the image rules then apply to it like to every
-    image of the message), or, where it holds no image the query can give as one, a text that
-    says so; the image is then counted as not given."""
-    image = _as_image(block)
+def _as_image(block: dict) -> tuple[Optional[dict], str]:
+    """The image part the wire carries for a stored image block, or None and why the query cannot
+    give it as one. An ``image_url`` part needs an ``image_url`` that is a non-blank string or a dict
+    with a non-blank string ``url`` and is given as ``{type, image_url}`` as stored; an
+    ``input_image`` part likewise, its ``detail`` kept only as a string; an Anthropic ``image`` block
+    needs a base64 source with non-blank data and a non-blank media type (never supplied by the
+    plugin: a guess), or a non-blank URL, and is given as the ``image_url`` part it holds."""
+    kind = block["type"]
+    if kind in ("image_url", "input_image"):
+        if _url_of(block.get("image_url")) is None:
+            return None, "no url"
+        image = {"type": kind, "image_url": block["image_url"]}
+        if kind == "input_image" and isinstance(block.get("detail"), str):
+            image["detail"] = block["detail"]
+        return image, ""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return None, "no source"
+    if source.get("type") == "base64":
+        data, media = source.get("data"), source.get("media_type")
+        if isinstance(data, str) and data.strip() and isinstance(media, str) and media.strip():
+            return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}, ""
+        return None, "a base64 source without its data or its media type"
+    if isinstance(source.get("url"), str) and source["url"].strip():
+        return {"type": "image_url", "image_url": {"url": source["url"]}}, ""
+    return None, "a source of no shape the query can give"
+
+
+def _other_image_keys(block: dict) -> dict:
+    """What an image part holds beside what makes its image (and the host's cache marker)."""
+    named = _IMAGE_KEYS[block["type"]]
+    other = {key: value for key, value in block.items() if key not in named and key != "cache_control"}
+    if block["type"] == "input_image" and "detail" in block and not isinstance(block["detail"], str):
+        other["detail"] = block["detail"]
+    return other
+
+
+GIVEN_IMAGE, REPLACED_IMAGE, NOT_HERE, NOT_GIVABLE = "given", "replaced", "not here", "not givable"
+
+
+def _image_outcome(block: dict, path: tuple, image_site: bool, given: Given) -> tuple[str, Optional[dict], str]:
+    """The one decision on an image the query meets (M3): ``(outcome, part, text)``.
+
+    At a place where the query does not give an image as an image (inside a value rendered from
+    a reasoning field, a call, a carrier's other keys, a ``codex_message_items`` part, an unknown
+    key: ELSEWHERE) it is named where it stood; at an image site (a content member, an envelope
+    member, an image lifted from the stored content, a carrier's or the stash's image block) a
+    block of a shape the query cannot give is named with why; where the model does not read
+    images, or that is not known, it is replaced by the placeholder that says so; else it is given
+    as the image part the wire carries. Each image is counted in exactly one class of ``Given``;
+    ``text`` is what a marker or a note says of it."""
+    media = image_media_type(block)
+    if not image_site:
+        given.images_elsewhere.append(path)
+        return NOT_HERE, None, (f"[an image part ({media}) stored here, in a field the query does not give as an "
+                                f"image; not given as one]")
+    image, why = _as_image(block)
     if image is None:
-        given.images_not_given.append(path)
-        return [given.made({"type": "text", "text": f"[{_path_text(path)} holds an image block of a shape the query "
-                                                    f"cannot give as an image ({image_media_type(block)}); not "
-                                                    f"given]"}, FIELD, path)]
+        given.images_ungivable.append(path)
+        return NOT_GIVABLE, None, (f"[{_path_text(path)} holds an image block of a shape the query cannot give as an "
+                                   f"image ({why}); not given]")
+    if not given.reads_images:
+        given.images_replaced += 1
+        placeholder = _image_placeholder(block, given.record, _NOT_KNOWN if given.reads_images is None else _NOT_READ)
+        return REPLACED_IMAGE, placeholder, placeholder["text"]
+    given.lifted += 1
+    return GIVEN_IMAGE, image, f"[image {given.lifted} of this record, given as its own part after this one]"
+
+
+def _image_parts(block: dict, path: tuple, given: Given, origin: str, kind: str, standing: str,
+                 label: Optional[str] = None) -> tuple[list[dict], bool]:
+    """An image block at an image site given as parts, in its place: the image (after ``label``,
+    written only where the image is given), and its other stored keys as their JSON beside it; a
+    placeholder, or a note that says why it is not given. Returns the parts and whether anything
+    under a key of the opaque vocabulary was withheld from the other keys."""
+    outcome, part, text = _image_outcome(block, path, True, given)
+    if outcome == REPLACED_IMAGE:
+        return [given.made(part, REPLACED, path, origin)], False
+    if outcome == NOT_GIVABLE:
+        return [given.made({"type": "text", "text": text}, NOTE, path)], False
     parts = [given.made({"type": "text", "text": label}, FIELD, path)] if label else []
-    return parts + [given.made(image if image is not block else block, origin, path)]
+    parts.append(given.made(part, origin, path))
+    other, withheld = [], False
+    rest = _other_image_keys(block)
+    if rest:
+        other, withheld = _render(f"[{_path_text(path)}: the other stored keys of this image part; shown as their JSON "
+                                  f"by the query:]", rest, path, kind, standing, given, RENDERED if origin == STORED
+                                  else FIELD)
+    return parts + other, withheld
 
 
-def _face(value: Any, path: tuple, lift: bool, given: Given, images: list) -> Any:
-    """The value with every structural image part inside it replaced by a text of the query's
-    (PLAN-83e §3): lifted (given as its own part after the JSON) or named as not given."""
+def _image_paths(value: Any, path: tuple) -> Iterable[tuple]:
+    """Every image part inside a value, at any depth, each once (an image part is not searched
+    further): the walk ``_render`` makes, with nothing given (M3, the images behind a sidecar)."""
     if image_part(value):
-        if lift:
-            given.lifted += 1
-            images.append((path, value))
-            return _Marker(f"[image {given.lifted} of this record, given as its own part after this one]")
-        given.images_not_given.append(path)
-        return _Marker(f"[an image part ({image_media_type(value)}) stored here; the agent's context never held it "
-                       f"as an image, so it is not given as one]")
-    if isinstance(value, dict):
-        return {key: _face(item, path + (key,), lift, given, images) for key, item in value.items()}
+        yield path
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _image_paths(item, path + (key,))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _image_paths(item, path + (index,))
+
+
+# --- M1: one walk carrying the kind of the stored field (PLAN-83g §3.1) --------------------------
+#
+# The kinds of a stored value: a message's content (members, an envelope, api_content, a tool
+# result's content); a tool-call dict (canonical or not, wherever stored); a call's name and
+# arguments and everything inside them; reasoning (the reasoning fields, the reasoning replay
+# carriers, a thinking block, everything under them); a text replay carrier or the stash
+# (everything under it unless a transition names another kind); an unknown top-level key. Three
+# more names mark the places where a transition of table T is taken inside one walk: a list of
+# calls, a call's ``function``, a tool_use block.
+CONTENT, CALL, CALL_VALUE, REASONING, CARRIER, STORED_KIND = (
+    "content", "call", "call value", "reasoning", "carrier", "stored")
+_CALLS, _CALL_DICT, _FUNCTION, _TOOL_USE = "calls", "call dict", "function", "tool use"
+
+# The host's opaque vocabulary (PLAN-83g §3.1; Hermes 375930d089, reader RH1 Q2): the keys under
+# which the host keeps replay material no other model can read, at its own places —
+# ``signature`` (anthropic_message_convert.py 297-298, 559, 590; bedrock_adapter.py 726-727,
+# 846-848; reasoning_summaries.py 36, 40), ``data`` (anthropic_message_convert.py 302, 559;
+# bedrock_adapter.py 755, 851), ``encrypted_content`` (codex_responses_adapter.py 787-803,
+# 1059-1067; model_metadata.py 2469-2478, 2525-2528), ``redactedContent`` (bedrock_adapter.py
+# 578-586, 849), ``redactedContentBase64`` (bedrock_adapter.py 729-733, 852); and on a tool-call
+# dict ``extra_content``, withheld whole, which holds the thought signatures
+# (chat_completion_helpers.py 1643-1662; transports/chat_completions.py 284-288;
+# gemini_native_adapter.py 305-308). The host never treats these names as opaque inside a tool
+# call's arguments or a tool's result (chat_completion_helpers.py 1641-1645: arguments kept
+# verbatim), so the transcript's own content and a call's name and arguments never withhold them
+# (ruling OD-F1).
+OPAQUE_VOCABULARY = frozenset({"signature", "data", "encrypted_content", "redactedContent", "redactedContentBase64"})
+_CALL_VOCABULARY = OPAQUE_VOCABULARY | {"extra_content"}
+_NEVER_WITHHELD = frozenset({CONTENT, CALL_VALUE})
+_CALL_KINDS = frozenset({CALL, CALL_VALUE, _CALLS, _CALL_DICT, _FUNCTION, _TOOL_USE})
+_WITHHELD = ("[withheld: opaque replay material under this key; counted in the header's encrypted_withheld]")
+
+# Table T (PLAN-83g §3.1), the transitions taken inside one walk: a member of the stored content
+# typed as one of the host's blocks (T11, ruling OD-G1) is walked by that block's row; a call
+# dict's ``function`` name and arguments are the call's values (T1); ``extra_content`` is
+# withheld whole (T2); a call dict's other keys are the call's (T2′). The transitions at the first
+# level of a carrier, an entry or a block (T3-T10) are taken by the walkers, which hand a value to
+# ``_render`` with the kind their row names; every depth not named inherits its parent's kind.
+_CONTENT_BLOCK_KINDS = {"thinking": REASONING, "redacted_thinking": REASONING, "tool_use": _TOOL_USE}
+
+
+def _standing(kind: str, base: str) -> str:
+    """M2: a value's standing is its kind's (PLAN-83g §3.2): reasoning → reasoning; a call or its
+    values → call; content, a carrier's value of no other kind and an unknown key → the record's
+    own (content, or result on a tool row; ruling OD-F2)."""
+    if kind == REASONING:
+        return GIVEN_REASONING
+    if kind in _CALL_KINDS:
+        return GIVEN_CALL
+    return base
+
+
+@dataclass
+class _Walk:
+    given: Given
+    lift: bool
+    images: list = field(default_factory=list)       # (path, image part) given after the JSON
+    withheld: bool = False
+
+
+def _step(value: Any, path: tuple, kind: str, base: str, walk: _Walk) -> Any:
+    """One value of the walk with its kind: the value as given inside the JSON, every image part
+    decided by ``_image_outcome``, every value under a key of the opaque vocabulary withheld where
+    the kind withholds, every leaf recorded with its kind's standing (M1, M2)."""
+    if isinstance(value, _Marker):
+        return value
+    if isinstance(value, str):
+        walk.given.values.append((path, value, _standing(kind, base)))
+        return value
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        walk.given.values.append((path, json.dumps(value), _standing(kind, base)))
+        return value
     if isinstance(value, list):
-        return [_face(item, path + (index,), lift, given, images) for index, item in enumerate(value)]
-    return value
+        inner = _CALL_DICT if kind == _CALLS else kind
+        return [_step(item, path + (index,), inner, base, walk) for index, item in enumerate(value)]
+    if not isinstance(value, dict):
+        return value
+    if image_part(value):
+        site = walk.lift and kind == CONTENT
+        outcome, part, text = _image_outcome(value, path, site, walk.given)
+        if outcome == GIVEN_IMAGE:
+            walk.images.append((path, part))
+        payload = "source" if value["type"] == "image" else "image_url"
+        faced = {}
+        for key, item in value.items():
+            faced[key] = _Marker(text) if key == payload else _step(item, path + (key,), kind, base, walk)
+        if payload not in value:
+            faced[payload] = _Marker(text)
+        return faced
+    if kind == CONTENT and isinstance(value.get("type"), str) and value["type"] in (*_CONTENT_BLOCK_KINDS,
+                                                                                   "tool_result"):
+        if value["type"] == "tool_result":
+            # T11: a tool_result block's content is a result; its tool_use_id the block's metadata.
+            return {key: _step(item, path + (key,), CONTENT, GIVEN_RESULT if key == "content" else base, walk)
+                    for key, item in value.items()}
+        kind = _CONTENT_BLOCK_KINDS[value["type"]]
+    if kind == _CALLS:
+        kind = _CALL_DICT
+    vocabulary = _CALL_VOCABULARY if kind in (_CALL_DICT, CALL) else OPAQUE_VOCABULARY
+    faced = {}
+    for key, item in value.items():
+        where = path + (key,)
+        if kind not in _NEVER_WITHHELD and key in vocabulary and not carries_nothing(item):
+            walk.withheld = True
+            faced[key] = _Marker(_WITHHELD)
+            continue
+        if kind == _CALL_DICT:
+            child = _FUNCTION if key == "function" and isinstance(item, dict) else CALL
+        elif kind == _FUNCTION:
+            child = CALL_VALUE if key in ("name", "arguments") else CALL
+        elif kind == _TOOL_USE:
+            child = CALL_VALUE if key in ("name", "input") else CALL
+        else:
+            child = kind
+        faced[key] = _step(item, where, child, base, walk)
+    return faced
 
 
-def _render(label: str, value: Any, path: tuple, standing: str, given: Given, origin: str = FIELD, *,
-            lift: bool = False) -> list[dict]:
-    """The only place a stored value becomes labelled JSON: nothing where the value carries
-    nothing; else the label, the value's JSON with every image part faced, and, where the value
-    stood in the stored content (``lift``), each image part inside it as its own part."""
+def _render(label: str, value: Any, path: tuple, kind: str, base: str, given: Given, origin: str = FIELD, *,
+            lift: bool = False) -> tuple[list[dict], bool]:
+    """The only place a stored value becomes labelled JSON (M1): nothing where the value carries
+    nothing; else the label and the value's JSON as the walk gives it, and, where the value stood in
+    the stored content (``lift``), each image given as an image after it. Returns the parts and
+    whether anything under a key of the opaque vocabulary was withheld (the caller counts it under
+    its stored field)."""
     if carries_nothing(value):
-        return []
-    images: list = []
-    faced = _face(value, path, lift, given, images)
+        return [], False
+    walk = _Walk(given, lift)
+    faced = _step(value, path, kind, base, walk)
     part = {"type": "text", "text": f"{label}\n{json.dumps(faced, ensure_ascii=False)}"}
-    given.values.extend((leaf_path, text, standing) for leaf_path, text in _leaves(faced, path))
     parts = [given.made(part, origin, path)]
-    for image_path, image in images:
-        parts.extend(_give_image(image, image_path, given, LIFTED))
-    return parts
+    for image_path, image in walk.images:
+        parts.append(given.made(image, LIFTED, image_path))
+    return parts, walk.withheld
 
 
 def text_part(part: Any) -> bool:
@@ -335,49 +533,61 @@ def text_part(part: Any) -> bool:
             and isinstance(part["text"], str))
 
 
-def _canonical_parts(parts: list, prefix: tuple, standing: str, given: Given) -> list:
-    """A list content's members: a text part or an image part as stored, any other member as a
-    labelled part holding its JSON (its image parts lifted out), a member that carries nothing
-    not at all."""
+def _canonical_parts(parts: list, prefix: tuple, standing: str, given: Given, face: "_Record") -> list:
+    """A list content's members: a text part as stored; an image part by the image function (M3);
+    any other member as a labelled part holding its JSON, walked as content (its image parts lifted
+    out; a member typed as one of the host's blocks walked by that block's row, T11); a member that
+    carries nothing not at all."""
     shown = []
     for index, part in enumerate(parts):
+        where = prefix + (index,)
         if carries_nothing(part) or (text_part(part) and carries_nothing(part["text"])):
             continue
         if text_part(part):
-            shown.append(given.made(part, STORED, prefix + (index,)))
-            given.values.append((prefix + (index, "text"), part["text"], standing))
+            shown.append(given.made(part, STORED, where))
+            given.values.append((where + ("text",), part["text"], standing))
         elif image_part(part):
-            shown.append(given.made(part, STORED, prefix + (index,)))
+            parts_, withheld = _image_parts(part, where, given, STORED, CONTENT, standing)
+            shown.extend(parts_)
+            face.withheld_content = face.withheld_content or withheld
         else:
-            shown.extend(_render(f"[Member {index + 1} of the stored content is not a text part (a type and a text "
-                                 f"only) or an image part; shown as its JSON by the query:]", part, prefix + (index,),
-                                 standing, given, RENDERED, lift=True))
+            rendered, withheld = _render(f"[{_path_text(where)} is not a text part (a type and a text only) or an image "
+                                         f"part; shown as its JSON by the query:]", part, where, CONTENT, standing,
+                                         given, RENDERED, lift=True)
+            shown.extend(rendered)
+            face.withheld_content = face.withheld_content or withheld
     return shown
 
 
-def _canonical_content(content: Any, standing: str, given: Given) -> Any:
+def _canonical_content(content: Any, standing: str, given: Given, face: "_Record") -> Any:
     """The message's content: a string or null as stored; a list as its members; the host's
     ``_multimodal`` envelope as its parts and one labelled part holding every other key of it (its
     ``_multimodal`` mark included, so that the part says the content was stored as an envelope);
-    any other value as one labelled part holding its JSON (ruling OD-E)."""
+    any other value as one labelled part holding its JSON (ruling OD-E). A content that carries
+    nothing, or of which nothing is given, is given as "" (ruling OD-F4); null stays null."""
     base = ("message", "content")
     if content is None:
         return None
     if isinstance(content, str):
-        if not carries_nothing(content):
-            given.values.append((base, content, standing))
+        if carries_nothing(content):
+            return ""
+        given.values.append((base, content, standing))
         return content
     if isinstance(content, list):
-        return _canonical_parts(content, base, standing, given)
+        return _canonical_parts(content, base, standing, given, face) or ""
     parts = content_parts(content)
     if parts is not None and isinstance(content, dict):
-        shown = _canonical_parts(parts, base + ("content",), standing, given)
+        shown = _canonical_parts(parts, base + ("content",), standing, given, face)
         rest = {key: value for key, value in content.items() if key != "content"}
-        shown.extend(_render("[The rest of this stored multimodal envelope (every key but its content), shown as its "
-                             "JSON by the query:]", rest, base, standing, given, RENDERED, lift=True))
-        return shown
-    return _render(f"[The stored content is a JSON {json_kind(content)}, shown as its JSON by the query:]", content,
-                   base, standing, given, RENDERED, lift=True)
+        rendered, withheld = _render("[The rest of this stored multimodal envelope (every key but its content), shown "
+                                     "as its JSON by the query:]", rest, base, CONTENT, standing, given, RENDERED,
+                                     lift=True)
+        face.withheld_content = face.withheld_content or withheld
+        return (shown + rendered) or ""
+    rendered, withheld = _render(f"[The stored content is a JSON {json_kind(content)}, shown as its JSON by the "
+                                 f"query:]", content, base, CONTENT, standing, given, RENDERED, lift=True)
+    face.withheld_content = face.withheld_content or withheld
+    return rendered or ""
 
 
 def canonical_call(call: Any) -> bool:
@@ -412,8 +622,8 @@ def parsed_arguments(arguments: str) -> tuple[Any, Optional[str]]:
 # of the message (ruling OD-G, rule 3); a text of the stash, given where the content lacks it; a
 # call that must be one of the stored calls; an image; opaque material, withheld and counted per
 # stored field; the carrier's metadata, not given. Any key the table does not name is given as
-# labelled JSON at its path.
-READABLE, MESSAGE_TEXT, STASH_TEXT, CALL, IMAGE, OPAQUE, METADATA, CITED = (
+# labelled JSON at its path, walked with the kind table T names for its container (M1).
+READABLE, MESSAGE_TEXT, STASH_TEXT, CALL_KEY, IMAGE, OPAQUE, METADATA, CITED = (
     "readable", "message_text", "stash_text", "call", "image", "opaque", "metadata", "cited")
 
 # No host reader treats a signature or data as making the text beside it unreadable (#24):
@@ -435,16 +645,17 @@ def _table(**classes: tuple) -> dict:
 
 _CLASSES = {
     # reasoning_details entries: provider dicts kept verbatim (chat_completion_helpers.py 1712-1724,
-    # reasoning_summaries.py 49-75), Anthropic thinking blocks (transports/anthropic.py 82-87).
+    # reasoning_summaries.py 49-75), Anthropic thinking blocks (transports/anthropic.py 82-87). T9.
     ("reasoning_details", "entry"): _table(readable=_READABLE_KEYS, opaque=_OPAQUE_KEYS, metadata=_ENTRY_METADATA),
-    # codex_reasoning_items (codex_responses_adapter.py 1059-1084): summary pieces {type, text}.
+    # codex_reasoning_items (codex_responses_adapter.py 1059-1084): summary pieces {type, text}. T9.
     ("codex_reasoning_items", "item"): _table(opaque=("encrypted_content",), metadata=_ENTRY_METADATA,
                                               readable=("text", "content")),
     ("codex_reasoning_items", "piece"): _table(metadata=("type",), readable=("text",)),
     # anthropic_content_blocks, by block type (anthropic_message_convert.py 287-329): text blocks
-    # keep citations and a cache marker; tool_use its sanitised id; image its source.
-    # Citations survive only here (the stored content is the prose of the text blocks,
-    # transports/anthropic.py 80-81, 102): given as their JSON (ruling OD-E3).
+    # keep citations and a cache marker (T3); thinking blocks are reasoning (T4); tool_use its
+    # sanitised id (T5); image its source (T6). Citations survive only here (the stored content is
+    # the prose of the text blocks, transports/anthropic.py 80-81, 102): given as their JSON (ruling
+    # OD-E3).
     ("anthropic_content_blocks", "text"): _table(metadata=("type", "cache_control"), message_text=("text",),
                                                  cited=("citations",)),
     ("anthropic_content_blocks", "thinking"): _table(metadata=("type", "cache_control"), readable=("thinking",),
@@ -458,6 +669,7 @@ _CLASSES = {
     (STASH, "thinking"): _table(metadata=("type", "cache_control"), readable=("thinking",),
                                 opaque=("signature", "data")),
     (STASH, "redacted_thinking"): _table(metadata=("type", "cache_control"), opaque=("data",)),
+    (STASH, "tool_use"): _table(metadata=("type", "id", "cache_control"), call=("name", "input")),
     (STASH, "image"): _table(metadata=("type", "cache_control"), image=("source",)),
     # bedrock_content_blocks, stored flattened (bedrock_adapter.py 824-899, 909-998): a block can
     # hold a text and a reasoning together (977).
@@ -466,19 +678,21 @@ _CLASSES = {
         "signature", "redactedContentBase64", "redactedContent")),
     ("bedrock_content_blocks", "reasoningText"): _table(readable=("text",), opaque=("signature",)),
     ("bedrock_content_blocks", "toolUse"): _table(metadata=("toolUseId",), call=("name", "input")),
-    # codex_message_items (codex_responses_adapter.py 367-373, 1124-1139): one output_text part.
+    # codex_message_items (codex_responses_adapter.py 367-373, 1124-1139): one output_text part (T7).
     ("codex_message_items", "item"): _table(metadata=("type", "role", "status", "id", "phase")),
     ("codex_message_items", "part"): _table(metadata=("type",), message_text=("text",)),
     # A stored tool call (chat_completion_helpers.py 1622-1663): its ids beside ``id`` and its
     # type are the host's; ``extra_content`` holds the stored model's thought signature
-    # (transports/chat_completions.py 274-288), withheld and counted (ruling OD-P2a).
+    # (transports/chat_completions.py 274-288), withheld and counted (ruling OD-P2a; T2).
     ("tool_calls", "call"): _table(metadata=("call_id", "response_item_id"), opaque=("extra_content",)),
 }
 
 
 @dataclass
 class _Record:
-    """One record's facing: what the classification gives and counts, gathered in one place."""
+    """One record's facing: what the classification gives and counts, gathered in one place.
+    ``foreign``: the field is stored on a role whose domain lacks it (M4): its carrier texts are
+    given as parts, not held against the content."""
 
     record: str
     given: Given
@@ -488,51 +702,77 @@ class _Record:
     after: list = field(default_factory=list)         # parts after the content
     content_texts: list = field(default_factory=list)
     calls: list = field(default_factory=list)         # (name, arguments, parsed) of the calls given
+    foreign: bool = False
+    withheld_content: bool = False
 
-    def json(self, label: str, value: Any, path: tuple, standing: Optional[str] = None) -> None:
-        self.after.extend(_render(label, value, path, standing or self.standing, self.given))
+    def json(self, label: str, value: Any, path: tuple, kind: str, standing: Optional[str] = None) -> bool:
+        parts, withheld = _render(label, value, path, kind, standing or self.standing, self.given)
+        self.after.extend(parts)
+        return withheld
 
-    def not_text(self, value: Any, path: tuple, standing: Optional[str] = None) -> None:
-        self.json(f"[{_path_text(path)} as stored is not text; shown as its JSON by the query:]", value, path,
-                  standing)
+    def not_text(self, value: Any, path: tuple, kind: str, standing: Optional[str] = None) -> bool:
+        return self.json(f"[{_path_text(path)} as stored is not text; shown as its JSON by the query:]", value, path,
+                         kind, standing)
 
-    def readable_text(self, value: Any, path: tuple) -> None:
+    def readable_text(self, value: Any, path: tuple) -> bool:
         if isinstance(value, str):
             self.readable.append((path, value))
-        else:
-            self.not_text(value, path, GIVEN_REASONING)
+            return False
+        return self.not_text(value, path, REASONING)
 
-    def carried(self, value: Any, path: tuple) -> None:
+    def carried(self, value: Any, path: tuple) -> bool:
         """A replay carrier's message text must stand in what is given of the message: its content,
-        or its readable reasoning (a Codex commentary item's text is the host's ``reasoning``,
-        codex_responses_adapter.py 1125-1134); else the record is a problem that refuses the query."""
+        or its main readable reasoning (a Codex commentary item's text is the host's ``reasoning``,
+        codex_responses_adapter.py 1125-1134); else the record is a problem that refuses the query.
+        On a role where the host writes no carrier no converter reads it: a text the content lacks
+        is given as its own part (ruling OD-F5)."""
         if not isinstance(value, str):
-            self.not_text(value, path)
-        elif not any(value in text for text in self.content_texts):
-            self.given.problems.append(f"its replay carrier holds text its content does not ({_path_text(path)})")
-
-    def stashed(self, value: Any, path: tuple) -> None:
-        """The host's Anthropic converter replaces a tool result's content with its stash, so a
-        stashed text the content lacks is given as its own part."""
-        if not isinstance(value, str):
-            self.not_text(value, path)
-        elif not any(value in text for text in self.content_texts):
-            self.given.values.append((path, value, self.standing))
+            return self.not_text(value, path, CARRIER)
+        if any(value in text for text in self.content_texts):
+            return False
+        if self.foreign:
+            self.given.values.append((path, value, GIVEN_CONTENT))
             self.after.append(self.given.made({"type": "text", "text": (
-                f"[A text block stored in {_path_text(path)}, which the stored content does not hold:]\n{value}")},
-                FIELD, path))
+                f"[A text stored in {_path_text(path)} on this message, where the host writes no such field, which its "
+                f"content does not hold:]\n{value}")}, FIELD, path))
+        else:
+            self.given.problems.append(f"its replay carrier holds text its content does not ({_path_text(path)})")
+        return False
+
+    def stashed(self, value: Any, path: tuple) -> bool:
+        """The host's Anthropic converter replaces a tool result's content with its stash, so a
+        stashed text the content lacks is given as its own part, a result."""
+        if not isinstance(value, str):
+            return self.not_text(value, path, CARRIER, GIVEN_RESULT)
+        if not any(value in text for text in self.content_texts):
+            self.given.values.append((path, value, GIVEN_RESULT))
+            what = (f"[A text stored in {_path_text(path)} on this message, where the host writes no such field, which "
+                    f"its content does not hold:]" if self.foreign else
+                    f"[A text block stored in {_path_text(path)}, which the stored content does not hold:]")
+            self.after.append(self.given.made({"type": "text", "text": f"{what}\n{value}"}, FIELD, path))
+        return False
 
     def called(self, name: Any, arguments: Any, path: tuple) -> None:
         """A replay carrier's call must be one of the calls given: by name and parsed input
-        (PLAN-83c §5.2; the block's id is the host's sanitised one, not compared)."""
-        if not any(name == stored_name and (not parsed or arguments == stored_arguments)
-                   for stored_name, stored_arguments, parsed in self.calls):
+        (PLAN-83c §5.2; the block's id is the host's sanitised one, not compared). Where the stored
+        call of that name has arguments that do not parse, its input cannot be shown equal: the
+        record is refused naming the block (T5, the ruled extension of rule 3)."""
+        named = [(stored_arguments, parsed) for stored_name, stored_arguments, parsed in self.calls
+                 if name == stored_name]
+        if any(parsed and arguments == stored_arguments for stored_arguments, parsed in named):
+            return
+        shown = name if isinstance(name, str) else "?"
+        if any(not parsed for _stored_arguments, parsed in named):
+            self.given.problems.append(f"its replay carrier holds a call whose input cannot be compared with its stored "
+                                       f"arguments, which do not parse ({_path_text(path)}, {shown})")
+        else:
             self.given.problems.append(f"its replay carrier holds a call its tool calls do not ({_path_text(path)}, "
-                                       f"{name if isinstance(name, str) else '?'})")
+                                       f"{shown})")
 
-    def keys(self, container: dict, table: dict, path: tuple, *, skip: tuple = ()) -> bool:
-        """Every key of an entry or block by its class; returns whether opaque material that
-        carries something was withheld."""
+    def keys(self, container: dict, table: dict, path: tuple, other: str, *, skip: tuple = ()) -> bool:
+        """Every key of an entry or block by its class; ``other``: the kind (table T) of every key
+        the table does not name. Returns whether opaque material that carries something was
+        withheld, at this level or inside a key given as JSON."""
         withheld = False
         for key, value in container.items():
             if key in skip or carries_nothing(value):
@@ -544,35 +784,36 @@ class _Record:
             if cls == OPAQUE:
                 withheld = True
             elif cls == READABLE:
-                self.readable_text(value, where)
+                withheld = self.readable_text(value, where) or withheld
             elif cls == MESSAGE_TEXT:
-                self.carried(value, where)
+                withheld = self.carried(value, where) or withheld
             elif cls == STASH_TEXT:
-                self.stashed(value, where)
+                withheld = self.stashed(value, where) or withheld
             elif cls == CITED:
-                self.json(f"[{_path_text(where)}: the citations the provider returned with this text, which the "
-                          f"stored content does not hold; shown as their JSON by the query:]", value, where)
+                withheld = self.json(f"[{_path_text(where)}: the citations stored with this text block; shown as their "
+                                     f"JSON by the query:]", value, where, CARRIER,
+                                     GIVEN_RESULT if path[1] == STASH else None) or withheld
             else:
-                standing = (GIVEN_REASONING if path[1] in REASONING_REPLAY_CARRIERS
-                            else GIVEN_CALL if path[1] == "tool_calls" else None)
-                self.json(f"[{_path_text(where)} is a key of no kind the query knows; shown as its JSON by the "
-                          f"query:]", value, where, standing)
+                withheld = self.json(f"[{_path_text(where)} is a key of no kind the query knows; shown as its JSON by "
+                                     f"the query:]", value, where, other) or withheld
         return withheld
 
     def count(self, kind: str) -> None:
         self.opaque[kind] = self.opaque.get(kind, 0) + 1
 
-    def not_a_list(self, key: str, value: Any, standing: Optional[str] = None) -> None:
-        self.json(f"[{key} as stored is not a list; shown as its JSON by the query:]", value, ("message", key),
-                  standing)
+    def not_a_list(self, key: str, value: Any, kind: str) -> bool:
+        return self.json(f"[{_path_text(('message', key))} as stored is not a list; shown as its JSON by the query:]",
+                         value, ("message", key), kind)
 
-    def members(self, key: str, value: Any, standing: Optional[str] = None) -> Iterable[tuple[tuple, dict]]:
+    def members(self, key: str, value: Any, kind: str) -> Iterable[tuple[tuple, dict]]:
         """The members of a stored list field that carry something and are objects; any other
-        member, and a value that is not a list, given as JSON."""
+        member, and a value that is not a list, given as JSON with the field's kind, counted under
+        the field where something inside was withheld."""
         if carries_nothing(value):
             return
         if not isinstance(value, list):
-            self.not_a_list(key, value, standing)
+            if self.not_a_list(key, value, kind):
+                self.count(key)
             return
         for index, member in enumerate(value):
             path = ("message", key, index)
@@ -580,18 +821,18 @@ class _Record:
                 continue
             if isinstance(member, dict):
                 yield path, member
-            else:
-                self.json(f"[{_path_text(path)} as stored is not an entry of the host's shape; shown as its JSON by "
-                          f"the query:]", member, path, standing)
+            elif self.json(f"[{_path_text(path)} as stored is not an entry of the host's shape; shown as its JSON by "
+                           f"the query:]", member, path, kind):
+                self.count(key)
 
 
 def _reasoning_details(value: Any, face: _Record) -> None:
-    """A ``<provider>.native_assistant`` entry is another provider's private replay carrier
-    (agent/transports/chat_completions.py:388, providers/base.py 100-102): its top-level readable
-    strings are given (the host merged the first into ``reasoning``), all else of it withheld and
-    named by its type (ruling OD-P2b)."""
+    """``reasoning_details`` entries, reasoning at every depth (T9). A ``<provider>.native_assistant``
+    entry is another provider's private replay carrier (agent/transports/chat_completions.py:388,
+    providers/base.py 100-102): its top-level readable strings are given (the host merged the
+    first into ``reasoning``), all else of it withheld and named by its type (ruling OD-P2b; T10)."""
     table = _CLASSES[("reasoning_details", "entry")]
-    for path, entry in face.members("reasoning_details", value, GIVEN_REASONING):
+    for path, entry in face.members("reasoning_details", value, REASONING):
         kind = entry.get("type")
         if isinstance(kind, str) and kind.endswith(".native_assistant"):
             withheld = False
@@ -604,57 +845,69 @@ def _reasoning_details(value: Any, face: _Record) -> None:
                     withheld = True
             if withheld:
                 face.count(f"reasoning_details ({kind}, another provider's private replay carrier)")
-        elif face.keys(entry, table, path):
+        elif face.keys(entry, table, path, REASONING):
             face.count("reasoning_details")
 
 
 def _codex_reasoning_items(value: Any, face: _Record) -> None:
-    for path, item in face.members("codex_reasoning_items", value, GIVEN_REASONING):
-        withheld = face.keys(item, _CLASSES[("codex_reasoning_items", "item")], path, skip=("summary",))
+    """``codex_reasoning_items``, reasoning at every depth (T9); a string ``summary`` is readable
+    text, as the host reads it (agent_runtime_helpers.py 1376-1378)."""
+    for path, item in face.members("codex_reasoning_items", value, REASONING):
+        withheld = face.keys(item, _CLASSES[("codex_reasoning_items", "item")], path, REASONING, skip=("summary",))
         summary = item.get("summary")
+        where_summary = path + ("summary",)
         if isinstance(summary, list):
             for number, piece in enumerate(summary):
-                where = path + ("summary", number)
+                where = where_summary + (number,)
                 if carries_nothing(piece):
                     continue
                 if isinstance(piece, dict):
-                    face.keys(piece, _CLASSES[("codex_reasoning_items", "piece")], where)
+                    withheld = face.keys(piece, _CLASSES[("codex_reasoning_items", "piece")], where, REASONING) \
+                        or withheld
                 else:
-                    face.json(f"[{_path_text(where)} is not a summary piece of the host's shape; shown as its JSON by "
-                              f"the query:]", piece, where, GIVEN_REASONING)
+                    withheld = face.json(f"[{_path_text(where)} is not a summary piece of the host's shape; shown as "
+                                         f"its JSON by the query:]", piece, where, REASONING) or withheld
+        elif isinstance(summary, str) and not carries_nothing(summary):
+            face.readable.append((where_summary, summary))
         elif not carries_nothing(summary):
-            face.json(f"[{_path_text(path + ('summary',))} is not a list of summary pieces; shown as its JSON by the "
-                      f"query:]", summary, path + ("summary",), GIVEN_REASONING)
+            withheld = face.json(f"[{_path_text(where_summary)} is not a list of summary pieces; shown as its JSON by "
+                                 f"the query:]", summary, where_summary, REASONING) or withheld
         if withheld:
             face.count("codex_reasoning_items")
 
 
 def _anthropic_blocks(key: str, value: Any, face: _Record) -> None:
     """``anthropic_content_blocks`` of an agent message, or the stash of a tool result, block by
-    block and key by key; an image block is given as an image (the host's converter replays it,
-    anthropic_message_convert.py 309-311, 443-447); a block of a type the host does not write is
-    given whole as its JSON."""
-    for path, block in face.members(key, value):
+    block and key by key (T3-T6); an image block is given as an image (the host's converter
+    replays it, anthropic_message_convert.py 309-311, 443-447); a block of a type the host does not
+    write is given whole as its JSON, walked as the carrier's (T8)."""
+    for path, block in face.members(key, value, CARRIER):
         kind = block.get("type")
         table = _CLASSES.get((key if key == STASH else "anthropic_content_blocks", kind)) if isinstance(kind, str) \
             else None
-        if key == STASH and kind in ("image_url", "input_image"):
-            face.after.extend(_give_image(block, path, face.given, FIELD,
-                                          f"[An image block stored in {_path_text(path)}, given as an image:]"))
+        standing = GIVEN_RESULT if key == STASH else face.standing
+        if image_part(block) and (key == STASH or kind == "image"):
+            # T6: an image site. An image_url/input_image block of anthropic_content_blocks is not
+            # (the host's replay whitelist has no such type): it falls to the block of no type below.
+            parts, withheld = _image_parts(block, path, face.given, FIELD, CARRIER, standing,
+                                           f"[An image block stored in {_path_text(path)}, given as an image:]")
+            face.after.extend(parts)
+            if withheld:
+                face.count(key)
             continue
         if table is None:
-            face.json(f"[{_path_text(path)} is a block of no type the query knows; shown as its JSON by the query:]",
-                      block, path)
+            if face.json(f"[{_path_text(path)} is a block of no type the query knows; shown as its JSON by the query:]",
+                         block, path, CARRIER, standing):
+                face.count(key)
             continue
-        if kind == "image":
-            face.after.extend(_give_image(block, path, face.given, FIELD,
-                                          f"[An image block stored in {_path_text(path)}, given as an image:]"))
-            withheld = face.keys(block, table, path, skip=("source",))
+        if kind in ("thinking", "redacted_thinking"):
+            withheld = face.keys(block, table, path, REASONING)
         elif kind == "tool_use":
+            # T5: the block's name and input compared with the stored canonical calls (rule 3).
             face.called(block.get("name"), block.get("input"), path)
-            withheld = face.keys(block, table, path, skip=("name", "input"))
+            withheld = face.keys(block, table, path, CALL, skip=("name", "input"))
         else:
-            withheld = face.keys(block, table, path)
+            withheld = face.keys(block, table, path, CARRIER)
         if withheld:
             face.count(key)
 
@@ -662,67 +915,73 @@ def _anthropic_blocks(key: str, value: Any, face: _Record) -> None:
 def _bedrock_blocks(value: Any, face: _Record) -> None:
     """``bedrock_content_blocks`` key by key: a block can hold a text and a reasoning together."""
     field_ = "bedrock_content_blocks"
-    for path, block in face.members(field_, value):
-        withheld = face.keys(block, _CLASSES[(field_, "block")], path, skip=("reasoningContent", "toolUse"))
+    for path, block in face.members(field_, value, CARRIER):
+        withheld = face.keys(block, _CLASSES[(field_, "block")], path, CARRIER, skip=("reasoningContent", "toolUse"))
         reasoning = block.get("reasoningContent")
+        where = path + ("reasoningContent",)
         if isinstance(reasoning, dict):
-            where = path + ("reasoningContent",)
-            withheld = face.keys(reasoning, _CLASSES[(field_, "reasoningContent")], where, skip=("reasoningText",)) \
-                or withheld
+            withheld = face.keys(reasoning, _CLASSES[(field_, "reasoningContent")], where, REASONING,
+                                 skip=("reasoningText",)) or withheld
             nested = reasoning.get("reasoningText")
             if isinstance(nested, dict):
-                withheld = face.keys(nested, _CLASSES[(field_, "reasoningText")], where + ("reasoningText",)) \
-                    or withheld
+                withheld = face.keys(nested, _CLASSES[(field_, "reasoningText")], where + ("reasoningText",),
+                                     REASONING) or withheld
             elif not carries_nothing(nested):
-                face.readable_text(nested, where + ("reasoningText",))
+                withheld = face.readable_text(nested, where + ("reasoningText",)) or withheld
         elif not carries_nothing(reasoning):
-            face.json(f"[{_path_text(path + ('reasoningContent',))} is not an object of the host's shape; shown as its "
-                      f"JSON by the query:]", reasoning, path + ("reasoningContent",))
+            withheld = face.json(f"[{_path_text(where)} is not an object of the host's shape; shown as its JSON by the "
+                                 f"query:]", reasoning, where, REASONING) or withheld
         tool = block.get("toolUse")
+        where = path + ("toolUse",)
         if isinstance(tool, dict):
-            face.called(tool.get("name"), tool.get("input"), path + ("toolUse",))
-            face.keys(tool, _CLASSES[(field_, "toolUse")], path + ("toolUse",), skip=("name", "input"))
+            face.called(tool.get("name"), tool.get("input"), where)
+            withheld = face.keys(tool, _CLASSES[(field_, "toolUse")], where, CALL, skip=("name", "input")) or withheld
         elif not carries_nothing(tool):
-            face.json(f"[{_path_text(path + ('toolUse',))} is not an object of the host's shape; shown as its JSON by "
-                      f"the query:]", tool, path + ("toolUse",))
+            withheld = face.json(f"[{_path_text(where)} is not an object of the host's shape; shown as its JSON by the "
+                                 f"query:]", tool, where, CALL) or withheld
         if withheld:
             face.count(field_)
 
 
 def _codex_message_items(value: Any, face: _Record) -> None:
-    """``codex_message_items``: message items of one ``output_text`` part (the host's replay reads
-    only such parts, codex_responses_adapter.py 457, so an image part there was never an image to
-    any converter: ruling OD-E1)."""
+    """``codex_message_items``: message items of one ``output_text`` part (T7; the host's replay
+    reads only such parts, codex_responses_adapter.py 457, so an image part there was never an image
+    to any converter: ruling OD-E1); any other item or part is the carrier's (T8)."""
     field_ = "codex_message_items"
-    for path, item in face.members(field_, value):
+    for path, item in face.members(field_, value, CARRIER):
         parts = item.get("content")
+        withheld = False
         if item.get("type") != "message" or not isinstance(parts, list):
-            face.json(f"[{_path_text(path)} is an item of no shape the query knows; shown as its JSON by the query:]",
-                      item, path)
-            continue
-        face.keys(item, _CLASSES[(field_, "item")], path, skip=("content",))
-        for number, part in enumerate(parts):
-            where = path + ("content", number)
-            if carries_nothing(part):
-                continue
-            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
-                face.keys(part, _CLASSES[(field_, "part")], where)
-            else:
-                face.json(f"[{_path_text(where)} is a part of no shape the query knows; shown as its JSON by the "
-                          f"query:]", part, where)
+            withheld = face.json(f"[{_path_text(path)} is an item of no shape the query knows; shown as its JSON by the "
+                                 f"query:]", item, path, CARRIER)
+        else:
+            withheld = face.keys(item, _CLASSES[(field_, "item")], path, CARRIER, skip=("content",))
+            for number, part in enumerate(parts):
+                where = path + ("content", number)
+                if carries_nothing(part):
+                    continue
+                if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                    withheld = face.keys(part, _CLASSES[(field_, "part")], where, CARRIER) or withheld
+                else:
+                    withheld = face.json(f"[{_path_text(where)} is a part of no shape the query knows; shown as its "
+                                         f"JSON by the query:]", part, where, CARRIER) or withheld
+        if withheld:
+            face.count(field_)
 
 
-def _tool_calls(value: Any, face: _Record) -> list[dict]:
-    """An agent message's calls as the wire carries them: each call of the host's shape as its
-    id, type and function's name and arguments; every other key of it faced by the table (a
-    stored type other than "function" given as its JSON, never overwritten unsaid); any other
-    value or call given as labelled JSON after the content, not a call on the wire."""
+def _tool_calls(value: Any, face: _Record) -> list[tuple[int, dict]]:
+    """An agent message's calls as the wire carries them, with their stored positions: each call of
+    the host's shape as its id, type and function's name and arguments (T1); every other key of it
+    faced by the table (T2, T2′; a stored type other than "function" given as its JSON, never
+    overwritten unsaid); any other value or call given as labelled JSON after the content, walked
+    as a call, not a call on the wire."""
     base = ("message", "tool_calls")
     if carries_nothing(value):
         return []
     if not isinstance(value, list):
-        face.json(f"[The stored tool calls are a JSON {json_kind(value)}, not a list of calls; shown as their JSON by "
-                  f"the query:]", value, base, GIVEN_CALL)
+        if face.json(f"[The stored tool calls are a JSON {json_kind(value)}, not a list of calls; shown as their JSON by "
+                     f"the query:]", value, base, _CALL_DICT if isinstance(value, dict) else CALL):
+            face.count("tool_calls")
         return []
     kept = []
     table = _CLASSES[("tool_calls", "call")]
@@ -731,21 +990,25 @@ def _tool_calls(value: Any, face: _Record) -> list[dict]:
         if carries_nothing(call):
             continue
         if not canonical_call(call):
-            face.json(f"[Tool call {index + 1} as stored is not a call the wire can carry; shown as its JSON by the "
-                      f"query:]", call, path, GIVEN_CALL)
+            if face.json(f"[{_path_text(path)} as stored is not a call the wire can carry; shown as its JSON by the "
+                         f"query:]", call, path, _CALL_DICT if isinstance(call, dict) else CALL):
+                face.count("tool_calls")
             continue
         function = call["function"]
-        kept.append({"id": call["id"], "type": "function",
-                     "function": {"name": function["name"], "arguments": function["arguments"]}})
+        kept.append((index, {"id": call["id"], "type": "function",
+                             "function": {"name": function["name"], "arguments": function["arguments"]}}))
         face.given.values.append((path + ("function", "name"), function["name"], GIVEN_CALL))
         face.given.values.append((path + ("function", "arguments"), function["arguments"], GIVEN_CALL))
+        withheld = False
         kind = call.get("type")
         if not carries_nothing(kind) and kind != "function":
-            face.json(f"[{_path_text(path + ('type',))} as stored is not \"function\"; shown as its JSON by the "
-                      f"query:]", kind, path + ("type",), GIVEN_CALL)
-        if face.keys(call, table, path, skip=("id", "function", "type")):
+            withheld = face.json(f"[{_path_text(path + ('type',))} as stored is not \"function\"; the call is given as a "
+                                 f"function call, its stored type shown as its JSON by the query:]", kind,
+                                 path + ("type",), CALL)
+        withheld = face.keys(call, table, path, CALL, skip=("id", "function", "type")) or withheld
+        withheld = face.keys(function, {}, path + ("function",), CALL, skip=("name", "arguments")) or withheld
+        if withheld:
             face.count("tool_calls")
-        face.keys(function, {}, path + ("function",), skip=("name", "arguments"))
     return kept
 
 
@@ -754,7 +1017,9 @@ def _host_metadata_keys() -> frozenset:
     at run time (ruling OD-3a): the session schema's columns (``hermes_state_messages
     ._MESSAGE_SCHEMA_KEYS``), the message core keys (``agent.message_sanitization._MESSAGE_CORE_KEYS``),
     the keys the Chat Completions transport strips (``_STRIP_MSG_KEYS``) and the persistence-only
-    fields."""
+    fields. Two of these constants hold transcript keys too (the core keys: content, name,
+    tool_calls, role; the schema's columns); the union is right at its one call site only because
+    ``strict_message`` faces the transcript keys first (PLAN-83g §2; a fact for #72)."""
     so = "which of a message's keys are the host's own bookkeeping is not known"
     schema = _strict_import("session schema keys", "hermes_state_messages", "_MESSAGE_SCHEMA_KEYS", so=so)
     core = _strict_import("message core keys", "agent.message_sanitization", "_MESSAGE_CORE_KEYS", so=so)
@@ -802,13 +1067,77 @@ def wire_role(raw: dict) -> str:
     return role if isinstance(role, str) and role in _WIRE_ROLES else "user"
 
 
-def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, given: Given) -> dict:
-    """One record's message as the query gives it (PLAN-83e §2-§5). The host's per-row rules run
-    first, each host function called strictly (the clone, the sidecar, the reasoning-echo policy,
-    the fill decided on the host's own row); then the message is built from the stored role's
-    domain and every stored key is faced. ``given`` receives what is given of the record and the
-    origin of every part of its content; ``withheld`` counts, per stored field, the entries and
-    blocks whose opaque material is withheld."""
+def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> None:
+    """A transcript field stored on a role whose domain lacks it, walked by its own walker (M4,
+    ruling OD-F5): the row decides only that its outputs are given as parts, never placed on the
+    wire; the first part says where it is stored."""
+    sub = _Record(face.record, face.given, face.standing, face.opaque, content_texts=face.content_texts,
+                  foreign=True)
+    path = ("message", key)
+    if key in ("reasoning", "reasoning_content"):
+        sub.readable_text(value, path)
+    elif key == "reasoning_details":
+        _reasoning_details(value, sub)
+    elif key == "codex_reasoning_items":
+        _codex_reasoning_items(value, sub)
+    elif key in ("anthropic_content_blocks", STASH):
+        _anthropic_blocks(key, value, sub)
+    elif key == "bedrock_content_blocks":
+        _bedrock_blocks(value, sub)
+    elif key == "codex_message_items":
+        _codex_message_items(value, sub)
+    elif key == "tool_calls":
+        # Every call as labelled JSON, walked as a call (T1-T2′), never a call on the wire and never
+        # labelled with a handle.
+        if isinstance(value, list):
+            for index, call in enumerate(value):
+                if not carries_nothing(call) and sub.json(
+                        f"[{_path_text(path + (index,))}, a tool call; shown as its JSON by the query:]", call,
+                        path + (index,), _CALL_DICT if isinstance(call, dict) else CALL):
+                    sub.count("tool_calls")
+        elif sub.json(f"[{_path_text(path)}, the stored tool calls; shown as their JSON by the query:]", value, path,
+                      _CALL_DICT if isinstance(value, dict) else CALL):
+            sub.count("tool_calls")
+    elif key == "api_content":
+        sub.not_text(value, path, CONTENT)
+    else:
+        # tool_call_id, name: the wire's pairing key and the host's bookkeeping, stored where the host
+        # writes neither; given as they are stored.
+        sub.json(f"[{_path_text(path)} as stored; shown as its JSON by the query:]", value, path, STORED_KIND)
+    readable = _readable_parts(sub.readable, face.given, shown)
+    if not (readable or sub.after):
+        return
+    label = face.given.made({"type": "text", "text": (f"[{_path_text(path)} is stored on this message "
+                                                      f"{stored_role_text(raw)}, where the host writes no such field; "
+                                                      f"what the query gives of it follows:]")}, NOTE, path)
+    face.after.extend([label] + readable + sub.after)
+
+
+def _readable_parts(readable: list, given: Given, shown: list) -> list[dict]:
+    """Readable reasoning texts as labelled parts, each unless it carries nothing or is contained
+    verbatim in the message's reasoning or an earlier such part (exact containment, ruling OD-4a)."""
+    parts = []
+    for path, text in readable:
+        if carries_nothing(text) or any(text in earlier for earlier in shown):
+            continue
+        parts.append(given.made({"type": "text", "text": f"[Readable reasoning stored in {_path_text(path)}:]\n{text}"},
+                                FIELD, path))
+        given.values.append((path, text, GIVEN_REASONING))
+        given.reasoning_parts += 1
+        shown.append(text)
+    return parts
+
+
+def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, given: Given,
+                   call_handles: Optional[dict] = None) -> dict:
+    """One record's message as the query gives it (PLAN-83e §2-§5, PLAN-83g §3). The host's per-row
+    rules run first, each host function called strictly (the clone, the sidecar, the reasoning-echo
+    policy with the pad the host's own agent applies, the fill decided on the host's own row); then
+    the message is built from the stored role's domain and every stored key is faced. ``given``
+    receives what is given of the record and the origin of every part of its content; ``withheld``
+    counts, per stored field, the entries, blocks, calls and keys whose opaque material is withheld;
+    ``call_handles`` names, by stored position, the handles the store minted for the record's calls."""
+    given.record, given.reads_images = record, facts.reads_images
     role = wire_role(raw)
     stored_role = raw.get("role")
     domain = _DOMAIN.get(stored_role, _OTHER_DOMAIN) if isinstance(stored_role, str) else _OTHER_DOMAIN
@@ -816,18 +1145,27 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     fill = host_fill_text(row)
     standing = GIVEN_RESULT if role == "tool" else GIVEN_CONTENT
     message: dict = {"role": role}
-    if "content" in row:
-        message["content"] = _canonical_content(row["content"], standing, given)
     face = _Record(record, given, standing, {})
+    if "content" in row:
+        message["content"] = _canonical_content(row["content"], standing, given, face)
+    if face.withheld_content:
+        face.count("content")
+    if sidecar_sent(raw) and not carries_nothing(raw.get("content")):
+        # M3: the images of a stored content the host sends api_content in place of (the host
+        # replaces the content wholesale on every request, agent/turn_context.py 1231-1256), held
+        # by the handles and not given; its label says the stored content is not given.
+        given.images_behind_sidecar += sum(1 for _path in _image_paths(raw["content"], ("message", "content")))
     # The keys in the order the host's own row has them (role, content, reasoning_content,
     # tool_calls; a tool result's call id after its content), so that the request is the host's.
     if "reasoning_content" in domain and isinstance(row.get("reasoning_content"), str):
         message["reasoning_content"] = row["reasoning_content"]   # as the host's echo policy left it
+    positions: list = []
     if "tool_calls" in domain:
-        message_calls = _tool_calls(raw.get("tool_calls"), face)
-        if message_calls:
-            message["tool_calls"] = message_calls
-            face.calls = [(call["function"]["name"], *_call_arguments(call)) for call in message_calls]
+        kept = _tool_calls(raw.get("tool_calls"), face)
+        if kept:
+            positions = [position for position, _call in kept]
+            message["tool_calls"] = [call for _position, call in kept]
+            face.calls = [(call["function"]["name"], *_call_arguments(call)) for _position, call in kept]
     if "tool_call_id" in domain and "tool_call_id" in raw:
         message["tool_call_id"] = raw["tool_call_id"]      # the wire's pairing key, as stored
     main = readable_reasoning(raw) if "reasoning" in domain else None
@@ -838,7 +1176,8 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
             value = raw.get(key)
             if carries_nothing(value) or value == main:
                 continue
-            face.readable_text(value, ("message", key))
+            if face.readable_text(value, ("message", key)):
+                face.count(key)
         _reasoning_details(raw.get("reasoning_details"), face)
         _codex_reasoning_items(raw.get("codex_reasoning_items"), face)
         _anthropic_blocks("anthropic_content_blocks", raw.get("anthropic_content_blocks"), face)
@@ -847,56 +1186,50 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     if STASH in domain:
         _anthropic_blocks(STASH, raw.get(STASH), face)
     if "api_content" in domain and not sidecar_sent(raw):
-        face.not_text(raw.get("api_content"), ("message", "api_content"))
+        # T13: a sidecar that is not a string is content, given as its JSON.
+        face.not_text(raw.get("api_content"), ("message", "api_content"), CONTENT)
+    # Readable reasoning: the message's reasoning first, then every other readable text not
+    # contained in it or an earlier such part.
+    before: list = []
+    shown: list[str] = []
+    if main:
+        field_ = "reasoning" if raw.get("reasoning") == main else "reasoning_content"
+        before.append(given.made({"type": "text", "text": f"[Readable reasoning stored in "
+                                                          f"{_path_text(('message', field_))}:]\n{main}"}, FIELD,
+                                 ("message", field_)))
+        given.values.append((("lcm", "reasoning"), main, GIVEN_REASONING))
+        shown.append(main)
+    before.extend(_readable_parts(face.readable, given, shown))
     known = _host_metadata_keys()
     for key, value in raw.items():
         if key == "role" or carries_nothing(value):
             continue
         if key in _TRANSCRIPT_KEYS:
             if key not in domain:
-                face.json(f"[{key} is stored on this {json.dumps(stored_role) if stored_role is not None else 'role-less'} "
-                          f"message, where the host writes no such field; shown as its JSON by the query:]", value,
-                          ("message", key))
+                _foreign(key, value, raw, face, shown)
         elif not _is_metadata(key, known):
-            face.json(f"[The stored key {key!r} is no field the query knows; shown as its JSON by the query:]", value,
-                      ("message", key))
+            # T14: an unknown top-level key, walked as a stored value of no kind the store tells.
+            if face.json(f"[The stored key {_path_text(('message', key))} is no field the query knows; shown as its "
+                         f"JSON by the query:]", value, ("message", key), STORED_KIND):
+                face.count("other stored keys")
     for kind, count in face.opaque.items():
         withheld[kind] = withheld.get(kind, 0) + count
-    # Readable reasoning: the message's reasoning, then every other readable text not contained in
-    # it or an earlier such part (exact containment, ruling OD-4a).
-    before: list = []
-    shown: list[str] = []
-    if main:
-        field_ = "reasoning" if raw.get("reasoning") == main else "reasoning_content"
-        before.append(given.made({"type": "text", "text": f"[Readable reasoning stored in {field_}:]\n{main}"}, FIELD,
-                                 ("message", field_)))
-        given.values.append((("lcm", "reasoning"), main, GIVEN_REASONING))
-        shown.append(main)
-    for path, text in face.readable:
-        if carries_nothing(text) or any(text in earlier for earlier in shown):
-            continue
-        before.append(given.made({"type": "text", "text": f"[Readable reasoning stored in {_path_text(path)}:]\n"
-                                                          f"{text}"}, FIELD, path))
-        given.values.append((path, text, GIVEN_REASONING))
-        given.reasoning_parts += 1
-        shown.append(text)
     unparsed = []
-    for index, call in enumerate(message.get("tool_calls") or []):
+    for index, call in zip(positions, message.get("tool_calls") or []):
         why = parsed_arguments(call["function"]["arguments"])[1]
         if why is not None:
+            path = ("message", "tool_calls", index, "function", "arguments")
+            named = (call_handles or {}).get(index) or _path_text(("message", "tool_calls", index))
             unparsed.append(given.made({"type": "text", "text": (
-                f"[The arguments of tool call {call['id']} ({call['function']['name']}) as stored; {why}:]\n"
-                f"{call['function']['arguments']}")}, FIELD, ("message", "tool_calls", index, "function", "arguments")))
+                f"[The arguments of tool call {named} ({call['function']['name']}) as stored; {why}:]\n"
+                f"{call['function']['arguments']}")}, FIELD, path))
     _assemble(message, before, face.after + unparsed, given)
-    # The image rules, over every image the message now holds (stored, lifted, a carrier's or the
-    # stash's): sent where the model reads images, else a placeholder that says so.
-    if not facts.reads_images and isinstance(message.get("content"), list):
-        why = _NOT_KNOWN if facts.reads_images is None else _NOT_READ
-        message["content"] = [given.made(_image_placeholder(part, record, why), REPLACED,
-                                         given.origins[id(part)][2] if given.origin(part) else (),
-                                         given.origin(part)) if image_part(part) else part
-                              for part in message["content"]]
+    # Every image was decided where it was met (M3): none stands in the content of a model that
+    # does not read images, or where that is not known.
     content = message.get("content")
+    if not facts.reads_images and isinstance(content, list) and any(image_part(part) for part in content):
+        raise AssertionError(f"record {record}: an image part stands in the content of a model that is not given "
+                             f"images (PLAN-83g §3.3)")
     payload = (isinstance(content, str) and not carries_nothing(content)) or (isinstance(content, list) and content) \
         or message.get("tool_calls")
     if not payload and face.opaque:
