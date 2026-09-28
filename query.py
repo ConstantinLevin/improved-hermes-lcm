@@ -992,7 +992,7 @@ def parse_reply(content: str) -> tuple[str, list]:
         raise refuse(f"{exc}; the reply had {len(content)} characters") from None
     if not isinstance(value, dict) or set(value) != {"report", "excerpts"}:
         raise refuse("it is not an object with exactly the keys report and excerpts" if isinstance(value, dict)
-                     else f"it is a JSON {type(value).__name__}, not an object")
+                     else f"it is a JSON {json_kind(value)}, not an object")
     report, excerpts = value["report"], value["excerpts"]
     if not isinstance(report, str) or not report.strip():
         raise refuse("report is not a non-empty string")
