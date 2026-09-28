@@ -38,9 +38,10 @@ can answer from one of them with no record, rulings OD-2a); a managed NeMo Relay
 **Refused before the call**, with the cause: a wire the plugin has not established (OD-I); more
 images than the host's converter keeps in one request; an input over the model's input (its
 window less its output cap, by the estimate times ``estimate_ratio_max``, #34 D4; where the model
-table has no window this is said); a record the query cannot give as it is (a replay carrier that
-holds text or a call its content and calls do not; a record stored as a JSON value that is not a
-message; a chunk that begins with a tool result; a carrier call whose input cannot be compared;
+table has no window this is said); a record the query cannot give as it is (a replay carrier on an
+agent message that holds text or a call its content and calls do not, where on any other message
+such a text is given as its own part and such a call as labelled JSON; a record stored as a JSON
+value that is not a message; a chunk that begins with a tool result; a carrier call whose input cannot be compared;
 a part without a recorded origin); anything the query gives its model that a wire's converter
 would not deliver, in order; a page too small for the result's header and one piece of it. Every
 error passes through one scope (``_Refusals``) that says once whether the model was called

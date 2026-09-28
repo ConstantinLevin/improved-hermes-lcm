@@ -357,16 +357,18 @@ def _image_outcome(block: dict, path: tuple, image_site: bool, given: Given) -> 
 def _image_parts(block: dict, path: tuple, given: Given, origin: str, kind: str, standing: str,
                  label: Optional[str] = None) -> tuple[list[dict], bool]:
     """An image block at an image site given as parts, in its place: the image (after ``label``,
-    written only where the image is given), and its other stored keys as their JSON beside it; a
-    placeholder, or a note that says why it is not given. Returns the parts and whether anything
-    under a key of the opaque vocabulary was withheld from the other keys."""
+    written only where the image is given), a placeholder, or a note that says why it is not given;
+    in every outcome its other stored keys as their JSON beside it (the orchestrator's ruling on
+    PI-9, 2026-09-28). Returns the parts and whether anything under a key of the opaque vocabulary
+    was withheld from the other keys."""
     outcome, part, text = _image_outcome(block, path, True, given)
     if outcome == REPLACED_IMAGE:
-        return [given.made(part, REPLACED, path, origin)], False
-    if outcome == NOT_GIVABLE:
-        return [given.made({"type": "text", "text": text}, NOTE, path)], False
-    parts = [given.made({"type": "text", "text": label}, FIELD, path)] if label else []
-    parts.append(given.made(part, origin, path))
+        parts = [given.made(part, REPLACED, path, origin)]
+    elif outcome == NOT_GIVABLE:
+        parts = [given.made({"type": "text", "text": text}, NOTE, path)]
+    else:
+        parts = [given.made({"type": "text", "text": label}, FIELD, path)] if label else []
+        parts.append(given.made(part, origin, path))
     other, withheld = [], False
     rest = _other_image_keys(block)
     if rest:
@@ -693,7 +695,10 @@ _CLASSES = {
 class _Record:
     """One record's facing: what the classification gives and counts, gathered in one place.
     ``foreign``: the field is stored on a role whose domain lacks it (M4): its carrier texts are
-    given as parts, not held against the content."""
+    given as parts, not held against the content. ``compares_calls``: the message is an agent
+    message, whose carrier calls are compared with its calls (T5, rule 3); on any other message a
+    carrier call is given as labelled JSON (the orchestrator's ruling on PI-2, 2026-09-28).
+    ``role_text``: the stored role as the labels say it (``stored_role_text``)."""
 
     record: str
     given: Given
@@ -705,6 +710,8 @@ class _Record:
     calls: list = field(default_factory=list)         # (name, arguments, parsed) of the calls given
     foreign: bool = False
     withheld_content: bool = False
+    compares_calls: bool = False
+    role_text: str = ""
 
     def json(self, label: str, value: Any, path: tuple, kind: str, standing: Optional[str] = None) -> bool:
         parts, withheld = _render(label, value, path, kind, standing or self.standing, self.given)
@@ -769,6 +776,23 @@ class _Record:
         else:
             self.given.problems.append(f"its replay carrier holds a call its tool calls do not ({_path_text(path)}, "
                                        f"{shown})")
+
+    def call_block(self, block: dict, table: dict, path: tuple) -> bool:
+        """A carrier's call block (``tool_use``, ``toolUse``; T5). On an agent message its name and
+        input are compared with the message's calls (``called``); on any other message, where the
+        call is only a stored value, they are given as labelled JSON, the call's values (standing
+        call; the vocabulary is never withheld inside ``input``), and nothing is refused (the
+        orchestrator's ruling on PI-2, 2026-09-28). Its metadata is not given; every other key is
+        the call's. Returns whether opaque material was withheld."""
+        withheld = False
+        if self.compares_calls and not self.foreign:
+            self.called(block.get("name"), block.get("input"), path)
+        else:
+            values = {key: block[key] for key in ("name", "input") if key in block}
+            withheld = self.json(f"[{_path_text(path)} holds a tool call, stored on this message {self.role_text}, "
+                                 f"which is not one of the calls the query gives; its name and input shown as their "
+                                 f"JSON by the query:]", values, path, _TOOL_USE)
+        return self.keys(block, table, path, CALL, skip=("name", "input")) or withheld
 
     def keys(self, container: dict, table: dict, path: tuple, other: str, *, skip: tuple = ()) -> bool:
         """Every key of an entry or block by its class; ``other``: the kind (table T) of every key
@@ -907,9 +931,9 @@ def _anthropic_blocks(key: str, value: Any, face: _Record) -> None:
         if kind in ("thinking", "redacted_thinking"):
             withheld = face.keys(block, table, path, REASONING)
         elif kind == "tool_use":
-            # T5: the block's name and input compared with the stored canonical calls (rule 3).
-            face.called(block.get("name"), block.get("input"), path)
-            withheld = face.keys(block, table, path, CALL, skip=("name", "input"))
+            # T5: on an agent message the block's name and input compared with the stored canonical
+            # calls (rule 3); on any other message given as labelled JSON (ruling on PI-2).
+            withheld = face.call_block(block, table, path)
         else:
             withheld = face.keys(block, table, path, CARRIER)
         if withheld:
@@ -938,8 +962,7 @@ def _bedrock_blocks(value: Any, face: _Record) -> None:
         tool = block.get("toolUse")
         where = path + ("toolUse",)
         if isinstance(tool, dict):
-            face.called(tool.get("name"), tool.get("input"), where)
-            withheld = face.keys(tool, _CLASSES[(field_, "toolUse")], where, CALL, skip=("name", "input")) or withheld
+            withheld = face.call_block(tool, _CLASSES[(field_, "toolUse")], where) or withheld
         elif not carries_nothing(tool):
             withheld = face.json(f"[{_path_text(where)} is not an object of the host's shape; shown as its JSON by the "
                                  f"query:]", tool, where, CALL) or withheld
@@ -1076,7 +1099,7 @@ def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> Non
     ruling OD-F5): the row decides only that its outputs are given as parts, never placed on the
     wire; the first part says where it is stored."""
     sub = _Record(face.record, face.given, face.standing, face.opaque, content_texts=face.content_texts,
-                  foreign=True)
+                  foreign=True, role_text=face.role_text)
     path = ("message", key)
     if key in ("reasoning", "reasoning_content"):
         if sub.readable_text(value, path):
@@ -1150,7 +1173,7 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     fill = host_fill_text(row)
     standing = GIVEN_RESULT if role == "tool" else GIVEN_CONTENT
     message: dict = {"role": role}
-    face = _Record(record, given, standing, {})
+    face = _Record(record, given, standing, {}, compares_calls="tool_calls" in domain, role_text=stored_role_text(raw))
     if "content" in row:
         message["content"] = _canonical_content(row["content"], standing, given, face)
     if face.withheld_content:
@@ -1214,10 +1237,17 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
                 _foreign(key, value, raw, face, shown)
         elif not _is_metadata(key, known):
             # T14: an unknown top-level key, walked as a stored value of no kind the store tells; one
-            # named by the opaque vocabulary is withheld whole (M1).
-            if _withholds(key, STORED_KIND) or face.json(
-                    f"[The stored key {_path_text(('message', key))} is no field the query knows; shown as its JSON by "
-                    f"the query:]", value, ("message", key), STORED_KIND):
+            # named by the opaque vocabulary is withheld whole (M1), and a note in the record's
+            # after-parts marks its place, since no JSON holds a marker there (the orchestrator's
+            # ruling on PI-3, 2026-09-28; nothing of it is recorded).
+            where = ("message", key)
+            if _withholds(key, STORED_KIND):
+                face.after.append(given.made({"type": "text", "text": (
+                    f"[{_path_text(where)}: withheld, opaque replay material under this key; counted in the header's "
+                    f"encrypted_withheld]")}, NOTE, where))
+                face.count("other stored keys")
+            elif face.json(f"[The stored key {_path_text(where)} is no field the query knows; shown as its JSON by the "
+                           f"query:]", value, where, STORED_KIND):
                 face.count("other stored keys")
     for kind, count in face.opaque.items():
         withheld[kind] = withheld.get(kind, 0) + count
