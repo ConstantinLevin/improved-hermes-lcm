@@ -1397,7 +1397,15 @@ def _carrier_legs(facts: _RouteFacts) -> str:
     for wire in facts.wires:
         replayed = _REPLAYED.get(wire, ())
         for carrier in TEXT_REPLAY_CARRIERS + (STASH,):
-            if carrier in replayed:
+            if carrier == STASH and carrier in replayed:
+                # ``_tool_result_content`` (anthropic_message_convert.py 431-450): the stash only where the content is
+                # no _multimodal envelope and makes no image block of its own (``query_input.stash_sent``), after the
+                # content's text where the content is a non-blank string, else in the content's place.
+                said.append(f"{carrier}: the host's converter for {wire} sends a tool result's stash only where the "
+                            f"result's content is no _multimodal envelope and makes no image block of its own, after "
+                            f"the content's text where the content is a non-blank string and in the content's place "
+                            f"otherwise; the query sends the content and no stash")
+            elif carrier in replayed:
                 said.append(f"{carrier}: the host's converter for {wire} would send this carrier in place of the "
                             f"content; the query sends the content and no carrier (the carrier shadows the content; its "
                             f"encrypted items go only to the producing family)")
@@ -1864,9 +1872,10 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                                         f"stored content is what the model reads; on every message a text of a replay "
                                         f"carrier or of the stash that the message's content (or its main reasoning) "
                                         f"does not hold is given as a labelled part of its own, and a carrier's tool "
-                                        f"call that is not one of the calls given as calls (by name, and by its input "
-                                        f"where the stored arguments parse) is given as labelled JSON with its name and "
-                                        f"input; per leg: {_carrier_legs(route_facts)}; readable reasoning is given; an "
+                                        f"call that is not one of the calls given as calls (by its name and its input; a "
+                                        f"call whose stored arguments do not parse is never matched) is given as "
+                                        f"labelled JSON with its name and input; per leg: {_carrier_legs(route_facts)}; "
+                                        f"readable reasoning is given; an "
                                         f"image block by the image rules; citations and every key the query does not "
                                         f"know as their JSON; opaque material withheld at any depth; metadata not "
                                         f"given; empty values inside a value given as JSON are shown as stored; a "
