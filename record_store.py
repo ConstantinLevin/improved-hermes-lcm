@@ -1091,10 +1091,17 @@ class RecordStore:
         ``WriteFenced`` is raised. A failure raises; the event is never kept pending, since a
         pending event would be written by another writer after the host stopped waiting."""
         text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
+        try:
+            with self._fenced_tx(fence) as conn:
+                conn.execute("INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
+                             (time.time(), kind, session, None, text))
+        except BaseException as exc:
+            # The log says an event only where one was written (PLAN-83e §7).
+            logger.warning("LCM store event %s (session=%s) not written (%s): %s", kind, session,
+                           "the host asked the call to stop" if isinstance(exc, WriteFenced) else type(exc).__name__,
+                           text)
+            raise
         logger.warning("LCM store event %s (session=%s): %s", kind, session, text)
-        with self._fenced_tx(fence) as conn:
-            conn.execute("INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
-                         (time.time(), kind, session, None, text))
 
     def query_report(self, report_id: str) -> Optional[tuple[str, str]]:
         """(session, body) of a stored query result, or None."""

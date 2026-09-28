@@ -11,12 +11,13 @@ each; a tool call's or a message's handle is refused with a pointer to ``lcm_exp
 
 **What the model is given.** One call over one context, on the summariser's route with its
 effort (``_summariser_settings``), through the host's ``call_llm``: the query's instructions,
-then every record as the query gives it (``summariser_input.strict_message``: the host's
-per-row rules, each host function called strictly; a content of text and image parts only,
-every other value given as a labelled rendering of its JSON; tool calls of the shape the host
-writes; readable reasoning from every field that holds it; the host's replay carriers not sent,
-their blocks faced one by one; the host's fill of an empty message quoted, never given as the
-message's content), then the question. Every user and agent message carries a label naming its
+then every record as the query gives it (``query_input.strict_message``: the host's per-row
+rules, each host function called strictly; the message built from the stored role's domain; a
+content of text and image parts only, every other value given as a labelled rendering of its JSON
+with the image parts inside it faced; tool calls of the shape the host writes, on agent messages;
+readable reasoning from every field that holds it; the host's replay carriers not sent, every key
+of their blocks faced by one classification; nothing shown of a value that carries nothing; the
+host's fill of an empty message quoted, never given as the message's content), then the question. Every user and agent message carries a label naming its
 handle; a message's label also names its tool calls' handles and, where the stored ids establish
 it among the records given, the records that hold their results; every other tool result is
 named, with no claim about which call it answers, on the label before it. A tool result carries
@@ -53,9 +54,9 @@ is an interim value (#22): the host's configured sequential tool timeout, else 4
 **The reply.** Its content must be exactly one JSON object ``{"report": str, "excerpts": [{"handle":
 str, "text": str}, ...]}``; nothing is stripped or recognised by pattern (#9 Decided). Each
 excerpt is accepted only where its text is contained in one of the strings the query gave its
-model from the record its handle names (for a tool call, from one of the call's results by the
-store's pairing), and the result names the field it was found in and that field's standing. One
-that fails is named and withheld, without its text.
+model from the record its handle names (for a tool call, from the results its label names, the
+one pairing fact the query asserts), and the result names the field it was found in and that
+field's standing. One that fails is named and withheld, without its text.
 
 **Pages.** The result is served by the one page mechanism (``expansion.serve_page``). A result
 that needs a second page is stored once (``query_reports``) before page 1 is returned, in a
@@ -90,27 +91,29 @@ from .message_analysis import _tool_call_id
 from .message_content import content_parts, image_media_type, is_image_part, sidecar_sent
 from .model_table import lookup as lookup_model
 from .record_store import HANDLE_RE, ReadFenced, RecordStore, WriteFenced
-from .summariser_input import (
+from .query_input import (
     GIVEN_CALL,
     GIVEN_CONTENT,
     GIVEN_REASONING,
     GIVEN_RESULT,
+    LABEL,
+    LIFTED,
     RENDERED,
     REPLACED,
+    STASH,
     STORED,
     TEXT_REPLAY_CARRIERS,
     Given,
-    HostUnavailable,
-    _add_parts,
-    _json_kind,
-    _strict_import,
+    blank,
     canonical_call,
-    image_count,
+    carries_nothing,
+    json_kind,
+    label_message,
     strict_message,
     text_part,
-    wire_facts,
-    wire_image_limit,
+    unrecorded_parts,
 )
+from .summariser_input import HostUnavailable, _strict_import, image_count, wire_facts, wire_image_limit
 from .tokens import Estimator
 
 logger = logging.getLogger(__name__)
@@ -194,17 +197,23 @@ INSTRUCTIONS = (
     "what the stretches may show about the question, hedged, because the agent reading it has not seen "
     "them; wherever the report draws on a message or a tool call, name its handle. Then give the "
     "excerpts most relevant to the question, each copied character for character from one message or "
-    "one tool result, with the handle of that message (m…) or of the tool call whose result it is (t…)."
+    "one tool result, with the handle of that message (m…), or of the tool call (t…) where its label "
+    "names the message holding its result; a tool result the labels name without a call is cited by its "
+    "own handle (m…)."
 )
 CONTRACT = ('Reply with one JSON object and nothing else: {"report": "…", "excerpts": [{"handle": "…", '
             '"text": "…"}]}')
 NOTE = ("The report is a model's description of what it read, hedged: orientation, not something to "
         "act on. Each excerpt was found verbatim in the record named by \"in\", in the field named by \"from\". "
         "One from a message's content or a tool result may be relied on as an expansion may; one from a "
-        "tool call's name or arguments is what was called; one found only in reasoning is the model's "
+        "tool call's name or arguments (cited by the handle of the message that made the call) is what was "
+        "called; one found only in reasoning is the model's "
         "account of its thinking, and nothing rests on it. A withheld excerpt did not pass the check its "
         "\"why\" names and is not shown.")
 _GROUP_NOTE = "one of the results of calls the store cannot pair"
+_NOT_A_CALL_GIVEN = "not a tool call the query gave as a call"
+_NO_RESULT_NAMED = ("the query named no result for this call (see its label); a result is cited by its own "
+                    "handle (m…), which the labels name")
 _STANDINGS = (GIVEN_CONTENT, GIVEN_RESULT, GIVEN_CALL, GIVEN_REASONING)
 
 
@@ -226,6 +235,9 @@ class _Read:
     pairing: dict = field(default_factory=dict)         # chunk -> pairing.Pairing
     calls: dict = field(default_factory=dict)           # record -> {position: call handle}
     given: dict = field(default_factory=dict)           # record -> Given (what the query gave of it)
+    # The one pairing fact the query asserts (PLAN-83e §6): the handle of every call it gives as a
+    # call -> the results its label names (none: an empty tuple), and whether they are a group.
+    named: dict = field(default_factory=dict)           # call handle -> (tuple of result records, group?)
     stored_at: Optional[str] = None
 
 
@@ -497,10 +509,13 @@ def _recovery(exc: BaseException, facts: _RouteFacts, timeout: float) -> str:
 
 def _wire_calls(raw: dict) -> list[int]:
     """The positions of the stored calls the query gives as calls on the wire: those of the shape
-    the host writes (``summariser_input.canonical_call``); every other value of ``tool_calls`` is
-    given as labelled JSON and is not a call the model sees (plan §4.2)."""
+    the host writes (``query_input.canonical_call``) on an agent message, the only role the host
+    writes calls on (PLAN-83e §5); every other value of ``tool_calls``, and calls stored on another
+    role, are given as labelled JSON and are not calls the model sees."""
     calls = raw.get("tool_calls")
-    return [position for position, call in enumerate(calls) if canonical_call(call)] if isinstance(calls, list) else []
+    if raw.get("role") != "assistant" or not isinstance(calls, list):
+        return []
+    return [position for position, call in enumerate(calls) if canonical_call(call)]
 
 
 def _counted(count: int, one: str, many: str) -> str:
@@ -515,13 +530,14 @@ def _stored_shape(raw: dict) -> str:
     if content is None:
         return "stored as null"
     if isinstance(content, str):
-        return "stored as a string" if content else "stored as an empty string"
+        return ("stored as an empty string" if not content else "stored as a blank string" if blank(content)
+                else "stored as a string")
     if isinstance(content, list):
         return f"stored as a list of {_counted(len(content), 'member', 'members')}"
     parts = content_parts(content)
     if isinstance(content, dict) and parts is not None:
         return f"stored as a multimodal envelope of {_counted(len(parts), 'part', 'parts')}"
-    return f"stored as a JSON {_json_kind(content)}"
+    return f"stored as a JSON {json_kind(content)}"
 
 
 def _joined_tool_content(record: str, message: dict, raw: dict, given: Given) -> Optional[str]:
@@ -541,7 +557,11 @@ def _joined_tool_content(record: str, message: dict, raw: dict, given: Given) ->
         raise ExpansionError(f"record {record}: a part the query gives of it has no recorded origin, so the query "
                              f"cannot say what it gives; nothing was sent")
     message["content"] = "\n".join(part["text"] for part in content)
-    stored, replaced, rendered = origins.count(STORED), origins.count(REPLACED), origins.count(RENDERED)
+    # A placeholder counts as a stored image replaced where it replaced an image of the stored
+    # content (kept as a part, or lifted out of a member given as JSON); one that replaced an
+    # image of another stored field counts with that field's parts.
+    stored, rendered = origins.count(STORED), origins.count(RENDERED)
+    replaced = sum(1 for part in content if given.origin(part) == REPLACED and given.replaced(part) in (STORED, LIFTED))
     other = len(origins) - stored - replaced - rendered
     pieces = [_counted(stored, "stored text part", "stored text parts")] if stored else []
     if replaced:
@@ -564,7 +584,9 @@ def _labels(found: _Read, rows: list, joined: dict) -> dict:
     ``_groups``), or the store's pairing puts it in a group whose calls and results are exactly
     those given carrying its ids. Every tool result the labels do not name is named, with no
     claim about the store, on the nearest labelled message before it in its chunk. A message
-    whose stored content the host's sidecar replaces says so."""
+    whose stored content the host's sidecar replaces says so, as does one stored with a role the
+    query sends as a user message (ruling OD-E2). What the labels name is the one pairing fact the
+    query asserts: it is kept in ``found.named``, which ``check_excerpts`` reads (PLAN-83e §6)."""
     raw_of = {record: raw for _chunk, record, raw in rows}
     calls_with: dict = {}
     results_with: dict = {}
@@ -588,6 +610,7 @@ def _labels(found: _Read, rows: list, joined: dict) -> dict:
 
     named: set = set()
     labels: dict = {}
+    found.named = {}
     for chunk in found.chunks:
         pairing = found.pairing[chunk]
         for record, raw in found.records[chunk]:
@@ -596,7 +619,10 @@ def _labels(found: _Read, rows: list, joined: dict) -> dict:
             calls = []
             for position in _wire_calls(raw):
                 place = (record, position)
-                said = f"{found.calls.get(record, {}).get(position)} {raw['tool_calls'][position]['function']['name']}"
+                handle = found.calls.get(record, {}).get(position)
+                said = f"{handle} {raw['tool_calls'][position]['function']['name']}"
+                results: tuple = ()
+                group_named = False
                 if place in pairing.group:
                     group = pairing.group[place]
                     ids = group_ids(group)
@@ -605,16 +631,24 @@ def _labels(found: _Read, rows: list, joined: dict) -> dict:
                             and set().union(*(results_with.get(i, set()) for i in ids)) == set(group.results)):
                         said += (f" → one of results {', '.join(result_named(r) for r in group.results)} (the store "
                                  f"cannot tell which result answers which call)")
-                        named.update(group.results)
+                        results, group_named = tuple(group.results), True
                 elif place in pairing.answer:
                     result = pairing.answer[place]
                     ident = _tool_call_id(raw["tool_calls"][position])
                     if result in raw_of and calls_with.get(ident) == {place} and results_with.get(ident) == {result}:
                         said += f" → result {result_named(result)} (the only call and result given here with that id)"
-                        named.add(result)
+                        results = (result,)
+                named.update(results)
+                if handle is not None:
+                    found.named[handle] = (results, group_named)
                 calls.append(said)
             label = f"[message {record} · tool calls: {'; '.join(calls)}]" if calls else _label_message(record)
-            if sidecar_sent(raw) and raw.get("content") != raw.get("api_content"):
+            role = raw.get("role")
+            if not (isinstance(role, str) and role in ("user", "assistant")):
+                stored = f"with role {json.dumps(role, ensure_ascii=False)}" if "role" in raw else "with no role"
+                label = f"{label[:-1]} · stored {stored}; given here as a user message]"
+            if (sidecar_sent(raw) and not carries_nothing(raw.get("content"))
+                    and raw.get("content") != raw.get("api_content")):
                 label = (f"{label[:-1]} · its stored content is not given here: the host sent the text of api_content "
                          f"in its place, which is given]")
             labels[record] = label
@@ -660,7 +694,7 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     for key in ("images_not_sent", "carriers", "reasoning_parts"):
         stats.setdefault(key, 0)
     rows = [(chunk, record, raw) for chunk in found.chunks for record, raw in found.records[chunk]]
-    objects = [f"{record} (a JSON {_json_kind(raw)})" for _chunk, record, raw in rows if not isinstance(raw, dict)]
+    objects = [f"{record} (a JSON {json_kind(raw)})" for _chunk, record, raw in rows if not isinstance(raw, dict)]
     if objects:
         raise ExpansionError(f"these records are stored as JSON values that are not messages: {', '.join(objects)}; "
                              f"the store's own writer never writes one (a hand-edited store), and the query cannot give "
@@ -683,9 +717,8 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
         problems.extend(f"{record}: {problem}" for problem in given.problems)
         content = message.get("content")
         stats["images_not_sent"] += sum(1 for part in (content if isinstance(content, list) else [])
-                                        if given.origin(part) == REPLACED)
-        if any(isinstance(raw.get(key), list) and raw.get(key) for key in TEXT_REPLAY_CARRIERS + (
-                "_anthropic_content_blocks",)):
+                                        if given.origin(part) == REPLACED) + len(given.images_not_given)
+        if any(isinstance(raw.get(key), list) and raw.get(key) for key in TEXT_REPLAY_CARRIERS + (STASH,)):
             stats["carriers"] += 1
         if joins and raw.get("role") == "tool":
             said = _joined_tool_content(record, message, raw, given)
@@ -701,8 +734,14 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     for entry in sent:
         if entry.record in labels:
             # No label of the plugin's inside a tool result (OD-D).
-            _add_parts(entry.message, [{"type": "text", "text": labels[entry.record]}], [])
+            label_message(entry.message, labels[entry.record], entry.given)
             entry.label = labels[entry.record]
+    # Every part of every message has one recorded origin (PLAN-83d §2's property, asserted where
+    # the messages are finished, PLAN-83e §8.3).
+    unrecorded = [entry.record for entry in sent if unrecorded_parts(entry.message, entry.given)]
+    if unrecorded:
+        raise ExpansionError(f"a part the query gives of {', '.join(unrecorded)} has no recorded origin, so the query "
+                             f"cannot say what it gives; nothing was sent")
     closing = f"Question:\n{question}\n\n{CONTRACT}"
     messages = ([{"role": "system", "content": INSTRUCTIONS}] + [entry.message for entry in sent]
                 + [{"role": "user", "content": closing}])
@@ -817,10 +856,12 @@ def _given_tokens(messages: list[dict], sent: list[_Sent]) -> list[tuple]:
                 tokens.append(("image", None, who, f"image part {number}"))
             elif isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
                 text = part["text"]
-                what = ("the query's label" if entry is not None and text == entry.label
-                        else f"the query's part {number} ({text.split(']', 1)[0]}])"
-                        if entry is not None and text in entry.given.added
-                        else "its text" if entry is None else f"stored text part {number}")
+                origin = entry.given.origin(part) if entry is not None else None
+                what = ("its text" if entry is None
+                        else "its stored text" if isinstance(content, str)
+                        else "the query's label" if origin == LABEL
+                        else f"stored text part {number}" if origin == STORED
+                        else f"the query's part {number} ({text.split(']', 1)[0]}])")
                 tokens.append(("text", text, who, what))
         for number, call in enumerate(message.get("tool_calls") or [], start=1):
             function = call["function"]
@@ -1000,27 +1041,17 @@ def check_excerpts(found: _Read, excerpts: list) -> list[Item]:
                 continue
             candidates = [handle]
         else:
-            place = next(((record, position) for record, positions in found.calls.items()
-                          for position, call in positions.items() if call == handle), None)
-            # The call's pairing: of the chunk that holds the call or one of its results (a
-            # result read may belong to a call in a chunk not read; its label names that call).
-            pairing = next((found.pairing[chunk] for chunk in found.chunks
-                            if place in found.pairing[chunk].group or place in found.pairing[chunk].answer),
-                           None) if place is not None else None
-            if pairing is None:
-                items.append(withhold("not a tool call this query read" if place is None or place[0] not in chunk_of
-                                      else "the call has no result on the active record"))
+            # Which results a call's excerpt is searched in is what the call's label named, and
+            # nothing else (the one pairing fact, PLAN-83e §6): a result the labels name without a
+            # call is cited by its own handle.
+            if handle not in found.named:
+                items.append(withhold(_NOT_A_CALL_GIVEN))
                 continue
-            if place in pairing.group:
-                candidates, note = list(pairing.group[place].results), _GROUP_NOTE
-            else:
-                candidates = [pairing.answer[place]]
-            outside = [record for record in candidates if record not in chunk_of]
-            candidates = [record for record in candidates if record in chunk_of]
-            if not candidates:
-                items.append(withhold(f"the call's result ({', '.join(outside)}) lies outside the chunks this query "
-                                      f"read, so it was not searched"))
+            results, group = found.named[handle]
+            if not results:
+                items.append(withhold(_NO_RESULT_NAMED))
                 continue
+            candidates, note = list(results), (_GROUP_NOTE if group else None)
         where, fields = next(((record, _found_in(text, found.given[record])) for record in candidates
                               if _found_in(text, found.given[record])), (None, []))
         if where is None:
@@ -1068,9 +1099,7 @@ def _precheck_room(read: _Read, header: dict, limit: Any, largest_group: int) ->
     # Every "why" check_excerpts can write, each at its longest; the longest one is measured
     # (a withheld item has no text to cut into pieces).
     whys = ["not the handle of a tool call (t…) or a message (m…)", "empty",
-            "not a message this query read", "not a tool call this query read",
-            "the call has no result on the active record",
-            f"the call's result ({groups}) lies outside the chunks this query read, so it was not searched",
+            "not a message this query read", _NOT_A_CALL_GIVEN, _NO_RESULT_NAMED,
             f"not found verbatim in what the query gave of {groups}"]
     path = _longest_path(read)
     candidates = [
@@ -1287,12 +1316,22 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                       "images_not_sent": stats["images_not_sent"],
                       "encrypted_withheld": dict(sorted(withheld.items())),
                       "encrypted_withheld_is": (
-                          "per stored field, how many entries or blocks held a signature, encrypted content or opaque "
-                          "data (another provider's private replay carrier by its type), which the query does not "
-                          "give; the readable text beside it (summary, thinking, content, text) is given, as the "
-                          "message's reasoning where the host merged it there or as a labelled part of its own; the "
-                          "host can store one payload in two fields (reasoning_details and a replay carrier), and "
-                          "each field is counted"),
+                          "per stored field (reasoning_details, codex_reasoning_items, anthropic_content_blocks, "
+                          "_anthropic_content_blocks, bedrock_content_blocks, tool_calls), how many entries, blocks "
+                          "or calls held a signature, encrypted content or opaque data that carries something, which "
+                          "the query does not give (a reasoning_details entry of another provider's private replay "
+                          "carrier is counted under its type, all of it but its readable text withheld); the readable "
+                          "text beside it (summary, thinking, content, text) is given, as the message's reasoning "
+                          "where the host merged it there or as a labelled part of its own; the host can store one "
+                          "payload in two fields (reasoning_details and a replay carrier), and each field is "
+                          "counted"),
+                      "reasoning_echo": (
+                          "the host's reasoning-echo policy for this route keeps each agent message's "
+                          "reasoning_content on the message it sends (a blank one as a single space), as the "
+                          "provider requires of replayed tool-call turns; its readable reasoning is also given as a "
+                          "labelled part" if wire.needs_reasoning_echo else
+                          "the host's reasoning-echo policy for this route removes reasoning_content from every "
+                          "message it sends; readable reasoning is given only as labelled parts"),
                       "window": window,
                       "wire": [f"{name}: {why}; the host's converter for it was run over the query's messages before "
                                f"the call and gives the model, in its place, every non-blank text the query gives it "
@@ -1305,12 +1344,16 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                                         f"({', '.join(TEXT_REPLAY_CARRIERS)}) or blocks the host stashed in "
                                         f"_anthropic_content_blocks, as a list; the query sends none of them, nor the "
                                         f"replay carriers of reasoning (reasoning_details, codex_reasoning_items): the "
-                                        f"stored content is what the model reads; each carrier block is checked "
-                                        f"against it (a text must stand in the given content and a call must be one "
-                                        f"of the stored calls, else the query refuses), given as readable reasoning, "
-                                        f"as an image or as its JSON, or withheld and counted under "
-                                        f"encrypted_withheld; a blank text carries nothing and is not shown; a "
-                                        f"carrier that is not a list is given as its JSON; a provider that requires "
+                                        f"stored content is what the model reads; every key of every carrier block is "
+                                        f"faced: a text of a replay carrier must stand in what is given of the "
+                                        f"message (its content or its readable reasoning) and a call must be one of "
+                                        f"the calls given, else the query refuses; a text of the stash that the "
+                                        f"content does not hold is given as its own part; readable reasoning is "
+                                        f"given, an image block as an image, citations and any key the query does "
+                                        f"not know as their JSON; opaque material is withheld and counted under "
+                                        f"encrypted_withheld; the carriers' metadata is not given; a value that "
+                                        f"carries nothing is not shown; a carrier that is not a list is given as its "
+                                        f"JSON; a provider that requires "
                                         f"replayed reasoning on earlier agent messages would refuse the call, and the "
                                         f"query's error then names that refusal"),
                       "reasoning_given_apart": (f"{stats['reasoning_parts']} readable reasoning text(s) held in another "
