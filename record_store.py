@@ -94,6 +94,11 @@ class WriteFenced(Exception):
     (``RecordStore._fenced_tx``)."""
 
 
+class ReadFenced(Exception):
+    """A fenced read's fence tripped while it waited: nothing more was read
+    (``RecordStore.snapshot`` with a fence)."""
+
+
 @dataclass(frozen=True)
 class Cover:
     """A session's latest effective return as the tools read it (``RecordStore.cover``)."""
@@ -248,42 +253,59 @@ class RecordStore:
                 self._tx_depth = 0
             self._flush_events()
 
+    def _fenced_lock(self, check: Callable[[], None]) -> None:
+        """Take the helper's lock in slices of ``_POLL_S``, asking ``check`` between them: the
+        wait for the lock lasts as long as this engine copy's other store work holding it
+        (planning, derivation and return writes, confirmations, grep's scan, expand's page, the
+        doctor's invariant: each finite, none waiting on a model, the limiter or a condition;
+        PLAN-83d §5), or until the fence trips."""
+        while not self._lock.acquire(timeout=_POLL_S):
+            check()
+
+    @staticmethod
+    def _retried(conn: sqlite3.Connection, statement: str, check: Callable[[], None]) -> Any:
+        """``statement`` at busy timeout 0, retried on SQLITE_BUSY with ``check`` asked before
+        each try, within the store's own bound, as its unfenced writers have it: the busy timeout
+        per statement, counted from the statement's first try.
+
+        Which error is SQLITE_BUSY: ``sqlite_errorcode`` is set on an error raised from an SQLite
+        return code on every interpreter the plugin runs in (the host requires Python >= 3.11,
+        Hermes 375930d089 pyproject.toml:15 ``requires-python = ">=3.11,<3.15"``, and the
+        attribute exists from 3.11). An ``OperationalError`` the sqlite3 module raises itself
+        carries no such attribute at all (observed on CPython 3.14.4, the scratch venv of the
+        host's export, 2026-09-28: ``sqlite3.OperationalError("…")`` has no ``sqlite_errorcode``,
+        and ``sqlite3.Error`` has no class default), so it is read with a sentinel: an error
+        without it is no SQLite return code, is not busy, and is raised as it is."""
+        deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000.0
+        while True:
+            check()
+            try:
+                return conn.execute(statement)
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if not isinstance(code, int) or (code & 0xFF) != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                    raise
+            time.sleep(max(0.0, min(_POLL_S, deadline - time.monotonic())))
+
     @contextlib.contextmanager
     def _fenced_tx(self, fence: Callable[[], bool]):
         """One short write transaction that commits nothing once ``fence()`` is true (the
-        query's result, #19; plan §6.2 on PR #83). Every wait is fenced: the helper's lock is
-        taken in slices of ``_POLL_S`` with the fence asked between them; the connection's busy
-        timeout is 0 for the transaction's duration, so that ``BEGIN IMMEDIATE`` and ``COMMIT``
-        return SQLITE_BUSY at once and are retried here, the fence asked before each try, each
-        statement within the store's own busy timeout from its first try (in rollback-journal
-        mode a COMMIT waits for readers' shared locks and, after SQLITE_BUSY, "the transaction
-        remains active and the COMMIT can be retried", sqlite.org lang_transaction.html §2.3);
-        the fence is asked again after the body. A fence that trips rolls the transaction back (which also releases the PENDING
-        lock a waiting COMMIT holds) and raises ``WriteFenced``. What it cannot close: the
-        COMMIT's own execution once its last try has begun. Never nested in another
-        transaction of this helper. Events pending from other callers are flushed after the
-        commit, unfenced, as ``_tx`` does."""
+        query's result and its failure event, #19; PLAN-83d §5). Every wait is fenced: the
+        helper's lock is taken in slices of ``_POLL_S`` with the fence asked between them; the
+        connection's busy timeout is 0 for the transaction's duration, so that ``BEGIN
+        IMMEDIATE`` and ``COMMIT`` return SQLITE_BUSY at once and are retried here, the fence
+        asked before each try (in rollback-journal mode a COMMIT waits for readers' shared locks
+        and, after SQLITE_BUSY, "the transaction remains active and the COMMIT can be retried",
+        sqlite.org lang_transaction.html §2.3); the fence is asked again after the body. A fence
+        that trips rolls the transaction back (which also releases the PENDING lock a waiting
+        COMMIT holds) and raises ``WriteFenced``. What it cannot close: the COMMIT's own execution
+        once its last try has begun. Never nested in another transaction of this helper. It
+        writes no event other work left pending (ruling OD-P4a): those stay for the next
+        unfenced writer."""
         def check() -> None:
             if fence():
                 raise WriteFenced()
-
-        def retried(statement: str) -> None:
-            # The store's own bound, as its unfenced writers have it: the busy timeout per
-            # statement, counted from the statement's first try (never the wait for the helper's
-            # lock, which the fence alone bounds).
-            deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000.0
-            while True:
-                check()
-                try:
-                    conn.execute(statement)
-                    return
-                except sqlite3.OperationalError as exc:
-                    busy = getattr(exc, "sqlite_errorcode", None)
-                    if busy is None or (busy & 0xFF) != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
-                        raise
-                time.sleep(max(0.0, min(_POLL_S, deadline - time.monotonic())))
-        while not self._lock.acquire(timeout=_POLL_S):
-            check()
+        self._fenced_lock(check)
         try:
             if self._tx_depth or self._read_depth:
                 raise RuntimeError("a fenced transaction cannot be nested in an open one of this helper")
@@ -291,11 +313,11 @@ class RecordStore:
             check()
             conn.execute("PRAGMA busy_timeout = 0")
             try:
-                retried("BEGIN IMMEDIATE")
+                self._retried(conn, "BEGIN IMMEDIATE", check)
                 self._tx_depth = 1
                 try:
                     yield conn
-                    retried("COMMIT")
+                    self._retried(conn, "COMMIT", check)
                 except BaseException:
                     self._rollback(conn)
                     raise
@@ -303,7 +325,6 @@ class RecordStore:
                     self._tx_depth = 0
             finally:
                 conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-            self._flush_events()
         finally:
             self._lock.release()
 
@@ -721,12 +742,23 @@ class RecordStore:
     # --- Reading for the tools (#18; #29 W5) -----------------------------------------
 
     @contextlib.contextmanager
-    def snapshot(self):
+    def snapshot(self, fence: Optional[Callable[[], bool]] = None):
         """One read transaction around a tool's reads, so that a compaction committing
         meanwhile, in this process or another, is not half seen. It holds the helper's
         lock and, in rollback-journal mode, a shared lock on the file: a writer's commit
         waits for it (within its busy timeout), so nothing slow runs inside it, and never
-        a model call. Inside an open transaction of this helper it joins that one."""
+        a model call. Inside an open transaction of this helper it joins that one.
+
+        With a ``fence`` (the query, PLAN-83d §5; ruling OD-P4c) every wait is fenced: the
+        helper's lock is taken in slices with the fence asked between them; the shared lock
+        is taken by a first read at busy timeout 0, retried with the fence asked before each
+        try, and the busy timeout is restored once it is held (a read transaction keeps it to
+        its end, so no later read of it waits for a lock); a fence that trips ends the read
+        and raises ``ReadFenced``. It writes no pending event at its end: those stay for the
+        next unfenced writer. What it cannot close: a read's own execution once begun."""
+        if fence is not None:
+            yield from self._fenced_snapshot(fence)
+            return
         with self._lock:
             conn = self._conn
             if self._tx_depth or self._read_depth:
@@ -748,6 +780,38 @@ class RecordStore:
             finally:
                 self._read_depth = 0
             self._flush_events()
+
+    def _fenced_snapshot(self, fence: Callable[[], bool]):
+        """``snapshot`` with a fence (its docstring)."""
+        def check() -> None:
+            if fence():
+                raise ReadFenced()
+        self._fenced_lock(check)
+        try:
+            if self._tx_depth or self._read_depth:
+                raise RuntimeError("a fenced read cannot be nested in an open transaction of this helper")
+            conn = self._conn
+            check()
+            conn.execute("BEGIN")
+            self._read_depth = 1
+            try:
+                conn.execute("PRAGMA busy_timeout = 0")
+                try:
+                    # The first read takes the file's shared lock (the store's identity row is
+                    # always there, db_bootstrap's store_identity).
+                    self._retried(conn, "SELECT 1 FROM store_identity LIMIT 1", check).fetchall()
+                finally:
+                    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+                yield
+            except BaseException:
+                self._rollback(conn)
+                raise
+            else:
+                conn.execute("COMMIT")
+            finally:
+                self._read_depth = 0
+        finally:
+            self._lock.release()
 
     def cover(self, session: str) -> Optional["Cover"]:
         """What the session's latest effective compaction returned, as the tools see it:
@@ -1039,6 +1103,18 @@ class RecordStore:
                 (report_id, session, time.time(), question, body, model or None, provider or None, effort or None,
                  finish_reason or None))
         return True
+
+    def write_event_fenced(self, kind: str, *, session: Optional[str], detail: Any,
+                           fence: Callable[[], bool]) -> None:
+        """One store event written in a fenced transaction (``_fenced_tx``; the query's failure
+        to store its result, ruling OD-P4b): once ``fence()`` is true nothing is written and
+        ``WriteFenced`` is raised. A failure raises; the event is never kept pending, since a
+        pending event would be written by another writer after the host stopped waiting."""
+        text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
+        logger.warning("LCM store event %s (session=%s): %s", kind, session, text)
+        with self._fenced_tx(fence) as conn:
+            conn.execute("INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
+                         (time.time(), kind, session, None, text))
 
     def query_report(self, report_id: str) -> Optional[tuple[str, str]]:
         """(session, body) of a stored query result, or None."""
