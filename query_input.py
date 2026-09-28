@@ -18,9 +18,11 @@ passes through, never by a sentence applied at each site by hand:
   where table T says (``_step``), a value under a key of the host's opaque vocabulary is withheld
   in every kind but the transcript's own content and a call's name and arguments, and every leaf
   is recorded with the standing its kind gives it (M2);
-- ``_image_outcome`` is the one function that decides every image the query meets (M3): given
-  as an image, replaced by a placeholder, named where it stood (a field the query does not give as
-  an image, or a shape it cannot give as one), each marker or label written from that decision;
+- ``_image_outcome`` is the one function that decides every image the query meets (M3', PLAN-19
+  §2.2): given as an image (as stored) where the host's own per-part function delivers it on every
+  leg, replaced by a placeholder, named where it stood (a field the query does not give as an image,
+  or an image the host's converter does not deliver on a leg, with its own text), or, where the legs
+  disagree, a problem that refuses the query; each marker or label written from that decision;
 - one key classification (``_CLASSES``), read by one walker per stored field, faces every key of
   every entry of every reasoning field and every block of every replay carrier, and of every
   stored tool call (PLAN-83e §4); a field stored on a role whose domain lacks it is walked by its
@@ -40,6 +42,7 @@ lines named where they are used).
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -213,17 +216,22 @@ class Given:
     for the header."""
 
     values: list = field(default_factory=list)
-    problems: list = field(default_factory=list)
+    problems: list = field(default_factory=list)      # images the legs disagree on (M3', PLAN-19 §2.2)
     origins: dict = field(default_factory=dict)       # id(part) -> (part, origin, path, was)
     images_replaced: int = 0                          # replaced by a placeholder that says so
     images_elsewhere: list = field(default_factory=list)     # paths: a field the query does not give as an image
-    images_ungivable: list = field(default_factory=list)     # paths: a shape the query cannot give as an image
+    images_ungivable: list = field(default_factory=list)     # paths: the host's converter delivers none as an image
     images_behind_sidecar: int = 0                    # in a stored content the host sends api_content in place of
     reasoning_parts: int = 0
     lifted: int = 0
     joined: bool = False      # the content was joined into one string by the query (``query._join``)
     record: str = ""
     reads_images: Optional[bool] = None
+    # The legs the host can send the call on (``query._Leg``: name, wire, prepass), the role the record is sent
+    # under, and the host's stop, read before each image's per-part functions run (PLAN-19 §2.2, §2.7).
+    legs: tuple = ()
+    role: str = ""
+    check: Any = None
 
     def made(self, part: dict, origin: str, path: tuple = (), was: Optional[str] = None) -> dict:
         self.origins[id(part)] = (part, origin, path, was)
@@ -276,41 +284,96 @@ _IMAGE_KEYS = {"image_url": ("type", "image_url"), "input_image": ("type", "imag
                "image": ("type", "source")}
 
 
-def _url_of(value: Any) -> Optional[str]:
-    """An ``image_url`` value's URL: a non-blank string, or a dict with a non-blank string ``url``."""
-    if isinstance(value, str) and value.strip():
-        return value
-    if isinstance(value, dict) and isinstance(value.get("url"), str) and value["url"].strip():
-        return value["url"]
-    return None
-
-
-def _as_image(block: dict) -> tuple[Optional[dict], str]:
-    """The image part the wire carries for a stored image block, or None and why the query cannot
-    give it as one. An ``image_url`` part needs an ``image_url`` that is a non-blank string or a dict
-    with a non-blank string ``url`` and is given as ``{type, image_url}`` as stored; an
-    ``input_image`` part likewise, its ``detail`` kept only as a string; an Anthropic ``image`` block
-    needs a base64 source with non-blank data and a non-blank media type (never supplied by the
-    plugin: a guess), or a non-blank URL, and is given as the ``image_url`` part it holds."""
+def _as_sent(block: dict) -> dict:
+    """The image part the query sends for a stored image block: the block as stored, with only the keys that make
+    its image (``_IMAGE_KEYS``; an ``input_image``'s ``detail`` only as a string); the plugin converts nothing
+    (PLAN-19 §2.2: the host's converters decide what reaches the model)."""
     kind = block["type"]
-    if kind in ("image_url", "input_image"):
-        if _url_of(block.get("image_url")) is None:
-            return None, "no url"
-        image = {"type": kind, "image_url": block["image_url"]}
-        if kind == "input_image" and isinstance(block.get("detail"), str):
-            image["detail"] = block["detail"]
-        return image, ""
-    source = block.get("source")
-    if not isinstance(source, dict):
-        return None, "no source"
-    if source.get("type") == "base64":
-        data, media = source.get("data"), source.get("media_type")
-        if isinstance(data, str) and data.strip() and isinstance(media, str) and media.strip():
-            return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}, ""
-        return None, "a base64 source without its data or its media type"
-    if isinstance(source.get("url"), str) and source["url"].strip():
-        return {"type": "image_url", "image_url": {"url": source["url"]}}, ""
-    return None, "a source of no shape the query can give"
+    image = {key: block[key] for key in _IMAGE_KEYS[kind] if key in block and key != "detail"}
+    if kind == "input_image" and isinstance(block.get("detail"), str):
+        image["detail"] = block["detail"]
+    return image
+
+
+_CHAT_UNKNOWN = "the host's Chat Completions converter sends it as stored; whether this endpoint reads it is not known"
+_DROPPED = "dropped"
+
+
+def _text_of(blocks: list) -> str:
+    """The converter's own text for an image it does not deliver, where it wrote one, else "dropped"."""
+    for block in blocks:
+        if isinstance(block, dict) and isinstance(block.get("text"), str) and block["text"].strip():
+            return block["text"]
+    return _DROPPED
+
+
+def _delivered_on(part: dict, role: str, wire: str, prepass: bool) -> tuple[bool, str]:
+    """Whether the host's own converter for ``wire`` delivers one image part as an image, and its own text where it
+    does not (M3', PLAN-19 §2.2, rulings D-1, X1-X3), by the host's per-part functions at Hermes 375930d089, each
+    called on a copy of exactly the part the query sends:
+
+    - where ``prepass``, first ``_convert_openai_images_to_anthropic`` (agent/auxiliary_client.py 6408-6436), which
+      raises on an ``image_url`` that is a string (6424);
+    - Anthropic Messages: ``_convert_content_part_to_anthropic`` on a user or agent message,
+      ``_content_parts_to_anthropic_blocks([part])`` on a tool result (anthropic_message_convert.py 190-209,
+      264-276);
+    - Responses: ``_chat_content_to_responses_parts([part], role=…)`` (codex_responses_adapter.py 249-266; a tool
+      result's parts are converted with the role user, 534);
+    - Chat Completions: the transport passes a part as stored (transports/chat_completions.py 375-433); with the
+      host's image conversion off only ``{"type": "image_url", "image_url": {"url": <a non-empty string>}}`` is
+      delivered as an image (ruling D-1), with it on only the block that conversion makes, an Anthropic ``image``
+      block, whose endpoint's own shape it is.
+
+    An image block out is delivered; anything else is not, with the converter's own text or "dropped"."""
+    so = "what the host's converter does to an image part is not known"
+    probe = copy.deepcopy(part)
+    if prepass:
+        convert = _strict_import("image-block conversion", "agent.auxiliary_client",
+                                 "_convert_openai_images_to_anthropic", so=so)
+        try:
+            probe = convert([{"role": role, "content": [probe]}])[0]["content"][0]
+        except AttributeError as exc:
+            return False, (f"the host's image conversion for this endpoint (_convert_openai_images_to_anthropic) "
+                           f"raises on it (AttributeError: {exc})")
+    if wire == "chat_completions":
+        if prepass:
+            return (probe.get("type") == "image", "" if probe.get("type") == "image" else _CHAT_UNKNOWN)
+        value = probe.get("image_url")
+        url = value.get("url") if isinstance(value, dict) else None
+        ok = probe.get("type") == "image_url" and isinstance(url, str) and bool(url)
+        return ok, "" if ok else _CHAT_UNKNOWN
+    if wire == "anthropic_messages":
+        if role == "tool":
+            blocks = _strict_import("tool-result block conversion", "agent.anthropic_message_convert",
+                                    "_content_parts_to_anthropic_blocks", so=so)([probe])
+        else:
+            block = _strict_import("content-part conversion", "agent.anthropic_message_convert",
+                                   "_convert_content_part_to_anthropic", so=so)(probe)
+            blocks = [block] if block is not None else []
+        ok = any(isinstance(block, dict) and block.get("type") == "image" for block in blocks)
+        return ok, "" if ok else _text_of(blocks)
+    if wire == "codex_responses":
+        parts = _strict_import("Responses part conversion", "agent.codex_responses_adapter",
+                               "_chat_content_to_responses_parts", so=so)([probe], role="user" if role == "tool" else role)
+        ok = any(isinstance(item, dict) and item.get("type") == "input_image" for item in parts)
+        return ok, "" if ok else _text_of(parts)
+    return False, f"the {wire} wire, which the plugin has not established"
+
+
+def _deliveries(part: dict, given: Given) -> list[tuple[str, bool, str]]:
+    """``(leg, delivered, the converter's text)`` for one image part on every leg of the call, under every value of
+    the leg's image conversion."""
+    if not given.legs:
+        raise AssertionError("an image met at an image site with no leg to decide it (PLAN-19 §2.2)")
+    if callable(given.check):
+        given.check()
+    out = []
+    for leg in given.legs:
+        for prepass in leg.prepass:
+            value = (f", the host's image conversion {'on' if prepass else 'off'}" if len(leg.prepass) > 1 else "")
+            ok, text = _delivered_on(part, given.role or "user", leg.wire, prepass)
+            out.append((f"{leg.wire} ({leg.name}{value})", ok, text))
+    return out
 
 
 def _other_image_keys(block: dict) -> dict:
@@ -326,32 +389,41 @@ GIVEN_IMAGE, REPLACED_IMAGE, NOT_HERE, NOT_GIVABLE = "given", "replaced", "not h
 
 
 def _image_outcome(block: dict, path: tuple, image_site: bool, given: Given) -> tuple[str, Optional[dict], str]:
-    """The one decision on an image the query meets (M3): ``(outcome, part, text)``.
+    """The one decision on an image the query meets (M3', PLAN-19 §2.2): ``(outcome, part, text)``.
 
     At a place where the query does not give an image as an image (inside a value rendered from
     a reasoning field, a call, a carrier's other keys, a ``codex_message_items`` part, an unknown
-    key: ELSEWHERE) it is named where it stood; at an image site (a content member, an envelope
-    member, an image lifted from the stored content, a carrier's or the stash's image block) a
-    block of a shape the query cannot give is named with why; where the model does not read
-    images, or that is not known, it is replaced by the placeholder that says so; else it is given
-    as the image part the wire carries. Each image is counted in exactly one class of ``Given``;
-    ``text`` is what a marker or a note says of it."""
+    key: ELSEWHERE) it is named where it stood; where the model does not read images, or that is
+    not known, it is replaced by the placeholder that says so; else, at an image site (a content
+    member, an envelope member, an image lifted from the stored content, a carrier's or the stash's
+    image block), the host's own per-part function of every leg decides (``_deliveries``): where
+    every leg delivers it, it is given as stored (``_as_sent``); where none does, it is named with
+    each leg's own text; where the legs disagree, the record is a problem that refuses the query
+    (whether the model sees it would depend on which leg answers). Each image is counted in exactly
+    one class of ``Given``; ``text`` is what a marker or a note says of it."""
     media = image_media_type(block)
     if not image_site:
         given.images_elsewhere.append(path)
         return NOT_HERE, None, (f"[an image part ({media}) stored here, in a field the query does not give as an "
                                 f"image; not given as one]")
-    image, why = _as_image(block)
-    if image is None:
-        given.images_ungivable.append(path)
-        return NOT_GIVABLE, None, (f"[{_path_text(path)} holds an image block of a shape the query cannot give as an "
-                                   f"image ({why}); not given]")
     if not given.reads_images:
         given.images_replaced += 1
         placeholder = _image_placeholder(block, given.record, _NOT_KNOWN if given.reads_images is None else _NOT_READ)
         return REPLACED_IMAGE, placeholder, placeholder["text"]
-    given.lifted += 1
-    return GIVEN_IMAGE, image, f"[image {given.lifted} of this record, given as its own part after this one]"
+    image = _as_sent(block)
+    deliveries = _deliveries(image, given)
+    if all(ok for _leg, ok, _text in deliveries):
+        given.lifted += 1
+        return GIVEN_IMAGE, image, f"[image {given.lifted} of this record, given as its own part after this one]"
+    missing = [(leg, text) for leg, ok, text in deliveries if not ok]
+    if len(missing) < len(deliveries):
+        delivering = ", ".join(leg for leg, ok, _text in deliveries if ok)
+        given.problems.append(f"{_path_text(path)} holds an image ({media}) that {delivering} deliver(s) as an image "
+                              f"and {'; '.join(f'{leg} does not ({text})' for leg, text in missing)}")
+    given.images_ungivable.append(path)
+    return NOT_GIVABLE, None, (f"[{_path_text(path)} holds an image ({media}) that the host's converter does not "
+                               f"deliver as an image: {'; '.join(f'{leg}: {text}' for leg, text in missing)}; not "
+                               f"given]")
 
 
 def _image_parts(block: dict, path: tuple, given: Given, origin: str, kind: str, standing: str,
@@ -1157,7 +1229,7 @@ def _readable_parts(readable: list, given: Given, shown: list) -> list[dict]:
 
 
 def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, given: Given,
-                   call_handles: Optional[dict] = None) -> dict:
+                   call_handles: Optional[dict] = None, legs: tuple = (), check: Any = None) -> dict:
     """One record's message as the query gives it (PLAN-83e §2-§5, PLAN-83g §3). The host's per-row
     rules run first, each host function called strictly (the clone, the sidecar, the reasoning-echo
     policy with the pad the host's own agent applies, the fill decided on the host's own row); then
@@ -1167,6 +1239,7 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     ``call_handles`` names, by stored position, the handles the store minted for the record's calls."""
     given.record, given.reads_images = record, facts.reads_images
     role = wire_role(raw)
+    given.legs, given.role, given.check = tuple(legs), role, check
     stored_role = raw.get("role")
     domain = _DOMAIN.get(stored_role, _OTHER_DOMAIN) if isinstance(stored_role, str) else _OTHER_DOMAIN
     row = _row_before_fill(raw, needs_echo=facts.needs_reasoning_echo, strict=True)

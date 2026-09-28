@@ -870,17 +870,18 @@ class _Sent:
 
 
 def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
-           joins: bool) -> tuple[list[dict], list[_Sent]]:
+           joins: bool, legs: tuple = (), check: Any = None) -> tuple[list[dict], list[_Sent]]:
     """The call's messages, and per record what was given. ``stats["images_not_sent"]`` counts
     the images of what the handles hold that are not given to the model as images, in four
-    classes each image counted in one (M3, PLAN-83g §3.3): replaced by a placeholder that says so
+    classes each image counted in one (M3', PLAN-19 §2.2): replaced by a placeholder that says so
     (the model does not read images, or that is not known); stored in a field the query does not
-    give as an image; of a shape the query cannot give as an image; in a stored content the host
-    sends as its api_content text instead; ``stats["carriers"]`` counts the records holding a replay
-    carrier of their text, or the host's stash, as a list; ``stats["reasoning_parts"]`` the
-    readable reasoning texts given as parts of their own. ``joins``: a wire whose converter
-    serialises a text-only list tool content is among the wires checked (ruling OD-3b). A record
-    the query cannot give as it is refuses the query, naming the record."""
+    give as an image; not delivered as an image by the host's converter on a leg; in a stored
+    content the host sends as its api_content text instead; ``stats["carriers"]`` counts the records
+    holding a replay carrier of their text, or the host's stash, as a list; ``stats["reasoning_parts"]``
+    the readable reasoning texts given as parts of their own. ``joins``: a wire whose converter
+    serialises a text-only list tool content is among the wires checked (ruling OD-3b). ``legs``: the
+    legs every image is decided on (``_image_outcome``); ``check``: the host's stop, read before each
+    record. A record the query cannot give as it is refuses the query, naming the record."""
     sent: list[_Sent] = []
     for key in ("images_not_sent", "carriers", "reasoning_parts"):
         stats.setdefault(key, 0)
@@ -902,8 +903,10 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     for key in ("images_replaced", "images_elsewhere", "images_ungivable", "images_behind_sidecar"):
         stats.setdefault(key, 0)
     for _chunk, record, raw in rows:
+        if callable(check):
+            check()
         given = Given(values=[], problems=[])
-        message = strict_message(raw, record, wire, withheld, given, found.calls.get(record))
+        message = strict_message(raw, record, wire, withheld, given, found.calls.get(record), legs=legs, check=check)
         found.given[record] = given
         stats["reasoning_parts"] += given.reasoning_parts
         problems.extend(f"{record}: {problem}" for problem in given.problems)
@@ -918,8 +921,9 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
         sent.append(_Sent(record, message, None, given))
     if problems:
         raise ExpansionError(
-            f"the query gives its model each message's stored content and calls, never the host's replay carrier, and "
-            f"these records cannot be given as they are: {' | '.join(problems)}: ask over other handles")
+            f"these records cannot be given as they are (an image the legs of this call disagree on would reach the "
+            f"model or not by which leg answers; a replay carrier's text or call the message does not hold): "
+            f"{' | '.join(problems)}: ask over other handles")
     # Every part of every message has one recorded origin (PLAN-83d §2's property), asserted at one
     # site, before the join reads the origins of a tool result's parts (PLAN-83g §4.3). The labels
     # added after it make only parts they record (``label_message``: the label, and a string content
@@ -1552,7 +1556,8 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         withheld: dict[str, int] = {}
         stats: dict = {}
         messages_in, sent = _input(found, question, wire, withheld, stats,
-                                   joins="anthropic_messages" in route_facts.wires)
+                                   joins="anthropic_messages" in route_facts.wires, legs=tuple(route_facts.legs),
+                                   check=step)
         step()
 
         # The checks before the call; each a refusal, no call made.
@@ -1605,8 +1610,9 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                           f"images: {stats['images_replaced']} replaced by a placeholder that says so, because the "
                           f"model does not read images or whether it does is not known; {stats['images_elsewhere']} "
                           f"stored in a field the query does not give as an image, named where they stood; "
-                          f"{stats['images_ungivable']} of a shape the query cannot give as an image, named where they "
-                          f"stood; {stats['images_behind_sidecar']} in a stored content the host sends as its "
+                          f"{stats['images_ungivable']} not delivered as an image by the host's converter on a leg (the "
+                          f"converter's own text, or dropped), named where they stood; "
+                          f"{stats['images_behind_sidecar']} in a stored content the host sends as its "
                           f"api_content text instead, which the record's label says; an image inside material withheld "
                           f"as opaque is counted under encrypted_withheld, and the host's bookkeeping keys, which the "
                           f"query does not give, are not searched for images"),
@@ -1694,8 +1700,20 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         }
         svg = _svg_images(messages_in)
         if svg:
-            header["input"]["svg_images"] = (f"{svg} SVG image(s): the host rasterised each for the query's wire "
-                                             f"check and rasterises it again for the call")
+            # What the host does to an SVG data URL is not a pure function of the part (PLAN-19 X7): on the Anthropic
+            # and Responses converters it runs the rasterisers installed (tools/vision_tools_image_prep.py
+            # rasterize_svg_data_url, 156-181), writing temporary files; the Chat Completions transport sends it as
+            # stored.
+            rasterising = [w for w in route_facts.wires if w in ("anthropic_messages", "codex_responses")]
+            said = [f"{svg} SVG image(s) given as images"]
+            if rasterising:
+                said.append(f"on {', '.join(rasterising)} the host's rasteriser turned each into PNG when the query "
+                            f"checked (it wrote and removed temporary files in the Hermes cache); the host rasterises "
+                            f"again for the call, and where that fails the model receives the host's placeholder text "
+                            f"instead, which the query cannot see")
+            if "chat_completions" in route_facts.wires:
+                said.append("on chat_completions the host sends each as stored")
+            header["input"]["svg_images"] = "; ".join(said)
         largest_group = max([len(g.results) for chunk in found.chunks for g in found.pairing[chunk].group.values()]
                             or [1])
         _precheck_room(found, header, limit, largest_group)
