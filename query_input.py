@@ -430,6 +430,15 @@ _WITHHELD = ("[withheld: opaque replay material under this key; counted in the h
 _CONTENT_BLOCK_KINDS = {"thinking": REASONING, "redacted_thinking": REASONING, "tool_use": _TOOL_USE}
 
 
+def _withholds(key: Any, kind: str) -> bool:
+    """M1's one rule: a value under a key of the host's opaque vocabulary is withheld in every kind
+    but the transcript's own content and a call's name and arguments (ruling OD-F1), at every depth,
+    the first level of an entry, a block, a call or a stored key included."""
+    if kind in _NEVER_WITHHELD:
+        return False
+    return key in (_CALL_VOCABULARY if kind in (_CALL_DICT, CALL) else OPAQUE_VOCABULARY)
+
+
 def _standing(kind: str, base: str) -> str:
     """M2: a value's standing is its kind's (PLAN-83g §3.2): reasoning → reasoning; a call or its
     values → call; content, a carrier's value of no other kind and an unknown key → the record's
@@ -487,11 +496,10 @@ def _step(value: Any, path: tuple, kind: str, base: str, walk: _Walk) -> Any:
         kind = _CONTENT_BLOCK_KINDS[value["type"]]
     if kind == _CALLS:
         kind = _CALL_DICT
-    vocabulary = _CALL_VOCABULARY if kind in (_CALL_DICT, CALL) else OPAQUE_VOCABULARY
     faced = {}
     for key, item in value.items():
         where = path + (key,)
-        if kind not in _NEVER_WITHHELD and key in vocabulary and not carries_nothing(item):
+        if _withholds(key, kind) and not carries_nothing(item):
             walk.withheld = True
             faced[key] = _Marker(_WITHHELD)
             continue
@@ -793,6 +801,9 @@ class _Record:
                 withheld = self.json(f"[{_path_text(where)}: the citations stored with this text block; shown as their "
                                      f"JSON by the query:]", value, where, CARRIER,
                                      GIVEN_RESULT if path[1] == STASH else None) or withheld
+            elif _withholds(key, other):
+                # A key of the opaque vocabulary the table does not name at this container (M1).
+                withheld = True
             else:
                 withheld = self.json(f"[{_path_text(where)} is a key of no kind the query knows; shown as its JSON by "
                                      f"the query:]", value, where, other) or withheld
@@ -1208,9 +1219,11 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
             if key not in domain:
                 _foreign(key, value, raw, face, shown)
         elif not _is_metadata(key, known):
-            # T14: an unknown top-level key, walked as a stored value of no kind the store tells.
-            if face.json(f"[The stored key {_path_text(('message', key))} is no field the query knows; shown as its "
-                         f"JSON by the query:]", value, ("message", key), STORED_KIND):
+            # T14: an unknown top-level key, walked as a stored value of no kind the store tells; one
+            # named by the opaque vocabulary is withheld whole (M1).
+            if _withholds(key, STORED_KIND) or face.json(
+                    f"[The stored key {_path_text(('message', key))} is no field the query knows; shown as its JSON by "
+                    f"the query:]", value, ("message", key), STORED_KIND):
                 face.count("other stored keys")
     for kind, count in face.opaque.items():
         withheld[kind] = withheld.get(kind, 0) + count
