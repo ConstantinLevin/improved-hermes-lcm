@@ -254,11 +254,11 @@ class RecordStore:
         query's result, #19; plan §6.2 on PR #83). Every wait is fenced: the helper's lock is
         taken in slices of ``_POLL_S`` with the fence asked between them; the connection's busy
         timeout is 0 for the transaction's duration, so that ``BEGIN IMMEDIATE`` and ``COMMIT``
-        return SQLITE_BUSY at once and are retried here, the fence asked before each try, within
-        the store's own busy timeout (in rollback-journal mode a COMMIT waits for readers' shared
-        locks and, after SQLITE_BUSY, "the transaction remains active and the COMMIT can be
-        retried", sqlite.org lang_transaction.html §2.3); the fence is asked again after the
-        body. A fence that trips rolls the transaction back (which also releases the PENDING
+        return SQLITE_BUSY at once and are retried here, the fence asked before each try, each
+        statement within the store's own busy timeout from its first try (in rollback-journal
+        mode a COMMIT waits for readers' shared locks and, after SQLITE_BUSY, "the transaction
+        remains active and the COMMIT can be retried", sqlite.org lang_transaction.html §2.3);
+        the fence is asked again after the body. A fence that trips rolls the transaction back (which also releases the PENDING
         lock a waiting COMMIT holds) and raises ``WriteFenced``. What it cannot close: the
         COMMIT's own execution once its last try has begun. Never nested in another
         transaction of this helper. Events pending from other callers are flushed after the
@@ -266,9 +266,12 @@ class RecordStore:
         def check() -> None:
             if fence():
                 raise WriteFenced()
-        deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000.0
 
         def retried(statement: str) -> None:
+            # The store's own bound, as its unfenced writers have it: the busy timeout per
+            # statement, counted from the statement's first try (never the wait for the helper's
+            # lock, which the fence alone bounds).
+            deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000.0
             while True:
                 check()
                 try:

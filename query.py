@@ -92,6 +92,7 @@ from .summariser_input import (
     HostUnavailable,
     _add_parts,
     _strict_import,
+    canonical_call,
     image_count,
     image_part,
     strict_message,
@@ -406,6 +407,8 @@ def _route_unverifiable(facts: _RouteFacts) -> list[str]:
     if facts.nous:
         said.append("on a model-not-found error the host's Nous rungs can swap the model without a new record")
     said.append("no managed NeMo Relay carries this call (checked before the call from the host's own state)")
+    said.append("these facts were read from the host's state before the call; its unhealthy marks, credential-pool "
+                "hints and Relay consumers can change while the call runs")
     return said
 
 
@@ -459,18 +462,33 @@ def _call_results(found: _Read, chunk: str, record: str, position: int) -> str:
     return "no result on the record"
 
 
+def _wire_calls(raw: dict) -> list[int]:
+    """The positions of the stored calls the query gives as calls on the wire: those of the shape
+    the host writes (``summariser_input.canonical_call``); every other value of ``tool_calls`` is
+    given as labelled JSON and is not a call the model sees (plan §4.2)."""
+    calls = raw.get("tool_calls")
+    return [position for position, call in enumerate(calls) if canonical_call(call)] if isinstance(calls, list) else []
+
+
+def _joined_said(joined: dict, result: str) -> str:
+    stored, added, as_list = joined[result]
+    return (f" ({f'stored as {stored} text parts' if as_list else 'stored as its text'}"
+            f"{f', and {added} part(s) the query added, each under its own label' if added else ''}, given joined by "
+            f"newlines)")
+
+
 def _assistant_label(found: _Read, chunk: str, record: str, raw: dict, joined: dict) -> str:
-    calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
-    if not calls:
+    positions = _wire_calls(raw)
+    if not positions:
         return _label_message(record)
     named = []
-    for position, call in enumerate(calls):
-        function = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else {}
+    for position in positions:
+        function = raw["tool_calls"][position]["function"]
         where = _call_results(found, chunk, record, position)
         result = found.pairing[chunk].answer.get((record, position))
         if result in joined:
-            where += f" (stored as {joined[result]} text parts, given joined by newlines)"
-        named.append(f"{found.calls.get(record, {}).get(position)} {function.get('name') or '?'} → {where}")
+            where += _joined_said(joined, result)
+        named.append(f"{found.calls.get(record, {}).get(position)} {function['name']} → {where}")
     return f"[message {record} · tool calls: {'; '.join(named)}]"
 
 
@@ -485,19 +503,23 @@ class _Sent:
     given: Given
 
 
-def _joined_tool_content(message: dict) -> Optional[int]:
-    """A tool result stored as a list of text parts only (a real host shape: an engine result
-    without images, agent/vision_message_prep.py 213-215 at Hermes 375930d089), which the host's
-    Anthropic converter sends as the list's escaped JSON (anthropic_message_convert.py 450): the
-    query gives it as its texts joined by newlines, and the calling agent message's label says so
-    (ruling OD-3b). Returns the number of parts joined, or None where the content is not that."""
+def _joined_tool_content(message: dict, raw: dict, given: Given) -> Optional[tuple[int, int, bool]]:
+    """A tool result given as a list of text parts only: stored so (a real host shape: an engine
+    result without images, agent/vision_message_prep.py 213-215 at Hermes 375930d089), or stored as
+    a string to which the query added parts of its own. The host's Anthropic converter sends such a
+    list as its escaped JSON (anthropic_message_convert.py 450), so the query gives it as its texts
+    joined by newlines, each added part keeping its own label inside, and the calling agent
+    message's label says so (ruling OD-3b). Returns (the stored parts, the parts the query added,
+    whether the stored content was a list), or None where the content is not that."""
     content = message.get("content")
     if (message.get("role") != "tool" or not isinstance(content, list) or not content
             or not all(isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)
                        for p in content)):
         return None
+    added = set(given.added)
+    ours = sum(1 for part in content if part["text"] in added)
     message["content"] = "\n".join(part["text"] for part in content)
-    return len(content)
+    return len(content) - ours, ours, isinstance(raw.get("content"), list)
 
 
 def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
@@ -516,10 +538,22 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     for chunk in found.chunks:
         labels: dict[int, str] = {}
         strays: dict[int, list[str]] = {}
-        joined: dict[str, int] = {}
+        joined: dict[str, tuple] = {}
         last_labelled = None
         rows = found.records[chunk]
         base = len(sent)
+        pairing = found.pairing[chunk]
+        # A result answers a call the model sees only where that call is one the query gives as a
+        # call on the wire; the result of a call given as labelled JSON is, for the model, a result
+        # of no call, and the label says so (plan §4.2).
+        named_results: set = set()
+        for record, raw in rows:
+            for position in _wire_calls(raw):
+                place = (record, position)
+                if place in pairing.answer:
+                    named_results.add(pairing.answer[place])
+                if place in pairing.group:
+                    named_results.update(pairing.group[place].results)
         for index, (record, raw) in enumerate(rows):
             given = Given(values=[], added=[], problems=[])
             message = strict_message(raw, record, wire, withheld, given)
@@ -528,16 +562,16 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
             problems.extend(f"{record}: {problem}" for problem in given.problems)
             stored = sum(1 for part in (content_parts(raw.get("content")) or []) if image_part(part))
             stats["images_not_sent"] += max(0, stored - image_count(message))
-            if any(isinstance(raw.get(key), list) and raw[key] for key in TEXT_REPLAY_CARRIERS):
+            if any(raw.get(key) for key in TEXT_REPLAY_CARRIERS + ("_anthropic_content_blocks",)):
                 stats["carriers"] += 1
             if raw.get("role") == "tool":
                 # No label of the plugin's inside a tool result (OD-D): its call's label names it;
-                # a result the store pairs with no call is named in the label before it.
+                # a result that answers no call the model sees is named in the label before it.
                 if joins:
-                    parts = _joined_tool_content(message)
+                    parts = _joined_tool_content(message, raw, given)
                     if parts is not None:
                         joined[record] = parts
-                if record in found.pairing[chunk].stray and last_labelled is not None:
+                if record not in named_results and last_labelled is not None:
                     strays.setdefault(last_labelled, []).append(record)
             else:
                 last_labelled = index
@@ -548,9 +582,9 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
             label = (_assistant_label(found, chunk, record, raw, joined) if raw.get("role") == "assistant"
                      else _label_message(record))
             if index in strays:
-                named = ", ".join(f"{r}{f' (stored as {joined[r]} text parts, given joined by newlines)' if r in joined else ''}"
-                                  for r in strays[index])
-                label = f"{label[:-1]} · the tool result(s) {named} after it belong to no call on the record]"
+                named = ", ".join(f"{r}{_joined_said(joined, r) if r in joined else ''}" for r in strays[index])
+                label = (f"{label[:-1]} · the tool result(s) {named} after it answer no call given here as a call "
+                         f"(the store pairs none with them, or their call is given as JSON)]")
             if index == 0:
                 under = found.under.get(chunk)
                 label = f"[chunk {chunk}{' — behind summary ' + under if under else ''}] {label}"
@@ -1102,13 +1136,17 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
                       "images_not_sent": stats["images_not_sent"],
                       "encrypted_withheld": dict(sorted(withheld.items())), "window": window,
                       "wire": [f"{name}: {why}; the host's converter for it was run over the query's messages before "
-                               f"the call and gives the model every text, tool call and image the query gives it, in "
-                               f"its place{'; ' + renamed[name] if name in renamed else ''}"
+                               f"the call and gives the model, in its place, every non-blank text the query gives it "
+                               f"(blank ones are left to the converter's own stand-ins), every image by its position "
+                               f"and kind (not its bytes), and every tool call by its name and, where the stored "
+                               f"arguments parse as JSON, by its arguments"
+                               f"{'; ' + renamed[name] if name in renamed else ''}"
                                for name, why in route_facts.wires.items()],
-                      "text_carriers": (f"{stats['carriers']} record(s) carry a host replay carrier of their text; the "
-                                        f"query does not send it: the stored content is what the model reads, each "
-                                        f"carrier block checked against it, given as readable reasoning or as its "
-                                        f"JSON, or withheld as encrypted and counted"),
+                      "text_carriers": (f"{stats['carriers']} record(s) carry a host replay carrier of their text or "
+                                        f"blocks the host stashed in _anthropic_content_blocks; the query sends "
+                                        f"neither: the stored content is what the model reads, each carrier block "
+                                        f"checked against it, given as readable reasoning or as its JSON, or withheld "
+                                        f"as encrypted and counted"),
                       "reasoning_given_apart": (f"{stats['reasoning_parts']} readable reasoning text(s) held in another "
                                                 f"field than the message's reasoning, and not contained in it "
                                                 f"verbatim, were given as labelled parts of their own; one that "
@@ -1116,7 +1154,11 @@ def _ask(engine: Any, session: str, handles: list, question: str, *, messages: A
             "call": {
                 "timeout": timeout,
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",
-                "if_the_host_asks_this_call_to_stop": _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[route.target_api_mode],
+                "if_the_host_asks_this_call_to_stop": (
+                    _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[route.target_api_mode]
+                    + "; once the stop is seen, a failure to store the result is only logged; where the result was "
+                      "stored just before the stop, the store's events other work of this engine left pending are "
+                      "written with it"),
                 "entered_the_host": ("once; the query retries no failure (the host's own recovery runs inside the "
                                      "call, and one entry can send several provider requests: its re-sends, rungs "
                                      "and fallbacks)"),

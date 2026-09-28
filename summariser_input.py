@@ -609,6 +609,18 @@ def _canonical_content(content: Any, standing: str, given: Given) -> Any:
                        content, base, standing, given)]
 
 
+def canonical_call(call: Any) -> bool:
+    """A stored tool call of the shape the host writes (``_assistant_tool_call_dict``,
+    agent/chat_completion_helpers.py 1622-1663 at Hermes 375930d089): a dict, a dict ``function``
+    with a non-blank string ``name`` and a string ``arguments``, a non-blank string ``id``. The one
+    test of which stored calls the query gives as calls on the wire (the projection and the
+    query's labels both ask it)."""
+    function = call.get("function") if isinstance(call, dict) else None
+    return (isinstance(function, dict) and isinstance(function.get("name"), str) and bool(function["name"].strip())
+            and isinstance(function.get("arguments"), str) and isinstance(call.get("id"), str)
+            and bool(call["id"].strip()))
+
+
 def _canonical_calls(message: dict, given: Given) -> list[dict]:
     """The message's tool calls as the wire can carry them (plan §4.2): a list of calls of
     the shape the host writes (a dict, a dict ``function`` with a non-blank string ``name``
@@ -627,10 +639,8 @@ def _canonical_calls(message: dict, given: Given) -> list[dict]:
                            f"their JSON by the query:]", calls, base, GIVEN_CALL, given)]
     kept, after = [], []
     for index, call in enumerate(calls):
-        function = call.get("function") if isinstance(call, dict) else None
-        if (isinstance(function, dict) and isinstance(function.get("name"), str) and function["name"].strip()
-                and isinstance(function.get("arguments"), str) and isinstance(call.get("id"), str)
-                and call["id"].strip()):
+        if canonical_call(call):
+            function = call["function"]
             kept.append(call)
             given.values.append((base + (index, "function", "name"), function["name"], GIVEN_CALL))
             given.values.append((base + (index, "function", "arguments"), function["arguments"], GIVEN_CALL))
@@ -725,10 +735,19 @@ def _reasoning_and_carriers(raw: dict, message: dict, given: Given, withheld_tex
     if isinstance(details, list):
         for index, entry in enumerate(details):
             if isinstance(entry, dict):
-                texts = [pair for key in _READABLE_DETAIL_KEYS if key in entry
+                # An entry the host marks signed or encrypted is withheld whole (R3), its text
+                # included, except an Anthropic signed thinking block, whose ``thinking`` is plain
+                # text beside its signature (the plan's §5.2 table): that text is given and only
+                # the signature withheld.
+                signed_thinking = (entry.get("type") == "thinking" and bool(entry.get("signature"))
+                                   and not entry.get("data"))
+                if _signed_or_encrypted_detail(entry) and not signed_thinking:
+                    continue
+                keys = ("thinking",) if signed_thinking else _READABLE_DETAIL_KEYS
+                texts = [pair for key in keys if key in entry
                          for pair in _readable_strings(entry[key], ("message", "reasoning_details", index, key))]
                 readable.extend(texts)
-                if texts and _signed_or_encrypted_detail(entry):
+                if texts and signed_thinking:
                     withheld_text["reasoning_details"] = withheld_text.get("reasoning_details", 0) + 1
             elif entry is not None:
                 after.append(_json_part(f"[reasoning_details[{index}] as stored is not an entry; shown as its JSON "
