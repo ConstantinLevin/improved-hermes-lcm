@@ -1406,6 +1406,38 @@ def _carrier_legs(facts: _RouteFacts) -> str:
     return " | ".join(said)
 
 
+def _svg_text(count: int, facts: _RouteFacts, messages: list[dict]) -> str:
+    """What the host does, per leg and per value of its image conversion, to the SVG images the query gives (PLAN-19
+    X7), each clause from the function that handles an SVG there (Hermes 375930d089): with the conversion on,
+    ``_convert_openai_images_to_anthropic`` (agent/auxiliary_client.py 6408-6436) makes an ``image_url`` part an
+    Anthropic image block of its data URL's media type and rasterises nothing, and the Anthropic converter and the
+    Chat Completions transport then pass that block as it is (anthropic_message_convert.py 205-206; transports/
+    chat_completions.py 375-433); with it off, the Anthropic converter (``_image_block_from_openai_url`` 170-187) and
+    the Responses converter (``_input_image_part``, codex_responses_adapter.py 218-246) run the rasterisers installed
+    (tools/vision_tools_image_prep.py ``rasterize_svg_data_url`` 156-181, writing temporary files), and the Chat
+    Completions transport sends the part as stored. An Anthropic image block of SVG media is passed as it is by every
+    converter that delivers it. What a rasteriser does is not a pure function of the part: the query's check ran it,
+    and the call runs it again."""
+    rasterises = ("the host's rasteriser turned each into PNG when the query checked (it wrote and removed temporary "
+                  "files in the Hermes cache); the host rasterises again for the call, and where that fails the model "
+                  "receives the host's placeholder text instead, which the query cannot see")
+    said = []
+    for leg in facts.legs:
+        values = list(dict.fromkeys(prepass for prepass, _oauth in _leg_values(leg, messages)))
+        for prepass in values:
+            if prepass:
+                clause = ("the host's image conversion makes each image_url part an Anthropic image block of media "
+                          "type image/svg+xml and rasterises nothing; the converter passes that block as it is")
+            elif leg.wire == "chat_completions":
+                clause = "the host sends each as stored"
+            else:
+                clause = rasterises
+            value = f" (the host's image conversion {'on' if prepass else 'off'})" if len(values) > 1 else ""
+            said.append(f"on {leg.wire}, {leg.name}{value}: {clause}")
+    return (f"{count} SVG image(s) given as images (an Anthropic image block of SVG media is passed as it is by every "
+            f"converter that delivers it); per leg: {' | '.join(said)}")
+
+
 def _svg_images(messages: list[dict]) -> int:
     return sum(1 for message in messages for part in (content_parts(message.get("content")) or [])
                if is_image_part(part) and image_media_type(part) == "image/svg+xml")
@@ -1894,20 +1926,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         }
         svg = _svg_images(messages_in)
         if svg:
-            # What the host does to an SVG data URL is not a pure function of the part (PLAN-19 X7): on the Anthropic
-            # and Responses converters it runs the rasterisers installed (tools/vision_tools_image_prep.py
-            # rasterize_svg_data_url, 156-181), writing temporary files; the Chat Completions transport sends it as
-            # stored.
-            rasterising = [w for w in route_facts.wires if w in ("anthropic_messages", "codex_responses")]
-            said = [f"{svg} SVG image(s) given as images"]
-            if rasterising:
-                said.append(f"on {', '.join(rasterising)} the host's rasteriser turned each into PNG when the query "
-                            f"checked (it wrote and removed temporary files in the Hermes cache); the host rasterises "
-                            f"again for the call, and where that fails the model receives the host's placeholder text "
-                            f"instead, which the query cannot see")
-            if "chat_completions" in route_facts.wires:
-                said.append("on chat_completions the host sends each as stored")
-            header["input"]["svg_images"] = "; ".join(said)
+            header["input"]["svg_images"] = _svg_text(svg, route_facts, messages_in)
         largest_group = max([len(g.results) for chunk in found.chunks for g in found.pairing[chunk].group.values()]
                             or [1])
         _precheck_room(found, header, limit, largest_group)
