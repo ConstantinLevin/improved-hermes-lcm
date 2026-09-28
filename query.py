@@ -355,9 +355,9 @@ NOTE = ("The report is a model's description of what it read, hedged: orientatio
         "from a hook's output, or as its own interruption placeholder, and on a user message from the user's text "
         "with what the host injected; which of these, the host does not record. carrier: a text stored in the "
         "host's replay carrier of the message, or in its stash of a tool result's blocks, which the message's "
-        "content does not hold: the model's output as the provider handed it over before the host stripped it, so "
-        "reasoning the host stripped, a tool call the model wrote as text, or content the host altered "
-        "(whitespace, a masked secret, a non-text part); which, the host does not record. stored: a value under "
+        "content does not hold: the provider's text before the host stripped it, so reasoning the host stripped, a "
+        "tool call the model wrote as text, or content the host altered (its outer whitespace, a secret it masked, "
+        "a non-text part it dropped); which, the host does not record. stored: a value under "
         "a key no producer of this host writes on this message's role. An excerpt found only in sidecar, carrier "
         "or stored fields is verbatim what the store holds there, and nothing rests on it as the message's "
         "content. A withheld excerpt did not pass the check its \"why\" names and is not shown.")
@@ -1694,14 +1694,20 @@ def _body(header: dict, items: list[Item]) -> str:
 
 
 def _target(body: str, report_id: str = "") -> Target:
-    """The stored body as a target, or a refusal by name where the body is not of the query's shape
+    """The body as a target, or a refusal by name where the body is not of the query's shape
     (``_body``: an object with ``header`` an object and ``items`` a list of objects each with ``a`` and
-    ``p`` objects; M-VERSION): a row hand-edited or written by no head of this query (a ``{}`` body)
-    is told as that on a page request, never as a KeyError of the wrapper. A body of the query's shape
-    written under another meaning is refused before this by its token's version (``decode_token``)."""
+    ``p`` objects; M-VERSION). On the page branch (``report_id`` given) the body is a stored row: one
+    hand-edited or written by no head of this query (a ``{}`` body) is told as that, never as a
+    KeyError of the wrapper, and a body of the query's shape written under another meaning is refused
+    before this by its token's version (``decode_token``). On the question branch (no ``report_id``,
+    ``_ask`` before the write) the body is the query's own result, just built: a refusal there names
+    it as that, and the scope adds that the reply is not shown."""
     def refuse(what: str) -> ExpansionError:
-        which = f"stored query result {report_id}" if report_id else "the stored query result"
-        return ExpansionError(f"{which} is not of the query's shape ({what}); ask the question again")
+        if report_id:
+            return ExpansionError(f"stored query result {report_id} is not of the query's shape ({what}); ask the "
+                                  f"question again")
+        return ExpansionError(f"the query's own result is not of the query's shape ({what}; a defect of the query, "
+                              f"not of the reply)")
     try:
         value = json.loads(body)
     except ValueError as exc:
@@ -2013,10 +2019,13 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                                         f"carrier that is not a list is given as its JSON; a provider that requires "
                                         f"replayed reasoning on earlier agent messages would refuse the call, and the "
                                         f"query's error then names that refusal"),
-                      "reasoning_given_apart": (f"{stats['reasoning_parts']} readable reasoning text(s) held in another "
-                                                f"field than the message's reasoning, and contained verbatim neither in "
-                                                f"it nor in an earlier part of the message, were given as labelled "
-                                                f"parts of their own; one that differs from those only in its "
+                      "reasoning_given_apart": (f"{stats['reasoning_parts']} readable reasoning text(s) given as labelled "
+                                                f"parts of their own: one held in a reasoning field or in a carrier's "
+                                                f"thinking, unless contained verbatim in the message's reasoning or an "
+                                                f"earlier such part; one held by a codex message item the host stamped "
+                                                f"as a commentary or analysis phase, unless contained verbatim in the "
+                                                f"message's content (the sidecar where the host sends it), a tool result "
+                                                f"or the message's reasoning; one that differs from those only in its "
                                                 f"separators is given twice"),
                       "calls_not_given_as_calls": (
                           f"{stats['calls_as_json']} tool call(s) are given as JSON and {stats['results_as_user']} tool "
@@ -2065,8 +2074,11 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                 "after_the_return": (
                     "the host may replace the returned page before it stands in the context: a "
                     "transform_tool_result hook of any plugin (model_tools.py 849-866, the first string returned "
-                    "wins); its identical-result stub for a second byte-identical result of at least 512 characters "
-                    "in one turn (tool_guardrails.py 484-486, 528-543), a repeated page request among them; its "
+                    "wins); its identical-result stub where a call repeats the previous call's tool and arguments "
+                    "consecutively in one turn and its result, of at least 512 characters and not counted as failed, "
+                    "hashes the same (canonical JSON where the result parses; tool_guardrails.py 436-487, 484-486, "
+                    "_result_hash 618-624, the stub 528-543), a page request repeated with the same token among "
+                    "them; its "
                     "spill to a file above the threshold the page was measured against (tool_result_storage.py "
                     "293-334; expansion.host_page_limits reads that threshold), and its turn budget over every "
                     "result of the same assistant message, applied in place after the result was flushed "

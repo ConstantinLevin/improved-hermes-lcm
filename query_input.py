@@ -938,7 +938,7 @@ class _Record:
             elif cls == STASH_TEXT:
                 withheld = self.stashed(value, where) or withheld
             elif cls == CITED:
-                # The record's standing, a result on a stored tool result (PLAN-19 §2.8).
+                # Walked with the carrier's kind: standing carrier, stored on a foreign record (M-STANDING).
                 withheld = self.json(f"[{_path_text(where)}: the citations stored with this text block; shown as their "
                                      f"JSON by the query:]", value, where, CARRIER) or withheld
             elif _withholds(key, other):
@@ -1052,7 +1052,8 @@ def _anthropic_blocks(key: str, value: Any, face: _Record) -> None:
         kind = block.get("type")
         table = _CLASSES.get((key if key == STASH else "anthropic_content_blocks", kind)) if isinstance(kind, str) \
             else None
-        standing = face.standing        # the record's, a result on a stored tool result (PLAN-19 §2.8)
+        standing = face.standing        # the base ``_standing`` decides over: a carrier value stands as carrier, stored on a
+        #                                 foreign record (M-STANDING); an image block's other keys likewise
         if image_part(block) and key == STASH and not (face.stash_site and kind == "image"):
             # M-STASH (PLAN-19 §2.6): the host's Anthropic converter sends the stash only for a tool result whose
             # content is no _multimodal envelope and yields no image block of its own, and replays its blocks as they

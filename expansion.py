@@ -110,8 +110,9 @@ from .summariser_input import (
 # result, call and reasoning), its note and its header moved (#19, M-VERSION): a query result a
 # head before this one stored is a page of another meaning, reached only through a token, so the
 # token's version carries the meaning of what a page shows (the store format carries the tables,
-# which did not move). A v4 token of lcm_query is refused with "ask the question again", one of
-# lcm_expand or lcm_grep with "start again from the handle".
+# which did not move). A v4 token of lcm_query is refused with "ask the question again, without
+# page", one of lcm_expand or lcm_grep with "start again from the handle, without page"
+# (``decode_token``).
 TOKEN_VERSION = 5
 
 # What each status of ``RecordStore.resolve`` tells the agent; "inactive" is told by its
