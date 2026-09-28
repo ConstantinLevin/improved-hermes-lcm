@@ -412,7 +412,7 @@ def _draw_report_id() -> str:
 
 
 _STOPPED = ("the host asked this tool call to stop (its interrupt bit is set, or its sequential tool timeout, counted "
-            "from the query's entry, has passed)")
+            "from the engine's boundary, has passed)")
 
 
 class _Told(ExpansionError):

@@ -641,9 +641,12 @@ class RecordWriteMixin:
         (``RecordStore._fenced_tx``): every wait is fenced, the fence is asked before each
         compaction, nothing is committed once it is true, no event of other work is flushed,
         and a failure's event is written afterwards in a fenced transaction of its own
-        (``write_event_fenced``), never kept pending. A fence that trips raises
-        ``WriteFenced`` with its text; the boundary renders it. Without a fence (the turn's
-        end, the occasion, planning) nothing changes."""
+        (``write_event_fenced``), never kept pending. A fence that trips before the commit
+        raises ``WriteFenced`` with its text, and the boundary renders it; one that trips
+        after the commit, while a failure's event is written, loses that event (the log says
+        so, ``_settle_events``), what committed is applied in memory, and the call goes on to
+        the handler, which reads the same latch. Without a fence (the turn's end, the
+        occasion, planning) nothing changes."""
         if not messages or not self._plugin_session or not self._returned_attempts:
             return
         keyed: set[int] = set()
@@ -721,9 +724,13 @@ class RecordWriteMixin:
                 self._bind_applied(*value)
 
     def _settle_events(self, failures: list, fence: Optional[Callable[[], bool]]) -> None:
-        """The events of a settle's failures: unfenced as every event (kept pending where the store
-        is locked), or, under a fence, each in a fenced transaction of its own, written only while
-        the host still waits; a fence that trips there ends the call with the stop's text."""
+        """The events of a settle's failures, recorded after the settle's transaction: unfenced as
+        every event (kept pending where the store is locked), or, under a fence, each in a fenced
+        transaction of its own, written only while the host still waits. A fence that trips there
+        does not end the call: what the transaction settled is committed already, so the boundary
+        could not say that nothing was settled; the event is lost, the log line says so, the caller
+        applies in memory what committed, and the handler reads the same latch and stops with its
+        own text. Any other failure to write the event is logged."""
         for compaction, exc in failures:
             if fence is None:
                 self._records.event("settle_write_failed", session=self._plugin_session, compaction=compaction,
@@ -733,7 +740,8 @@ class RecordWriteMixin:
                 self._records.write_event_fenced("settle_write_failed", session=self._plugin_session,
                                                  detail={"compaction": compaction, "error": repr(exc)}, fence=fence)
             except WriteFenced:
-                raise WriteFenced(SETTLE_STOPPED) from None
+                logger.warning("LCM could not record that settling compaction %s failed (%r): the host asked this tool "
+                               "call to stop before the event was written; the event is lost", compaction, exc)
             except Exception as failure:
                 logger.error("LCM could not record that settling compaction %s failed (%s: %s)", compaction,
                              type(failure).__name__, failure)
