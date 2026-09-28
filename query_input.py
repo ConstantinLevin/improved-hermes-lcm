@@ -38,8 +38,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-from .message_content import IMAGE_PART_TYPES, content_parts, image_media_type, is_image_part, readable_reasoning, \
-    sidecar_sent
+from .message_content import content_parts, image_media_type, is_image_part, readable_reasoning, sidecar_sent
 from .summariser_input import WireFacts, _image_placeholder, _row_before_fill, _strict_import, host_fill_text
 
 # The standing of a value the query gives: what the agent may rest on an excerpt found in it.
@@ -170,12 +169,6 @@ class Given:
         entry = self._entry(part)
         return entry[3] if entry is not None else None
 
-    @property
-    def added(self) -> list[str]:
-        """The texts of every part that is not a stored content part kept as it is."""
-        return [part["text"] for part, origin, _path, _was in self.origins.values()
-                if origin != STORED and isinstance(part.get("text"), str)]
-
 
 def unrecorded_parts(message: dict, given: Given) -> int:
     """How many parts of the message's content have no recorded origin (the query refuses a
@@ -246,10 +239,10 @@ def _give_image(block: Any, path: tuple, given: Given, origin: str, label: Optio
     return parts + [given.made(image if image is not block else block, origin, path)]
 
 
-def _face(value: Any, path: tuple, lift: bool, given: Given, images: list, top: bool = True) -> Any:
+def _face(value: Any, path: tuple, lift: bool, given: Given, images: list) -> Any:
     """The value with every structural image part inside it replaced by a text of the query's
     (PLAN-83e §3): lifted (given as its own part after the JSON) or named as not given."""
-    if top and image_part(value):
+    if image_part(value):
         if lift:
             given.lifted += 1
             images.append((path, value))
@@ -484,15 +477,14 @@ class _Record:
             self.given.problems.append(f"its replay carrier holds a call its tool calls do not ({_path_text(path)}, "
                                        f"{name if isinstance(name, str) else '?'})")
 
-    def keys(self, container: dict, table: dict, path: tuple, *, default: Optional[str] = None,
-             skip: tuple = ()) -> bool:
+    def keys(self, container: dict, table: dict, path: tuple, *, skip: tuple = ()) -> bool:
         """Every key of an entry or block by its class; returns whether opaque material that
         carries something was withheld."""
         withheld = False
         for key, value in container.items():
             if key in skip or carries_nothing(value):
                 continue
-            cls = table.get(key, default)
+            cls = table.get(key)
             where = path + (key,)
             if cls == METADATA:
                 continue

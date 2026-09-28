@@ -65,7 +65,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .message_content import content_parts, image_media_type, is_image_part, readable_reasoning, sent_content, \
     sidecar_sent
@@ -467,7 +467,7 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
                        withheld: Optional[dict[str, int]] = None) -> dict:
     """One record's message as the summariser receives it (see the module docstring).
     The encrypted items withheld from it are added to ``withheld`` by kind. (The query's
-    strict projection is ``strict_message``.)"""
+    strict projection is ``query_input.strict_message``.)"""
     message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
     for kind, count in _withhold_encrypted(message).items():
         if withheld is not None:
