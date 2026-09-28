@@ -109,11 +109,12 @@ from .query_input import (
     carries_nothing,
     json_kind,
     label_message,
+    query_wire_facts,
     strict_message,
     text_part,
     unrecorded_parts,
 )
-from .summariser_input import HostUnavailable, _strict_import, image_count, wire_facts, wire_image_limit
+from .summariser_input import HostUnavailable, _strict_import, image_count, wire_image_limit
 from .tokens import Estimator
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,13 @@ _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP = {
                         "request of its own (a retry after a credit-limit error)"),
 }
 _ESTABLISHED_WIRES = tuple(_IF_THE_HOST_ASKS_THIS_CALL_TO_STOP)
+
+
+def _stop_clauses(facts: Any) -> str:
+    """What happens to the model's request, if the host asks this call to stop, on each wire the
+    host can send the call on (PLAN-83g §4.3: one clause per wire of the route's facts)."""
+    return " | ".join(f"{wire}: {_IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[wire]}" for wire in facts.wires
+                      if wire in _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP)
 
 def _refresh_wire(provider: str, model: str, so: str) -> Optional[str]:
     """The wire of the client the host's credential-refresh retry builds for ``provider``
@@ -245,7 +253,7 @@ def _call_timeout() -> tuple[float, str]:
     """The ``timeout`` passed to the host (interim, #22): the host's sequential tool timeout as
     its own function resolves it, strictly, else the plugin's interim value."""
     resolve = _strict_import("sequential tool timeout", "agent.tool_executor", "_resolve_sequential_tool_timeout",
-                             so="how long the host waits for this call is not known; nothing was sent")
+                             so="how long the host waits for this call is not known")
     value = resolve()
     if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
         return float(value), "the host's configured tool timeout (interim, #22)"
@@ -258,7 +266,51 @@ def _draw_report_id() -> str:
     return "q" + base64.b32encode(secrets.token_bytes(5)).decode("ascii").lower()
 
 
-_STOPPED = "the host asked this tool call to stop (its interrupt bit is set); nothing was sent"
+_STOPPED = "the host asked this tool call to stop (its interrupt bit is set)"
+
+
+class _Told(ExpansionError):
+    """A refusal raised after the model was called, whose own text says what became of the reply
+    (the call's stop, a refused reply, a failed call, the stored result's stop or failure)."""
+
+
+class _Refusals:
+    """The one scope every error of an ``lcm_query`` call passes through, so that each says once
+    whether the model was called (PLAN-83g §3.7, the orchestrator's ruling OD-F8). Entered at the
+    top of ``query()`` once the branch is known: on a page request every error says that no page
+    was served (no call is made there); on a question every error raised before ``enter_call()``
+    says that nothing was sent, and one raised after it says what became of the reply, by its own
+    text (``_Told``) or, for any other, that the reply is not shown. An exception that is not the
+    query's own keeps its class and message in the text. A ``BaseException`` passes unchanged: it
+    is the host's. The engine's own boundary (a closed engine, settling the host's list, finishing
+    the result) lies outside it and is every tool's (ruling OD-G2, #78)."""
+
+    def __init__(self, page: bool):
+        self.page = page
+        self.called = False
+
+    def enter_call(self) -> None:
+        """Called as the first statement inside the host's interrupt protection, immediately
+        before the one ``_call_once``: from here the model may have been called."""
+        self.called = True
+
+    def __enter__(self) -> "_Refusals":
+        return self
+
+    def __exit__(self, kind: Any, exc: Optional[BaseException], traceback: Any) -> bool:
+        if exc is None or not isinstance(exc, Exception):
+            return False
+        ours = isinstance(exc, (ExpansionError, HostUnavailable))
+        if self.page:
+            text = str(exc) if ours else f"lcm_query failed on a page request ({type(exc).__name__}: {exc})"
+            raise ExpansionError(f"{text}; no page was served") from None
+        if not self.called:
+            text = str(exc) if ours else f"lcm_query failed before its model call ({type(exc).__name__}: {exc})"
+            raise ExpansionError(f"{text}; nothing was sent") from None
+        if isinstance(exc, _Told):
+            return False
+        text = str(exc) if ours else f"lcm_query failed after its model call ({type(exc).__name__}: {exc})"
+        raise ExpansionError(f"{text}; the model's reply is not shown") from None
 
 
 def _resolve(records: RecordStore, session: str, handles: list, interrupted: Any) -> _Read:
@@ -344,11 +396,11 @@ def _relay_refusal() -> Optional[str]:
     Also, whether this tool call itself runs as a managed Relay callback: its thread is then set
     by the native package and not established, and the query reads the host's stop by this
     thread's interrupt bit (ruling OD-2b)."""
-    so = "whether a managed NeMo Relay carries this call is not known; nothing was sent"
+    so = "whether a managed NeMo Relay carries this call is not known"
     depth = _strict_import("managed Relay callback depth", "agent.relay_runtime", "_MANAGED_CALLBACK_DEPTH", so=so)
     if depth.get() > 0:
         return ("this tool call runs as a callback of a managed NeMo Relay, on a thread the plugin cannot establish, "
-                "so whether the host asked it to stop cannot be read; nothing was sent")
+                "so whether the host asked it to stop cannot be read")
     active_turn = _strict_import("Relay turn", "agent.relay_runtime", "active_turn", so=so)
     turn = active_turn()
     session = turn.lease.session_id if turn is not None else None
@@ -357,7 +409,7 @@ def _relay_refusal() -> Optional[str]:
     if not _strict_import("Relay instrumentation", "agent.relay_runtime", "relay_instrumentation_enabled", so=so)():
         return None
     carried = ("a managed NeMo Relay would carry this call: it can rewrite the request, so what the model receives "
-               "cannot be shown; nothing was sent")
+               "cannot be shown")
     turn = active_turn(session)
     host = turn.lease.live_runtime() if turn is not None else None
     if host is not None:
@@ -382,7 +434,7 @@ def _route_facts(route: Any) -> _RouteFacts:
     under the route's own provider (7721, backend_identity.py 77-118), recording each as
     ``_fallback_provider_from_label`` of its provider and ``_normalize_resolved_model`` of its
     model (7746, 4512). ``route_info`` is written at 7349 and 7746 only."""
-    so = "which legs the host can answer this call on is not known; nothing was sent"
+    so = "which legs the host can answer this call on is not known"
 
     def host(name: str, what: str, module: str = "agent.auxiliary_client") -> Any:
         return _strict_import(what, module, name, so=so)
@@ -473,18 +525,33 @@ def _recovery(exc: BaseException, facts: _RouteFacts, timeout: float) -> str:
     """What the host's own recovery for this failure can have changed, on this route, by the
     host's own tests of the error it raised (agent/auxiliary_client.py at Hermes 375930d089:
     the same-provider re-sends, 8044-8067; the fallback walk, 7669-7760; the credential rungs,
-    7580-7641). The plugin cannot see which of it happened."""
-    so = "what the host's recovery did is not known"
+    7580-7641). The plugin cannot see which of it happened. Where one of the host's tests cannot be
+    read, that is the clause, and the call's own failure text stays whole (PLAN-83g §3.7)."""
+    class _Unread(Exception):
+        pass
+
+    def host(name: str) -> Any:
+        try:
+            return getattr(__import__("agent.auxiliary_client", fromlist=[name]), name)
+        except Exception as error:
+            raise _Unread(f"agent.auxiliary_client.{name} cannot be read: {type(error).__name__}: {error}") from None
 
     def test(name: str) -> bool:
-        check = _strict_import(f"error test {name}", "agent.auxiliary_client", name, so=so)
+        check = host(name)
         try:
             return bool(check(exc))
         except Exception:
             return False
+    try:
+        return _recovery_clauses(exc, facts, timeout, host, test)
+    except _Unread as unread:
+        return f"what the host's recovery did is not known ({unread})"
+
+
+def _recovery_clauses(exc: BaseException, facts: _RouteFacts, timeout: float, host: Any, test: Any) -> str:
     said = []
     if test("_is_transient_transport_error"):
-        retries = _strict_import("transient retry count", "agent.auxiliary_client", "_transient_retry_count", so=so)()
+        retries = host("_transient_retry_count")()
         said.append(f"it re-sent the request to the same provider up to {retries} time(s) (auxiliary.transient_"
                     f"retries), each read allowed {timeout:g} s")
     payment, rate, auth = test("_is_payment_error"), test("_is_rate_limit_error"), test("_is_auth_error")
@@ -552,18 +619,17 @@ def _joined_tool_content(record: str, message: dict, raw: dict, given: Given) ->
     if (message.get("role") != "tool" or not isinstance(content, list) or not content
             or not all(text_part(part) for part in content)):
         return None
+    # Read before the join, after every part's origin was asserted (``_input``); ``_join`` then
+    # joins the parts.
     origins = [given.origin(part) for part in content]
-    if None in origins:
-        raise ExpansionError(f"record {record}: a part the query gives of it has no recorded origin, so the query "
-                             f"cannot say what it gives; nothing was sent")
-    message["content"] = "\n".join(part["text"] for part in content)
     # A placeholder counts as a stored image replaced where it replaced an image of the stored
     # content (kept as a part, or lifted out of a member given as JSON); one that replaced an
     # image of another stored field counts with that field's parts.
     stored, rendered = origins.count(STORED), origins.count(RENDERED)
     replaced = sum(1 for part in content if given.origin(part) == REPLACED and given.replaced(part) in (STORED, LIFTED))
     other = len(origins) - stored - replaced - rendered
-    pieces = [_counted(stored, "stored text part", "stored text parts")] if stored else []
+    pieces = ([("its stored text" if isinstance(raw.get("content"), str)
+                else _counted(stored, "stored text part", "stored text parts"))] if stored else [])
     if replaced:
         pieces.append(f"{_counted(replaced, 'stored image', 'stored images')} replaced by the placeholder"
                       f"{'' if replaced == 1 else 's'} that say{'s' if replaced == 1 else ''} so")
@@ -573,7 +639,15 @@ def _joined_tool_content(record: str, message: dict, raw: dict, given: Given) ->
         pieces.append(f"{_counted(other, 'part', 'parts')} from other stored fields or the query's notes")
     ours = replaced + rendered + other
     return (f" ({_stored_shape(raw)}; given joined by newlines: {', '.join(pieces)}"
-            f"{', each part of the query under its own label' if ours else ''})")
+            f"{', each part of the query says what it is' if ours else ''})")
+
+
+def _join(message: dict, given: Given) -> None:
+    """The join itself (ruling OD-3b): the tool result's text parts joined by newlines into one
+    string, and ``given`` told so, so that the wire check names that string as the query's join
+    of its content, not as its stored text."""
+    message["content"] = "\n".join(part["text"] for part in message["content"])
+    given.joined = True
 
 
 def _labels(found: _Read, rows: list, joined: dict) -> dict:
@@ -698,15 +772,14 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     if objects:
         raise ExpansionError(f"these records are stored as JSON values that are not messages: {', '.join(objects)}; "
                              f"the store's own writer never writes one (a hand-edited store), and the query cannot give "
-                             f"one as a message without inventing its role; nothing was sent: ask over other handles")
+                             f"one as a message without inventing its role: ask over other handles")
     tool_first = [chunk for chunk in found.chunks
                   if found.records[chunk] and found.records[chunk][0][1].get("role") == "tool"]
     if tool_first:
         raise ExpansionError(f"{', '.join(tool_first)} begin{'s' if len(tool_first) == 1 else ''} with a tool result, "
                              f"which the store's own cut never writes (a hand-edited store); the query labels a chunk "
                              f"on its first message and never inside a tool result, so it cannot give "
-                             f"{'this chunk' if len(tool_first) == 1 else 'these chunks'}; nothing was sent: ask over "
-                             f"other handles")
+                             f"{'this chunk' if len(tool_first) == 1 else 'these chunks'}: ask over other handles")
     problems: list[str] = []
     joined: dict[str, str] = {}
     for _chunk, record, raw in rows:
@@ -728,20 +801,22 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     if problems:
         raise ExpansionError(
             f"the query gives its model each message's stored content and calls, never the host's replay carrier, and "
-            f"these records cannot be given as they are: {' | '.join(problems)}; nothing was sent: ask over other "
-            f"handles")
+            f"these records cannot be given as they are: {' | '.join(problems)}: ask over other handles")
     labels = _labels(found, rows, joined)
     for entry in sent:
         if entry.record in labels:
             # No label of the plugin's inside a tool result (OD-D).
             label_message(entry.message, labels[entry.record], entry.given)
             entry.label = labels[entry.record]
-    # Every part of every message has one recorded origin (PLAN-83d §2's property, asserted where
-    # the messages are finished, PLAN-83e §8.3).
+    # Every part of every message has one recorded origin (PLAN-83d §2's property), asserted at
+    # one site, right after the labels are added and before any join (PLAN-83g §4.3).
     unrecorded = [entry.record for entry in sent if unrecorded_parts(entry.message, entry.given)]
     if unrecorded:
         raise ExpansionError(f"a part the query gives of {', '.join(unrecorded)} has no recorded origin, so the query "
-                             f"cannot say what it gives; nothing was sent")
+                             f"cannot say what it gives")
+    for entry in sent:
+        if entry.record in joined:
+            _join(entry.message, entry.given)
     closing = f"Question:\n{question}\n\n{CONTRACT}"
     messages = ([{"role": "system", "content": INSTRUCTIONS}] + [entry.message for entry in sent]
                 + [{"role": "user", "content": closing}])
@@ -777,7 +852,7 @@ def _payload_for_wire(route: Any, messages: list[dict], wire: str) -> Any:
     this wire (``None`` where no converter renames: only the Anthropic builder on an OAuth
     credential does). Every host function is taken strictly: one that cannot be read refuses the
     query."""
-    so = "what the model would receive cannot be shown; nothing was sent"
+    so = "what the model would receive cannot be shown"
     client = route.target_client_object
     base_url = str(getattr(client, "base_url", "") or "")
     own = wire == route.target_api_mode
@@ -857,11 +932,15 @@ def _given_tokens(messages: list[dict], sent: list[_Sent]) -> list[tuple]:
             elif isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
                 text = part["text"]
                 origin = entry.given.origin(part) if entry is not None else None
+                head = text.split("\n", 1)[0]
+                if ":]" in head:
+                    head = head[:head.index(":]") + 2]
                 what = ("its text" if entry is None
+                        else "its content, joined by the query" if isinstance(content, str) and entry.given.joined
                         else "its stored text" if isinstance(content, str)
                         else "the query's label" if origin == LABEL
                         else f"stored text part {number}" if origin == STORED
-                        else f"the query's part {number} ({text.split(']', 1)[0]}])")
+                        else f"the query's part {number} ({head})")
                 tokens.append(("text", text, who, what))
         for number, call in enumerate(message.get("tool_calls") or [], start=1):
             function = call["function"]
@@ -969,7 +1048,7 @@ def _wire_check(route: Any, messages: list[dict], sent: list[_Sent], wires: dict
         raise ExpansionError(
             f"the host's converter would not give the query's model these records as the query gives them, in their "
             f"place, on a wire the host can send this call on: {' || '.join(refused)}; it cannot be shown that the "
-            f"model receives them, so nothing was sent: ask over other handles")
+            f"model receives them: ask over other handles")
     return said
 
 
@@ -990,6 +1069,10 @@ def parse_reply(content: str) -> tuple[str, list]:
         value = json.loads(content)
     except ValueError as exc:
         raise refuse(f"{exc}; the reply had {len(content)} characters") from None
+    except RecursionError:
+        # A reply nested past the parser is the contract's failure, as ``parsed_arguments`` says
+        # it for arguments, never a failed call (PLAN-83g §4.1 S9).
+        raise refuse("it is JSON nested deeper than the parser reads") from None
     if not isinstance(value, dict) or set(value) != {"report", "excerpts"}:
         raise refuse("it is not an object with exactly the keys report and excerpts" if isinstance(value, dict)
                      else f"it is a JSON {json_kind(value)}, not an object")
@@ -1128,8 +1211,7 @@ def _serve_stored(engine: Any, session: str, state: dict, limit: Any, interrupte
             store_uuid = str(records.identity().get("store_uuid") or "")
             stored = records.query_report(state["k"]) if state["s"] == store_uuid else None
     except ReadFenced:
-        raise ExpansionError("the host asked this tool call to stop (its interrupt bit is set); no page was served") \
-            from None
+        raise ExpansionError(_STOPPED) from None
     if state["s"] != store_uuid:
         raise ExpansionError("page is a token of another store: the store it was issued by is not this one")
     if stored is None:
@@ -1150,20 +1232,22 @@ def _serve_stored(engine: Any, session: str, state: dict, limit: Any, interrupte
 def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
     """The ``lcm_query`` tool (the module docstring). ``args`` is always a dict: the host refuses
     arguments that are not a JSON object before dispatch (agent/tool_executor.py 168-179,
-    1852-1857 at Hermes 375930d089), and its hooks, Relay and middleware keep a dict."""
-    removed = [f"{name} ({why})" for name, why in _REMOVED.items() if name in args]
-    if removed:
-        raise ExpansionError("lcm_query no longer accepts " + "; ".join(removed) + ". It takes handles, question "
-                             "and page.")
-    unknown = [name for name in args if name not in _ARGUMENTS]
-    if unknown:
-        raise ExpansionError("lcm_query takes handles, question and page; not " + ", ".join(unknown))
-    session = engine.current_session_id
-    if not session:
-        raise ExpansionError("this engine copy is bound to no session of the plugin, so no handle resolves")
-    try:
+    1852-1857 at Hermes 375930d089), and its hooks, Relay and middleware keep a dict. Every error
+    it raises passes through one scope (``_Refusals``), entered before anything else once the
+    branch is known from the arguments."""
+    with _Refusals(page="page" in args) as scope:
+        removed = [f"{name} ({why})" for name, why in _REMOVED.items() if name in args]
+        if removed:
+            raise ExpansionError("lcm_query no longer accepts " + "; ".join(removed) + ". It takes handles, question "
+                                 "and page.")
+        unknown = [name for name in args if name not in _ARGUMENTS]
+        if unknown:
+            raise ExpansionError("lcm_query takes handles, question and page; not " + ", ".join(unknown))
+        session = engine.current_session_id
+        if not session:
+            raise ExpansionError("this engine copy is bound to no session of the plugin, so no handle resolves")
         interrupted = _stop_latch()
-        if "page" in args:
+        if scope.page:
             if len(args) != 1:
                 raise ExpansionError("page continues a query's stored result: give page alone")
             state = expansion.decode_token(args["page"])
@@ -1177,9 +1261,7 @@ def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
                                  "to read")
         if not isinstance(question, str) or not question.strip():
             raise ExpansionError("question is required: a non-empty question")
-        return _ask(engine, session, handles, question, interrupted, messages=messages)
-    except HostUnavailable as exc:
-        raise ExpansionError(str(exc)) from None
+        return _ask(engine, session, handles, question, interrupted, scope, messages=messages)
 
 
 def _stop_latch() -> Any:
@@ -1194,7 +1276,7 @@ def _stop_latch() -> Any:
     once seen, the stop holds for the rest of this call."""
     worker = threading.get_ident()
     thread_interrupted = _strict_import("tool interrupt bit", "tools.interrupt", "is_thread_interrupted",
-                                        so="whether the host asked this call to stop cannot be known; nothing was sent")
+                                        so="whether the host asked this call to stop cannot be known")
     stopped = threading.Event()
 
     def interrupted() -> bool:
@@ -1204,7 +1286,8 @@ def _stop_latch() -> Any:
     return interrupted
 
 
-def _ask(engine: Any, session: str, handles: list, question: str, interrupted: Any, *, messages: Any) -> Any:
+def _ask(engine: Any, session: str, handles: list, question: str, interrupted: Any, scope: _Refusals, *,
+         messages: Any) -> Any:
     limit = expansion.host_page_limits(engine, TOOL, messages)
     timeout, timeout_source = _call_timeout()
 
@@ -1212,7 +1295,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         # The stop read at each step before the call (PLAN-83d §5).
         if interrupted():
             raise ExpansionError(_STOPPED)
-    cancellation = "the host's stop of this call cannot be acted on; nothing was sent"
+    cancellation = "the host's stop of this call cannot be acted on"
     protection = _strict_import("auxiliary cancellation", "agent.auxiliary_client", "aux_interrupt_protection",
                                 so=cancellation)
     cancelled = _strict_import("auxiliary cancellation signal", "agent.auxiliary_client",
@@ -1220,6 +1303,10 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
     if not (isinstance(cancelled, type) and issubclass(cancelled, BaseException)):
         raise ExpansionError(f"the host's auxiliary cancellation signal (AuxiliaryExplicitCancellation) is not an "
                              f"exception class, so {cancellation}")
+    # The name ``_call_once`` imports inside the call (escalation.py 576), read here, before the
+    # call, so that it cannot first fail after the scope's phase has turned (PLAN-83g §3.7).
+    _strict_import("auxiliary call", "agent.auxiliary_client", "call_llm",
+                   so="the query's model cannot be called through the host")
     records: RecordStore = engine._records
 
     def fence() -> None:
@@ -1236,9 +1323,9 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
             code = getattr(cause, "sqlite_errorcode", None)
             if isinstance(cause, sqlite3.OperationalError) and isinstance(code, int) and (code & 0xFF) == sqlite3.SQLITE_BUSY:
                 raise ExpansionError(f"the session's reasoning effort could not be read because the store's lock was "
-                                     f"held past its busy timeout ({cause}); nothing was sent") from None
-            raise ExpansionError(f"the session's reasoning effort could not be read ({type(cause).__name__}: {cause}); "
-                                 f"nothing was sent") from None
+                                     f"held past its busy timeout ({cause})") from None
+            raise ExpansionError(f"the session's reasoning effort could not be read ({type(cause).__name__}: "
+                                 f"{cause})") from None
         step()
         if settings is None:
             raise ExpansionError(f"the query's model is the summariser's, and there is none: {why_not}")
@@ -1248,18 +1335,19 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
             # shown, for text as for images.
             raise ExpansionError(f"the host routes the query's model {route.describe()} through a "
                                  f"{route.target_client}, a wire the plugin has not established: it cannot be shown "
-                                 f"what the model receives; nothing was sent")
+                                 f"what the model receives")
         route_facts = _route_facts(route)
         if route_facts.refusals:
             raise ExpansionError(f"the host can answer this call on a leg whose wire the query cannot know before the "
-                                 f"call: {' | '.join(route_facts.refusals)}; nothing was sent")
+                                 f"call: {' | '.join(route_facts.refusals)}")
         unestablished = [wire for wire in route_facts.wires if wire not in _ESTABLISHED_WIRES]
         if unestablished:
             raise ExpansionError(f"a leg of the host's recovery can send this call on a wire the plugin has not "
-                                 f"established ({', '.join(unestablished)}); nothing was sent")
+                                 f"established ({', '.join(unestablished)})")
         facts = lookup_model(route.target_model, route.target_provider)
-        wire = wire_facts(route.target_provider, route.target_model, route.target_base_url, route.target_api_mode,
-                          reads_images=facts.reads_images if facts is not None else None, strict=True)
+        # The route's wire facts, the reasoning pad the host's own agent would apply (M7) among
+        # them, read once here; every reader of the pad takes it from ``wire``.
+        wire, echo = query_wire_facts(route, reads_images=facts.reads_images if facts is not None else None)
         step()
         found = _resolve(records, session, handles, interrupted)
         step()
@@ -1291,8 +1379,8 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                     f"the input would reach {route.describe()} as about {provider_tokens} provider tokens ("
                     f"{estimate.tokens} by the plugin's estimate, its characters / 4 times {worst}, the configured "
                     f"estimate_ratio_max, #34 D4; {estimate.label()}), more than it reads in one call "
-                    f"({facts.context_window} window {output}; {facts.basis}); nothing was cut and nothing was sent: "
-                    f"ask over fewer handles")
+                    f"({facts.context_window} window {output}; {facts.basis}); nothing was cut: ask over fewer "
+                    f"handles")
             uncounted = (f"; {estimate.uncounted_images} image(s) the estimate could not count are not in it"
                          if estimate.uncounted_images else "")
             window = (f"checked: about {provider_tokens} provider tokens by estimate_ratio_max {worst} against "
@@ -1326,18 +1414,27 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                           "payload in two fields (reasoning_details and a replay carrier), and each field is "
                           "counted"),
                       "reasoning_echo": (
-                          "the host's reasoning-echo policy for this route keeps each agent message's "
-                          "reasoning_content on the message it sends (a blank one as a single space), as the "
-                          "provider requires of replayed tool-call turns; its readable reasoning is also given as a "
-                          "labelled part" if wire.needs_reasoning_echo else
-                          "the host's reasoning-echo policy for this route removes reasoning_content from every "
-                          "message it sends; readable reasoning is given only as labelled parts"),
+                          f"the host's own agent pads on this route: the family test needs_reasoning_echo("
+                          f"{echo.provider}, {echo.model}, {echo.base_url}) says {'yes' if echo.family else 'no'}, and "
+                          f"model.reasoning_echo as the host reads it (ReasoningParamsMixin."
+                          f"_read_reasoning_echo_from_config) is {'true' if echo.opt_in else 'false'}; so the query "
+                          f"itself applies the host's apply_reasoning_content_policy to each agent message "
+                          f"{'with' if echo.pad else 'without'} the pad (call_llm applies none): "
+                          + ("a stored reasoning_content string is kept as stored, an empty one becomes a single "
+                             "space; a message without one gets its reasoning where it has no tool calls, else a "
+                             "single space" if echo.pad else
+                             "reasoning_content is removed from every agent message")
+                          + "; readable reasoning is also given as a labelled part. The host's agent read "
+                            "model.reasoning_echo when it was created or switched model, and takes it from a fallback "
+                            "entry on a route it activated from fallback_providers; the query reads the configuration "
+                            "at this call"),
                       "window": window,
                       "wire": [f"{name}: {why}; the host's converter for it was run over the query's messages before "
-                               f"the call and gives the model, in its place, every non-blank text the query gives it "
-                               f"(blank ones are left to the converter's own stand-ins), every image by its position "
-                               f"and kind (not its bytes), and every tool call by its name and, where the stored "
-                               f"arguments parse as JSON, by its arguments"
+                               f"the call and gives the model, in order, every non-blank text part the query gives it "
+                               f"(blank ones are left to the converter's own stand-ins), every image in order, as an "
+                               f"image (not its bytes), and every tool call by its name and, where the stored "
+                               f"arguments parse as JSON, by its arguments; role, message boundaries, ids and "
+                               f"reasoning_content (the host's echo) are not compared"
                                f"{'; ' + renamed[name] if name in renamed else ''}"
                                for name, why in route_facts.wires.items()],
                       "text_carriers": (f"{stats['carriers']} record(s) hold a host replay carrier of their text "
@@ -1365,21 +1462,21 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                 "timeout": timeout,
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",
                 "if_the_host_asks_this_call_to_stop": (
-                    _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[route.target_api_mode]
-                    + "; the query reads the host's interrupt bit from its start: while it waits for the store's "
-                      "locks and the store's file locks as it reads (this session's reasoning effort and the records) "
-                      "and as it stores a result that needs more than one page, at each step before the call, while "
-                      "it waits for a call slot and throughout the call; once "
-                      "it has seen the bit set it reads, sends and stores nothing more for this call; a "
-                      "result that fits one page is returned whatever the bit (the host uses it within its 3 s "
-                      "grace after an interrupt and discards it after its own timeout); a failure to store the "
-                      "result is written as a store event only in a transaction that commits nothing once the bit "
-                      "is seen; the query writes no event of other work"),
+                    _stop_clauses(route_facts)
+                    + "; the query reads the host's interrupt bit from its first store read (this session's reasoning "
+                      "effort) on: while it waits for the store's locks and file locks as it reads the records and as "
+                      "it stores a result that needs more than one page, at each step before the call, while it waits "
+                      "for a call slot and throughout the call; once it has seen the bit set it reads, sends and "
+                      "stores nothing more for this call; a result that fits one page is returned whatever the bit "
+                      "(the host uses it within its 3 s grace after an interrupt and discards it after its own "
+                      "timeout); a failure to store the result is written as a store event only in a transaction "
+                      "that commits nothing once the bit is seen; the query writes no event of other work"),
                 "entered_the_host": ("once; the query retries no failure (the host's own recovery runs inside the "
                                      "call, and one entry can send several provider requests: its re-sends, rungs "
                                      "and fallbacks)"),
                 "limiter": (f"one of the {slots} slots of the plugin's limiter for {endpoint}, held until the query "
-                            f"stops reading; a request the host keeps running after that is not counted in it"),
+                            f"stops reading; a request the host keeps running after that is not counted in it; a "
+                            f"failed call's Retry-After holds every call of the plugin to this endpoint until then"),
             },
             "route_unverifiable": _route_unverifiable(route_facts),
             "excerpts_checked": 0,
@@ -1397,22 +1494,25 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
 
         if not limiter.acquire(slots, lambda: not interrupted()):
             raise ExpansionError(f"the host asked this tool call to stop (its interrupt bit is set) while it waited for "
-                                 f"one of the {slots} call slots of {endpoint}; nothing was sent")
+                                 f"one of the {slots} call slots of {endpoint}")
         usage: dict = {}
         try:
             with protection(cancel_check=interrupted):
+                scope.enter_call()
                 content, finish_reason = _call_once(messages_in, settings, timeout, usage)
             report, excerpts = parse_reply(content)
         except cancelled:
             logger.warning("LCM's query was stopped: the host asked lcm_query on %s to stop", route.describe())
-            raise ExpansionError("the host asked this tool call to stop (its interrupt bit is set); the model's reply "
-                                 "was not read, and nothing was stored") from None
+            raise _Told(f"the host asked this tool call to stop (its interrupt bit is set); the model's reply was not "
+                        f"read, and nothing was stored; {_stop_clauses(route_facts)}") from None
         except SummaryFailure as failure:
             text = settings.scrub(str(failure))
             logger.warning("LCM's query got no answer: %s", text)
-            raise ExpansionError(f"lcm_query's model call did not give an answer: {text}; nothing of the reply is "
-                                 f"shown") from None
+            raise _Told(f"lcm_query's model reply was refused: {text}; nothing of the reply is shown") from None
         except Exception as exc:
+            if not scope.called:
+                # Raised by the protection's entry, before the call: the scope says nothing was sent.
+                raise
             retry_after = _retry_after_seconds(exc)
             if retry_after and _is_transient(exc):
                 # The endpoint said when: no call to it before then, this one's or another's,
@@ -1421,10 +1521,10 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
             status = _host_status(exc)
             text = failure_text(exc, settings.secrets)
             logger.warning("LCM's query call failed: %s", text)
-            raise ExpansionError(
-                f"lcm_query's model call failed ({text}{f'; HTTP status {status}' if status else ''}). The host's own "
-                f"recovery ran inside the call before it failed: {_recovery(exc, route_facts, timeout)}. The query "
-                f"does not try again; nothing of a reply is shown") from None
+            raise _Told(
+                f"lcm_query's model call failed ({text}{f'; HTTP status {status}' if status else ''}). What the host's "
+                f"own recovery can have done inside the call for this error: {_recovery(exc, route_facts, timeout)}. "
+                f"The query does not try again; no reply is shown") from None
         finally:
             limiter.release()
 
@@ -1457,7 +1557,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                                                 fence=interrupted)
         except WriteFenced:
             logger.warning("LCM's query result was not stored: the host asked lcm_query to stop meanwhile")
-            raise ExpansionError(unstored) from None
+            raise _Told(unstored) from None
         except Exception as exc:  # a lock past the busy timeout, a store closed meanwhile
             # The failure is written as a store event in a fenced transaction: nothing is written
             # once the host asked this call to stop, and nothing is kept pending for another
@@ -1472,12 +1572,11 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
             except Exception as failure:
                 logger.error("LCM could not record that a query result of %d characters was not stored (%s: %s)",
                              len(body), type(failure).__name__, failure)
-            raise ExpansionError(f"the query's result of {len(body)} characters needs more than one page and could "
-                                 f"not be stored for its pages ({type(exc).__name__}: {exc}); nothing of it is "
-                                 f"shown") from None
+            raise _Told(f"the query's result of {len(body)} characters needs more than one page and could not be "
+                        f"stored for its pages ({type(exc).__name__}: {exc}); nothing of it is shown") from None
         if stored:
             return page_one
         report_id = _draw_report_id()
         page_one = page_one_as(report_id)
-    raise ExpansionError(f"the query's result needs more than one page, and the {_HANDLE_DRAWS} ids drawn for "
-                         f"storing it were all taken; nothing of it is shown")
+    raise _Told(f"the query's result needs more than one page, and the {_HANDLE_DRAWS} ids drawn for storing it were "
+                f"all taken; nothing of it is shown")

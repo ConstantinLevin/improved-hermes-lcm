@@ -39,7 +39,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
 from .message_content import content_parts, image_media_type, is_image_part, readable_reasoning, sidecar_sent
-from .summariser_input import WireFacts, _image_placeholder, _row_before_fill, _strict_import, host_fill_text
+from .summariser_input import (HostUnavailable, WireFacts, _image_placeholder, _row_before_fill, _strict_import,
+                               host_fill_text)
 
 # The standing of a value the query gives: what the agent may rest on an excerpt found in it.
 GIVEN_CONTENT, GIVEN_RESULT, GIVEN_CALL, GIVEN_REASONING = "content", "result", "call", "reasoning"
@@ -98,6 +99,57 @@ _NOT_READ = "not shown to this model, which does not read images"
 _NOT_KNOWN = "image not sent: whether this model reads images is unknown"
 
 
+@dataclass(frozen=True)
+class EchoInputs:
+    """The two inputs of the reasoning pad the host's own agent applies on the query's route, each
+    as the host's own function reads it (PLAN-83g §3.8, ruling OD-F3)."""
+
+    provider: str
+    model: str
+    base_url: str
+    family: bool          # agent.message_sanitization.needs_reasoning_echo(provider, model, base_url)
+    opt_in: bool          # model.reasoning_echo, read by ReasoningParamsMixin._read_reasoning_echo_from_config
+
+    @property
+    def pad(self) -> bool:
+        return self.family or self.opt_in
+
+
+def query_wire_facts(route: Any, reads_images: Optional[bool]) -> tuple[WireFacts, EchoInputs]:
+    """The query's wire facts, computed once per call; every reader of the pad (the projection
+    through ``_row_before_fill``, the Estimator, the header) takes it from here (PLAN-83g §3.8).
+
+    The host's own agent pads ``reasoning_content`` by ``_needs_thinking_reasoning_pad()``
+    (agent/reasoning_params.py 157-173 at Hermes 375930d089): the DeepSeek, Kimi and MiMo family
+    test, or its ``_reasoning_echo_flag``, which it reads at creation and ``switch_model`` with the
+    staticmethod ``_read_reasoning_echo_from_config`` (180-187; agent_init.py 2452-2453,
+    agent_runtime_helpers.py 2121-2122). The method needs the agent, which the query does not read
+    and does not stand in for, so its two inputs are read with the host's own functions: the family
+    test ``needs_reasoning_echo`` (message_sanitization.py 621-623, the same test line by line for
+    this route) and the opt-in reader itself. Each is imported strictly. The Anthropic-converter
+    fact is read as ``summariser_input.wire_facts`` reads it, strictly."""
+    provider, model, base_url = str(route.target_provider), str(route.target_model), str(route.target_base_url or "")
+    family = bool(_strict_import("reasoning-echo family test", "agent.message_sanitization", "needs_reasoning_echo",
+                                 so="whether the host's agent pads reasoning_content on this route is not known")(
+        provider, model, base_url))
+    mixin = _strict_import("reasoning parameters", "agent.reasoning_params", "ReasoningParamsMixin",
+                           so="whether the host's agent pads reasoning_content on this route is not known")
+    reader = getattr(mixin, "_read_reasoning_echo_from_config", None)
+    if not callable(reader):
+        raise HostUnavailable("the host's reasoning-echo opt-in reader (agent.reasoning_params.ReasoningParamsMixin."
+                              "_read_reasoning_echo_from_config) cannot be read, so whether the host's agent pads "
+                              "reasoning_content on this route is not known")
+    opt_in = bool(reader())
+    mode = str(_strict_import("API mode canonicalisation", "hermes_cli.config_providers", "_canonical_api_mode",
+                              so="the route's API mode as the host reads it is not known")(
+        str(route.target_api_mode or ""))).lower()
+    dispatched = str(_strict_import("provider normalisation", "agent.auxiliary_client", "_normalize_aux_provider",
+                                    so="the route's provider as the host dispatches it is not known")(provider))
+    anthropic = mode == "anthropic_messages" or (dispatched == "anthropic" and mode in ("", "anthropic_messages"))
+    echo = EchoInputs(provider=provider, model=model, base_url=base_url, family=family, opt_in=opt_in)
+    return WireFacts(reads_images=reads_images, needs_reasoning_echo=echo.pad, anthropic_converter=anthropic), echo
+
+
 def json_kind(value: Any) -> str:
     """A JSON value's kind, in JSON's own names."""
     if value is None:
@@ -151,6 +203,7 @@ class Given:
     images_not_given: list = field(default_factory=list)
     reasoning_parts: int = 0
     lifted: int = 0
+    joined: bool = False      # the content was joined into one string by the query (``query._join``)
 
     def made(self, part: dict, origin: str, path: tuple = (), was: Optional[str] = None) -> dict:
         self.origins[id(part)] = (part, origin, path, was)
@@ -702,7 +755,7 @@ def _host_metadata_keys() -> frozenset:
     ._MESSAGE_SCHEMA_KEYS``), the message core keys (``agent.message_sanitization._MESSAGE_CORE_KEYS``),
     the keys the Chat Completions transport strips (``_STRIP_MSG_KEYS``) and the persistence-only
     fields."""
-    so = "which of a message's keys are the host's own bookkeeping is not known; nothing was sent"
+    so = "which of a message's keys are the host's own bookkeeping is not known"
     schema = _strict_import("session schema keys", "hermes_state_messages", "_MESSAGE_SCHEMA_KEYS", so=so)
     core = _strict_import("message core keys", "agent.message_sanitization", "_MESSAGE_CORE_KEYS", so=so)
     strip = _strict_import("Chat Completions strip keys", "agent.transports.chat_completions", "_STRIP_MSG_KEYS",
