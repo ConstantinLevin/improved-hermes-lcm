@@ -40,8 +40,11 @@ images than the host's converter keeps in one request; an input over the model's
 window less its output cap, by the estimate times ``estimate_ratio_max``, #34 D4; where the model
 table has no window this is said); a record the query cannot give as it is (a replay carrier that
 holds text or a call its content and calls do not; a record stored as a JSON value that is not a
-message; a chunk that begins with a tool result); anything the query gives its model that a
-wire's converter would not deliver, in its place; a page too small for the result's header.
+message; a chunk that begins with a tool result; a carrier call whose input cannot be compared;
+a part without a recorded origin); anything the query gives its model that a wire's converter
+would not deliver, in order; a page too small for the result's header and one piece of it. Every
+error passes through one scope (``_Refusals``) that says once whether the model was called
+(PLAN-83g §3.7).
 
 **How the call is made** (rulings OD-A, OD-B, OD-C). The host is entered once per dispatch: no
 failure is retried by the plugin. The call runs inside the host's ``aux_interrupt_protection``
