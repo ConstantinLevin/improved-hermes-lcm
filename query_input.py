@@ -1328,6 +1328,8 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
         _bedrock_blocks(raw.get("bedrock_content_blocks"), face)
         _codex_message_items(raw.get("codex_message_items"), face)
     if STASH in domain:
+        if callable(check):
+            check()     # the host's stop, read before the host's conversion of the content (PLAN-19 §2.7)
         face.stash_site = stash_sent(row.get("content"))
         _anthropic_blocks(STASH, raw.get(STASH), face)
     if "api_content" in domain and not sidecar_sent(raw):

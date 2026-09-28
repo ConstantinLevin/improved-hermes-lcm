@@ -1211,11 +1211,16 @@ def _leg_values(leg: _Leg, messages: list[dict]) -> list[tuple[bool, Optional[bo
     ``_ANTHROPIC_MEDIA_BLOCKS``, agent/auxiliary_client.py 6405; every other message it returns as it was, 6435),
     that conversion is the identity, and one value of an enumerated pre-pass stands for both."""
     prepass = leg.prepass
-    if len(prepass) > 1 and not any(isinstance(part, dict) and part.get("type") in _CONVERTED_MEDIA
-                                    for message in messages for part in (message.get("content") or [])
-                                    if isinstance(message.get("content"), list)):
+    if len(prepass) > 1 and not _media_given(messages):
         prepass = prepass[:1]
     return [(value, oauth) for value in prepass for oauth in (leg.oauth or (None,))]
+
+
+def _media_given(messages: list[dict]) -> bool:
+    """Whether the query gives a part the host's image conversion converts (``image_url``, ``video_url``)."""
+    return any(isinstance(part, dict) and part.get("type") in _CONVERTED_MEDIA
+               for message in messages for part in (message.get("content") or [])
+               if isinstance(message.get("content"), list))
 
 
 def _retired_images(facts: _RouteFacts, messages: list[dict]) -> None:
@@ -1357,12 +1362,17 @@ _OAUTH_ADDITION = ("under is_oauth True the host prefixes the instructions with 
                    "and are compared as sent")
 
 
-def _wire_text(leg: _Leg, renamed: dict) -> str:
+def _wire_text(leg: _Leg, renamed: dict, media: bool) -> str:
     """What the header says of one leg's check (PLAN-19 §5): the leg, its inputs, what the check compares, and every
-    text the host itself adds on that leg."""
+    text the host itself adds on that leg. ``media``: whether the query gives a part the host's image conversion
+    converts; where it gives none, that conversion is the identity and one of its values was run for both
+    (``_leg_values``), which the text says."""
     values = ""
-    if len(leg.prepass) > 1 or len(leg.oauth) > 1:
+    if len(leg.oauth) > 1 or (len(leg.prepass) > 1 and media):
         values = ", under each value of its enumerated inputs"
+    if len(leg.prepass) > 1 and not media:
+        values += (" (the host's image conversion changes nothing here, since no image_url or video_url part is given, "
+                   "so one of its values stood for both)")
     oauth = f"; {_OAUTH_ADDITION}" if True in leg.oauth else ""
     return (f"{leg.wire}, {leg.why} ({leg.inputs}): the host's converter for it was run over the query's messages "
             f"before the call{values} and gives the model, in order, every non-blank text part the query gives it "
@@ -1814,7 +1824,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                             "entry on a route it activated from fallback_providers; the query reads the configuration "
                             "at this call"),
                       "window": window,
-                      "wire": [_wire_text(leg, renamed) for leg in route_facts.legs],
+                      "wire": [_wire_text(leg, renamed, _media_given(messages_in)) for leg in route_facts.legs],
                       "text_carriers": (f"{stats['carriers']} record(s) hold a host replay carrier of their text "
                                         f"({', '.join(TEXT_REPLAY_CARRIERS)}) or blocks the host stashed in "
                                         f"_anthropic_content_blocks, as a list; the query sends none of them, nor the "
@@ -1839,8 +1849,9 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                       "calls_not_given_as_calls": (
                           f"{stats['calls_as_json']} tool call(s) are given as JSON and {stats['results_as_user']} tool "
                           f"result(s) as user messages because their partner lies in records the query does not give, "
-                          f"or the host's Anthropic converter would strip them; each such message's label or part says "
-                          f"so")},
+                          f"or is given but the stored ids do not establish the pair among the records given (the "
+                          f"store's pairing residual, #78), or the host's Anthropic converter would strip them; each "
+                          f"such message's label or part says so")},
             "call": {
                 "timeout": timeout,
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",
