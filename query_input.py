@@ -527,6 +527,10 @@ class _Walk:
     lift: bool
     images: list = field(default_factory=list)       # (path, image part) given after the JSON
     withheld: bool = False
+    # The members of a rendered list under which something was withheld (their index at ``depth`` of a path), so
+    # that a list is counted per member (ruling D-6, PLAN-19 §2.8).
+    depth: int = 0
+    withheld_at: set = field(default_factory=set)
 
 
 def _step(value: Any, path: tuple, kind: str, base: str, walk: _Walk) -> Any:
@@ -569,6 +573,7 @@ def _step(value: Any, path: tuple, kind: str, base: str, walk: _Walk) -> Any:
         where = path + (key,)
         if _withholds(key, kind) and not carries_nothing(item):
             walk.withheld = True
+            walk.withheld_at.add(where[walk.depth] if len(where) > walk.depth else None)
             faced[key] = _Marker(_WITHHELD)
             continue
         if kind == _CALL_DICT:
@@ -584,21 +589,24 @@ def _step(value: Any, path: tuple, kind: str, base: str, walk: _Walk) -> Any:
 
 
 def _render(label: str, value: Any, path: tuple, kind: str, base: str, given: Given, origin: str = FIELD, *,
-            lift: bool = False) -> tuple[list[dict], bool]:
+            lift: bool = False) -> tuple[list[dict], int]:
     """The only place a stored value becomes labelled JSON (M1): nothing where the value carries
     nothing; else the label and the value's JSON as the walk gives it, and, where the value stood in
-    the stored content (``lift``), each image given as an image after it. Returns the parts and
-    whether anything under a key of the opaque vocabulary was withheld (the caller counts it under
-    its stored field)."""
+    the stored content (``lift``), each image given as an image after it. Returns the parts and how
+    many units held something withheld under a key of the opaque vocabulary (the caller counts
+    them under its stored field): for a list, the members that did (ruling D-6); for any other
+    value, 1 or 0."""
     if carries_nothing(value):
-        return [], False
-    walk = _Walk(given, lift)
+        return [], 0
+    walk = _Walk(given, lift, depth=len(path))
     faced = _step(value, path, kind, base, walk)
     part = {"type": "text", "text": f"{label}\n{json.dumps(faced, ensure_ascii=False)}"}
     parts = [given.made(part, origin, path)]
     for image_path, image in walk.images:
         parts.append(given.made(image, LIFTED, image_path))
-    return parts, walk.withheld
+    if not walk.withheld:
+        return parts, 0
+    return parts, (len(walk.withheld_at) if isinstance(value, list) else 1)
 
 
 def text_part(part: Any) -> bool:
@@ -625,13 +633,13 @@ def _canonical_parts(parts: list, prefix: tuple, standing: str, given: Given, fa
         elif image_part(part):
             parts_, withheld = _image_parts(part, where, given, STORED, CONTENT, standing)
             shown.extend(parts_)
-            face.withheld_content = face.withheld_content or withheld
+            face.withheld_content += 1 if withheld else 0      # per member (ruling D-6)
         else:
             rendered, withheld = _render(f"[{_path_text(where)} is not a text part (a type and a text only) or an image "
                                          f"part; shown as its JSON by the query:]", part, where, CONTENT, standing,
                                          given, RENDERED, lift=True)
             shown.extend(rendered)
-            face.withheld_content = face.withheld_content or withheld
+            face.withheld_content += 1 if withheld else 0      # per member (ruling D-6)
     return shown
 
 
@@ -658,11 +666,11 @@ def _canonical_content(content: Any, standing: str, given: Given, face: "_Record
         rendered, withheld = _render("[The rest of this stored multimodal envelope (every key but its content), shown "
                                      "as its JSON by the query:]", rest, base, CONTENT, standing, given, RENDERED,
                                      lift=True)
-        face.withheld_content = face.withheld_content or withheld
+        face.withheld_content += 1 if withheld else 0          # the envelope's other keys, one unit
         return (shown + rendered) or ""
     rendered, withheld = _render(f"[The stored content is a JSON {json_kind(content)}, shown as its JSON by the "
                                  f"query:]", content, base, CONTENT, standing, given, RENDERED, lift=True)
-    face.withheld_content = face.withheld_content or withheld
+    face.withheld_content += withheld                          # per member of a list (ruling D-6)
     return rendered or ""
 
 
@@ -782,7 +790,7 @@ class _Record:
     content_texts: list = field(default_factory=list)
     calls: list = field(default_factory=list)         # (name, arguments, parsed) of the calls given
     foreign: bool = False
-    withheld_content: bool = False
+    withheld_content: int = 0     # members of the content under which something was withheld (ruling D-6)
     compares_calls: bool = False
     role_text: str = ""
     stash_site: bool = False      # the host's Anthropic converter sends this tool result's stash (``stash_sent``)
@@ -821,11 +829,12 @@ class _Record:
 
     def stashed(self, value: Any, path: tuple) -> bool:
         """The host's Anthropic converter replaces a tool result's content with its stash, so a
-        stashed text the content lacks is given as its own part, a result."""
+        stashed text the content lacks is given as its own part, with the record's standing (a result
+        on a stored tool result; the stored role's elsewhere, PLAN-19 §2.8)."""
         if not isinstance(value, str):
-            return self.not_text(value, path, CARRIER, GIVEN_RESULT)
+            return self.not_text(value, path, CARRIER, self.standing)
         if not any(value in text for text in self.content_texts):
-            self.given.values.append((path, value, GIVEN_RESULT))
+            self.given.values.append((path, value, self.standing))
             what = (f"[A text stored in {_path_text(path)} on this message, where the host writes no such field, which "
                     f"its content does not hold:]" if self.foreign else
                     f"[A text block stored in {_path_text(path)}, which the stored content does not hold:]")
@@ -875,9 +884,9 @@ class _Record:
             elif cls == STASH_TEXT:
                 withheld = self.stashed(value, where) or withheld
             elif cls == CITED:
+                # The record's standing, a result on a stored tool result (PLAN-19 §2.8).
                 withheld = self.json(f"[{_path_text(where)}: the citations stored with this text block; shown as their "
-                                     f"JSON by the query:]", value, where, CARRIER,
-                                     GIVEN_RESULT if path[1] == STASH else None) or withheld
+                                     f"JSON by the query:]", value, where, CARRIER) or withheld
             elif _withholds(key, other):
                 # A key of the opaque vocabulary the table does not name at this container (M1).
                 withheld = True
@@ -886,8 +895,8 @@ class _Record:
                                      f"the query:]", value, where, other) or withheld
         return withheld
 
-    def count(self, kind: str) -> None:
-        self.opaque[kind] = self.opaque.get(kind, 0) + 1
+    def count(self, kind: str, units: int = 1) -> None:
+        self.opaque[kind] = self.opaque.get(kind, 0) + units
 
     def not_a_list(self, key: str, value: Any, kind: str) -> bool:
         return self.json(f"[{_path_text(('message', key))} as stored is not a list; shown as its JSON by the query:]",
@@ -989,7 +998,7 @@ def _anthropic_blocks(key: str, value: Any, face: _Record) -> None:
         kind = block.get("type")
         table = _CLASSES.get((key if key == STASH else "anthropic_content_blocks", kind)) if isinstance(kind, str) \
             else None
-        standing = GIVEN_RESULT if key == STASH else face.standing
+        standing = face.standing        # the record's, a result on a stored tool result (PLAN-19 §2.8)
         if image_part(block) and key == STASH and not (face.stash_site and kind == "image"):
             # M-STASH (PLAN-19 §2.6): the host's Anthropic converter sends the stash only for a tool result whose
             # content is no _multimodal envelope and yields no image block of its own, and replays its blocks as they
@@ -1224,7 +1233,9 @@ def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> Non
                       _CALL_DICT if isinstance(value, dict) else CALL):
             sub.count("tool_calls")
     elif key == "api_content":
-        sub.not_text(value, path, CONTENT)
+        withheld_units = sub.not_text(value, path, CONTENT)
+        if withheld_units:
+            sub.count("api_content", withheld_units)      # per member of a list (ruling D-6)
     elif sub.json(f"[{_path_text(path)} as stored; shown as its JSON by the query:]", value, path, STORED_KIND):
         # tool_call_id, name: the wire's pairing key and the host's bookkeeping, stored where the host
         # writes neither; given as they are stored, what the vocabulary names inside withheld and counted.
@@ -1281,7 +1292,7 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     if "content" in row:
         message["content"] = _canonical_content(row["content"], standing, given, face)
     if face.withheld_content:
-        face.count("content")
+        face.count("content", face.withheld_content)
     if sidecar_sent(raw) and not carries_nothing(raw.get("content")):
         # M3: the images of a stored content the host sends api_content in place of (the host
         # replaces the content wholesale on every request, agent/turn_context.py 1231-1256), held
@@ -1321,7 +1332,9 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
         _anthropic_blocks(STASH, raw.get(STASH), face)
     if "api_content" in domain and not sidecar_sent(raw):
         # T13: a sidecar that is not a string is content, given as its JSON.
-        face.not_text(raw.get("api_content"), ("message", "api_content"), CONTENT)
+        withheld_units = face.not_text(raw.get("api_content"), ("message", "api_content"), CONTENT)
+        if withheld_units:
+            face.count("api_content", withheld_units)      # per member of a list (ruling D-6)
     # Readable reasoning: the message's reasoning first, then every other readable text not
     # contained in it or an earlier such part.
     before: list = []

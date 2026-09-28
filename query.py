@@ -106,7 +106,6 @@ from .query_input import (
     GIVEN_REASONING,
     GIVEN_RESULT,
     LABEL,
-    LIFTED,
     RENDERED,
     REPLACED,
     STASH,
@@ -745,11 +744,12 @@ def _joined_tool_content(record: str, message: dict, raw: dict, given: Given) ->
     # Read before the join, after every part's origin was asserted (``_input``); ``_join`` then
     # joins the parts.
     origins = [given.origin(part) for part in content]
-    # A placeholder counts as a stored image replaced where it replaced an image of the stored
-    # content (kept as a part, or lifted out of a member given as JSON); one that replaced an
-    # image of another stored field counts with that field's parts.
+    # A placeholder counts as a stored image replaced where it replaced an image part of the stored
+    # content; one that replaced an image of another stored field counts with that field's parts. A
+    # lift never makes a placeholder (``_step`` lifts only an image given as one), so no class is
+    # named that cannot occur (the orchestrator's ruling; PLAN-19 §2.8).
     stored, rendered = origins.count(STORED), origins.count(RENDERED)
-    replaced = sum(1 for part in content if given.origin(part) == REPLACED and given.replaced(part) in (STORED, LIFTED))
+    replaced = sum(1 for part in content if given.origin(part) == REPLACED and given.replaced(part) == STORED)
     other = len(origins) - stored - replaced - rendered
     pieces = ([("its stored text" if isinstance(raw.get("content"), str)
                 else _counted(stored, "stored text part", "stored text parts"))] if stored else [])
