@@ -35,8 +35,11 @@ this call, keyed by leg, never by wire: the route's own client; a plain Chat Com
 where the host's Nous refresh can rebuild it; the refreshed provider's own client where the host's
 credential refresh can apply, on the wire the host's own rule for that provider picks (for GitHub
 Copilot, its Responses-model rule). Each converter input of a leg is read from the host, or shown
-to bear on nothing the query compares, or enumerated over its whole domain (the refresh leg's
-``is_oauth`` and whether the host's image conversion runs there); the host's own converter is run
+to bear on nothing the query compares, or enumerated over its whole domain (an Anthropic refresh
+leg's ``is_oauth``; whether the host's image conversion runs on an Anthropic or Copilot refresh
+leg), and where a source of an input cannot be read the leg is refused naming it (an openai-codex
+or xai-oauth refresh leg's endpoint, read from the host's own side-effect-free sources,
+``_refresh_prepass``); the host's own converter is run
 over a copy of the input for every leg under every value, and the query refuses where one would not
 deliver it. It refuses, naming what, where a leg's wire cannot be known before the call: a
 ``fallback_providers`` entry that would answer under this route's own provider and model; a
@@ -192,6 +195,81 @@ def _stop_after(facts: Any) -> str:
     its first "; " (the query's own part, before it, is said by the stop's text itself)."""
     return " | ".join(f"on {wire} " + _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[wire].split("; ", 1)[1]
                       for wire in facts.wires if wire in _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP)
+
+
+_ENUMERATED_PREPASS = ("whether the host's image conversion runs there (it runs where '/anthropic' is in that endpoint, "
+                       "which the host resolves with the refreshed credential) enumerated, both values checked")
+
+
+def _refresh_prepass(provider: str, so: str) -> tuple[tuple, str]:
+    """The values of the host's image conversion on the credential-refresh leg of ``provider``, and what the header
+    says of them (PLAN-19 §2.1; the orchestrator's ruling, 2026-09-28). The host runs
+    ``_convert_openai_images_to_anthropic`` on that retry where ``_is_anthropic_compat_endpoint(provider, base)`` holds
+    for the base the rebuilt client has (``_prepare_same_provider_retry``, agent/auxiliary_client.py 3768, 3781-3782,
+    at Hermes 375930d089). For openai-codex and xai-oauth that base is read here before the call from the host's own
+    side-effect-free sources and ordered by the host's own functions; the value is then "on" where the host's
+    predicate holds for it. Loading or selecting the host's credential pool can write auth.json, refresh tokens or
+    probe a quota, so the persisted rows are read with ``read_credential_pool`` (hermes_cli/auth.py 884-908), which
+    sees only rows an earlier load persisted; each persisted row with a token a selection could pick is a candidate
+    base (without one, the host's own fallback base), and where they differ both values are checked; a row the pool
+    loader seeds at the call carries the default base, whose value is off. For any other provider (anthropic,
+    copilot) the base comes from a credential
+    resolution with side effects, and both values are checked. A source that cannot be read raises, and the caller
+    refuses the leg naming it."""
+    if provider not in ("openai-codex", "xai-oauth"):
+        return (False, True), _ENUMERATED_PREPASS
+
+    def host(what: str, module: str, name: str) -> Any:
+        return _strict_import(what, module, name, so=so)
+    compat = host("Anthropic-compatible endpoint test", "agent.auxiliary_client", "_is_anthropic_compat_endpoint")
+    rows = host("persisted credential pool reader", "hermes_cli.auth", "read_credential_pool")(provider)
+    pooled = host("pooled credential", "agent.credential_pool", "PooledCredential")
+    entries = [pooled.from_dict(provider, row) for row in rows if isinstance(row, dict)]
+    if provider == "openai-codex":
+        # ``_resolve_codex_credential_and_base`` (2110-2126): the profile-scoped HERMES_CODEX_BASE_URL wins; a pooled row
+        # with a token goes where the host's pool route sends it (``_codex_pool_route_base_url``, which applies
+        # ``_pool_entry_mode_and_url`` over ``model.base_url`` read by ``load_config_readonly``); without such a row the
+        # override, else the host's default.
+        override = host("Codex endpoint override", "agent.auxiliary_client", "_codex_base_url_override")()
+        default = host("Codex default endpoint", "agent.auxiliary_client", "_CODEX_AUX_BASE_URL")
+        key_of = host("pooled key reader", "agent.auxiliary_client", "_pool_runtime_api_key")
+        base_of = host("pooled endpoint reader", "agent.auxiliary_client", "_pool_runtime_base_url")
+        route_of = host("Codex pool route", "hermes_cli.auth_codex", "_codex_pool_route_base_url")
+        bases = ([override or route_of(base_of(entry)) for entry in entries if key_of(entry)]
+                 or [override or default])
+        sources = ("the profile-scoped HERMES_CODEX_BASE_URL; each persisted openai-codex pool row with a token, "
+                   "routed by the host's _codex_pool_route_base_url over model.base_url; else the host's default")
+    else:
+        # ``_resolve_xai_oauth_for_aux`` (2075-2107): a pooled row with a token, its base the profile-scoped
+        # HERMES_XAI_BASE_URL, else XAI_BASE_URL, else the row's own, validated to the xAI origin; else the auth
+        # store's singleton, whose base ``_xai_oauth_inference_base_url`` resolves the same way from the process env.
+        scoped = host("scoped environment reader", "agent.auxiliary_client", "_scoped_key_env")
+        validate = host("xAI endpoint validation", "hermes_cli.auth_xai", "_xai_validate_inference_base_url")
+        default = host("xAI default endpoint", "hermes_cli.auth_constants", "DEFAULT_XAI_OAUTH_BASE_URL")
+        singleton = host("xAI singleton endpoint", "hermes_cli.auth_xai", "_xai_oauth_inference_base_url")
+
+        def url(value: Any) -> str:
+            return str(value or "").strip().rstrip("/")
+        bases = []
+        for entry in entries:
+            key = str(getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "") or "").strip()
+            base = validate(url(scoped("HERMES_XAI_BASE_URL")) or url(scoped("XAI_BASE_URL"))
+                            or url(getattr(entry, "runtime_base_url", None)) or url(getattr(entry, "base_url", None)),
+                            fallback=default)
+            if key and base:
+                bases.append(base)
+        bases = bases or [singleton()]
+        sources = ("each persisted xai-oauth pool row with a token, its base the profile-scoped HERMES_XAI_BASE_URL, "
+                   "else XAI_BASE_URL, else the row's own, validated by the host's _xai_validate_inference_base_url; "
+                   "else the auth store's singleton endpoint")
+    values = tuple(sorted({bool(compat(provider, base)) for base in bases}))
+    said = (f"its endpoint read before the call from the host's own sources in the host's order ({sources}): "
+            f"{len(bases)} candidate endpoint(s), on which the host's _is_anthropic_compat_endpoint gives the image "
+            f"conversion {' and '.join('on' if value else 'off' for value in values)}"
+            f"{', both values checked' if len(values) > 1 else ''}; a pool row persisted after this read is not seen, "
+            f"nor one the host's pool loader seeds at the call, which carries the default endpoint (where that row "
+            f"answers, the image conversion is off, and the check refused whatever the conversion on would lose)")
+    return values, said
 
 
 def _refresh_wire(provider: str, model: str, so: str) -> Optional[str]:
@@ -535,18 +613,28 @@ def _route_facts(route: Any) -> _RouteFacts:
             refusals.append(f"after an authentication error the host can refresh {refresh} and retry on that "
                             f"provider's own client, a wire the plugin has not established")
         else:
-            enumerated = ("whether the host's image conversion runs there (it runs where '/anthropic' is in that "
-                          "endpoint) enumerated, both values checked")
-            if wire == "anthropic_messages":
-                enumerated += ("; is_oauth, which the host takes from the refreshed token's type, enumerated, both "
-                               "values checked")
-            legs.append(_Leg(name=f"the host's credential refresh of {refresh}", wire=wire,
-                             why=f"the host's credential refresh of {refresh} can, after an authentication error, "
-                                 f"retry on {refresh}'s own client, where the failed credential is one it can "
-                                 f"refresh", own=False, prepass=(False, True),
-                             oauth=(False, True) if wire == "anthropic_messages" else (),
-                             inputs=f"its endpoint, which the host resolves with the refreshed credential, bears on "
-                                    f"nothing compared; {enumerated}"))
+            try:
+                prepass, said = _refresh_prepass(refresh, so)
+            except Exception as error:
+                # A source of the leg's endpoint cannot be read: whether the host's image conversion runs there stays
+                # unknown, and the leg is refused naming it (the orchestrator's ruling, 2026-09-28).
+                refusals.append(f"after an authentication error the host can refresh {refresh} and retry on "
+                                f"{refresh}'s own client, whose endpoint the query cannot read before the call "
+                                f"({type(error).__name__}: {error}), so whether the host's image conversion runs "
+                                f"there is not known")
+                prepass = None
+            if prepass is not None:
+                if wire == "anthropic_messages":
+                    said += ("; is_oauth, which the host takes from the refreshed token's type, enumerated, both "
+                             "values checked")
+                legs.append(_Leg(name=f"the host's credential refresh of {refresh}", wire=wire,
+                                 why=f"the host's credential refresh of {refresh} can, after an authentication error, "
+                                     f"retry on {refresh}'s own client, where the failed credential is one it can "
+                                     f"refresh", own=False, prepass=prepass,
+                                 oauth=(False, True) if wire == "anthropic_messages" else (),
+                                 inputs=f"its endpoint, which the host resolves with the refreshed credential, bears "
+                                        f"on nothing compared but whether the host's image conversion runs there; "
+                                        f"{said}"))
     pool = host("_recoverable_pool_provider", "credential-pool provider test")("auto", client,
                                                                              main_runtime=route.main_runtime())
     chain = host("get_fallback_chain", "fallback chain", "hermes_cli.fallback_config")(
@@ -1297,7 +1385,7 @@ def _stripped(route: Any, messages: list[dict], sent: list[_Sent], legs: list, c
 def _leg_value_text(leg: _Leg, prepass: bool, is_oauth: Optional[bool]) -> str:
     """How one checked value of a leg's inputs is named in the query's texts."""
     said = []
-    if len(leg.prepass) > 1:
+    if prepass or len(leg.prepass) > 1:
         said.append(f"the host's image conversion {'on' if prepass else 'off'}")
     if len(leg.oauth) > 1:
         said.append(f"is_oauth {is_oauth}")

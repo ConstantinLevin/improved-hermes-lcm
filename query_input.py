@@ -374,7 +374,9 @@ def _deliveries(part: dict, given: Given) -> list[tuple[str, bool, str]]:
         for prepass in leg.prepass:
             if callable(given.check):
                 given.check()   # the host's stop, read before each leg's per-part functions (PLAN-19 §2.7)
-            value = (f", the host's image conversion {'on' if prepass else 'off'}" if len(leg.prepass) > 1 else "")
+            # Named where it runs, and where it is one of two values checked.
+            value = (f", the host's image conversion {'on' if prepass else 'off'}" if prepass or len(leg.prepass) > 1
+                     else "")
             ok, text = _delivered_on(part, given.role or "user", leg.wire, prepass)
             out.append((f"{leg.wire} ({leg.name}{value})", ok, text))
     return out
