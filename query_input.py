@@ -865,6 +865,8 @@ class _Record:
             return False
         standing = _standing(REASONING if standing == GIVEN_REASONING else CARRIER, self.standing)
         self.given.values.append((path, value, standing))
+        if standing == GIVEN_REASONING:      # counted in the header's reasoning_given_apart, as every reasoning part
+            self.given.reasoning_parts += 1
         where = ", where the host writes no such field," if self.foreign else ""
         holds = ("which its content and its readable reasoning do not hold" if standing == GIVEN_REASONING
                  else "which its content does not hold")
@@ -1331,8 +1333,10 @@ def _readable_parts(readable: list, given: Given, shown: list, base: str = GIVEN
             continue
         parts.append(given.made({"type": "text", "text": f"[Readable reasoning stored in {_path_text(path)}:]\n{text}"},
                                 FIELD, path))
-        given.values.append((path, text, _standing(REASONING, base)))
-        given.reasoning_parts += 1
+        standing = _standing(REASONING, base)
+        given.values.append((path, text, standing))
+        if standing == GIVEN_REASONING:      # the header's reasoning_given_apart counts reasoning, never stored
+            given.reasoning_parts += 1
         shown.append(text)
     return parts
 
