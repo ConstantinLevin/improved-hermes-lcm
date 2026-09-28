@@ -315,7 +315,7 @@ def _keep(message: dict, key: str, drop) -> int:
 # table's ``encrypted_reasoning`` column names the same kinds (#8, 9.6).
 ENCRYPTED_KINDS = ("reasoning_details", "codex_reasoning_items", "anthropic_content_blocks", "bedrock_content_blocks")
 # The host's stored carriers from which its converters replay a message's text instead of
-# reading ``content`` (the strict projection sends none of them, ``summariser_message``).
+# reading ``content`` (the query's strict projection sends none of them, ``strict_message``).
 TEXT_REPLAY_CARRIERS = ("codex_message_items", "anthropic_content_blocks", "bedrock_content_blocks")
 
 
@@ -562,6 +562,12 @@ def _json_part(label: str, value: Any, path: tuple, standing: str, given: Given)
     return part
 
 
+def image_part(part: Any) -> bool:
+    """An image part by structure (``message_content.is_image_part``), for any stored value: a
+    ``type`` that is not a string (a list, an object) is no image type and is never hashed."""
+    return isinstance(part, dict) and isinstance(part.get("type"), str) and is_image_part(part)
+
+
 def _canonical_parts(parts: list, prefix: tuple, standing: str, given: Given) -> list:
     """A list content's members, each a text part, an image part, or a labelled part holding
     the member's JSON (plan §4.2)."""
@@ -570,7 +576,7 @@ def _canonical_parts(parts: list, prefix: tuple, standing: str, given: Given) ->
         if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
             shown.append(part)
             given.values.append((prefix + (index, "text"), part["text"], standing))
-        elif is_image_part(part):
+        elif image_part(part):
             shown.append(part)
         else:
             shown.append(_json_part(f"[Member {index + 1} of the stored content is not a text or image part; shown "
@@ -642,12 +648,33 @@ def _given_texts(given: Given, standings: tuple) -> list[str]:
     return [text for _path, text, standing in given.values if standing in standings]
 
 
+def _parsed(arguments: str) -> tuple[Any, bool]:
+    """A call's arguments parsed as JSON, or (None, False) where they are not JSON the parser can
+    read (not valid, or nested past its recursion limit): then the stored string is given in a
+    labelled part and the call is compared by its name."""
+    try:
+        return json.loads(arguments), True
+    except (ValueError, RecursionError):
+        return None, False
+
+
 def _call_arguments(call: dict) -> tuple[str, Any, bool]:
     function = call["function"]
-    try:
-        return function["name"], json.loads(function["arguments"]), True
-    except ValueError:
-        return function["name"], None, False
+    arguments, parsed = _parsed(function["arguments"])
+    return function["name"], arguments, parsed
+
+
+def _unparsed_argument_parts(message: dict) -> list[dict]:
+    """The strict projection's ``_malformed_argument_parts``, over its canonical calls: a
+    labelled part carrying, verbatim, each call's arguments that are not JSON the parser reads."""
+    parts = []
+    for call in message.get("tool_calls") or []:
+        function = call["function"]
+        if not _parsed(function["arguments"])[1]:
+            parts.append({"type": "text", "text": (
+                f"[The arguments of tool call {call.get('id') or '?'} ({function.get('name') or '?'}) as stored; "
+                f"they are not valid JSON:]\n{function['arguments']}")})
+    return parts
 
 
 def _readable_block(path: tuple, text: Any, readable: list) -> None:
@@ -828,8 +855,8 @@ def _reasoning_and_carriers(raw: dict, message: dict, given: Given, withheld_tex
             _readable_block(path + ("thinking",), block.get("thinking"), readable)
             if block.get("signature") and isinstance(block.get("thinking"), str) and block["thinking"].strip():
                 withheld_text["anthropic_content_blocks"] = withheld_text.get("anthropic_content_blocks", 0) + 1
-        elif kind == "image" or is_image_part(block):
-            if is_image_part(block) and kind != "image":
+        elif kind == "image" or image_part(block):
+            if image_part(block) and kind != "image":
                 label = {"type": "text", "text": f"[An image the host stashed in _anthropic_content_blocks[{index}]:]"}
                 given.added.append(label["text"])
                 after.extend([label, block])
@@ -903,7 +930,7 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
     # and counted, their other blocks faced above.
     for carrier in TEXT_REPLAY_CARRIERS + ("_anthropic_content_blocks",):
         message.pop(carrier, None)
-    malformed = _malformed_argument_parts(message)
+    malformed = _unparsed_argument_parts(message)
     given.added.extend(part["text"] for part in malformed)
     _add_parts(message, before, after + malformed)
     # The image rules, over every image the message now holds (the stored ones and those a

@@ -93,6 +93,7 @@ from .summariser_input import (
     _add_parts,
     _strict_import,
     image_count,
+    image_part,
     strict_message,
     wire_facts,
     wire_image_limit,
@@ -525,7 +526,7 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
             found.given[record] = given
             stats["reasoning_parts"] += given.reasoning_parts
             problems.extend(f"{record}: {problem}" for problem in given.problems)
-            stored = sum(1 for part in (content_parts(raw.get("content")) or []) if is_image_part(part))
+            stored = sum(1 for part in (content_parts(raw.get("content")) or []) if image_part(part))
             stats["images_not_sent"] += max(0, stored - image_count(message))
             if any(isinstance(raw.get(key), list) and raw[key] for key in TEXT_REPLAY_CARRIERS):
                 stats["carriers"] += 1
@@ -646,7 +647,7 @@ def _arguments(value: Any) -> tuple[Any, bool]:
     if isinstance(value, str):
         try:
             return json.loads(value), True
-        except ValueError:
+        except (ValueError, RecursionError):
             return value, False
     return value, True
 
