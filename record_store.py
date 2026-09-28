@@ -99,6 +99,16 @@ class ReadFenced(Exception):
     (``RecordStore.snapshot`` with a fence)."""
 
 
+class CommittedButNotRestored(Exception):
+    """A fenced write committed, and a step after its COMMIT failed: restoring the connection's
+    busy timeout or releasing the helper's lock (``RecordStore._fenced_tx``; PLAN-83g §7). Both
+    facts hold: what the transaction wrote is in the store, and ``cause`` is the later failure."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(f"the transaction was committed; afterwards {type(cause).__name__}: {cause}")
+        self.cause = cause
+
+
 @dataclass(frozen=True)
 class Cover:
     """A session's latest effective return as the tools read it (``RecordStore.cover``)."""
@@ -281,32 +291,44 @@ class RecordStore:
         COMMIT holds) and raises ``WriteFenced``. What it cannot close: the COMMIT's own execution
         once its last try has begun. Never nested in another transaction of this helper. It
         writes no event other work left pending (ruling OD-P4a): those stay for the next
-        unfenced writer."""
+        unfenced writer. Once the COMMIT has returned, a failure of a later step (restoring the
+        busy timeout, releasing the lock) is raised as ``CommittedButNotRestored``, so that no
+        caller reports a committed transaction as not written (PLAN-83g §7)."""
         def check() -> None:
             if fence():
                 raise WriteFenced()
+        committed = False
         self._fenced_lock(check)
         try:
-            if self._tx_depth or self._read_depth:
-                raise RuntimeError("a fenced transaction cannot be nested in an open one of this helper")
-            conn = self._conn
-            check()
-            conn.execute("PRAGMA busy_timeout = 0")
             try:
-                self._retried(conn, "BEGIN IMMEDIATE", check)
-                self._tx_depth = 1
+                if self._tx_depth or self._read_depth:
+                    raise RuntimeError("a fenced transaction cannot be nested in an open one of this helper")
+                conn = self._conn
+                check()
+                conn.execute("PRAGMA busy_timeout = 0")
                 try:
-                    yield conn
-                    self._retried(conn, "COMMIT", check)
-                except BaseException:
-                    self._rollback(conn)
-                    raise
+                    self._retried(conn, "BEGIN IMMEDIATE", check)
+                    self._tx_depth = 1
+                    try:
+                        yield conn
+                        self._retried(conn, "COMMIT", check)
+                        committed = True
+                    except BaseException:
+                        self._rollback(conn)
+                        raise
+                    finally:
+                        self._tx_depth = 0
                 finally:
-                    self._tx_depth = 0
+                    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             finally:
-                conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-        finally:
-            self._lock.release()
+                self._lock.release()
+        except Exception as exc:
+            # Only an Exception is converted: a BaseException after the COMMIT passes as the host's,
+            # and the event's log line then says not written for a written event (the orchestrator's
+            # ruling on PLAN-83g §7, 2026-09-28; a residual, said in the PR body).
+            if committed:
+                raise CommittedButNotRestored(exc) from exc
+            raise
 
     def transaction(self):
         """One write transaction, or a savepoint inside an open one (``_tx``)."""
@@ -1073,16 +1095,23 @@ class RecordStore:
                            finish_reason: Optional[str], fence: Callable[[], bool]) -> bool:
         """One query's checked result, written once, in one short fenced transaction
         (``_fenced_tx``: once ``fence()`` is true nothing is committed and ``WriteFenced`` is
-        raised). False, and nothing written, when the report id is already taken."""
-        with self._fenced_tx(fence) as conn:
-            if conn.execute("SELECT 1 FROM query_reports WHERE id = ?", (report_id,)).fetchone():
-                return False
-            conn.execute(
-                "INSERT INTO query_reports(id, session, created_at, question, body, model, provider, effort, "
-                "finish_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (report_id, session, time.time(), question, body, model or None, provider or None, effort or None,
-                 finish_reason or None))
-        return True
+        raised). False, and nothing written, when the report id is already taken. True once the
+        row is committed, also where a step after the COMMIT failed (``CommittedButNotRestored``:
+        the row is stored and a page token addresses it; the later failure is logged at ERROR)."""
+        taken = False
+        try:
+            with self._fenced_tx(fence) as conn:
+                if conn.execute("SELECT 1 FROM query_reports WHERE id = ?", (report_id,)).fetchone():
+                    taken = True
+                else:
+                    conn.execute(
+                        "INSERT INTO query_reports(id, session, created_at, question, body, model, provider, effort, "
+                        "finish_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (report_id, session, time.time(), question, body, model or None, provider or None,
+                         effort or None, finish_reason or None))
+        except CommittedButNotRestored as exc:
+            logger.error("LCM stored query result %s in %s; %s", report_id, self.db_path, exc)
+        return not taken
 
     def write_event_fenced(self, kind: str, *, session: Optional[str], detail: Any,
                            fence: Callable[[], bool]) -> None:
@@ -1095,6 +1124,10 @@ class RecordStore:
             with self._fenced_tx(fence) as conn:
                 conn.execute("INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
                              (time.time(), kind, session, None, text))
+        except CommittedButNotRestored as exc:
+            # Written: the log says so, and the failure after the COMMIT beside it (PLAN-83g §7).
+            logger.error("LCM store event %s (session=%s) written; %s: %s", kind, session, exc, text)
+            return
         except BaseException as exc:
             # The log says an event only where one was written (PLAN-83e §7).
             logger.warning("LCM store event %s (session=%s) not written (%s): %s", kind, session,
