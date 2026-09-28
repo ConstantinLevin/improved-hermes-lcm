@@ -24,13 +24,16 @@ named, with no claim about which call it answers, on the label before it. A tool
 no label of the plugin's (#19 OD-D). No replay carrier of a message's text or reasoning is sent:
 its readable text is given, its opaque material withheld and counted (rulings OD-G, OD-P2a).
 
-**Every leg the host can answer on** (#83 plan §3). Before the call the query computes, from the
-host's own functions at Hermes 375930d089, the wires any leg of the host's recovery can send this
-call on: the route's own; Chat Completions where the host's Nous refresh can rebuild the client;
-the refreshed provider's own wire where the host's credential refresh can apply, by the host's own
-rule for that provider (for GitHub Copilot, its Responses-model rule). The host's own
-converter for each of them is run over a copy of the input, and the query refuses where one would
-not deliver it. It refuses, naming what, where a leg's wire cannot be known before the call: a
+**Every leg the host can answer on** (#83 plan §3; PLAN-19 §2.1). Before the call the query computes,
+from the host's own functions at Hermes 375930d089, the legs of the host's recovery that can send
+this call, keyed by leg, never by wire: the route's own client; a plain Chat Completions client
+where the host's Nous refresh can rebuild it; the refreshed provider's own client where the host's
+credential refresh can apply, on the wire the host's own rule for that provider picks (for GitHub
+Copilot, its Responses-model rule). Each converter input of a leg is read from the host, or shown
+to bear on nothing the query compares, or enumerated over its whole domain (the refresh leg's
+``is_oauth`` and whether the host's image conversion runs there); the host's own converter is run
+over a copy of the input for every leg under every value, and the query refuses where one would not
+deliver it. It refuses, naming what, where a leg's wire cannot be known before the call: a
 ``fallback_providers`` entry that would answer under this route's own provider and model; a
 credential pool the host can rotate while fallback providers are configured (a rotation's retry
 can answer from one of them with no record, rulings OD-2a); a managed NeMo Relay (OD-2b).
@@ -382,6 +385,24 @@ def _read(records: RecordStore, session: str, handles: list) -> _Read:
 
 # --- The route's legs (#83 plan §3) ---------------------------------------------------------
 
+@dataclass(frozen=True)
+class _Leg:
+    """One leg the host can send this call on (PLAN-19 §2.1), keyed by leg, never by wire: its wire, why the host can
+    take it, and each input of its converter, as one of three: read from the host before the call (one value);
+    shown, from the converter read whole, to bear on nothing the query compares (not an input of the check); or
+    enumerated over its whole domain, every value checked. ``prepass``: whether the host's image conversion for
+    Anthropic-compatible endpoints (``_convert_openai_images_to_anthropic``) runs on this leg, each value checked;
+    ``oauth``: the values of ``is_oauth`` an Anthropic leg is checked under (empty on another wire)."""
+
+    name: str
+    wire: str
+    why: str
+    own: bool
+    prepass: tuple
+    oauth: tuple
+    inputs: str
+
+
 @dataclass
 class _RouteFacts:
     """Facts of the route in use, each read from the host function that decides it."""
@@ -390,8 +411,13 @@ class _RouteFacts:
     refresh: Optional[str]               # the provider the host's OAuth refresh rung refreshes, if it can apply
     nous: bool                           # the host's Nous rungs apply to this client
     fallbacks: list                      # every ``fallback_providers`` entry, as the host reads the chain
-    wires: dict                          # wire -> why a leg of the host can send the call on it
-    refusals: list                       # the legs whose wire cannot be known before the call
+    legs: list                           # every leg the host can send the call on (``_Leg``), the own one first
+    refusals: list                       # the legs whose converter inputs cannot be known before the call
+
+    @property
+    def wires(self) -> tuple:
+        """The wires of the legs, each once, in the legs' order."""
+        return tuple(dict.fromkeys(leg.wire for leg in self.legs))
 
 
 def _relay_refusal() -> Optional[str]:
@@ -439,33 +465,71 @@ def _route_facts(route: Any) -> _RouteFacts:
     fallback walks ``get_fallback_chain(load_config_readonly())`` (4468-4471) and skips no entry
     under the route's own provider (7721, backend_identity.py 77-118), recording each as
     ``_fallback_provider_from_label`` of its provider and ``_normalize_resolved_model`` of its
-    model (7746, 4512). ``route_info`` is written at 7349 and 7746 only."""
+    model (7746, 4512). ``route_info`` is written at 7349 and 7746 only.
+
+    Keyed by leg (PLAN-19 §2.1): a leg on the own wire is its own leg, with its own converter inputs. The own leg's
+    inputs are read from the own client; the Nous leg's messages are the primary's, after the own leg's image
+    conversion (the host carries the converted kwargs over, 7370, 7523-7577), and its endpoint and model reach only
+    the Chat Completions transport's stripping of ``reasoning_details`` and ``extra_content`` (transports/
+    chat_completions.py 447-460), which the query does not compare; a refresh leg's endpoint is resolved by the host
+    with the refreshed credential (``_get_cached_client``, 3742-3783), so it is not read: it bears on nothing the
+    query compares on an Anthropic leg (``build_anthropic_kwargs`` reads it only for thinking signatures and fast
+    mode, anthropic_adapter.py 614-676) or a Responses leg (``_build_responses_kwargs`` reads it for tool aliasing,
+    none without tools, and replayed items, none sent, 1405-1500), and whether the host's image conversion runs there
+    (it runs where ``/anthropic`` is in that endpoint, ``_is_anthropic_compat_endpoint`` 6397-6399; no refresh
+    provider is a MiniMax one) is enumerated, as is ``is_oauth`` on an Anthropic refresh leg (the host takes it from
+    the token's type, ``_try_anthropic`` 3064-3065)."""
     so = "which legs the host can answer this call on is not known"
 
     def host(name: str, what: str, module: str = "agent.auxiliary_client") -> Any:
         return _strict_import(what, module, name, so=so)
     client = route.target_client_object
     base_url = str(getattr(client, "base_url", "") or "")
-    wires: dict = {route.target_api_mode: f"the route's own client ({route.target_client})"}
+    compat = host("_is_anthropic_compat_endpoint", "Anthropic-compatible endpoint test")
+    own_prepass = bool(compat(route.target_request_provider or "auto", base_url))
+    own_oauth: tuple = ()
+    if route.target_api_mode == "anthropic_messages":
+        adapter = getattr(getattr(client, "chat", None), "completions", None)
+        if not hasattr(adapter, "_is_oauth"):
+            raise ExpansionError(f"the host's Anthropic adapter's OAuth mode ({type(adapter).__name__}._is_oauth) "
+                                 f"cannot be read, so {so}")
+        own_oauth = (bool(adapter._is_oauth),)
+    legs: list[_Leg] = [_Leg(name="the route's own client", wire=route.target_api_mode,
+                             why=f"the route's own client ({route.target_client})", own=True,
+                             prepass=(own_prepass,), oauth=own_oauth,
+                             inputs="every converter input read from the route's own client")]
     refusals: list[str] = []
     nous = bool(host("base_url_host_matches", "endpoint host test", "utils")(base_url, "inference-api.nousresearch.com"))
     if nous:
-        wires.setdefault("chat_completions", "the host's Nous refresh rebuilds a plain Chat Completions client "
-                                             "(agent/auxiliary_client.py _refresh_nous_auxiliary_client)")
+        legs.append(_Leg(name="the host's Nous refresh", wire="chat_completions",
+                         why="the host's Nous refresh rebuilds a plain Chat Completions client "
+                             "(agent/auxiliary_client.py _refresh_nous_auxiliary_client)", own=False,
+                         prepass=(own_prepass,), oauth=(),
+                         inputs="the primary's messages after the own leg's image conversion; its endpoint and "
+                                "model bear on nothing compared"))
     effective = host("_effective_provider_for_client", "effective-provider reader")(client, "")
     refresh = host("_auth_refresh_provider_for_route", "credential-refresh provider")("auto", base_url, effective)
     refreshers = host("_CREDENTIAL_REFRESHERS", "credential refreshers")
     if not refresh or refresh == "auto" or nous or refresh not in refreshers:
         refresh = None
     else:
-        leg = _refresh_wire(refresh, route.target_model, so)
-        if leg is None:
+        wire = _refresh_wire(refresh, route.target_model, so)
+        if wire is None:
             refusals.append(f"after an authentication error the host can refresh {refresh} and retry on that "
                             f"provider's own client, a wire the plugin has not established")
         else:
-            wires.setdefault(leg, f"the host's credential refresh of {refresh} can, after an authentication error, "
-                                  f"retry on {refresh}'s own client, where the failed credential is one it can "
-                                  f"refresh")
+            enumerated = ("whether the host's image conversion runs there (it runs where '/anthropic' is in that "
+                          "endpoint) enumerated, both values checked")
+            if wire == "anthropic_messages":
+                enumerated += ("; is_oauth, which the host takes from the refreshed token's type, enumerated, both "
+                               "values checked")
+            legs.append(_Leg(name=f"the host's credential refresh of {refresh}", wire=wire,
+                             why=f"the host's credential refresh of {refresh} can, after an authentication error, "
+                                 f"retry on {refresh}'s own client, where the failed credential is one it can "
+                                 f"refresh", own=False, prepass=(False, True),
+                             oauth=(False, True) if wire == "anthropic_messages" else (),
+                             inputs=f"its endpoint, which the host resolves with the refreshed credential, bears on "
+                                    f"nothing compared; {enumerated}"))
     pool = host("_recoverable_pool_provider", "credential-pool provider test")("auto", client,
                                                                              main_runtime=route.main_runtime())
     chain = host("get_fallback_chain", "fallback chain", "hermes_cli.fallback_config")(
@@ -493,20 +557,31 @@ def _route_facts(route: Any) -> _RouteFacts:
     relay = _relay_refusal()
     if relay:
         refusals.append(relay)
-    return _RouteFacts(pool=str(pool) if pool else None, refresh=refresh, nous=nous, fallbacks=entries, wires=wires,
+    return _RouteFacts(pool=str(pool) if pool else None, refresh=refresh, nous=nous, fallbacks=entries, legs=legs,
                        refusals=refusals)
 
 
-def _route_unverifiable(facts: _RouteFacts) -> list[str]:
+def _route_unverifiable(facts: _RouteFacts, effort: str) -> list[str]:
     """What the host can change about the request or its credential without a new route record,
-    on this route only (#83 plan §3.2), each clause on the host's own gate."""
+    on this route only (#83 plan §3.2), each clause on the host's own gate, and only where that gate's
+    precondition holds for this call (PLAN-19 §5; agent/auxiliary_client.py at Hermes 375930d089: the
+    same-client re-sends 8048-8067 and 6921-6943, the parameter rungs 7463-7520, the pool rung 7610-7638;
+    agent/auxiliary_reasoning_floor.py ``known_reasoning_floor`` and ``with_reasoning_floor``)."""
     said = ["after a connection error, a timeout or a server error the host can re-send the request on the same "
             "route, and where the provider rejects a parameter it can re-send without the temperature, the "
             "reasoning setting or the output cap, with no new record"]
+    if effort == "none":
+        # The query passes the reasoning setting disabled only at effort "none" (escalation._call_once); the floor
+        # lifts only a disabled setting.
+        said.append("the query passes the reasoning setting disabled (effort none): where this route and model are "
+                    "known to refuse a disable (an earlier refusal in this process, or the route's model catalog "
+                    "marking reasoning mandatory; agent/auxiliary_reasoning_floor.py known_reasoning_floor) the host "
+                    "sends effort low instead, and after such a refusal inside the call it re-sends at effort low and "
+                    "remembers that for later calls, with no record")
     if facts.pool:
-        said.append(f"after a rate limit, a payment or an authentication error the host can retry once more after "
-                    f"rotating the {facts.pool} credential pool, with no new record: which credential answered is "
-                    f"not recorded")
+        said.append(f"after a rate limit the host can first re-send the request on the same client, and then, as after "
+                    f"a payment or an authentication error, rotate the {facts.pool} credential pool and retry once "
+                    f"more, with no new record: which credential answered is not recorded")
     if facts.refresh:
         said.append(f"after an authentication error the host can refresh the {facts.refresh} credential and retry on "
                     f"{facts.refresh}'s own endpoint and key, with no new record")
@@ -559,6 +634,11 @@ class _RecoveryUnread(Exception):
 
 
 def _recovery_clauses(exc: BaseException, facts: _RouteFacts, timeout: float, host: Any, test: Any) -> str:
+    def test_with(predicate: Any) -> bool:
+        try:
+            return bool(predicate(exc))
+        except Exception:
+            return False
     said = []
     if test("_is_transient_transport_error"):
         count = host("_transient_retry_count")
@@ -567,20 +647,37 @@ def _recovery_clauses(exc: BaseException, facts: _RouteFacts, timeout: float, ho
         except Exception as error:
             raise _RecoveryUnread(f"agent.auxiliary_client._transient_retry_count() raised "
                                   f"{type(error).__name__}: {error}") from None
-        said.append(f"it re-sent the request to the same provider up to {retries} time(s) (auxiliary.transient_"
-                    f"retries), each read allowed {timeout:g} s")
+        # The error ``call_llm`` raises can be a later rung's (a parameter rung's retry, a fallback candidate's), after
+        # which the transient loop did not run (8048-8067; reader C of PLAN-19).
+        said.append(f"it may have re-sent the request to the same provider up to {retries} time(s) (auxiliary."
+                    f"transient_retries), each read allowed {timeout:g} s; the error it raised can also come from a "
+                    f"later rung of its recovery, where no such re-send ran")
     payment, rate, auth = test("_is_payment_error"), test("_is_rate_limit_error"), test("_is_auth_error")
-    # An automatic route walks the fallback chain on every reason of ``_FALLBACK_REASONS``,
-    # authentication and payment included (7386-7395, 7683-7692).
-    if facts.fallbacks and (payment or rate or auth or test("_is_timeout_error") or test("_is_connection_error")):
-        said.append(f"it may have tried the {len(facts.fallbacks)} configured fallback_providers entr(y/ies), each "
-                    f"refused by the route check if it answered, and hides one that failed from auxiliary calls in "
-                    f"this process for 60 or 600 s")
+    # The automatic route walks the fallback chain on every reason of the host's own ``_FALLBACK_REASONS``
+    # (7386-7395, 7683-7693), read here and asked in the host's order.
+    reason = None
+    try:
+        for predicate, label in host("_FALLBACK_REASONS"):
+            if test_with(predicate):
+                reason = label
+                break
+    except _RecoveryUnread:
+        raise
+    except Exception as error:
+        raise _RecoveryUnread(f"agent.auxiliary_client._FALLBACK_REASONS cannot be read: {type(error).__name__}: "
+                              f"{error}") from None
+    if facts.fallbacks and reason:
+        said.append(f"it may have tried the {len(facts.fallbacks)} configured fallback_providers entr(y/ies) "
+                    f"({reason}), each refused by the route check if it answered, and hides one that failed from "
+                    f"auxiliary calls in this process for 60 or 600 s")
     if facts.pool and (payment or rate or auth):
         said.append(f"it may have benched a credential of the {facts.pool} pool in auth.json, which new agents, "
                     f"subagents and other processes on this Hermes home then skip (the running agent keeps its own)")
-    if payment:
-        said.append("it marks this provider's endpoint unhealthy for auxiliary calls in this process for 600 s")
+    if reason == "payment error":
+        # ``_mark_provider_unhealthy(_recoverable_pool_provider(...) or resolved_provider)`` (7694-7699), the resolved
+        # provider being the label "auto" on this call.
+        said.append(f"it marks {facts.pool if facts.pool else 'the label auto'} unhealthy for auxiliary calls in this "
+                    f"process for 600 s")
     if auth and facts.refresh:
         said.append(f"it may have refreshed the {facts.refresh} credential and dropped this home's cached auxiliary "
                     f"clients")
@@ -855,45 +952,43 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
 
 # --- The wire check (OD-G; positional, #83 plan §4.2) -------------------------------------
 
-def _payload_for_wire(route: Any, messages: list[dict], wire: str) -> Any:
-    """What the host's own converter for ``wire`` makes of the call's messages, run on a deep
-    copy (the converter can write into dicts it is handed), in the host's order
-    (agent/auxiliary_client.py at Hermes 375930d089): ``_convert_openai_images_to_anthropic``
-    where ``_is_anthropic_compat_endpoint`` holds for the request's provider and the client's
-    endpoint (7367-7370); then per wire:
+def _payload_for_leg(route: Any, messages: list[dict], leg: _Leg, prepass: bool, is_oauth: Optional[bool]) -> Any:
+    """What the host's own converter for ``leg`` makes of the call's messages under one value of each of its
+    converter inputs (PLAN-19 §2.1), run on a deep copy (the converter can write into dicts it is handed), in the
+    host's order (agent/auxiliary_client.py at Hermes 375930d089): ``_convert_openai_images_to_anthropic`` where
+    ``prepass`` (7367-7370, 3781-3782); then per wire:
 
-    - Chat Completions: ``prepare_chat_messages`` (agent/auxiliary_wire.py) on the route's own
-      client, or, for another leg's plain client, the transport it calls
-      (``ChatCompletionsTransport.convert_messages``);
-    - Anthropic Messages: ``build_anthropic_kwargs`` with the adapter's own ``_base_url`` and
-      ``_is_oauth`` (1750-1757; anthropic_adapter.py:614-640), its ``system`` and ``messages``;
-      for another leg, the refreshed provider's, an OAuth credential. On an OAuth credential the
-      builder renames every replayed tool call by the host's own ``_oauth_wire_namer`` over the
-      request's tools (``mcp__<name>``, two aliases; anthropic_adapter.py 510-541, 544-580,
-      638-640): that is the wire's rendering of the call's name, the one the agent's own context
-      has on that route, not a loss (the orchestrator's ruling on #83, 2026-09-28), and the check
-      compares a given call's name after that function;
-    - Codex Responses: the route's own adapter's ``_build_responses_kwargs`` (1405-1556), the
-      ``instructions`` and ``input`` it returns; for another leg the adapter's endpoint comes
-      from the host's credential resolution, which cannot run before the call without side
-      effects, so the query refuses (ruling OD-P7a on #83).
+    - Chat Completions: ``prepare_chat_messages`` (agent/auxiliary_wire.py) on the route's own client, or, for
+      another leg's plain client, the transport it calls (``ChatCompletionsTransport.convert_messages``);
+    - Anthropic Messages: ``build_anthropic_kwargs`` (1750-1757; anthropic_adapter.py 614-640) with ``is_oauth``,
+      its ``system`` and ``messages``; on the own leg with the adapter's own ``_base_url``, on another with the
+      route's endpoint, which bears on nothing compared (the builder reads it only for thinking signatures and fast
+      mode). On an OAuth credential the builder renames every replayed tool call by the host's own
+      ``_oauth_wire_namer`` over the request's tools (``mcp__<name>``, two aliases; anthropic_adapter.py 510-541,
+      544-580, 638-640): that is the wire's rendering of the call's name, the one the agent's own context has on
+      that route, not a loss (the orchestrator's ruling on #83, 2026-09-28), and the check compares a given call's
+      name after that function; it also prefixes the system with its Claude Code identity block and rewrites five
+      strings in system text only (``_apply_claude_code_identity``, 555-570), which the query's instructions do not
+      hold, so they are compared as sent (PLAN-19 §2.1b);
+    - Codex Responses: on the own leg the adapter's ``_build_responses_kwargs`` (1405-1556), the ``instructions``
+      and ``input`` it returns; on another leg the adapter's system diversion (1461-1476: every system message's
+      content becomes ``instructions``, the last one kept, a content that is not a string as its ``str``; the tool
+      renames apply only with tools, and the query passes none) and the shared converter it calls,
+      ``_chat_messages_to_responses_input`` (1484-1488) with no issuer: the endpoint the host resolves with the
+      refreshed credential reaches only replayed items (none are sent) and typed text (which keeps its text).
 
-    Returns the converted payload and the host's function that renames a tool call's name on
-    this wire (``None`` where no converter renames: only the Anthropic builder on an OAuth
-    credential does). Every host function is taken strictly: one that cannot be read refuses the
-    query."""
+    Returns the converted payload and the host's function that renames a tool call's name on this leg (``None``
+    where no converter renames: only the Anthropic builder on an OAuth credential does). Every host function is
+    taken strictly: one that cannot be read refuses the query."""
     so = "what the model would receive cannot be shown"
     client = route.target_client_object
     base_url = str(getattr(client, "base_url", "") or "")
-    own = wire == route.target_api_mode
     payload = copy.deepcopy(messages)
-    compat = _strict_import("Anthropic-compatible endpoint test", "agent.auxiliary_client",
-                            "_is_anthropic_compat_endpoint", so=so)
-    if compat(route.target_request_provider or "auto", base_url):
+    if prepass:
         payload = _strict_import("image-block conversion", "agent.auxiliary_client",
                                  "_convert_openai_images_to_anthropic", so=so)(payload)
-    if wire == "chat_completions":
-        if own:
+    if leg.wire == "chat_completions":
+        if leg.own:
             prepare = _strict_import("Chat Completions message preparation", "agent.auxiliary_wire",
                                      "prepare_chat_messages", so=so)
             return prepare(client, {"model": route.target_model, "messages": payload})["messages"], None
@@ -906,27 +1001,36 @@ def _payload_for_wire(route: Any, messages: list[dict], wire: str) -> Any:
         if not hasattr(adapter, name):
             raise ExpansionError(f"the host's {what} ({type(adapter).__name__}.{name}) cannot be read, so {so}")
         return getattr(adapter, name)
-    if wire == "anthropic_messages":
+    if leg.wire == "anthropic_messages":
         build = _strict_import("Anthropic request builder", "agent.anthropic_adapter", "build_anthropic_kwargs", so=so)
-        if own:
-            is_oauth = attribute("_is_oauth", "Anthropic adapter's OAuth mode")
-            endpoint = attribute("_base_url", "Anthropic adapter's endpoint")
-        else:
-            is_oauth, endpoint = True, base_url
+        endpoint = attribute("_base_url", "Anthropic adapter's endpoint") if leg.own else base_url
         built = build(model=route.target_model, messages=payload, tools=None, max_tokens=None, reasoning_config=None,
-                      is_oauth=is_oauth, base_url=endpoint)
+                      is_oauth=bool(is_oauth), base_url=endpoint)
         # The builder's own renamer over the request's tools, none (anthropic_adapter.py 638).
         namer = (_strict_import("OAuth tool-name renamer", "agent.anthropic_adapter", "_oauth_wire_namer", so=so)([])
                  if is_oauth else None)
         return {"system": built.get("system"), "messages": built.get("messages")}, namer
-    if wire == "codex_responses" and own:
-        # It returns (the Responses kwargs, the model, the timeout) (1405, 1556, used at 1571).
-        build = attribute("_build_responses_kwargs", "Codex adapter's request builder")
-        built, _model, _timeout = build({"model": route.target_model, "messages": payload})
-        return {"instructions": built.get("instructions"), "input": built.get("input")}, None
-    raise ExpansionError(f"a leg of the host's recovery for {route.describe()} can send this call on the {wire} wire, "
-                         f"whose converter the query cannot run before the call without resolving that leg's "
-                         f"credential and endpoint; {so}")
+    if leg.wire == "codex_responses":
+        if leg.own:
+            # It returns (the Responses kwargs, the model, the timeout) (1405, 1556, used at 1571).
+            build = attribute("_build_responses_kwargs", "Codex adapter's request builder")
+            built, _model, _timeout = build({"model": route.target_model, "messages": payload})
+            return {"instructions": built.get("instructions"), "input": built.get("input")}, None
+        convert = _strict_import("Responses converter", "agent.codex_responses_adapter",
+                                 "_chat_messages_to_responses_input", so=so)
+        instructions: Any = None
+        replay: list = []
+        for message in payload:
+            if message.get("role", "user") == "system":
+                content = message.get("content") or ""
+                instructions = content if isinstance(content, str) else str(content)
+                continue
+            replay.append(message)
+        return {"instructions": instructions, "input": convert(replay, is_github_responses=False,
+                                                                current_issuer_kind=None, current_issuer_model=None,
+                                                                native_compaction_eligible=False)}, None
+    raise ExpansionError(f"{leg.name} can send this call on the {leg.wire} wire, a wire the plugin has not "
+                         f"established; {so}")
 
 
 def _arguments(value: Any) -> tuple[Any, bool]:
@@ -1040,46 +1144,110 @@ def _matches(given: tuple, token: tuple, namer: Any = None) -> bool:
     return token[1][0] == (namer(name) if namer else name) and (not compared or token[1][1] == arguments)
 
 
-def _wire_check(route: Any, messages: list[dict], sent: list[_Sent], wires: dict) -> dict:
-    """Every value the query gives its model must reach it on every wire a leg of the host can
-    send the call on, in its place (OD-G as ruled; #83 plan §3-§4): the given texts, images and
-    tool calls, in document order, must stand in the converter's output in that order. The
-    per-record labels are unique by construction, so a value lost on the wire cannot be matched by
-    an equal value of another record. Blank texts are not checked (the converters give their own
-    stand-ins for them); what a converter adds is not loss. A tool call's name is compared after
-    the host's own renamer where the wire renames (the Anthropic builder on an OAuth credential;
-    the orchestrator's ruling on #83, 2026-09-28). Returns, per wire, what the header says of such
-    a renaming."""
+_CONVERTED_MEDIA = ("image_url", "video_url")
+
+
+def _leg_values(leg: _Leg, messages: list[dict]) -> list[tuple[bool, Optional[bool]]]:
+    """The values of a leg's converter inputs the check runs under (PLAN-19 §2.1): every value of each. Where the
+    query gives no part the host's image conversion converts (``image_url``, ``video_url``: the keys of
+    ``_ANTHROPIC_MEDIA_BLOCKS``, agent/auxiliary_client.py 6405; every other message it returns as it was, 6435),
+    that conversion is the identity, and one value of an enumerated pre-pass stands for both."""
+    prepass = leg.prepass
+    if len(prepass) > 1 and not any(isinstance(part, dict) and part.get("type") in _CONVERTED_MEDIA
+                                    for message in messages for part in (message.get("content") or [])
+                                    if isinstance(message.get("content"), list)):
+        prepass = prepass[:1]
+    return [(value, oauth) for value in prepass for oauth in (leg.oauth or (None,))]
+
+
+def _leg_value_text(leg: _Leg, prepass: bool, is_oauth: Optional[bool]) -> str:
+    """How one checked value of a leg's inputs is named in the query's texts."""
+    said = []
+    if len(leg.prepass) > 1:
+        said.append(f"the host's image conversion {'on' if prepass else 'off'}")
+    if len(leg.oauth) > 1:
+        said.append(f"is_oauth {is_oauth}")
+    return f" ({', '.join(said)})" if said else ""
+
+
+def _wire_check(route: Any, messages: list[dict], sent: list[_Sent], legs: list) -> dict:
+    """Every value the query gives its model must reach it on every leg the host can send the call
+    on, under every value of that leg's enumerated converter inputs, in its place (OD-G as ruled;
+    #83 plan §3-§4; PLAN-19 §2.1): the given texts, images and tool calls, in document order, must
+    stand in the converter's output in that order. The per-record labels are unique by construction,
+    so a value lost on the wire cannot be matched by an equal value of another record. Blank texts
+    are not checked (the converters give their own stand-ins for them); what a converter adds is
+    not loss (the given tokens are matched as an ordered subsequence of the payload's). A tool call's
+    name is compared after the host's own renamer where the leg renames (the Anthropic builder on an
+    OAuth credential; the orchestrator's ruling on #83, 2026-09-28). Returns, per leg name, what the
+    header says of such a renaming."""
     given = _given_tokens(messages, sent)
     refused: list[str] = []
     said: dict = {}
-    for wire in wires:
-        converted, namer = _payload_for_wire(route, messages, wire)
-        payload = _payload_tokens(wire, converted)
-        if namer is not None and any(token[0] == "call" for token in given):
-            said[wire] = ("the host sends the tool calls on this wire under its OAuth wire names (mcp__<name>, two "
-                          "aliases), as the agent's own context on this route has them; the labels name each call "
-                          "as stored" if wire == route.target_api_mode else
-                          "the calls travel under the host's OAuth wire names (mcp__<name>, two aliases) if the "
-                          "refreshed credential is an OAuth one, and were compared so; the labels name each call as "
-                          "stored")
-        position, lost = 0, {}
-        for token in given:
-            found = next((index for index in range(position, len(payload))
-                          if _matches(token, payload[index], namer)), None)
-            if found is None:
-                lost.setdefault(token[2], []).append(token[3])
-            else:
-                position = found + 1
-        if lost:
-            refused.append(f"{wire} ({wires[wire]}): " + " | ".join(f"{who}: {', '.join(what)}"
-                                                                  for who, what in lost.items()))
+    for leg in legs:
+        for prepass, is_oauth in _leg_values(leg, messages):
+            converted, namer = _payload_for_leg(route, messages, leg, prepass, is_oauth)
+            payload = _payload_tokens(leg.wire, converted)
+            if namer is not None and any(token[0] == "call" for token in given):
+                said[leg.name] = ("the host sends the tool calls on this leg under its OAuth wire names (mcp__<name>, "
+                                  "two aliases), as the agent's own context on this route has them; the labels name "
+                                  "each call as stored" if leg.own else
+                                  "the calls travel under the host's OAuth wire names (mcp__<name>, two aliases) where "
+                                  "the refreshed credential is an OAuth one, and were compared so; the labels name each "
+                                  "call as stored")
+            position, lost = 0, {}
+            for token in given:
+                found = next((index for index in range(position, len(payload))
+                              if _matches(token, payload[index], namer)), None)
+                if found is None:
+                    lost.setdefault(token[2], []).append(token[3])
+                else:
+                    position = found + 1
+            if lost:
+                refused.append(f"{leg.wire}, {leg.name}{_leg_value_text(leg, prepass, is_oauth)}: "
+                               + " | ".join(f"{who}: {', '.join(what)}" for who, what in lost.items()))
     if refused:
         raise ExpansionError(
             f"the host's converter would not give the query's model these records as the query gives them, in their "
-            f"place, on a wire the host can send this call on: {' || '.join(refused)}; it cannot be shown that the "
+            f"place, on a leg the host can send this call on: {' || '.join(refused)}; it cannot be shown that the "
             f"model receives them: ask over other handles")
     return said
+
+
+# The texts each wire's converter itself puts before the model (PLAN-19 §2.1b), read at Hermes 375930d089: the
+# Anthropic converter's stand-ins (anthropic_message_convert.py 425, 477, 505, 517, 594, 632, 650, 666, 683-690), the
+# Responses converter's (codex_responses_adapter.py 95, 594, 614-615); the Chat Completions transport adds none
+# (transports/chat_completions.py 375-460).
+_HOST_ADDITIONS = {
+    "chat_completions": "the host's Chat Completions converter adds no text of its own",
+    "anthropic_messages": ("the host's Anthropic converter adds texts of its own where it needs them: stand-ins for "
+                           "blank or removed blocks ((empty message), (empty), (tool call removed), (tool result "
+                           "removed), (no output), (thinking elided)), [screenshot removed to save context] for an image "
+                           "it retires, and a leading user turn; they are not compared"),
+    "codex_responses": ("the host's Responses converter adds its placeholder for an assistant image and wraps a string "
+                        "in a typed text part, which keeps its text; they are not compared"),
+}
+_OAUTH_ADDITION = ("under is_oauth True the host prefixes the instructions with its Claude Code identity block (\"You are "
+                   "Claude Code, Anthropic's official CLI for Claude.\") and rewrites 'Hermes Agent', 'Hermes agent', "
+                   "'Nous Research', a standalone 'hermes-agent' and 'session_search' in the system text "
+                   "(anthropic_adapter.py _apply_claude_code_identity); the query's instructions hold none of these "
+                   "and are compared as sent")
+
+
+def _wire_text(leg: _Leg, renamed: dict) -> str:
+    """What the header says of one leg's check (PLAN-19 §5): the leg, its inputs, what the check compares, and every
+    text the host itself adds on that leg."""
+    values = ""
+    if len(leg.prepass) > 1 or len(leg.oauth) > 1:
+        values = ", under each value of its enumerated inputs"
+    oauth = f"; {_OAUTH_ADDITION}" if True in leg.oauth else ""
+    return (f"{leg.wire}, {leg.why} ({leg.inputs}): the host's converter for it was run over the query's messages "
+            f"before the call{values} and gives the model, in order, every non-blank text part the query gives it "
+            f"(blank ones are left to the converter's own stand-ins), every image in order, as an image (not its "
+            f"bytes), and every tool call by its name and, where the stored arguments parse as JSON, by its "
+            f"arguments; role, message boundaries, ids and reasoning_content (the host's echo) are not compared; "
+            f"{_HOST_ADDITIONS.get(leg.wire, 'what the host adds on this wire is not known')}{oauth}"
+            f"{'; ' + renamed[leg.name] if leg.name in renamed else ''}")
 
 
 def _svg_images(messages: list[dict]) -> int:
@@ -1368,8 +1536,8 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                                  f"what the model receives")
         route_facts = _route_facts(route)
         if route_facts.refusals:
-            raise ExpansionError(f"the host can answer this call on a leg whose wire the query cannot know before the "
-                                 f"call: {' | '.join(route_facts.refusals)}")
+            raise ExpansionError(f"the host can answer this call on a leg whose wire or converter inputs the query "
+                                 f"cannot know before the call: {' | '.join(route_facts.refusals)}")
         unestablished = [wire for wire in route_facts.wires if wire not in _ESTABLISHED_WIRES]
         if unestablished:
             raise ExpansionError(f"a leg of the host's recovery can send this call on a wire the plugin has not "
@@ -1418,7 +1586,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         else:
             window = (f"not known: the model table has no window for {route.target_provider}/{route.target_model}, "
                       f"so the input was not checked against it; the provider's refusal is the only bound")
-        renamed = _wire_check(route, messages_in, sent, route_facts.wires)
+        renamed = _wire_check(route, messages_in, sent, route_facts.legs)
         step()
         endpoint = endpoint_key(route.target_provider, route.target_base_url)
         limiter, slots = limiter_for(endpoint), engine._calls_in_flight_limit(endpoint)
@@ -1475,14 +1643,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                             "entry on a route it activated from fallback_providers; the query reads the configuration "
                             "at this call"),
                       "window": window,
-                      "wire": [f"{name}: {why}; the host's converter for it was run over the query's messages before "
-                               f"the call and gives the model, in order, every non-blank text part the query gives it "
-                               f"(blank ones are left to the converter's own stand-ins), every image in order, as an "
-                               f"image (not its bytes), and every tool call by its name and, where the stored "
-                               f"arguments parse as JSON, by its arguments; role, message boundaries, ids and "
-                               f"reasoning_content (the host's echo) are not compared"
-                               f"{'; ' + renamed[name] if name in renamed else ''}"
-                               for name, why in route_facts.wires.items()],
+                      "wire": [_wire_text(leg, renamed) for leg in route_facts.legs],
                       "text_carriers": (f"{stats['carriers']} record(s) hold a host replay carrier of their text "
                                         f"({', '.join(TEXT_REPLAY_CARRIERS)}) or blocks the host stashed in "
                                         f"_anthropic_content_blocks, as a list; the query sends none of them, nor the "
@@ -1526,7 +1687,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                             f"stops reading; a request the host keeps running after that is not counted in it; a "
                             f"failed call's Retry-After holds every call of the plugin to this endpoint until then"),
             },
-            "route_unverifiable": _route_unverifiable(route_facts),
+            "route_unverifiable": _route_unverifiable(route_facts, settings.effort),
             "excerpts_checked": 0,
             "excerpts_withheld": 0,
             "note": NOTE,
