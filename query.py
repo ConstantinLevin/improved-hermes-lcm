@@ -38,8 +38,9 @@ deliver it. It refuses, naming what, where a leg's wire cannot be known before t
 credential pool the host can rotate while fallback providers are configured (a rotation's retry
 can answer from one of them with no record, rulings OD-2a); a managed NeMo Relay (OD-2b).
 
-**Refused before the call**, with the cause: a wire the plugin has not established (OD-I); more
-images than the host's converter keeps in one request; an input over the model's input (its
+**Refused before the call**, with the cause: a wire the plugin has not established (OD-I); images
+the host's Anthropic converter would retire on a leg (its own ``outbound_image_retire_count`` over the
+query's messages, PLAN-19 §2.3); an input over the model's input (its
 window less its output cap, by the estimate times ``estimate_ratio_max``, #34 D4; where the model
 table has no window this is said); an image the legs disagree on (one leg's converter delivers it,
 another's does not); a record the query cannot give as it is (a record stored as a JSON value that
@@ -122,7 +123,7 @@ from .query_input import (
     text_part,
     unrecorded_parts,
 )
-from .summariser_input import HostUnavailable, _strict_import, image_count, wire_image_limit
+from .summariser_input import HostUnavailable, _strict_import
 from .tokens import Estimator
 
 logger = logging.getLogger(__name__)
@@ -1207,6 +1208,37 @@ def _leg_values(leg: _Leg, messages: list[dict]) -> list[tuple[bool, Optional[bo
     return [(value, oauth) for value in prepass for oauth in (leg.oauth or (None,))]
 
 
+def _retired_images(facts: _RouteFacts, messages: list[dict]) -> None:
+    """M-COUNT (PLAN-19 §2.3, D-5): where a leg's converter is the host's Anthropic one, the query refuses where that
+    converter would retire images, by the host's own ``outbound_image_retire_count`` (agent/image_eviction_policy.py
+    33-96) over the query's messages after the image decision (M3'), grouped as ``_evict_old_screenshots`` groups them
+    (anthropic_message_convert.py 605-635): a carrier per message sent as a tool result (its ``tool_result`` block),
+    its images, newest first; reserved, the images of every other message. Counted on the query's messages, never on
+    the converted payload, which the converter has already evicted in place (734); the wire check sees an evicted
+    image as lost."""
+    legs = [leg for leg in facts.legs if leg.wire == "anthropic_messages"]
+    if not legs:
+        return
+    carriers, reserved = [], 0
+    for message in messages[1:-1]:
+        content = message.get("content")
+        images = sum(1 for part in content if is_image_part(part)) if isinstance(content, list) else 0
+        if message.get("role") == "tool":
+            if images:
+                carriers.append(images)
+        else:
+            reserved += images
+    carriers.reverse()
+    retire = _strict_import("image retirement policy", "agent.image_eviction_policy", "outbound_image_retire_count",
+                            so="whether the host's Anthropic converter retires images of this request is not known")(
+        carriers, reserved)
+    if retire > 0:
+        raise ExpansionError(f"on {', '.join(leg.name for leg in legs)} (anthropic_messages) the host's converter would "
+                             f"retire the images of the {retire} oldest of the {len(carriers)} tool results that carry "
+                             f"images (outbound_image_retire_count over those {len(carriers)} and {reserved} other "
+                             f"images); the model would not see them: ask over fewer handles")
+
+
 def _stripped(route: Any, messages: list[dict], sent: list[_Sent], legs: list, check: Any = None) -> set:
     """The calls given as calls that the host's Anthropic converter would strip (M-PAIR, PLAN-19 §2.4): on every leg
     on the Anthropic wire, under every value of its inputs, the query's messages are converted by the host's own
@@ -1667,13 +1699,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
             demoted |= stripped
 
         # The checks before the call; each a refusal, no call made.
-        images = sum(image_count(m) for m in messages_in[1:-1])
-        image_limit = wire_image_limit(wire)
-        if image_limit is not None and images > image_limit:
-            raise ExpansionError(f"what the handles hold carries {images} images, more than the {image_limit} the "
-                                 f"host's converter for {route.describe()} keeps in one request (beyond it the host "
-                                 f"retires images of earlier tool results): it cannot be shown that the model "
-                                 f"receives every image; ask over fewer handles")
+        _retired_images(route_facts, messages_in)
         estimator = Estimator(image_model=route.target_model, image_provider=route.target_provider,
                               reasoning_sent=wire.needs_reasoning_echo)
         estimate = estimator.messages(messages_in)
