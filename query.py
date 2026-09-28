@@ -73,12 +73,14 @@ import copy
 import json
 import logging
 import secrets
+import sqlite3
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from . import expansion
+from .compaction import SessionFactUnread
 from .escalation import (SummaryFailure, _call_once, _host_status, _is_transient, _retry_after_seconds,
                          failure_text)
 from .expansion import ExpansionError, Item, Target
@@ -1190,8 +1192,24 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         raise ExpansionError(f"the host's auxiliary cancellation signal (AuxiliaryExplicitCancellation) is not an "
                              f"exception class, so {cancellation}")
     records: RecordStore = engine._records
+
+    def fence() -> None:
+        # The session-fact read's fence (the orchestrator's ruling on PR #83, 2026-09-28).
+        if interrupted():
+            raise ReadFenced()
     with engine._route_scope():
-        settings, why_not = engine._summariser_settings()
+        try:
+            settings, why_not = engine._summariser_settings(fence=fence)
+        except SessionFactUnread as unread:
+            cause = unread.__cause__
+            if isinstance(cause, ReadFenced):
+                raise ExpansionError(_STOPPED) from None
+            code = getattr(cause, "sqlite_errorcode", None)
+            if isinstance(cause, sqlite3.OperationalError) and isinstance(code, int) and (code & 0xFF) == sqlite3.SQLITE_BUSY:
+                raise ExpansionError(f"the session's reasoning effort could not be read because the store's lock was "
+                                     f"held past its busy timeout ({cause}); nothing was sent") from None
+            raise ExpansionError(f"the session's reasoning effort could not be read ({type(cause).__name__}: {cause}); "
+                                 f"nothing was sent") from None
         step()
         if settings is None:
             raise ExpansionError(f"the query's model is the summariser's, and there is none: {why_not}")
@@ -1306,11 +1324,9 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                 "if_the_host_asks_this_call_to_stop": (
                     _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[route.target_api_mode]
                     + "; the query reads the host's interrupt bit from its start: while it waits for the store's "
-                      "lock and the store's file locks as it reads and as it stores a result that needs more than "
-                      "one page, at each step before the call, while it waits for a call slot and throughout the "
-                      "call, but not while it reads this session's reasoning effort from the plugin's session table "
-                      "(that read takes the session table's own lock and then waits within the store's busy "
-                      "timeout; the bit is read right after it); once "
+                      "locks and the store's file locks as it reads (this session's reasoning effort and the records) "
+                      "and as it stores a result that needs more than one page, at each step before the call, while "
+                      "it waits for a call slot and throughout the call; once "
                       "it has seen the bit set it reads, sends and stores nothing more for this call; a "
                       "result that fits one page is returned whatever the bit (the host uses it within its 3 s "
                       "grace after an interrupt and discards it after its own timeout); a failure to store the "

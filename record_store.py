@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from .db_bootstrap import SQLITE_BUSY_TIMEOUT_MS, close_connection, open_store
+from .db_bootstrap import SQLITE_BUSY_TIMEOUT_MS, close_connection, fenced_lock, fenced_retried, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .inflight import _POLL_S, ChunkSummary
 from .message_content import base64_like_strings, describe_image_part, grep_text, image_parts
@@ -258,34 +258,14 @@ class RecordStore:
         wait for the lock lasts as long as this engine copy's other store work holding it
         (planning, derivation and return writes, confirmations, grep's scan, expand's page, the
         doctor's invariant: each finite, none waiting on a model, the limiter or a condition;
-        PLAN-83d §5), or until the fence trips."""
-        while not self._lock.acquire(timeout=_POLL_S):
-            check()
+        PLAN-83d §5), or until the fence trips (``db_bootstrap.fenced_lock``)."""
+        fenced_lock(self._lock, check, _POLL_S)
 
     @staticmethod
     def _retried(conn: sqlite3.Connection, statement: str, check: Callable[[], None]) -> Any:
-        """``statement`` at busy timeout 0, retried on SQLITE_BUSY with ``check`` asked before
-        each try, within the store's own bound, as its unfenced writers have it: the busy timeout
-        per statement, counted from the statement's first try.
-
-        Which error is SQLITE_BUSY: ``sqlite_errorcode`` is set on an error raised from an SQLite
-        return code on every interpreter the plugin runs in (the host requires Python >= 3.11,
-        Hermes 375930d089 pyproject.toml:15 ``requires-python = ">=3.11,<3.15"``, and the
-        attribute exists from 3.11). An ``OperationalError`` the sqlite3 module raises itself
-        carries no such attribute at all (observed on CPython 3.14.4, the scratch venv of the
-        host's export, 2026-09-28: ``sqlite3.OperationalError("…")`` has no ``sqlite_errorcode``,
-        and ``sqlite3.Error`` has no class default), so it is read with a sentinel: an error
-        without it is no SQLite return code, is not busy, and is raised as it is."""
-        deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000.0
-        while True:
-            check()
-            try:
-                return conn.execute(statement)
-            except sqlite3.OperationalError as exc:
-                code = getattr(exc, "sqlite_errorcode", None)
-                if not isinstance(code, int) or (code & 0xFF) != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
-                    raise
-            time.sleep(max(0.0, min(_POLL_S, deadline - time.monotonic())))
+        """``statement`` at busy timeout 0, retried with the fence within the store's bound
+        (``db_bootstrap.fenced_retried``)."""
+        return fenced_retried(conn, statement, check, _POLL_S)
 
     @contextlib.contextmanager
     def _fenced_tx(self, fence: Callable[[], bool]):

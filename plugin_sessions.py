@@ -24,10 +24,11 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from .db_bootstrap import close_connection, open_store
+from .db_bootstrap import SQLITE_BUSY_TIMEOUT_MS, close_connection, fenced_lock, fenced_retried, open_store
 from .handles import SESSION, new_handle
+from .inflight import _POLL_S
 
 logger = logging.getLogger(__name__)
 
@@ -74,14 +75,36 @@ class PluginSessions:
             ).fetchone()
             return str(row[0]) if row else None
 
-    def latest_fact(self, session: str, kind: str) -> Optional[str]:
-        """The value of the newest fact of one kind about a plugin session, or None."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM session_facts WHERE session = ? AND kind = ? ORDER BY fact_id DESC LIMIT 1",
-                (session, kind),
-            ).fetchone()
+    def latest_fact(self, session: str, kind: str, fence: Optional[Callable[[], None]] = None) -> Optional[str]:
+        """The value of the newest fact of one kind about a plugin session, or None.
+
+        With a ``fence`` (the query, #19; the orchestrator's ruling on PR #83, 2026-09-28) every
+        wait is fenced, as the record store's fenced read is: this helper's lock is taken in
+        slices with ``fence`` called between them (it raises to end the wait), and the SELECT
+        runs at busy timeout 0, retried with ``fence`` called before each try within the store's
+        busy timeout, the timeout restored once the read is done (``db_bootstrap.fenced_lock``,
+        ``fenced_retried``). What it cannot close: the read's own execution once begun."""
+        if fence is None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT value FROM session_facts WHERE session = ? AND kind = ? ORDER BY fact_id DESC LIMIT 1",
+                    (session, kind),
+                ).fetchone()
+                return str(row[0]) if row else None
+        fenced_lock(self._lock, fence, _POLL_S)
+        try:
+            conn = self._conn
+            fence()
+            conn.execute("PRAGMA busy_timeout = 0")
+            try:
+                row = fenced_retried(
+                    conn, "SELECT value FROM session_facts WHERE session = ? AND kind = ? ORDER BY fact_id DESC LIMIT 1",
+                    fence, _POLL_S, (session, kind)).fetchone()
+            finally:
+                conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             return str(row[0]) if row else None
+        finally:
+            self._lock.release()
 
     def name_session(
         self,
