@@ -366,11 +366,11 @@ def _deliveries(part: dict, given: Given) -> list[tuple[str, bool, str]]:
     the leg's image conversion."""
     if not given.legs:
         raise AssertionError("an image met at an image site with no leg to decide it (PLAN-19 §2.2)")
-    if callable(given.check):
-        given.check()
     out = []
     for leg in given.legs:
         for prepass in leg.prepass:
+            if callable(given.check):
+                given.check()   # the host's stop, read before each leg's per-part functions (PLAN-19 §2.7)
             value = (f", the host's image conversion {'on' if prepass else 'off'}" if len(leg.prepass) > 1 else "")
             ok, text = _delivered_on(part, given.role or "user", leg.wire, prepass)
             out.append((f"{leg.wire} ({leg.name}{value})", ok, text))
