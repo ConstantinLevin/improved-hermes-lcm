@@ -766,10 +766,10 @@ _CLASSES = {
 @dataclass
 class _Record:
     """One record's facing: what the classification gives and counts, gathered in one place.
-    ``foreign``: the field is stored on a role whose domain lacks it (M4): its carrier texts are
-    given as parts, not held against the content. ``compares_calls``: the message is an agent
-    message, whose carrier calls are compared with its calls (T5, rule 3); on any other message a
-    carrier call is given as labelled JSON (the orchestrator's ruling on PI-2, 2026-09-28).
+    ``foreign``: the field is stored on a role whose domain lacks it (M4). ``compares_calls``: the
+    message is an agent message, whose carrier calls that are among its calls given as calls are
+    not repeated (T5); every other carrier call is given as labelled JSON (the orchestrator's ruling
+    on PI-2, 2026-09-28; PLAN-19 §2.5).
     ``role_text``: the stored role as the labels say it (``stored_role_text``)."""
 
     record: str
@@ -802,22 +802,20 @@ class _Record:
         return self.not_text(value, path, REASONING)
 
     def carried(self, value: Any, path: tuple) -> bool:
-        """A replay carrier's message text must stand in what is given of the message: its content,
-        or its main readable reasoning (a Codex commentary item's text is the host's ``reasoning``,
-        codex_responses_adapter.py 1125-1134); else the record is a problem that refuses the query.
-        On a role where the host writes no carrier no converter reads it: a text the content lacks
-        is given as its own part (ruling OD-F5)."""
+        """A replay carrier's message text stands in what is given of the message (its content, or its
+        main readable reasoning: a Codex commentary item's text is the host's ``reasoning``,
+        codex_responses_adapter.py 1125-1134), or it is given as a labelled part of its own, on every
+        message and every wire (M-CARRIER, PLAN-19 §2.5): the query sends no carrier (ruling OD-G), so
+        the part is what carries a text only the carrier holds; standing the record's."""
         if not isinstance(value, str):
             return self.not_text(value, path, CARRIER)
         if any(value in text for text in self.content_texts):
             return False
-        if self.foreign:
-            self.given.values.append((path, value, GIVEN_CONTENT))
-            self.after.append(self.given.made({"type": "text", "text": (
-                f"[A text stored in {_path_text(path)} on this message, where the host writes no such field, which its "
-                f"content does not hold:]\n{value}")}, FIELD, path))
-        else:
-            self.given.problems.append(f"its replay carrier holds text its content does not ({_path_text(path)})")
+        self.given.values.append((path, value, self.standing))
+        where = ", where the host writes no such field," if self.foreign else ""
+        self.after.append(self.given.made({"type": "text", "text": (
+            f"[A text stored in {_path_text(path)} on this message{where} which its content does not hold:]\n{value}")},
+            FIELD, path))
         return False
 
     def stashed(self, value: Any, path: tuple) -> bool:
@@ -833,34 +831,22 @@ class _Record:
             self.after.append(self.given.made({"type": "text", "text": f"{what}\n{value}"}, FIELD, path))
         return False
 
-    def called(self, name: Any, arguments: Any, path: tuple) -> None:
-        """A replay carrier's call must be one of the calls given: by name and parsed input
-        (PLAN-83c §5.2; the block's id is the host's sanitised one, not compared). Where the stored
-        call of that name has arguments that do not parse, its input cannot be shown equal: the
-        record is refused naming the block (T5, the ruled extension of rule 3)."""
-        named = [(stored_arguments, parsed) for stored_name, stored_arguments, parsed in self.calls
-                 if name == stored_name]
-        if any(parsed and arguments == stored_arguments for stored_arguments, parsed in named):
-            return
-        shown = name if isinstance(name, str) else "?"
-        if any(not parsed for _stored_arguments, parsed in named):
-            self.given.problems.append(f"its replay carrier holds a call whose input cannot be compared with its stored "
-                                       f"arguments, which do not parse ({_path_text(path)}, {shown})")
-        else:
-            self.given.problems.append(f"its replay carrier holds a call its tool calls do not ({_path_text(path)}, "
-                                       f"{shown})")
+    def called(self, name: Any, arguments: Any) -> bool:
+        """Whether a replay carrier's call is one of the calls given as calls: by name and parsed input
+        (PLAN-83c §5.2; the block's id is the host's sanitised one, not compared). Where the stored call
+        of that name has arguments that do not parse, its input cannot be shown equal: it is not."""
+        return any(parsed and arguments == stored_arguments
+                   for stored_name, stored_arguments, parsed in self.calls if name == stored_name)
 
     def call_block(self, block: dict, table: dict, path: tuple) -> bool:
-        """A carrier's call block (``tool_use``, ``toolUse``; T5). On an agent message its name and
-        input are compared with the message's calls (``called``); on any other message, where the
-        call is only a stored value, they are given as labelled JSON, the call's values (standing
-        call; the vocabulary is never withheld inside ``input``), and nothing is refused (the
-        orchestrator's ruling on PI-2, 2026-09-28). Its metadata is not given; every other key is
-        the call's. Returns whether opaque material was withheld."""
+        """A carrier's call block (``tool_use``, ``toolUse``; T5). On an agent message one of its calls
+        given as calls (``called``) is not repeated; every other carrier call, on any message and
+        every wire, is given as labelled JSON of its name and input, the call's values (standing call;
+        the vocabulary is never withheld inside ``input``), and nothing is refused (the orchestrator's
+        ruling on PI-2, 2026-09-28; M-CARRIER, PLAN-19 §2.5). Its metadata is not given; every other key
+        is the call's. Returns whether opaque material was withheld."""
         withheld = False
-        if self.compares_calls and not self.foreign:
-            self.called(block.get("name"), block.get("input"), path)
-        else:
+        if not (self.compares_calls and not self.foreign and self.called(block.get("name"), block.get("input"))):
             values = {key: block[key] for key in ("name", "input") if key in block}
             withheld = self.json(f"[{_path_text(path)} holds a tool call, stored on this message {self.role_text}, "
                                  f"which is not one of the calls the query gives; its name and input shown as their "

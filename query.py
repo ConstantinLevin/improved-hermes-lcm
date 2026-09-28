@@ -41,12 +41,12 @@ can answer from one of them with no record, rulings OD-2a); a managed NeMo Relay
 **Refused before the call**, with the cause: a wire the plugin has not established (OD-I); more
 images than the host's converter keeps in one request; an input over the model's input (its
 window less its output cap, by the estimate times ``estimate_ratio_max``, #34 D4; where the model
-table has no window this is said); a record the query cannot give as it is (a replay carrier on an
-agent message that holds text or a call its content and calls do not, where on any other message
-such a text is given as its own part and such a call as labelled JSON; a record stored as a JSON
-value that is not a message; a chunk that begins with a tool result; a carrier call whose input cannot be compared;
-a part without a recorded origin); anything the query gives its model that a wire's converter
-would not deliver, in order; a page too small for the result's header and one piece of it. Every
+table has no window this is said); an image the legs disagree on (one leg's converter delivers it,
+another's does not); a record the query cannot give as it is (a record stored as a JSON value that
+is not a message; a chunk that begins with a tool result; a part without a recorded origin);
+anything the query gives its model that a leg's converter would not deliver, in order; a page too
+small for the result's header and one piece of it. A replay carrier's text or call the message does
+not hold is given as a labelled part on every message and every wire (PLAN-19 §2.5). Every
 error passes through one scope (``_Refusals``) that says once whether the model was called
 (PLAN-83g §3.7).
 
@@ -921,9 +921,8 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
         sent.append(_Sent(record, message, None, given))
     if problems:
         raise ExpansionError(
-            f"these records cannot be given as they are (an image the legs of this call disagree on would reach the "
-            f"model or not by which leg answers; a replay carrier's text or call the message does not hold): "
-            f"{' | '.join(problems)}: ask over other handles")
+            f"these records hold images the legs of this call disagree on, so whether the model receives each would "
+            f"depend on which leg answers: {' | '.join(problems)}: ask over other handles")
     # Every part of every message has one recorded origin (PLAN-83d §2's property), asserted at one
     # site, before the join reads the origins of a tool result's parts (PLAN-83g §4.3). The labels
     # added after it make only parts they record (``label_message``: the label, and a string content
@@ -1252,6 +1251,29 @@ def _wire_text(leg: _Leg, renamed: dict) -> str:
             f"arguments; role, message boundaries, ids and reasoning_content (the host's echo) are not compared; "
             f"{_HOST_ADDITIONS.get(leg.wire, 'what the host adds on this wire is not known')}{oauth}"
             f"{'; ' + renamed[leg.name] if leg.name in renamed else ''}")
+
+
+# Which carriers each established wire's converter replays in place of a message's content (Hermes 375930d089):
+# anthropic_content_blocks on an agent message (anthropic_message_convert.py 393-397), the stash of a tool result where
+# it is sent (431-447); codex_message_items (codex_responses_adapter.py 624-630). The Chat Completions transport strips
+# them all (transports/chat_completions.py 36-39, 393).
+_REPLAYED = {"anthropic_messages": ("anthropic_content_blocks", STASH), "codex_responses": ("codex_message_items",)}
+
+
+def _carrier_legs(facts: _RouteFacts) -> str:
+    """Per wire of the legs, what its converter does with each text carrier (M-CARRIER, PLAN-19 §2.5): the clause
+    that it would replay one only where that is true of that wire's converter."""
+    said = []
+    for wire in facts.wires:
+        replayed = _REPLAYED.get(wire, ())
+        for carrier in TEXT_REPLAY_CARRIERS + (STASH,):
+            if carrier in replayed:
+                said.append(f"{carrier}: the host's converter for {wire} would send this carrier in place of the "
+                            f"content; the query sends the content and no carrier (the carrier shadows the content; its "
+                            f"encrypted items go only to the producing family)")
+            else:
+                said.append(f"{carrier}: which the host's converter for {wire} does not replay")
+    return " | ".join(said)
 
 
 def _svg_images(messages: list[dict]) -> int:
@@ -1654,14 +1676,12 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                                         f"({', '.join(TEXT_REPLAY_CARRIERS)}) or blocks the host stashed in "
                                         f"_anthropic_content_blocks, as a list; the query sends none of them, nor the "
                                         f"replay carriers of reasoning (reasoning_details, codex_reasoning_items): the "
-                                        f"stored content is what the model reads; a text of a replay carrier on an "
-                                        f"agent message must stand in its content or its main reasoning, and a call "
-                                        f"must be one of its calls (by name, and by its input where the stored "
-                                        f"arguments parse; where they do not, the input cannot be compared), else "
-                                        f"the query refuses; on any other message, and in the stash, a text the "
-                                        f"content lacks is given as its own part, and a carrier's tool call there is "
-                                        f"given as labelled JSON with its name and input; readable reasoning is "
-                                        f"given; an "
+                                        f"stored content is what the model reads; on every message a text of a replay "
+                                        f"carrier or of the stash that the message's content (or its main reasoning) "
+                                        f"does not hold is given as a labelled part of its own, and a carrier's tool "
+                                        f"call that is not one of the calls given as calls (by name, and by its input "
+                                        f"where the stored arguments parse) is given as labelled JSON with its name and "
+                                        f"input; per leg: {_carrier_legs(route_facts)}; readable reasoning is given; an "
                                         f"image block by the image rules; citations and every key the query does not "
                                         f"know as their JSON; opaque material withheld at any depth; metadata not "
                                         f"given; empty values inside a value given as JSON are shown as stored; a "
