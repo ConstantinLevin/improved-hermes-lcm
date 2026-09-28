@@ -84,6 +84,7 @@ import logging
 import secrets
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -178,6 +179,14 @@ def _stop_clauses(facts: Any) -> str:
     host can send the call on (PLAN-83g §4.3: one clause per wire of the route's facts)."""
     return " | ".join(f"{wire}: {_IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[wire]}" for wire in facts.wires
                       if wire in _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP)
+
+def _stop_after(facts: Any) -> str:
+    """What happens to the model's request once the host asked the call to stop after the call began (PLAN-19 §5,
+    correction 6): per wire of the legs, "on {wire} " and the clause of ``_IF_THE_HOST_ASKS_THIS_CALL_TO_STOP`` after
+    its first "; " (the query's own part, before it, is said by the stop's text itself)."""
+    return " | ".join(f"on {wire} " + _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP[wire].split("; ", 1)[1]
+                      for wire in facts.wires if wire in _IF_THE_HOST_ASKS_THIS_CALL_TO_STOP)
+
 
 def _refresh_wire(provider: str, model: str, so: str) -> Optional[str]:
     """The wire of the client the host's credential-refresh retry builds for ``provider``
@@ -276,7 +285,8 @@ def _draw_report_id() -> str:
     return "q" + base64.b32encode(secrets.token_bytes(5)).decode("ascii").lower()
 
 
-_STOPPED = "the host asked this tool call to stop (its interrupt bit is set)"
+_STOPPED = ("the host asked this tool call to stop (its interrupt bit is set, or its sequential tool timeout, counted "
+            "from the query's entry, has passed)")
 
 
 class _Told(ExpansionError):
@@ -1281,7 +1291,7 @@ def _leg_value_text(leg: _Leg, prepass: bool, is_oauth: Optional[bool]) -> str:
     return f" ({', '.join(said)})" if said else ""
 
 
-def _wire_check(route: Any, messages: list[dict], sent: list[_Sent], legs: list) -> dict:
+def _wire_check(route: Any, messages: list[dict], sent: list[_Sent], legs: list, check: Any = None) -> dict:
     """Every value the query gives its model must reach it on every leg the host can send the call
     on, under every value of that leg's enumerated converter inputs, in its place (OD-G as ruled;
     #83 plan §3-§4; PLAN-19 §2.1): the given texts, images and tool calls, in document order, must
@@ -1297,6 +1307,8 @@ def _wire_check(route: Any, messages: list[dict], sent: list[_Sent], legs: list)
     said: dict = {}
     for leg in legs:
         for prepass, is_oauth in _leg_values(leg, messages):
+            if callable(check):
+                check()     # the host's stop, read before each converter run (PLAN-19 §2.7)
             converted, namer = _payload_for_leg(route, messages, leg, prepass, is_oauth)
             payload = _payload_tokens(leg.wire, converted)
             if namer is not None and any(token[0] == "call" for token in given):
@@ -1598,23 +1610,44 @@ def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
 
 def _stop_latch() -> Any:
     """The host's stop of this tool call, read from the query's entry, before any store access
-    (PLAN-83d §5). The host sets the interrupt bit on this worker's thread when it asks the tool
-    call to stop (its tool timeout, after it stopped waiting; an interrupt, while it still waits
-    its 3 s grace), and clears the bit of every tracked worker at the end of the turn and on a
-    redirect (agent/tool_executor.py 870-976, agent/interrupt_control.py 199, 221-248,
-    agent/turn_finalizer.py 731, agent/turn_api_call.py 152, 184 at Hermes 375930d089). The check
-    reads this thread by its id, because the host also calls it from the daemon thread that runs
-    the provider call (agent/auxiliary_client.py 476; tools/interrupt.py 61-71), and it latches:
-    once seen, the stop holds for the rest of this call."""
+    (PLAN-83d §5; PLAN-19 §2.7, D-4). Two signals, both latched: once seen, the stop holds for the
+    rest of this call.
+
+    - The worker's interrupt bit. The host sets it on a sequential tool timeout only after it has
+      stopped waiting (agent/tool_executor.py 963-976), and on an interrupt while it still waits its
+      3 s grace (947-950); every ``clear_interrupt`` clears the bit of every tracked worker, an
+      abandoned one included: at the turn's end (agent/turn_finalizer.py 731) and at the clear sites
+      where a model-request redirect is pending (turn_api_call.py 152, 184; turn_api_error.py 154;
+      turn_recovery.py 1349; interrupt_control.py 231-232 returns without clearing otherwise), and at
+      turn_recovery.py 1327, codex_runtime.py 486, turn_facade_lease.py 376, tui_gateway/
+      prompt_turn.py 155, hermes_cli/cli_chat_turn_mixin.py 639 (at Hermes 375930d089, reader C of
+      PLAN-19). A redirect during tool execution sets no bit (it requests a yield, 285-295). The
+      check reads this thread by its id, because the host also calls it from the daemon thread that
+      runs the provider call (agent/auxiliary_client.py 476; tools/interrupt.py 61-71).
+    - The host's own sequential tool deadline (``_resolve_sequential_tool_timeout``), read at the
+      query's entry and counted from there. The host set its deadline when it dispatched the worker,
+      before the query's entry, so this deadline passes later than the host's by that latency: it
+      narrows the window in which the query can go on after the host stopped waiting to that
+      latency and does not close it; nothing on the worker's side marks it abandoned (ask A-D3.1).
+
+    The returned function has ``deadline_s``: the host's timeout it counts, or None where the host's
+    deadline is disabled."""
     worker = threading.get_ident()
     thread_interrupted = _strict_import("tool interrupt bit", "tools.interrupt", "is_thread_interrupted",
                                         so="whether the host asked this call to stop cannot be known")
+    resolve = _strict_import("sequential tool timeout", "agent.tool_executor", "_resolve_sequential_tool_timeout",
+                             so="when the host stops waiting for this call is not known")
+    value = resolve()
+    deadline_s = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+    deadline = time.monotonic() + deadline_s if deadline_s is not None else None
     stopped = threading.Event()
 
     def interrupted() -> bool:
-        if not stopped.is_set() and thread_interrupted(worker):
+        if not stopped.is_set() and (thread_interrupted(worker)
+                                     or (deadline is not None and time.monotonic() >= deadline)):
             stopped.set()
         return stopped.is_set()
+    interrupted.deadline_s = deadline_s  # type: ignore[attr-defined]
     return interrupted
 
 
@@ -1723,7 +1756,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         else:
             window = (f"not known: the model table has no window for {route.target_provider}/{route.target_model}, "
                       f"so the input was not checked against it; the provider's refusal is the only bound")
-        renamed = _wire_check(route, messages_in, sent, route_facts.legs)
+        renamed = _wire_check(route, messages_in, sent, route_facts.legs, step)
         step()
         endpoint = endpoint_key(route.target_provider, route.target_base_url)
         limiter, slots = limiter_for(endpoint), engine._calls_in_flight_limit(endpoint)
@@ -1813,14 +1846,24 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",
                 "if_the_host_asks_this_call_to_stop": (
                     _stop_clauses(route_facts)
-                    + "; the query reads the host's interrupt bit from its first store read (this session's reasoning "
-                      "effort) on: while it waits for the store's locks and file locks as it reads the records and as "
-                      "it stores a result that needs more than one page, at each step before the call, while it waits "
-                      "for a call slot and throughout the call; once it has seen the bit set it reads, sends and "
-                      "stores nothing more for this call; a result that fits one page is returned whatever the bit "
+                    + "; the query reads the host's stop from its first store read (this session's reasoning effort) "
+                      "on: the host's interrupt bit, and the host's own sequential tool timeout ("
+                    + (f"{interrupted.deadline_s:g} s, read at the query's entry and counted from there"
+                       if getattr(interrupted, "deadline_s", None) is not None else
+                       "disabled on this host, so no deadline is counted")
+                    + "), while it waits for the store's locks as it reads the records and as it stores a result "
+                      "that needs more than one page, before each record, image and leg it checks, at each step "
+                      "before the call, while it waits for a call slot and throughout the call; once it has seen the "
+                      "stop it reads, sends and stores nothing more for this call; what it cannot see: the host "
+                      "started its deadline before the query's entry, so for that latency after the host stopped "
+                      "waiting the query can still call the model or store a result nobody reads, and an interrupt "
+                      "the host sets and clears again (at the turn's end) while one host function of the check runs "
+                      "(a converter; an SVG rasteriser, up to 30 s per image and leg) is not seen, after which the "
+                      "query calls and stores as if no stop came (nothing on this side marks a worker the host "
+                      "abandoned: ask A-D3.1); a result that fits one page is returned whatever the bit "
                       "(the host uses it within its 3 s grace after an interrupt and discards it after its own "
                       "timeout); a failure to store the result is written as a store event only in a transaction "
-                      "that commits nothing once the bit is seen; the query writes no event of other work"),
+                      "that commits nothing once the stop is seen; the query writes no event of other work"),
                 "entered_the_host": ("once; the query retries no failure (the host's own recovery runs inside the "
                                      "call, and one entry can send several provider requests: its re-sends, rungs "
                                      "and fallbacks)"),
@@ -1855,8 +1898,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         step()
 
         if not limiter.acquire(slots, lambda: not interrupted()):
-            raise ExpansionError(f"the host asked this tool call to stop (its interrupt bit is set) while it waited for "
-                                 f"one of the {slots} call slots of {endpoint}")
+            raise ExpansionError(f"{_STOPPED} while it waited for one of the {slots} call slots of {endpoint}")
         usage: dict = {}
         try:
             with protection(cancel_check=interrupted):
@@ -1865,8 +1907,8 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
             report, excerpts = parse_reply(content)
         except cancelled:
             logger.warning("LCM's query was stopped: the host asked lcm_query on %s to stop", route.describe())
-            raise _Told(f"the host asked this tool call to stop (its interrupt bit is set); the model's reply was not "
-                        f"read, and nothing was stored; {_stop_clauses(route_facts)}") from None
+            raise _Told(f"{_STOPPED}; the model's reply was not read, and nothing was stored; "
+                        f"{_stop_after(route_facts)}") from None
         except SummaryFailure as failure:
             text = settings.scrub(str(failure))
             logger.warning("LCM's query got no answer: %s", text)
@@ -1909,8 +1951,8 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
     page_one = page_one_as(report_id)
     if json.loads(page_one).get("next_page") is None:
         return page_one
-    unstored = ("the host asked this tool call to stop (its interrupt bit is set) before its result, which needs more "
-                "than one page, could be stored; nothing was stored or shown")
+    unstored = (f"{_STOPPED} before its result, which needs more than one page, could be stored; nothing was stored or "
+                f"shown")
     for _ in range(_HANDLE_DRAWS):
         try:
             stored = records.write_query_report(report_id=report_id, session=session, question=question, body=body,
