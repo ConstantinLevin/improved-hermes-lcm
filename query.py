@@ -1192,6 +1192,7 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
     records: RecordStore = engine._records
     with engine._route_scope():
         settings, why_not = engine._summariser_settings()
+        step()
         if settings is None:
             raise ExpansionError(f"the query's model is the summariser's, and there is none: {why_not}")
         route = settings.route
@@ -1307,7 +1308,10 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                     + "; the query reads the host's interrupt bit from its start: while it waits for the store's "
                       "lock and the store's file locks as it reads and as it stores a result that needs more than "
                       "one page, at each step before the call, while it waits for a call slot and throughout the "
-                      "call; once it has seen the bit set it reads, sends and stores nothing more for this call; a "
+                      "call, but not while it reads this session's reasoning effort from the plugin's session table "
+                      "(that read takes the session table's own lock and then waits within the store's busy "
+                      "timeout; the bit is read right after it); once "
+                      "it has seen the bit set it reads, sends and stores nothing more for this call; a "
                       "result that fits one page is returned whatever the bit (the host uses it within its 3 s "
                       "grace after an interrupt and discards it after its own timeout); a failure to store the "
                       "result is written as a store event only in a transaction that commits nothing once the bit "
