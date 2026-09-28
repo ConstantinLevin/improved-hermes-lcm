@@ -5,7 +5,7 @@ author: "ConstantinLevin (fork of hermes-lcm by Stephen Schoettler)"
 provides_tools:
   - lcm_grep
   - lcm_expand
-  - lcm_expand_query
+  - lcm_query
   - lcm_status
   - lcm_inspect
   - lcm_doctor

@@ -42,13 +42,17 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import turn_signals
-from .record_store import RET_KEY, InputEntry, parse_ret_key
+from .record_store import RET_KEY, CommittedButNotRestored, InputEntry, WriteFenced, parse_ret_key
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
+
+# What a dispatched tool call's boundary says when the host's stop trips the settle's fence
+# (``_settle_from_list`` with a fence; the boundary renders it after its step's name).
+SETTLE_STOPPED = "the host asked this call to stop; nothing was settled, sent or stored"
 
 try:  # host internals; see the module docstring
     from agent.conversation_compression import (  # type: ignore
@@ -547,10 +551,14 @@ class RecordWriteMixin:
         messages: List[Dict[str, Any]],
         *,
         own_objects_only: bool,
+        events: Optional[list] = None,
     ) -> list[tuple[int, int, int]]:
         """(position, stamped row id, index in the list) for each keyed dict of this
         attempt, by the position in its own key. A position seen twice is bound not at
-        all, and recorded."""
+        all, and recorded: as an event at once, or, with ``events`` (the fenced settle,
+        M-BOUNDARY-FENCE), collected as (kind, compaction, detail) for the caller to write
+        after its transaction through ``write_event_fenced``, since an event written inside
+        the fenced transaction would stay pending for a writer after the host stopped waiting."""
         found: dict[int, list[tuple[int, int]]] = {}
         for index, message in enumerate(messages):
             if not isinstance(message, dict):
@@ -568,6 +576,9 @@ class RecordWriteMixin:
         for position, seen in found.items():
             if len(seen) == 1:
                 pairs.append((position, seen[0][0], seen[0][1]))
+            elif events is not None:
+                events.append(("binding_position_duplicated", attempt.compaction,
+                               {"position": position, "count": len(seen)}))
             else:
                 self._records.event("binding_position_duplicated", session=attempt.session,
                                     compaction=attempt.compaction, detail={"position": position, "count": len(seen)})
@@ -622,7 +633,7 @@ class RecordWriteMixin:
             logger.warning("LCM could not record the host's confirmation", exc_info=True)
             self._records.event("confirmation_write_failed", session=self._plugin_session or None, detail=repr(exc))
 
-    def _settle_from_list(self, messages: Optional[List[Dict[str, Any]]]) -> None:
+    def _settle_from_list(self, messages: Optional[List[Dict[str, Any]]], fence: Optional[Callable[[], bool]] = None) -> None:
         """Read the keys of a list the host hands over: attribute a waiting
         confirmation, find a return adopted without one, and bind stamped entries.
 
@@ -630,7 +641,21 @@ class RecordWriteMixin:
         it changes in memory (the waiting confirmation cleared, the bound positions, an
         attempt no longer waited for) is applied only after that transaction committed,
         so that memory never runs ahead of the store (pre-review of 78c2cbf). A failure
-        is logged and recorded as an event; nothing is changed in memory for it."""
+        is logged and recorded as an event; nothing is changed in memory for it.
+
+        With a ``fence`` (a dispatched tool call's stop latch, ``engine.handle_tool_call``;
+        PLAN-19 re-derived, M-BOUNDARY-FENCE) the transaction is the store's fenced one
+        (``RecordStore._fenced_tx``): every wait is fenced, the fence is asked before each
+        compaction, nothing is committed once it is true, no event of other work is flushed,
+        and every event of the settle's own (a failure's; the duplicated position
+        ``_returns_to_bind`` records, collected instead of written inside the transaction) is
+        written afterwards in a fenced transaction of its own (``write_event_fenced``,
+        ``_settle_events``), never kept pending. A fence that trips before the commit
+        raises ``WriteFenced`` with its text, and the boundary renders it; one that trips
+        after the commit, while a failure's event is written, loses that event (the log says
+        so, ``_settle_events``), what committed is applied in memory, and the call goes on to
+        the handler, which reads the same latch. Without a fence (the turn's end, the
+        occasion, planning) nothing changes."""
         if not messages or not self._plugin_session or not self._returned_attempts:
             return
         keyed: set[int] = set()
@@ -643,11 +668,18 @@ class RecordWriteMixin:
             return
         store = self._records
         applied: list = []   # in-memory changes, made once the transaction committed
+        # (kind, compaction or None, detail): the events recorded after the transaction. Under a fence
+        # the one event the settle's steps can raise (``_returns_to_bind``'s duplicated position) is
+        # collected here too; unfenced it is written as every event, inside the transaction.
+        events: list = []
+        collect: Optional[list] = events if fence is not None else None
         # The waiting confirmation as this pass sees it: used by one compaction at most.
         pending = getattr(self, "_pending_confirmation", None)
         try:
-            with store.transaction():
+            with (store._fenced_tx(fence) if fence is not None else store.transaction()):
                 for compaction in sorted(keyed):
+                    if fence is not None and fence():
+                        raise WriteFenced(SETTLE_STOPPED)
                     attempt = self._returned_attempts.get(compaction)
                     if attempt is None or attempt.session != self._plugin_session:
                         continue
@@ -674,26 +706,65 @@ class RecordWriteMixin:
                                     settled = True
                             if settled and store.effective_compaction(self._plugin_session) == compaction:
                                 written = store.bind(attempt.compaction,
-                                                     self._returns_to_bind(attempt, messages, own_objects_only=False),
+                                                     self._returns_to_bind(attempt, messages, own_objects_only=False,
+                                                                           events=collect),
                                                      ())
                                 changes.append(("bound", (attempt, written)))
+                    except WriteFenced:
+                        raise
                     except Exception as exc:
                         logger.warning("LCM could not settle a returned compaction", exc_info=True)
-                        self._records.event("settle_write_failed", session=self._plugin_session,
-                                            compaction=compaction, detail=repr(exc))
+                        events.append(("settle_write_failed", compaction, exc))   # rendered where it is written
                         continue
                     if any(what == "pending_cleared" for what, _value in changes):
                         pending = None
                     applied.extend(changes)
+        except WriteFenced:
+            logger.warning("LCM did not settle the list the host handed over: the host asked this tool call to stop")
+            raise WriteFenced(SETTLE_STOPPED) from None
+        except CommittedButNotRestored as exc:
+            # Committed: what the transaction wrote is in the store, and the later failure is logged.
+            logger.error("LCM settled the list the host handed over; %s", exc)
         except Exception as exc:
             logger.warning("LCM could not commit the settling of returned compactions", exc_info=True)
-            self._records.event("settle_write_failed", session=self._plugin_session, detail=repr(exc))
+            events.append(("settle_write_failed", None, exc))
+            self._settle_events(events, fence)
             return
+        self._settle_events(events, fence)
         for what, value in applied:
             if what == "pending_cleared" and getattr(self, "_pending_confirmation", None) is value:
                 self._pending_confirmation = None
             elif what == "bound":
                 self._bind_applied(*value)
+
+    def _settle_events(self, events: list, fence: Optional[Callable[[], bool]]) -> None:
+        """The events of a settle, (kind, compaction or None, detail), recorded after the settle's
+        transaction: its failures, and under a fence the one event its steps collect (the duplicated
+        position of ``_returns_to_bind``). Unfenced, each as every event (kept pending where the
+        store is locked); under a fence, each in a fenced transaction of its own, written only while
+        the host still waits, with the row shape ``event`` gives its kind (the compaction in its
+        column, the same detail). A fence that trips there does not end the call: what the
+        transaction settled is committed already, so the boundary could not say that nothing was
+        settled; the event is lost, the log line says so, the caller applies in memory what
+        committed, and the handler reads the same latch and stops with its own text. Any other
+        failure to write an event is logged. A failure's detail (its exception) is rendered here,
+        where its row is written, as ``repr`` gives it."""
+        for kind, compaction, detail in events:
+            if isinstance(detail, BaseException):
+                detail = repr(detail)
+            if fence is None:
+                self._records.event(kind, session=self._plugin_session, compaction=compaction, detail=detail)
+                continue
+            try:
+                self._records.write_event_fenced(kind, session=self._plugin_session, detail=detail, fence=fence,
+                                                 compaction=compaction)
+            except WriteFenced:
+                logger.warning("LCM could not record the settle's event %s of compaction %s (%s): the host asked this "
+                               "tool call to stop before the event was written; the event is lost", kind, compaction,
+                               detail)
+            except Exception as failure:
+                logger.error("LCM could not record the settle's event %s of compaction %s (%s: %s)", kind, compaction,
+                             type(failure).__name__, failure)
 
     def record_rejected_compaction(self, *args: Any, **kwargs: Any) -> None:
         """The host refused the result this copy last returned (for example a grown one)."""
@@ -708,8 +779,9 @@ class RecordWriteMixin:
             logger.warning("LCM could not record the host's rejection", exc_info=True)
             self._records.event("rejection_write_failed", session=self._plugin_session or None, detail=repr(exc))
 
-    def _bind_from_list(self, messages: Optional[List[Dict[str, Any]]]) -> None:
-        self._settle_from_list(messages)
+    def _bind_from_list(self, messages: Optional[List[Dict[str, Any]]],
+                        fence: Optional[Callable[[], bool]] = None) -> None:
+        self._settle_from_list(messages, fence)
 
     def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None, **kwargs: Any) -> None:
         """The turn ended (the hook state, #32 §1), and the first list after a commit

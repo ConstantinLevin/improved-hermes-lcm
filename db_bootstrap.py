@@ -52,7 +52,10 @@ logger = logging.getLogger(__name__)
 # scope's records; a hit is exact containment. The store keeps no full-text index: the
 # summaries' index (``nodes_fts``) and ``messages_fts`` go, summaries are never searched, and
 # no second copy of ``records.text`` exists that could disagree with it.
-STORE_FORMAT = "ihl-store/13"
+# Format 14 is the query's (#19 D3): ``query_reports`` holds a query's checked result when it
+# needs more than one page, so that every later page is cut from the same answer (never a
+# second model call); insert-only like every table here. A report id is no handle.
+STORE_FORMAT = "ihl-store/14"
 # The store's file carries its format: ``<base stem>-<N><base suffix>`` (ruling C on the
 # pre-review of 0771477). A change of format begins a new file beside the old one, which is
 # never opened, moved or changed (nor its -wal and -shm files): #29's "begun again" without
@@ -104,6 +107,7 @@ REQUIRED_CORE_TABLES = (
     "derivations",
     "derivation_sources",
     "compaction_returns",
+    "query_reports",
 )
 
 
@@ -228,6 +232,44 @@ def close_connection(conn, *, db_path: str | Path, reason: str, owner: str) -> C
     return ClosedConnection(db_path, reason)
 
 
+# --- Fenced waits (the query, #19; PLAN-83d §5, rulings OD-P4c and on the session-fact read) ------
+#
+# The one pair of primitives by which a helper of the store waits only while ``check`` lets it:
+# RecordStore's fenced write and fenced read, and PluginSessions' fenced fact read, use them.
+
+
+def fenced_lock(lock, check, poll: float) -> None:
+    """Take ``lock`` in slices of ``poll`` seconds, calling ``check`` between them (it raises
+    to end the wait)."""
+    while not lock.acquire(timeout=poll):
+        check()
+
+
+def fenced_retried(conn: sqlite3.Connection, statement: str, check, poll: float, args: Sequence = ()):
+    """``statement`` on ``conn`` whose busy timeout is 0, retried on SQLITE_BUSY with ``check``
+    called before each try, within the store's own bound, as its unfenced users have it: the busy
+    timeout per statement, counted from the statement's first try. Returns the cursor.
+
+    Which error is SQLITE_BUSY: ``sqlite_errorcode`` is set on an error raised from an SQLite
+    return code on every interpreter the plugin runs in (the host requires Python >= 3.11,
+    Hermes 375930d089 pyproject.toml:15 ``requires-python = ">=3.11,<3.15"``, and the attribute
+    exists from 3.11). An ``OperationalError`` the sqlite3 module raises itself carries no such
+    attribute at all (observed on CPython 3.14.4, the scratch venv of the host's export,
+    2026-09-28: ``sqlite3.OperationalError("…")`` has no ``sqlite_errorcode``, and
+    ``sqlite3.Error`` has no class default), so it is read with a sentinel: an error without it
+    is no SQLite return code, is not busy, and is raised as it is."""
+    deadline = time.monotonic() + SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    while True:
+        check()
+        try:
+            return conn.execute(statement, args)
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            if not isinstance(code, int) or (code & 0xFF) != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                raise
+        time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
+
+
 def _refuse(path: str | Path, reason: str) -> StoreRefusedError:
     message = (
         f"LCM refuses the database at {path}: {reason}. Nothing in it was read or "
@@ -259,6 +301,7 @@ INSERT_ONLY_TABLES = (
     "adoptions",
     "bindings",
     "store_events",
+    "query_reports",
 )
 
 
@@ -472,6 +515,21 @@ CREATE TABLE store_events (
     session TEXT,
     compaction INTEGER,
     detail TEXT
+);
+
+-- A query's checked result (#19 D3), written once when it needs a second page, so that every
+-- page is cut from the same answer. ``id`` is "q" and eight base32 characters, never a handle.
+-- ``body`` is the header and the items as JSON, each item its annotations and plugin fields.
+CREATE TABLE query_reports (
+    id TEXT PRIMARY KEY,
+    session TEXT NOT NULL REFERENCES sessions(handle),
+    created_at REAL NOT NULL,
+    question TEXT NOT NULL,
+    body TEXT NOT NULL,
+    model TEXT,
+    provider TEXT,
+    effort TEXT,
+    finish_reason TEXT
 );
 """
 

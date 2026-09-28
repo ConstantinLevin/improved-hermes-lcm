@@ -173,7 +173,7 @@ def register(ctx):
     from .schemas import (
         LCM_GREP,
         LCM_EXPAND,
-        LCM_EXPAND_QUERY,
+        LCM_QUERY,
         LCM_STATUS,
         LCM_INSPECT,
         LCM_DOCTOR,
@@ -264,7 +264,7 @@ def register(ctx):
     _TOOLS = [
         ("lcm_grep", LCM_GREP, "🔍"),
         ("lcm_expand", LCM_EXPAND, "🔎"),
-        ("lcm_expand_query", LCM_EXPAND_QUERY, "❓"),
+        ("lcm_query", LCM_QUERY, "❓"),
         ("lcm_status", LCM_STATUS, "💚"),
         ("lcm_inspect", LCM_INSPECT, "🧭"),
         ("lcm_doctor", LCM_DOCTOR, "🏥"),

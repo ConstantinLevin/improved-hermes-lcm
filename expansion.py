@@ -70,6 +70,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -105,7 +106,14 @@ from .summariser_input import (
 # version is refused with its own text.
 # 4: an item's plugin side and host side are two objects (``lcm``, ``message``), a path is a
 # tuple of structural steps (PR P): the fields and the pages moved.
-TOKEN_VERSION = 4
+# 5: the query's excerpt standings (``from``/``is``: sidecar, carrier and stored beside content,
+# result, call and reasoning), its note and its header moved (#19, M-VERSION): a query result a
+# head before this one stored is a page of another meaning, reached only through a token, so the
+# token's version carries the meaning of what a page shows (the store format carries the tables,
+# which did not move). A v4 token of lcm_query is refused with "ask the question again, without
+# page", one of lcm_expand or lcm_grep with "start again from the handle, without page"
+# (``decode_token``).
+TOKEN_VERSION = 5
 
 # What each status of ``RecordStore.resolve`` tells the agent; "inactive" is told by its
 # cause (``_inactive_text``).
@@ -334,18 +342,19 @@ def decode_token(token: Any) -> dict:
     if not isinstance(state, dict) or not _plain_int(state.get("v")):
         raise ExpansionError("page is not a next_page token of these tools")
     if 1 <= state["v"] < TOKEN_VERSION:
-        raise ExpansionError("page is a token of an earlier version of these tools; start again from the handle, "
-                             "without page")
+        # A query's result has no handle to start again from: its question is asked again.
+        again = ("ask the question again, without page" if state.get("t") == "lcm_query"
+                 else "start again from the handle, without page")
+        raise ExpansionError(f"page is a token of an earlier version of these tools; {again}")
     if state["v"] != TOKEN_VERSION:
         raise ExpansionError("page is not a next_page token of these tools")
     # Every field, by type and range: a garbled token is refused with what is wrong in it.
-    # The fields every token has, then the fields of its tool: lcm_expand's handle, and
-    # lcm_grep's term, scope and all (#18 D2).
+    # The fields every token has, then the fields of its tool: lcm_expand's handle and form,
+    # lcm_grep's term, scope, all and form (#18 D2), lcm_query's stored report (#19 D3).
     checks = (
         ("t", lambda v: isinstance(v, str) and bool(v), "a tool name"),
         ("s", lambda v: isinstance(v, str) and bool(v), "a store's uuid"),
         *(_TOOL_TOKEN_FIELDS.get(state.get("t"), _TOOL_TOKEN_FIELDS["lcm_expand"])),
-        ("m", lambda v: v in ("raw", "collapsed"), "raw or collapsed"),
         ("i", lambda v: _plain_int(v) and v >= 0, "an item number of 0 or more"),
         ("f", lambda v: _plain_int(v) and v >= -1, "a field number of -1 or more"),
         ("o", lambda v: _plain_int(v) and v >= 0, "a character offset of 0 or more"),
@@ -367,14 +376,23 @@ def _plain_int(value: Any) -> bool:
 
 
 # The fields a tool's token carries beside the common ones (``decode_token``). A token of a
-# tool not named here is checked as lcm_expand's, and refused by the tool that reads it.
+# tool not named here is checked as lcm_expand's, and refused by the tool that reads it. The
+# form (``m``) belongs to the tools that have one; the query's result has none.
+_FORM_FIELD = ("m", lambda v: v in ("raw", "collapsed"), "raw or collapsed")
+# A stored query result (``query_reports.id``): "q" and eight base32 characters, never a handle.
+QUERY_REPORT_RE = re.compile(r"q[a-z2-7]{8}")
 _TOOL_TOKEN_FIELDS = {
-    "lcm_expand": (("h", lambda v: isinstance(v, str) and HANDLE_RE.fullmatch(v) is not None, "a handle"),),
+    "lcm_expand": (("h", lambda v: isinstance(v, str) and HANDLE_RE.fullmatch(v) is not None, "a handle"),
+                   _FORM_FIELD),
     "lcm_grep": (
         ("q", lambda v: isinstance(v, str) and bool(v), "a search term"),
         ("p", lambda v: v == "" or (isinstance(v, str) and HANDLE_RE.fullmatch(v) is not None),
          "the session (\"\") or a handle"),
         ("a", lambda v: isinstance(v, bool), "true or false"),
+        _FORM_FIELD,
+    ),
+    "lcm_query": (
+        ("k", lambda v: isinstance(v, str) and QUERY_REPORT_RE.fullmatch(v) is not None, "a stored query result"),
     ),
 }
 
@@ -1304,7 +1322,7 @@ class PageBuilder:
         alone = (f"; alone in a message it would hold {self.origin.alone}"
                  if self.origin and self.origin.alone > self.limit else "")
         token = "; this page's token stays valid" if page > 1 else ""
-        raise ExpansionError(f"page {page} of {self.target.header.get('handle')} cannot be built without leaving "
+        raise ExpansionError(f"page {page} of {_subject(self.target.header)} cannot be built without leaving "
                              f"something out: {what} needs {size} characters on a page by itself; a page here holds "
                              f"{self.limit}{origin}{alone}. Nothing was skipped{token}.")
 
@@ -1388,7 +1406,7 @@ class PageBuilder:
                     # What a request has room for is decided when the item is built
                     # (``_images_of``, ``Route.room``); an image shown there that no request
                     # admits alone is refused visibly, never held here or sent unseen.
-                    raise ExpansionError(f"page {page} of {self.target.header.get('handle')} cannot be built: "
+                    raise ExpansionError(f"page {page} of {_subject(self.target.header)} cannot be built: "
                                          f"{_identity(item, piece)} is an image the host's request limits do not "
                                          f"admit even alone ({self.image_room.why_not(value)}). Nothing was "
                                          f"skipped.")
@@ -1472,10 +1490,24 @@ class PageBuilder:
 
 
 
+def _subject(header: dict) -> str:
+    """What a page belongs to, for a refusal: the handle it opens, or, where the result opens
+    none (grep, the query), the kind of result (#78 item 13: never "None")."""
+    return str(header.get("handle") or f"this {header.get('kind') or 'tool'} result")
+
+
 def _identity(item: Item, piece: Any) -> str:
     """What a refusal names: the item, and the field of a piece."""
     said = item.annotations
-    if "summaries" in said:
+    if said.get("part") == "report":
+        name = "the query's report"
+    elif "excerpt" in said:
+        name = f"excerpt {said.get('excerpt')} (from {said.get('in')})"
+    elif "withheld" in said:
+        name = f"withheld excerpt {said.get('withheld')}"
+    elif "tail" in said:
+        name = "the note on the stored fresh tail"
+    elif "summaries" in said:
         name = f"the marker of chunk {said.get('chunk')}"
     elif "summary" in said:
         name = f"summary {said.get('summary')}"

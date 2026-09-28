@@ -98,12 +98,14 @@ class HostUnavailable(Exception):
     call; the summariser's own path keeps its fallbacks, which are not D1's)."""
 
 
-def _strict_import(what: str, module: str, name: str) -> Any:
+def _strict_import(what: str, module: str, name: str,
+                   so: str = "the message as the host sends it is not known") -> Any:
+    """The host's function, or ``HostUnavailable`` naming it and what cannot be known without it."""
     try:
         return getattr(__import__(module, fromlist=[name]), name)
     except Exception as exc:
         raise HostUnavailable(f"the host's {what} ({module}.{name}) cannot be read ({type(exc).__name__}: {exc}), "
-                              f"so the message as the host sends it is not known") from None
+                              f"so {so}") from None
 
 
 def _host_clone(message: dict, strict: bool = False) -> dict:
@@ -165,11 +167,29 @@ def host_reasoning_pad(provider: str, model: str, base_url: str) -> bool:
 
 
 def wire_facts(provider: str, model: str, base_url: str, api_mode: str,
-               reads_images: Optional[bool]) -> WireFacts:
+               reads_images: Optional[bool], *, strict: bool = False) -> WireFacts:
     """The route's facts for the input: whether the host sends ``reasoning_content``
     to it (``needs_reasoning_echo``, agent/message_sanitization.py at 7b761da) and
     whether its wire is the host's Anthropic converter (provider anthropic, or the
-    anthropic_messages API mode)."""
+    anthropic_messages API mode). ``strict`` (the query, #19): every host function is
+    called, and one that cannot be read raises ``HostUnavailable`` naming it; the
+    summariser's call keeps its three fallbacks until #72 is worked."""
+    if strict:
+        # Each names the fact that cannot be known without it; nothing is sent either way.
+        echo = bool(_strict_import(
+            "reasoning-echo test", "agent.message_sanitization", "needs_reasoning_echo",
+            so="whether the host sends reasoning_content to this route is not known; nothing was sent")(
+            provider, model, base_url))
+        mode = str(_strict_import(
+            "API mode canonicalisation", "hermes_cli.config_providers", "_canonical_api_mode",
+            so="the route's API mode as the host reads it is not known; nothing was sent")(
+            str(api_mode or ""))).lower()
+        dispatched = str(_strict_import(
+            "provider normalisation", "agent.auxiliary_client", "_normalize_aux_provider",
+            so="the route's provider as the host dispatches it is not known; nothing was sent")(
+            provider))
+        anthropic = mode == "anthropic_messages" or (dispatched == "anthropic" and mode in ("", "anthropic_messages"))
+        return WireFacts(reads_images=reads_images, needs_reasoning_echo=echo, anthropic_converter=anthropic)
     try:
         from agent.message_sanitization import needs_reasoning_echo  # type: ignore
         echo = bool(needs_reasoning_echo(provider, model, base_url))
@@ -446,7 +466,8 @@ def _has_payload(message: dict) -> bool:
 def summariser_message(raw: dict, record: str, facts: WireFacts,
                        withheld: Optional[dict[str, int]] = None) -> dict:
     """One record's message as the summariser receives it (see the module docstring).
-    The encrypted items withheld from it are added to ``withheld`` by kind."""
+    The encrypted items withheld from it are added to ``withheld`` by kind. (The query's
+    strict projection is ``query_input.strict_message``.)"""
     message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
     for kind, count in _withhold_encrypted(message).items():
         if withheld is not None:

@@ -80,12 +80,6 @@ class SummaryDAG:
 
     # -- Read ---------------------------------------------------------------
 
-    def get_node(self, node_id: int) -> Optional[SummaryNode]:
-        row = self._locked.execute(
-            "SELECT * FROM summary_nodes WHERE node_id = ?", (node_id,)
-        ).fetchone()
-        return self._row_to_node(row) if row else None
-
     def get_session_nodes(self, session_id: str,
                           depth: int | None = None,
                           limit: int = 1000) -> List[SummaryNode]:

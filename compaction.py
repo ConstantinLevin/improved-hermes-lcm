@@ -142,6 +142,13 @@ from .tokens import Estimator, count_message_tokens, count_messages_tokens
 
 logger = logging.getLogger(__name__)
 
+
+class SessionFactUnread(Exception):
+    """The fenced read of the session's reasoning effort did not complete
+    (``_summariser_settings`` with a fence, the query's): its cause is the fence's own stop or
+    the read's failure, and the caller says which."""
+
+
 # The words around a summary row (Decision 8, until #10 writes them). The wrapper carries
 # what the plugin knows, the summary's handle, which the tools take (#29 W5, #18); nothing
 # in it is read out of the summary's text (#9, Decided: nothing in a reply is recognised by
@@ -1175,10 +1182,12 @@ class CompactionMixin:
                           f"{route.target_problem}")
         return route, ""
 
-    def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
+    def _summariser_settings(self, fence: Optional[Callable[[], None]] = None) -> tuple[Optional[CallSettings], str]:
         """The summariser's route, effort and output cap, or the reason there is none
         (#9). No part of the route is guessed: it is what the host handed
-        ``update_model``."""
+        ``update_model``. ``fence`` (the query's; compaction passes none) fences the read of
+        the session's reasoning effort (``PluginSessions.latest_fact``); with it, a failure of
+        that read, or the fence's own stop, is raised to the caller, which says what happened."""
         config = self._config
         route, problem = self._summariser_route()
         if route is None:
@@ -1187,8 +1196,10 @@ class CompactionMixin:
         effort = None
         if self._plugin_session:
             try:
-                effort = self._sessions.latest_fact(self._plugin_session, "effort")
+                effort = self._sessions.latest_fact(self._plugin_session, "effort", fence=fence)
             except Exception as exc:
+                if fence is not None:
+                    raise SessionFactUnread(exc) from exc
                 return None, f"the session's reasoning effort could not be read ({type(exc).__name__})"
         effort = (effort or config.summary_reasoning_effort or "").strip().lower()
         if effort not in REASONING_EFFORTS:

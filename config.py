@@ -232,10 +232,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("summary_api_key", "LCM_SUMMARY_API_KEY", str),
     _EnvFieldSpec("summary_api_mode", "LCM_SUMMARY_API_MODE", str),
     _EnvFieldSpec("summary_reasoning_effort", "LCM_SUMMARY_REASONING_EFFORT", str),
-    _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
-    _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
     _EnvFieldSpec("summary_calls_in_flight", "LCM_SUMMARY_CALLS_IN_FLIGHT", int),
-    _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
 )
 
@@ -346,9 +343,7 @@ class LCMConfig:
     # The summariser's reasoning effort, the host's levels; a session's own value, set
     # by the owner's command, is a session fact and wins (#9, #26).
     summary_reasoning_effort: str = "medium"
-    expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
-    # Serialized summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
-    expansion_context_tokens: int = 32_000
+    # The query (#19) runs on the summariser's model and effort; it has no settings of its own.
 
     # -- Summariser calls in flight (#33) ---
     # The most summariser calls at once to one endpoint, process-wide; per endpoint
@@ -357,9 +352,6 @@ class LCMConfig:
     # plugin's own: each call is bounded by the host's deadline at its dispatch.
     summary_calls_in_flight: int = 8
     summary_calls_per_endpoint: dict[str, int] = field(default_factory=dict)
-
-    # -- Timeouts ---
-    expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
     # The base the store's file is formed from (db_bootstrap.store_path: the file carries the

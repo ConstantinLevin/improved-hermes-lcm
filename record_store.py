@@ -34,9 +34,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from .db_bootstrap import close_connection, open_store
+from .db_bootstrap import SQLITE_BUSY_TIMEOUT_MS, close_connection, fenced_lock, fenced_retried, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
-from .inflight import ChunkSummary
+from .inflight import _POLL_S, ChunkSummary
 from .message_content import base64_like_strings, describe_image_part, grep_text, image_parts
 from .tokens import Estimator
 
@@ -87,6 +87,26 @@ def _warn_media(handle: str, message: dict) -> None:
 
 
 HANDLE_RE = re.compile(r"[mtcs][a-z2-7]{8}")
+
+
+class WriteFenced(Exception):
+    """A fenced write's fence tripped: nothing of the transaction was committed
+    (``RecordStore._fenced_tx``)."""
+
+
+class ReadFenced(Exception):
+    """A fenced read's fence tripped while it waited: nothing more was read
+    (``RecordStore.snapshot`` with a fence)."""
+
+
+class CommittedButNotRestored(Exception):
+    """A fenced write committed, and a step after its COMMIT failed: restoring the connection's
+    busy timeout or releasing the helper's lock (``RecordStore._fenced_tx``; PLAN-83g §7). Both
+    facts hold: what the transaction wrote is in the store, and ``cause`` is the later failure."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(f"the transaction was committed; afterwards {type(cause).__name__}: {cause}")
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -243,6 +263,73 @@ class RecordStore:
                 self._tx_depth = 0
             self._flush_events()
 
+    def _fenced_lock(self, check: Callable[[], None]) -> None:
+        """Take the helper's lock in slices of ``_POLL_S``, asking ``check`` between them: the
+        wait for the lock lasts as long as this engine copy's other store work holding it
+        (planning, derivation and return writes, confirmations, grep's scan, expand's page, the
+        doctor's invariant: each finite, none waiting on a model, the limiter or a condition;
+        PLAN-83d §5), or until the fence trips (``db_bootstrap.fenced_lock``)."""
+        fenced_lock(self._lock, check, _POLL_S)
+
+    @staticmethod
+    def _retried(conn: sqlite3.Connection, statement: str, check: Callable[[], None]) -> Any:
+        """``statement`` at busy timeout 0, retried with the fence within the store's bound
+        (``db_bootstrap.fenced_retried``)."""
+        return fenced_retried(conn, statement, check, _POLL_S)
+
+    @contextlib.contextmanager
+    def _fenced_tx(self, fence: Callable[[], bool]):
+        """One short write transaction that commits nothing once ``fence()`` is true (the
+        query's result and its failure event, #19; PLAN-83d §5). Every wait is fenced: the
+        helper's lock is taken in slices of ``_POLL_S`` with the fence asked between them; the
+        connection's busy timeout is 0 for the transaction's duration, so that ``BEGIN
+        IMMEDIATE`` and ``COMMIT`` return SQLITE_BUSY at once and are retried here, the fence
+        asked before each try (in rollback-journal mode a COMMIT waits for readers' shared locks
+        and, after SQLITE_BUSY, "the transaction remains active and the COMMIT can be retried",
+        sqlite.org lang_transaction.html §2.3); the fence is asked again after the body. A fence
+        that trips rolls the transaction back (which also releases the PENDING lock a waiting
+        COMMIT holds) and raises ``WriteFenced``. What it cannot close: the COMMIT's own execution
+        once its last try has begun. Never nested in another transaction of this helper. It
+        writes no event other work left pending (ruling OD-P4a): those stay for the next
+        unfenced writer. Once the COMMIT has returned, a failure of a later step (restoring the
+        busy timeout, releasing the lock) is raised as ``CommittedButNotRestored``, so that no
+        caller reports a committed transaction as not written (PLAN-83g §7)."""
+        def check() -> None:
+            if fence():
+                raise WriteFenced()
+        committed = False
+        self._fenced_lock(check)
+        try:
+            try:
+                if self._tx_depth or self._read_depth:
+                    raise RuntimeError("a fenced transaction cannot be nested in an open one of this helper")
+                conn = self._conn
+                check()
+                conn.execute("PRAGMA busy_timeout = 0")
+                try:
+                    self._retried(conn, "BEGIN IMMEDIATE", check)
+                    self._tx_depth = 1
+                    try:
+                        yield conn
+                        self._retried(conn, "COMMIT", check)
+                        committed = True
+                    except BaseException:
+                        self._rollback(conn)
+                        raise
+                    finally:
+                        self._tx_depth = 0
+                finally:
+                    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+            finally:
+                self._lock.release()
+        except Exception as exc:
+            # Only an Exception is converted: a BaseException after the COMMIT passes as the host's,
+            # and the event's log line then says not written for a written event (the orchestrator's
+            # ruling on PLAN-83g §7, 2026-09-28; a residual, said in the PR body).
+            if committed:
+                raise CommittedButNotRestored(exc) from exc
+            raise
+
     def transaction(self):
         """One write transaction, or a savepoint inside an open one (``_tx``)."""
         return self._tx()
@@ -334,6 +421,11 @@ class RecordStore:
     def effective_count(self, session: str) -> int:
         """How many of the session's compactions took effect."""
         rows = self._q("SELECT COUNT(*) FROM effective_compactions WHERE session = ?", (session,))
+        return int(rows[0][0]) if rows else 0
+
+    def compaction_count(self, session: str) -> int:
+        """How many compactions of the session the store holds, whatever became of them."""
+        rows = self._q("SELECT COUNT(*) FROM compactions WHERE session = ?", (session,))
         return int(rows[0][0]) if rows else 0
 
     def derivations(self, handles: Iterable[str]) -> dict[str, tuple[int, str]]:
@@ -652,12 +744,23 @@ class RecordStore:
     # --- Reading for the tools (#18; #29 W5) -----------------------------------------
 
     @contextlib.contextmanager
-    def snapshot(self):
+    def snapshot(self, fence: Optional[Callable[[], bool]] = None):
         """One read transaction around a tool's reads, so that a compaction committing
         meanwhile, in this process or another, is not half seen. It holds the helper's
         lock and, in rollback-journal mode, a shared lock on the file: a writer's commit
         waits for it (within its busy timeout), so nothing slow runs inside it, and never
-        a model call. Inside an open transaction of this helper it joins that one."""
+        a model call. Inside an open transaction of this helper it joins that one.
+
+        With a ``fence`` (the query, PLAN-83d §5; ruling OD-P4c) every wait is fenced: the
+        helper's lock is taken in slices with the fence asked between them; the shared lock
+        is taken by a first read at busy timeout 0, retried with the fence asked before each
+        try, and the busy timeout is restored once it is held (a read transaction keeps it to
+        its end, so no later read of it waits for a lock); a fence that trips ends the read
+        and raises ``ReadFenced``. It writes no pending event at its end: those stay for the
+        next unfenced writer. What it cannot close: a read's own execution once begun."""
+        if fence is not None:
+            yield from self._fenced_snapshot(fence)
+            return
         with self._lock:
             conn = self._conn
             if self._tx_depth or self._read_depth:
@@ -679,6 +782,38 @@ class RecordStore:
             finally:
                 self._read_depth = 0
             self._flush_events()
+
+    def _fenced_snapshot(self, fence: Callable[[], bool]):
+        """``snapshot`` with a fence (its docstring)."""
+        def check() -> None:
+            if fence():
+                raise ReadFenced()
+        self._fenced_lock(check)
+        try:
+            if self._tx_depth or self._read_depth:
+                raise RuntimeError("a fenced read cannot be nested in an open transaction of this helper")
+            conn = self._conn
+            check()
+            conn.execute("BEGIN")
+            self._read_depth = 1
+            try:
+                conn.execute("PRAGMA busy_timeout = 0")
+                try:
+                    # The first read takes the file's shared lock (the store's identity row is
+                    # always there, db_bootstrap's store_identity).
+                    self._retried(conn, "SELECT 1 FROM store_identity LIMIT 1", check).fetchall()
+                finally:
+                    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+                yield
+            except BaseException:
+                self._rollback(conn)
+                raise
+            else:
+                conn.execute("COMMIT")
+            finally:
+                self._read_depth = 0
+        finally:
+            self._lock.release()
 
     def cover(self, session: str) -> Optional["Cover"]:
         """What the session's latest effective compaction returned, as the tools see it:
@@ -952,26 +1087,65 @@ class RecordStore:
                 f"SELECT handle, raw FROM records WHERE handle IN ({','.join('?' * len(part))})", part)})
         return found
 
-    def handles_of_records(self, record_ids: Iterable[int]) -> dict[int, str]:
-        """record id (the views' store_id) -> its handle."""
-        wanted = [int(i) for i in dict.fromkeys(record_ids) if i is not None]
-        found: dict[int, str] = {}
-        for start in range(0, len(wanted), 500):
-            part = wanted[start:start + 500]
-            found.update({int(i): str(h) for i, h in self._q(
-                f"SELECT record_id, handle FROM records WHERE record_id IN ({','.join('?' * len(part))})", part)})
-        return found
 
-    def handles_of_derivations(self, derivation_ids: Iterable[int]) -> dict[int, str]:
-        """derivation id (the views' node_id) -> its handle."""
-        wanted = [int(i) for i in dict.fromkeys(derivation_ids) if i is not None]
-        found: dict[int, str] = {}
-        for start in range(0, len(wanted), 500):
-            part = wanted[start:start + 500]
-            found.update({int(i): str(h) for i, h in self._q(
-                f"SELECT derivation_id, handle FROM derivations WHERE derivation_id IN ({','.join('?' * len(part))})",
-                part)})
-        return found
+    # --- The query's stored results (#19 D3) -----------------------------------------
+
+    def write_query_report(self, *, report_id: str, session: str, question: str, body: str,
+                           model: Optional[str], provider: Optional[str], effort: Optional[str],
+                           finish_reason: Optional[str], fence: Callable[[], bool]) -> bool:
+        """One query's checked result, written once, in one short fenced transaction
+        (``_fenced_tx``: once ``fence()`` is true nothing is committed and ``WriteFenced`` is
+        raised). False, and nothing written, when the report id is already taken. True once the
+        row is committed, also where a step after the COMMIT failed (``CommittedButNotRestored``:
+        the row is stored and a page token addresses it; the later failure is logged at ERROR)."""
+        taken = False
+        try:
+            with self._fenced_tx(fence) as conn:
+                if conn.execute("SELECT 1 FROM query_reports WHERE id = ?", (report_id,)).fetchone():
+                    taken = True
+                else:
+                    conn.execute(
+                        "INSERT INTO query_reports(id, session, created_at, question, body, model, provider, effort, "
+                        "finish_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (report_id, session, time.time(), question, body, model or None, provider or None,
+                         effort or None, finish_reason or None))
+        except CommittedButNotRestored as exc:
+            if taken:
+                logger.error("LCM wrote no query result %s in %s: the id is taken; %s", report_id, self.db_path, exc)
+            else:
+                logger.error("LCM stored query result %s in %s; %s", report_id, self.db_path, exc)
+        return not taken
+
+    def write_event_fenced(self, kind: str, *, session: Optional[str], detail: Any,
+                           fence: Callable[[], bool], compaction: Optional[int] = None) -> None:
+        """One store event written in a fenced transaction (``_fenced_tx``; the query's failure
+        to store its result, ruling OD-P4b; a fenced settle's failures and its duplicated
+        position, M-BOUNDARY-FENCE): once ``fence()`` is true nothing is written and
+        ``WriteFenced`` is raised. A failure raises; the event is never kept pending, since a
+        pending event would be written by another writer after the host stopped waiting. The row
+        has the shape ``event`` writes for its kind: ``compaction`` in its column where the event
+        is about one, ``detail`` as the string or the JSON of the value."""
+        text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
+        try:
+            with self._fenced_tx(fence) as conn:
+                conn.execute("INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
+                             (time.time(), kind, session, compaction, text))
+        except CommittedButNotRestored as exc:
+            # Written: the log says so, and the failure after the COMMIT beside it (PLAN-83g §7).
+            logger.error("LCM store event %s (session=%s) written; %s: %s", kind, session, exc, text)
+            return
+        except BaseException as exc:
+            # The log says an event only where one was written (PLAN-83e §7).
+            logger.warning("LCM store event %s (session=%s) not written (%s): %s", kind, session,
+                           "the host asked the call to stop" if isinstance(exc, WriteFenced) else type(exc).__name__,
+                           text)
+            raise
+        logger.warning("LCM store event %s (session=%s): %s", kind, session, text)
+
+    def query_report(self, report_id: str) -> Optional[tuple[str, str]]:
+        """(session, body) of a stored query result, or None."""
+        rows = self._q("SELECT session, body FROM query_reports WHERE id = ?", (report_id,))
+        return (str(rows[0][0]), str(rows[0][1])) if rows else None
 
     # --- The invariant (#29 W7, #34 D5) --------------------------------------------
 

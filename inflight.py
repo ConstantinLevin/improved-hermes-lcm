@@ -150,7 +150,8 @@ class EndpointLimiter:
             until = time.monotonic() + float(seconds)
             if until > self._held_until:
                 self._held_until = until
-                logger.warning("LCM holds summariser calls to %s for %.1fs (the provider's Retry-After)",
+                # The limiter is shared by the summariser's calls and the query's (#19).
+                logger.warning("LCM holds its model calls to %s for %.1fs (the provider's Retry-After)",
                                self.key, seconds)
             self._cond.notify_all()
 

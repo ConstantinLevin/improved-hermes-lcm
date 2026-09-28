@@ -130,38 +130,120 @@ LCM_DOCTOR = {
     },
 }
 
-LCM_EXPAND_QUERY = {
-    "name": "lcm_expand_query",
+LCM_QUERY = {
+    "name": "lcm_query",
     "description": (
-        "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt and "
-        "the handles (s…) of the summaries to read (lcm_grep finds where a term lies). Uses the expansion path "
-        "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
-        "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
-        "Prefer this for questions about the active conversation after compaction."
+        "Ask a question about what stands behind summaries or chunks in your context, without loading it: give "
+        "their handles (s… or c…) and the question; every handle must resolve, or the query reads nothing. It "
+        "reads the chunks behind them in the latest compaction of this session that took effect, in the order of "
+        "your context, each chunk once however many handles reach it, never a summary's text. Everything behind "
+        "every handle is given, in one call, to the model that writes your summaries, with the query's "
+        "instructions, a label on each message naming its handles, and notes of the query's own, each saying what "
+        "it is: each stored message as its role, content, tool calls and readable reasoning (where the host sends a "
+        "message's api_content text in place of its stored content, that text, and the message's label says so); "
+        "any other stored value is given as labelled JSON (a content member in its place, any other value after "
+        "the message's content); a message stored with a role other than user, assistant or tool, or with none, is "
+        "given as a user message whose label says so; a tool call is given as a call only where the records given "
+        "hold its result and the host's Anthropic converter would keep it, else as labelled JSON, and a tool result "
+        "no call given as a call answers is given as a user message whose label says so (the header's "
+        "calls_not_given_as_calls counts both); a text or tool call only a replay carrier holds is given as a "
+        "labelled part; an image is given as stored only where the host's own converter delivers it as an image on "
+        "every leg the call can go on; an image the model is not given as an image is replaced by a placeholder "
+        "that says so where it stood, or named where it stood and counted (the header's images_not_sent says each "
+        "kind); material the host treats as opaque replay (signatures, encrypted "
+        "content, a tool call's thought signature) is withheld and counted wherever it is stored outside the "
+        "transcript's own content, tool-call arguments and tool results; the host's bookkeeping keys and a replay "
+        "carrier's metadata are not given; null, empty and blank values carry nothing and are not given as parts "
+        "(inside a value given as JSON they stay as stored). Where that cannot be shown, the query is refused with "
+        "the cause, and nothing is ever cut: the input is larger than the model's window less its output, where "
+        "the plugin knows the window; the host's Anthropic converter would retire images on a leg the call can go "
+        "on (by its own outbound_image_retire_count); an image one leg's converter delivers as an image and another's "
+        "does not; a record cannot be given as it is (a record is stored as a JSON value that is not a message; a "
+        "chunk begins with a tool result; a part the query gives has no recorded origin); the host's converter, on "
+        "any leg the host can send the call on and under every value of that leg's inputs the plugin cannot read "
+        "before the call (on an Anthropic or GitHub Copilot credential refresh, whether the host's image "
+        "conversion runs there, and on an Anthropic one whether the token is an OAuth one; on an openai-codex or "
+        "xai-oauth refresh the endpoint is read from the host's own sources before the call), would not give the "
+        "model, in order, every non-blank text part, every "
+        "image (as an image, not its bytes) and every tool call (by its name, and by its arguments where they parse "
+        "as JSON) the query gives it; the host can send the call on a wire the plugin has not established, or "
+        "retry after an authentication error on a provider's client whose wire the plugin has not established; the "
+        "host could answer on a leg whose wire cannot be known before the call: a fallback provider configured "
+        "under this route's own provider and model, a credential pool the host can rotate while fallback providers "
+        "are configured, a managed NeMo Relay, or this call running as a managed Relay callback on a thread the "
+        "plugin cannot establish; an openai-codex or xai-oauth credential refresh whose endpoint the query cannot "
+        "read before the call; or a page cannot hold the result's header and one piece of it. Every other "
+        "failure is "
+        "an error that names its cause: an argument or handle the tool cannot take, an engine bound to no session, "
+        "a session with nothing compacted yet, the session's summariser route or reasoning effort (including a "
+        "store lock held past its busy timeout), a host function the query calls that cannot be read, the host's "
+        "per-result and per-message limits leaving no page, the host asking the call to stop, the model's call or "
+        "reply (another model answering, a cut or empty reply, a reply that is not the JSON asked for), a result "
+        "that needs pages and cannot be built or stored, a page token that does not fit, a stored result a page "
+        "token names that is not of the query's shape, a call reaching the query without the boundary's stop "
+        "latch, any other failure before "
+        "the call (named by its class), and the engine's own boundary (a closed engine, the host's stop read, the "
+        "host asking the call to stop while the engine settles the list it handed over, with nothing settled, sent "
+        "or stored, finishing the result), named by its step. An error raised before the model is called says that "
+        "nothing was sent; one raised after it says what became of the reply; one on a page request says that no "
+        "page was served. It returns a report and excerpts. The report is a model's description, asked to be "
+        "hedged: orientation, never something to act on; the model is asked to name the handles it draws on, "
+        "which lcm_expand opens (the query does not check them). Each excerpt was found verbatim in the record "
+        "named by \"in\", in the fields named by \"from\" (each a path into the record as lcm_expand shows it, with "
+        "that field's standing \"is\": a claim about where the text came from, which only the host's writer of the "
+        "field settles): content, the message's content as the host stored it, and result, a tool result, may be "
+        "relied on as an expansion may; call, a tool call's name or arguments (cited by the handle of the message "
+        "that made the call), is what was called; reasoning is the model's account of its thinking, and nothing "
+        "rests on it; sidecar is the text the host sent in place of the message's stored content (api_content: on "
+        "an agent message the model's reasoning when its reply had no content, then also found in reasoning, a "
+        "hook's output, or the host's interruption placeholder; on a user message the user's text with what the "
+        "host injected; which, the host does not record); carrier is a text of the host's replay carrier of the "
+        "message, or of its stash of a tool result's blocks, that the content does not hold (the provider's text "
+        "before the host stripped it, so reasoning the host stripped, a tool call the model wrote as text, or "
+        "content the host altered: its outer whitespace, a secret it masked, a non-text part it dropped; which, "
+        "the host does not record); stored is a value under a key no producer of this host "
+        "writes on the message's role. An excerpt found only in sidecar, carrier or stored fields is verbatim "
+        "what the store holds there, and nothing rests on it as the message's content. An excerpt that does "
+        "not pass the check is withheld, with the check it failed (its handle where it is one, never its text). A "
+        "result longer than one page carries next_page: call again with page=next_page alone. The query calls its "
+        "model once and tries nothing again: an error of the call names what the host's own recovery for that "
+        "error can have changed on the route in use; a reply the query refuses is named with why, and what the "
+        "host did before that reply is not known to the query; call again if you want to. If the host asks this "
+        "call to stop (its tool timeout, or you are interrupted), then once the plugin has seen the stop nothing "
+        "more is settled, read, sent or stored for this call: the stop is read at the engine's boundary, before the "
+        "list the host handed over is settled, and a settle that committed before the stop was seen stays; seen "
+        "before the model's reply is read, the answer is lost; after the reply, a result that fits one page "
+        "is still returned, and one that needs more pages is neither stored nor shown; a page asked for after the "
+        "stop is not served. The plugin sees the host's stop by its interrupt bit and by the host's own tool "
+        "timeout, which it counts from the boundary: the host set its deadline when it dispatched the worker, "
+        "before its own steps on the worker (a managed Relay pipeline where one is enabled, its request and "
+        "execution middleware, its pre_tool_call hooks with any approval wait, its pruned-argument scan and "
+        "guardrails) and extends it by the seconds an approval wait took, which the plugin cannot read; for that "
+        "difference after the host stopped waiting, and after an interrupt the host sets and clears again while "
+        "the query runs one long host function of its check, the query can still call the model and store a "
+        "result nobody reads. On some routes the model's request still runs on after the query stopped reading: "
+        "every result's header says under call what happens on each wire the host can send the call on, and "
+        "under after_the_return what the host can do to the returned page before it stands in the context (a "
+        "transform_tool_result hook, its identical-result stub for a repeated page, its spill and turn budget, "
+        "its loop notices, its failure count)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "The question or task to answer from expanded LCM context",
-            },
             "handles": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "The summary handles (s…) to expand",
+                "description": "The handles of the summaries (s…) or chunks (c…) whose stretches the question is about.",
             },
-            "max_tokens": {
-                "type": "integer",
-                "description": "Max answer tokens for bounded synthesis returned to the main agent (default 2000)",
-                "default": 2000,
+            "question": {
+                "type": "string",
+                "description": "The question.",
             },
-            "context_max_tokens": {
-                "type": "integer",
-                "description": "Expanded serialized summary/raw/child-source fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
-                "default": 32000,
+            "page": {
+                "type": "string",
+                "description": "The next_page token of an earlier result, given alone, to read its next page.",
             },
         },
-        "required": ["prompt"],
+        "required": [],
     },
 }
