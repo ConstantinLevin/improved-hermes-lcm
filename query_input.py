@@ -376,17 +376,13 @@ def _image_parts(block: dict, path: tuple, given: Given, origin: str, kind: str,
     return parts + other, withheld
 
 
-def _image_paths(value: Any, path: tuple) -> Iterable[tuple]:
-    """Every image part inside a value, at any depth, each once (an image part is not searched
-    further): the walk ``_render`` makes, with nothing given (M3, the images behind a sidecar)."""
-    if image_part(value):
-        yield path
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield from _image_paths(item, path + (key,))
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            yield from _image_paths(item, path + (index,))
+def _images_in(value: Any, path: tuple) -> int:
+    """How many image parts a stored value holds, at any depth, each once: ``_render``'s own walk
+    with lifting off, run into a Given of its own so that nothing of it is given (M3, the images of
+    a stored content the host sends api_content in place of; PLAN-83g §3.3)."""
+    scratch = Given()
+    _step(value, path, CONTENT, GIVEN_CONTENT, _Walk(scratch, lift=False))
+    return len(scratch.images_elsewhere)
 
 
 # --- M1: one walk carrying the kind of the stored field (PLAN-83g §3.1) --------------------------
@@ -396,11 +392,11 @@ def _image_paths(value: Any, path: tuple) -> Iterable[tuple]:
 # arguments and everything inside them; reasoning (the reasoning fields, the reasoning replay
 # carriers, a thinking block, everything under them); a text replay carrier or the stash
 # (everything under it unless a transition names another kind); an unknown top-level key. Three
-# more names mark the places where a transition of table T is taken inside one walk: a list of
-# calls, a call's ``function``, a tool_use block.
+# more names mark the places where a transition of table T is taken inside one walk: a call dict,
+# a call's ``function``, a tool_use block.
 CONTENT, CALL, CALL_VALUE, REASONING, CARRIER, STORED_KIND = (
     "content", "call", "call value", "reasoning", "carrier", "stored")
-_CALLS, _CALL_DICT, _FUNCTION, _TOOL_USE = "calls", "call dict", "function", "tool use"
+_CALL_DICT, _FUNCTION, _TOOL_USE = "call dict", "function", "tool use"
 
 # The host's opaque vocabulary (PLAN-83g §3.1; Hermes 375930d089, reader RH1 Q2): the keys under
 # which the host keeps replay material no other model can read, at its own places —
@@ -418,7 +414,7 @@ _CALLS, _CALL_DICT, _FUNCTION, _TOOL_USE = "calls", "call dict", "function", "to
 OPAQUE_VOCABULARY = frozenset({"signature", "data", "encrypted_content", "redactedContent", "redactedContentBase64"})
 _CALL_VOCABULARY = OPAQUE_VOCABULARY | {"extra_content"}
 _NEVER_WITHHELD = frozenset({CONTENT, CALL_VALUE})
-_CALL_KINDS = frozenset({CALL, CALL_VALUE, _CALLS, _CALL_DICT, _FUNCTION, _TOOL_USE})
+_CALL_KINDS = frozenset({CALL, CALL_VALUE, _CALL_DICT, _FUNCTION, _TOOL_USE})
 _WITHHELD = ("[withheld: opaque replay material under this key; counted in the header's encrypted_withheld]")
 
 # Table T (PLAN-83g §3.1), the transitions taken inside one walk: a member of the stored content
@@ -471,8 +467,7 @@ def _step(value: Any, path: tuple, kind: str, base: str, walk: _Walk) -> Any:
         walk.given.values.append((path, json.dumps(value), _standing(kind, base)))
         return value
     if isinstance(value, list):
-        inner = _CALL_DICT if kind == _CALLS else kind
-        return [_step(item, path + (index,), inner, base, walk) for index, item in enumerate(value)]
+        return [_step(item, path + (index,), kind, base, walk) for index, item in enumerate(value)]
     if not isinstance(value, dict):
         return value
     if image_part(value):
@@ -494,8 +489,6 @@ def _step(value: Any, path: tuple, kind: str, base: str, walk: _Walk) -> Any:
             return {key: _step(item, path + (key,), CONTENT, GIVEN_RESULT if key == "content" else base, walk)
                     for key, item in value.items()}
         kind = _CONTENT_BLOCK_KINDS[value["type"]]
-    if kind == _CALLS:
-        kind = _CALL_DICT
     faced = {}
     for key, item in value.items():
         where = path + (key,)
@@ -1086,7 +1079,8 @@ def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> Non
                   foreign=True)
     path = ("message", key)
     if key in ("reasoning", "reasoning_content"):
-        sub.readable_text(value, path)
+        if sub.readable_text(value, path):
+            sub.count(key)
     elif key == "reasoning_details":
         _reasoning_details(value, sub)
     elif key == "codex_reasoning_items":
@@ -1111,10 +1105,10 @@ def _foreign(key: str, value: Any, raw: dict, face: _Record, shown: list) -> Non
             sub.count("tool_calls")
     elif key == "api_content":
         sub.not_text(value, path, CONTENT)
-    else:
+    elif sub.json(f"[{_path_text(path)} as stored; shown as its JSON by the query:]", value, path, STORED_KIND):
         # tool_call_id, name: the wire's pairing key and the host's bookkeeping, stored where the host
-        # writes neither; given as they are stored.
-        sub.json(f"[{_path_text(path)} as stored; shown as its JSON by the query:]", value, path, STORED_KIND)
+        # writes neither; given as they are stored, what the vocabulary names inside withheld and counted.
+        sub.count(key)
     readable = _readable_parts(sub.readable, face.given, shown)
     if not (readable or sub.after):
         return
@@ -1165,7 +1159,7 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
         # M3: the images of a stored content the host sends api_content in place of (the host
         # replaces the content wholesale on every request, agent/turn_context.py 1231-1256), held
         # by the handles and not given; its label says the stored content is not given.
-        given.images_behind_sidecar += sum(1 for _path in _image_paths(raw["content"], ("message", "content")))
+        given.images_behind_sidecar += _images_in(raw["content"], ("message", "content"))
     # The keys in the order the host's own row has them (role, content, reasoning_content,
     # tool_calls; a tool result's call id after its content), so that the request is the host's.
     if "reasoning_content" in domain and isinstance(row.get("reasoning_content"), str):

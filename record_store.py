@@ -1110,7 +1110,10 @@ class RecordStore:
                         (report_id, session, time.time(), question, body, model or None, provider or None,
                          effort or None, finish_reason or None))
         except CommittedButNotRestored as exc:
-            logger.error("LCM stored query result %s in %s; %s", report_id, self.db_path, exc)
+            if taken:
+                logger.error("LCM wrote no query result %s in %s: the id is taken; %s", report_id, self.db_path, exc)
+            else:
+                logger.error("LCM stored query result %s in %s; %s", report_id, self.db_path, exc)
         return not taken
 
     def write_event_fenced(self, kind: str, *, session: Optional[str], detail: Any,

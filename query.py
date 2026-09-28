@@ -531,15 +531,14 @@ def _recovery(exc: BaseException, facts: _RouteFacts, timeout: float) -> str:
     host's own tests of the error it raised (agent/auxiliary_client.py at Hermes 375930d089:
     the same-provider re-sends, 8044-8067; the fallback walk, 7669-7760; the credential rungs,
     7580-7641). The plugin cannot see which of it happened. Where one of the host's tests cannot be
-    read, that is the clause, and the call's own failure text stays whole (PLAN-83g §3.7)."""
-    class _Unread(Exception):
-        pass
-
+    read, or its retry count raises, that is the clause, and the call's own failure text stays whole
+    (PLAN-83g §3.7)."""
     def host(name: str) -> Any:
         try:
             return getattr(__import__("agent.auxiliary_client", fromlist=[name]), name)
         except Exception as error:
-            raise _Unread(f"agent.auxiliary_client.{name} cannot be read: {type(error).__name__}: {error}") from None
+            raise _RecoveryUnread(f"agent.auxiliary_client.{name} cannot be read: {type(error).__name__}: "
+                                  f"{error}") from None
 
     def test(name: str) -> bool:
         check = host(name)
@@ -549,14 +548,24 @@ def _recovery(exc: BaseException, facts: _RouteFacts, timeout: float) -> str:
             return False
     try:
         return _recovery_clauses(exc, facts, timeout, host, test)
-    except _Unread as unread:
+    except _RecoveryUnread as unread:
         return f"what the host's recovery did is not known ({unread})"
+
+
+class _RecoveryUnread(Exception):
+    """A host function ``_recovery`` reads cannot be read, or raised: what the host's recovery did is
+    not known, and that is the clause."""
 
 
 def _recovery_clauses(exc: BaseException, facts: _RouteFacts, timeout: float, host: Any, test: Any) -> str:
     said = []
     if test("_is_transient_transport_error"):
-        retries = host("_transient_retry_count")()
+        count = host("_transient_retry_count")
+        try:
+            retries = count()
+        except Exception as error:
+            raise _RecoveryUnread(f"agent.auxiliary_client._transient_retry_count() raised "
+                                  f"{type(error).__name__}: {error}") from None
         said.append(f"it re-sent the request to the same provider up to {retries} time(s) (auxiliary.transient_"
                     f"retries), each read allowed {timeout:g} s")
     payment, rate, auth = test("_is_payment_error"), test("_is_rate_limit_error"), test("_is_auth_error")
@@ -808,27 +817,32 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
         stats["images_behind_sidecar"] += given.images_behind_sidecar
         if any(isinstance(raw.get(key), list) and raw.get(key) for key in TEXT_REPLAY_CARRIERS + (STASH,)):
             stats["carriers"] += 1
-        if joins and raw.get("role") == "tool":
-            said = _joined_tool_content(record, message, raw, given)
-            if said is not None:
-                joined[record] = said
         sent.append(_Sent(record, message, None, given))
     if problems:
         raise ExpansionError(
             f"the query gives its model each message's stored content and calls, never the host's replay carrier, and "
             f"these records cannot be given as they are: {' | '.join(problems)}: ask over other handles")
+    # Every part of every message has one recorded origin (PLAN-83d §2's property), asserted at one
+    # site, before the join reads the origins of a tool result's parts (PLAN-83g §4.3). The labels
+    # added after it make only parts they record (``label_message``: the label, and a string content
+    # as one stored part), and a tool result carries none (OD-D).
+    unrecorded = [entry.record for entry in sent if unrecorded_parts(entry.message, entry.given)]
+    if unrecorded:
+        raise ExpansionError(f"a part the query gives of {', '.join(unrecorded)} has no recorded origin, so the query "
+                             f"cannot say what it gives")
+    if joins:
+        raw_of = {record: raw for _chunk, record, raw in rows}
+        for entry in sent:
+            if raw_of[entry.record].get("role") == "tool":
+                said = _joined_tool_content(entry.record, entry.message, raw_of[entry.record], entry.given)
+                if said is not None:
+                    joined[entry.record] = said
     labels = _labels(found, rows, joined)
     for entry in sent:
         if entry.record in labels:
             # No label of the plugin's inside a tool result (OD-D).
             label_message(entry.message, labels[entry.record], entry.given)
             entry.label = labels[entry.record]
-    # Every part of every message has one recorded origin (PLAN-83d §2's property), asserted at
-    # one site, right after the labels are added and before any join (PLAN-83g §4.3).
-    unrecorded = [entry.record for entry in sent if unrecorded_parts(entry.message, entry.given)]
-    if unrecorded:
-        raise ExpansionError(f"a part the query gives of {', '.join(unrecorded)} has no recorded origin, so the query "
-                             f"cannot say what it gives")
     for entry in sent:
         if entry.record in joined:
             _join(entry.message, entry.given)
@@ -1250,7 +1264,7 @@ def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
     1852-1857 at Hermes 375930d089), and its hooks, Relay and middleware keep a dict. Every error
     it raises passes through one scope (``_Refusals``), entered before anything else once the
     branch is known from the arguments."""
-    with _Refusals(page="page" in args) as scope:
+    with _Refusals(page=isinstance(args, dict) and "page" in args) as scope:
         removed = [f"{name} ({why})" for name, why in _REMOVED.items() if name in args]
         if removed:
             raise ExpansionError("lcm_query no longer accepts " + "; ".join(removed) + ". It takes handles, question "
