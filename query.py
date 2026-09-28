@@ -203,19 +203,23 @@ _ENUMERATED_PREPASS = ("whether the host's image conversion runs there (it runs 
 
 def _refresh_prepass(provider: str, so: str) -> tuple[tuple, str]:
     """The values of the host's image conversion on the credential-refresh leg of ``provider``, and what the header
-    says of them (PLAN-19 §2.1; the orchestrator's ruling, 2026-09-28). The host runs
-    ``_convert_openai_images_to_anthropic`` on that retry where ``_is_anthropic_compat_endpoint(provider, base)`` holds
-    for the base the rebuilt client has (``_prepare_same_provider_retry``, agent/auxiliary_client.py 3768, 3781-3782,
-    at Hermes 375930d089). For openai-codex and xai-oauth that base is read here before the call from the host's own
-    side-effect-free sources and ordered by the host's own functions; the value is then "on" where the host's
-    predicate holds for it. Loading or selecting the host's credential pool can write auth.json, refresh tokens or
-    probe a quota, so the persisted rows are read with ``read_credential_pool`` (hermes_cli/auth.py 884-908), which
-    sees only rows an earlier load persisted; each persisted row with a token a selection could pick is a candidate
-    base (without one, the host's own fallback base), and where they differ both values are checked; a row the pool
-    loader seeds at the call carries the default base, whose value is off. For any other provider (anthropic,
-    copilot) the base comes from a credential
-    resolution with side effects, and both values are checked. A source that cannot be read raises, and the caller
-    refuses the leg naming it."""
+    says of them (PLAN-19 §2.1). The host runs ``_convert_openai_images_to_anthropic`` on that retry where
+    ``_is_anthropic_compat_endpoint(provider, base)`` holds for the base the rebuilt client has
+    (``_prepare_same_provider_retry``, agent/auxiliary_client.py 3768, 3781-3782, at Hermes 375930d089). Loading or
+    selecting the host's credential pool writes auth.json, refreshes tokens and probes a quota, so for openai-codex
+    and xai-oauth the bases are read from the persisted rows (``read_credential_pool``, hermes_cli/auth.py 884-908)
+    and routed by the host's own functions, before the call and without side effects.
+
+    Which branch the host takes at the call (which row ``select()`` returns, whether a row is on cooldown, expiring
+    or dead, whether the loader seeds a row) is not read but covered: the candidate set is every base the host's
+    resolver can return from those sources, and the values are the host's predicate over all of them, both checked
+    where they differ. The pool loader seeds, on every load, a row with source ``device_code`` from the singleton
+    ``providers.<id>.tokens`` with the default base, and overwrites a persisted device_code row's base with it
+    (agent/credential_pool.py ``load_pool`` 3039-3113, ``_seed_tokens_singleton`` 2773-2798); a device_code row
+    without a singleton is pruned. So a device_code row's base is the default whatever it stores.
+
+    For any other provider (anthropic, copilot) the base comes from a credential resolution with side effects, and
+    both values are checked. A source that cannot be read raises, and the caller refuses the leg naming it."""
     if provider not in ("openai-codex", "xai-oauth"):
         return (False, True), _ENUMERATED_PREPASS
 
@@ -225,24 +229,34 @@ def _refresh_prepass(provider: str, so: str) -> tuple[tuple, str]:
     rows = host("persisted credential pool reader", "hermes_cli.auth", "read_credential_pool")(provider)
     pooled = host("pooled credential", "agent.credential_pool", "PooledCredential")
     entries = [pooled.from_dict(provider, row) for row in rows if isinstance(row, dict)]
+    def seeded(entry: Any) -> bool:
+        return str(getattr(entry, "source", "") or "") == "device_code"
     if provider == "openai-codex":
-        # ``_resolve_codex_credential_and_base`` (2110-2126): the profile-scoped HERMES_CODEX_BASE_URL wins; a pooled row
-        # with a token goes where the host's pool route sends it (``_codex_pool_route_base_url``, which applies
-        # ``_pool_entry_mode_and_url`` over ``model.base_url`` read by ``load_config_readonly``); without such a row the
-        # override, else the host's default.
+        # ``_resolve_codex_credential_and_base`` (2110-2126): with the profile-scoped HERMES_CODEX_BASE_URL set, every
+        # branch returns it. Else a selected row with a token goes where the host's pool route sends it
+        # (``_codex_pool_route_base_url``, which applies ``_pool_entry_mode_and_url`` and so replaces a base that is ""
+        # or the default with ``model.base_url`` where ``model.provider`` is openai-codex, runtime_provider.py 520-564);
+        # the seeded device_code row, whose base is the default, is routed the same way; and where no row is selectable
+        # (cooldown, an expiring token, a dead row, no pool) the 2126 branch returns the default, not routed.
         override = host("Codex endpoint override", "agent.auxiliary_client", "_codex_base_url_override")()
         default = host("Codex default endpoint", "agent.auxiliary_client", "_CODEX_AUX_BASE_URL")
         key_of = host("pooled key reader", "agent.auxiliary_client", "_pool_runtime_api_key")
         base_of = host("pooled endpoint reader", "agent.auxiliary_client", "_pool_runtime_base_url")
         route_of = host("Codex pool route", "hermes_cli.auth_codex", "_codex_pool_route_base_url")
-        bases = ([override or route_of(base_of(entry)) for entry in entries if key_of(entry)]
-                 or [override or default])
-        sources = ("the profile-scoped HERMES_CODEX_BASE_URL; each persisted openai-codex pool row with a token, "
-                   "routed by the host's _codex_pool_route_base_url over model.base_url; else the host's default")
+        if override:
+            bases = [override]
+        else:
+            bases = ([route_of(default if seeded(entry) else base_of(entry)) for entry in entries if key_of(entry)]
+                     + [route_of(default), default])
+        sources = ("the profile-scoped HERMES_CODEX_BASE_URL, which every branch returns where it is set; else each "
+                   "persisted openai-codex pool row with a token and the row the pool loader seeds from the singleton "
+                   "(a device_code row, whose base is the default), each routed by the host's _codex_pool_route_base_url "
+                   "over model.base_url, and the default the host returns where no row is selectable")
     else:
-        # ``_resolve_xai_oauth_for_aux`` (2075-2107): a pooled row with a token, its base the profile-scoped
-        # HERMES_XAI_BASE_URL, else XAI_BASE_URL, else the row's own, validated to the xAI origin; else the auth
-        # store's singleton, whose base ``_xai_oauth_inference_base_url`` resolves the same way from the process env.
+        # ``_resolve_xai_oauth_for_aux`` (2075-2107): a selected row with a token, its base the profile-scoped
+        # HERMES_XAI_BASE_URL, else XAI_BASE_URL, else the row's own (the seeded device_code row's is the default),
+        # validated to the xAI origin; on any exception, a row without a token or no selectable row, the auth store's
+        # singleton, whose base ``_xai_oauth_inference_base_url`` reads the raw process environment, not the scoped one.
         scoped = host("scoped environment reader", "agent.auxiliary_client", "_scoped_key_env")
         validate = host("xAI endpoint validation", "hermes_cli.auth_xai", "_xai_validate_inference_base_url")
         default = host("xAI default endpoint", "hermes_cli.auth_constants", "DEFAULT_XAI_OAUTH_BASE_URL")
@@ -250,25 +264,30 @@ def _refresh_prepass(provider: str, so: str) -> tuple[tuple, str]:
 
         def url(value: Any) -> str:
             return str(value or "").strip().rstrip("/")
+
+        def pooled_base(row_base: Any) -> str:
+            return validate(url(scoped("HERMES_XAI_BASE_URL")) or url(scoped("XAI_BASE_URL")) or url(row_base),
+                            fallback=default)
         bases = []
         for entry in entries:
             key = str(getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "") or "").strip()
-            base = validate(url(scoped("HERMES_XAI_BASE_URL")) or url(scoped("XAI_BASE_URL"))
-                            or url(getattr(entry, "runtime_base_url", None)) or url(getattr(entry, "base_url", None)),
-                            fallback=default)
-            if key and base:
-                bases.append(base)
-        bases = bases or [singleton()]
-        sources = ("each persisted xai-oauth pool row with a token, its base the profile-scoped HERMES_XAI_BASE_URL, "
+            row_base = default if seeded(entry) else (getattr(entry, "runtime_base_url", None)
+                                                      or getattr(entry, "base_url", None))
+            if key:
+                bases.append(pooled_base(row_base))
+        bases += [pooled_base(default), singleton()]
+        sources = ("each persisted xai-oauth pool row with a token and the row the pool loader seeds from the singleton "
+                   "(a device_code row, whose base is the default), its base the profile-scoped HERMES_XAI_BASE_URL, "
                    "else XAI_BASE_URL, else the row's own, validated by the host's _xai_validate_inference_base_url; "
-                   "else the auth store's singleton endpoint")
+                   "and the auth store's singleton endpoint, which reads the raw process environment")
     values = tuple(sorted({bool(compat(provider, base)) for base in bases}))
-    said = (f"its endpoint read before the call from the host's own sources in the host's order ({sources}): "
-            f"{len(bases)} candidate endpoint(s), on which the host's _is_anthropic_compat_endpoint gives the image "
-            f"conversion {' and '.join('on' if value else 'off' for value in values)}"
-            f"{', both values checked' if len(values) > 1 else ''}; a pool row persisted after this read is not seen, "
-            f"nor one the host's pool loader seeds at the call, which carries the default endpoint (where that row "
-            f"answers, the image conversion is off, and the check refused whatever the conversion on would lose)")
+    said = (f"its endpoint read before the call from the host's own sources ({sources}): every endpoint the host's "
+            f"resolver can return from them is a candidate, whichever branch it takes at the call, {len(bases)} "
+            f"in all, on which the host's _is_anthropic_compat_endpoint gives the image conversion "
+            f"{' and '.join('on' if value else 'off' for value in values)}"
+            f"{', both values checked' if len(values) > 1 else ''}; the row the pool loader seeds and the host's "
+            f"fallback branch are covered; not seen: a pool row persisted after this read, and rows the host's heal "
+            f"of forked grants moves in profile mode before its own read (hermes_cli/auth_oauth_grants.py 569-658)")
     return values, said
 
 
@@ -617,7 +636,7 @@ def _route_facts(route: Any) -> _RouteFacts:
                 prepass, said = _refresh_prepass(refresh, so)
             except Exception as error:
                 # A source of the leg's endpoint cannot be read: whether the host's image conversion runs there stays
-                # unknown, and the leg is refused naming it (the orchestrator's ruling, 2026-09-28).
+                # unknown, and "Known, or nothing" refuses the leg, naming the source.
                 refusals.append(f"after an authentication error the host can refresh {refresh} and retry on "
                                 f"{refresh}'s own client, whose endpoint the query cannot read before the call "
                                 f"({type(error).__name__}: {error}), so whether the host's image conversion runs "
