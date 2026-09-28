@@ -232,6 +232,7 @@ class Given:
     legs: tuple = ()
     role: str = ""
     check: Any = None
+    call_positions: list = field(default_factory=list)   # the stored positions of the calls given as calls
 
     def made(self, part: dict, origin: str, path: tuple = (), was: Optional[str] = None) -> dict:
         self.origins[id(part)] = (part, origin, path, was)
@@ -1081,12 +1082,15 @@ def _codex_message_items(value: Any, face: _Record) -> None:
             face.count(field_)
 
 
-def _tool_calls(value: Any, face: _Record) -> list[tuple[int, dict]]:
+def _tool_calls(value: Any, face: _Record, calls_given: Optional[set] = None,
+                call_handles: Optional[dict] = None) -> list[tuple[int, dict]]:
     """An agent message's calls as the wire carries them, with their stored positions: each call of
     the host's shape as its id, type and function's name and arguments (T1); every other key of it
     faced by the table (T2, T2′; a stored type other than "function" given as its JSON, never
     overwritten unsaid); any other value or call given as labelled JSON after the content, walked
-    as a call, not a call on the wire."""
+    as a call, not a call on the wire. ``calls_given``: the positions of the calls of the host's shape
+    the query gives as calls (M-PAIR, PLAN-19 §2.4; None: every one); any other is given as labelled
+    JSON, walked as a call, its handle named."""
     base = ("message", "tool_calls")
     if carries_nothing(value):
         return []
@@ -1104,6 +1108,14 @@ def _tool_calls(value: Any, face: _Record) -> list[tuple[int, dict]]:
         if not canonical_call(call):
             if face.json(f"[{_path_text(path)} as stored is not a call the wire can carry; shown as its JSON by the "
                          f"query:]", call, path, _CALL_DICT if isinstance(call, dict) else CALL):
+                face.count("tool_calls")
+            continue
+        if calls_given is not None and index not in calls_given:
+            handle = (call_handles or {}).get(index)
+            named = f"tool call {handle} ({_path_text(path)})" if handle else _path_text(path)
+            if face.json(f"[{named} is a tool call the query does not give as a call: the query names no result for it "
+                         f"among the records it gives, or the host's Anthropic converter would strip it; shown as its "
+                         f"JSON by the query:]", call, path, _CALL_DICT):
                 face.count("tool_calls")
             continue
         function = call["function"]
@@ -1242,22 +1254,28 @@ def _readable_parts(readable: list, given: Given, shown: list) -> list[dict]:
 
 
 def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, given: Given,
-                   call_handles: Optional[dict] = None, legs: tuple = (), check: Any = None) -> dict:
+                   call_handles: Optional[dict] = None, legs: tuple = (), check: Any = None,
+                   calls_given: Optional[set] = None, as_user: bool = False) -> dict:
     """One record's message as the query gives it (PLAN-83e §2-§5, PLAN-83g §3). The host's per-row
     rules run first, each host function called strictly (the clone, the sidecar, the reasoning-echo
     policy with the pad the host's own agent applies, the fill decided on the host's own row); then
     the message is built from the stored role's domain and every stored key is faced. ``given``
     receives what is given of the record and the origin of every part of its content; ``withheld``
     counts, per stored field, the entries, blocks, calls and keys whose opaque material is withheld;
-    ``call_handles`` names, by stored position, the handles the store minted for the record's calls."""
+    ``call_handles`` names, by stored position, the handles the store minted for the record's calls;
+    ``calls_given``: the positions of its calls the query gives as calls, every other shown as labelled
+    JSON; ``as_user``: a stored tool result sent as a user message, without its call id (M-PAIR,
+    PLAN-19 §2.4); ``legs`` and ``check``: what decides its images, and the host's stop (§2.2, §2.7)."""
     given.record, given.reads_images = record, facts.reads_images
-    role = wire_role(raw)
+    # A stored tool result whose call the query does not give as a call is sent as a user message (M-PAIR, D-2).
+    role = "user" if as_user else wire_role(raw)
     given.legs, given.role, given.check = tuple(legs), role, check
     stored_role = raw.get("role")
     domain = _DOMAIN.get(stored_role, _OTHER_DOMAIN) if isinstance(stored_role, str) else _OTHER_DOMAIN
     row = _row_before_fill(raw, needs_echo=facts.needs_reasoning_echo, strict=True)
     fill = host_fill_text(row)
-    standing = GIVEN_RESULT if role == "tool" else GIVEN_CONTENT
+    # The standing is the stored role's, never the role the query sends the record under (PLAN-19 §2.8).
+    standing = GIVEN_RESULT if stored_role == "tool" else GIVEN_CONTENT
     message: dict = {"role": role}
     face = _Record(record, given, standing, {}, compares_calls="tool_calls" in domain, role_text=stored_role_text(raw))
     if "content" in row:
@@ -1275,12 +1293,13 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
         message["reasoning_content"] = row["reasoning_content"]   # as the host's echo policy left it
     positions: list = []
     if "tool_calls" in domain:
-        kept = _tool_calls(raw.get("tool_calls"), face)
+        kept = _tool_calls(raw.get("tool_calls"), face, calls_given, call_handles)
         if kept:
             positions = [position for position, _call in kept]
             message["tool_calls"] = [call for _position, call in kept]
             face.calls = [(call["function"]["name"], *_call_arguments(call)) for _position, call in kept]
-    if "tool_call_id" in domain and "tool_call_id" in raw:
+    given.call_positions = list(positions)
+    if "tool_call_id" in domain and "tool_call_id" in raw and not as_user:
         message["tool_call_id"] = raw["tool_call_id"]      # the wire's pairing key, as stored
     main = readable_reasoning(raw) if "reasoning" in domain else None
     face.content_texts = [text for _path, text, standing_ in given.values

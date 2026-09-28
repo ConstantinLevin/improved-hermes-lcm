@@ -762,17 +762,14 @@ def _join(message: dict, given: Given) -> None:
     given.joined = True
 
 
-def _labels(found: _Read, rows: list, joined: dict) -> dict:
-    """The label of every record that is not a tool result (PLAN-83d §4), over the whole query.
-    A call's label names a result only where the stored ids establish it among the records the
-    query gives: the store's pairing answers the call, and no other call or tool result given
-    carries that id (the cut's rule: ``id`` or ``tool_call_id``, stripped; compaction.py
-    ``_groups``), or the store's pairing puts it in a group whose calls and results are exactly
-    those given carrying its ids. Every tool result the labels do not name is named, with no
-    claim about the store, on the nearest labelled message before it in its chunk. A message
-    whose stored content the host's sidecar replaces says so, as does one stored with a role the
-    query sends as a user message (ruling OD-E2). What the labels name is the one pairing fact the
-    query asserts: it is kept in ``found.named``, which ``check_excerpts`` reads (PLAN-83e §6)."""
+def _pairs(found: _Read, rows: list) -> dict:
+    """The one pairing fact the query asserts (PLAN-83e §6), for every call of the host's shape on an
+    agent message (``_wire_calls``): ``(record, position) -> (results, group?)``. A call names a
+    result only where the stored ids establish it among the records the query gives: the store's
+    pairing answers the call, and no other call or tool result given carries that id (the cut's
+    rule: ``id`` or ``tool_call_id``, stripped; compaction.py ``_groups``), or the store's pairing
+    puts it in a group whose calls and results are exactly those given carrying its ids; else it
+    names none (an empty tuple). The pairing itself is #78's (``found.pairing``)."""
     raw_of = {record: raw for _chunk, record, raw in rows}
     calls_with: dict = {}
     results_with: dict = {}
@@ -787,26 +784,15 @@ def _labels(found: _Read, rows: list, joined: dict) -> dict:
             if ident:
                 results_with.setdefault(ident, set()).add(record)
 
-    def result_named(result: str) -> str:
-        return f"{result}{joined.get(result, '')}"
-
     def group_ids(group: Any) -> set:
         return {_tool_call_id(raw_of[record]["tool_calls"][position]) for record, position in group.calls
                 if record in raw_of and isinstance(raw_of[record].get("tool_calls"), list)} - {""}
-
-    named: set = set()
-    labels: dict = {}
-    found.named = {}
+    pairs: dict = {}
     for chunk in found.chunks:
         pairing = found.pairing[chunk]
         for record, raw in found.records[chunk]:
-            if raw.get("role") == "tool":
-                continue
-            calls = []
             for position in _wire_calls(raw):
                 place = (record, position)
-                handle = found.calls.get(record, {}).get(position)
-                said = f"{handle} {raw['tool_calls'][position]['function']['name']}"
                 results: tuple = ()
                 group_named = False
                 if place in pairing.group:
@@ -815,15 +801,57 @@ def _labels(found: _Read, rows: list, joined: dict) -> dict:
                     if (group.results and all(result in raw_of for result in group.results)
                             and set().union(*(calls_with.get(i, set()) for i in ids)) == set(group.calls)
                             and set().union(*(results_with.get(i, set()) for i in ids)) == set(group.results)):
-                        said += (f" → one of results {', '.join(result_named(r) for r in group.results)} (the store "
-                                 f"cannot tell which result answers which call)")
                         results, group_named = tuple(group.results), True
                 elif place in pairing.answer:
                     result = pairing.answer[place]
                     ident = _tool_call_id(raw["tool_calls"][position])
                     if result in raw_of and calls_with.get(ident) == {place} and results_with.get(ident) == {result}:
-                        said += f" → result {result_named(result)} (the only call and result given here with that id)"
                         results = (result,)
+                pairs[place] = (results, group_named)
+    return pairs
+
+
+def _labels(found: _Read, joined: dict, pairs: dict, as_calls: set, as_user: set) -> dict:
+    """The label of every record that is not given as a tool result (PLAN-83d §4; PLAN-19 §2.4),
+    over the whole query. A message's label names each call it gives as a call (``as_calls``) with
+    the results ``_pairs`` names for it; a call not given as a call is shown as labelled JSON in its
+    message, and the label names it not. A stored tool result given as a user message (``as_user``)
+    carries a label of its own saying so, with its stored call id. Every stored tool result the labels
+    do not name as a call's is named, with no claim about the store, on the nearest labelled message
+    before it in its chunk. A message whose stored content the host's sidecar replaces says so, as
+    does one stored with a role the query sends as a user message (ruling OD-E2). What the labels
+    name is the one pairing fact the query asserts: it is kept in ``found.named``, which
+    ``check_excerpts`` reads (PLAN-83e §6)."""
+    def result_named(result: str) -> str:
+        return f"{result}{joined.get(result, '')}"
+
+    named: set = set()
+    labels: dict = {}
+    found.named = {}
+    for chunk in found.chunks:
+        for record, raw in found.records[chunk]:
+            if raw.get("role") == "tool":
+                if record in as_user:
+                    ident = raw.get("tool_call_id")
+                    answering = (f" answering call id {json.dumps(ident, ensure_ascii=False)}"
+                                 if not carries_nothing(ident) else "")
+                    labels[record] = (f"[message {record} · a tool result (stored {stored_role_text(raw)}{answering}); "
+                                      f"given here as a user message because the query gives no call it answers as "
+                                      f"a call]")
+                continue
+            calls = []
+            for position in _wire_calls(raw):
+                place = (record, position)
+                if place not in as_calls:
+                    continue
+                handle = found.calls.get(record, {}).get(position)
+                said = f"{handle} {raw['tool_calls'][position]['function']['name']}"
+                results, group_named = pairs[place]
+                if group_named:
+                    said += (f" → one of results {', '.join(result_named(r) for r in results)} (the store cannot "
+                             f"tell which result answers which call)")
+                else:
+                    said += f" → result {result_named(results[0])} (the only call and result given here with that id)"
                 named.update(results)
                 if handle is not None:
                     found.named[handle] = (results, group_named)
@@ -870,7 +898,8 @@ class _Sent:
 
 
 def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
-           joins: bool, legs: tuple = (), check: Any = None) -> tuple[list[dict], list[_Sent]]:
+           joins: bool, legs: tuple = (), check: Any = None,
+           demoted: frozenset = frozenset()) -> tuple[list[dict], list[_Sent]]:
     """The call's messages, and per record what was given. ``stats["images_not_sent"]`` counts
     the images of what the handles hold that are not given to the model as images, in four
     classes each image counted in one (M3', PLAN-19 §2.2): replaced by a placeholder that says so
@@ -881,7 +910,10 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     the readable reasoning texts given as parts of their own. ``joins``: a wire whose converter
     serialises a text-only list tool content is among the wires checked (ruling OD-3b). ``legs``: the
     legs every image is decided on (``_image_outcome``); ``check``: the host's stop, read before each
-    record. A record the query cannot give as it is refuses the query, naming the record."""
+    record; ``demoted``: the calls (record, position) the host's Anthropic strip would remove, given as
+    labelled JSON (M-PAIR, PLAN-19 §2.4); ``stats["calls_as_json"]`` and ``stats["results_as_user"]``
+    count the calls and tool results M-PAIR does not give as such. A record the query cannot give as
+    it is refuses the query, naming the record."""
     sent: list[_Sent] = []
     for key in ("images_not_sent", "carriers", "reasoning_parts"):
         stats.setdefault(key, 0)
@@ -902,11 +934,23 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     joined: dict[str, str] = {}
     for key in ("images_replaced", "images_elsewhere", "images_ungivable", "images_behind_sidecar"):
         stats.setdefault(key, 0)
+    # M-PAIR (PLAN-19 §2.4): a call of the host's shape is a call on the wire only where its label names its results
+    # and the host's Anthropic strip leaves it (``demoted`` holds those it would strip, ``_stripped``); a stored tool
+    # result is a tool result on the wire only where a call given as a call names it, else a user message under its
+    # own label. The same decision on every leg.
+    pairs = _pairs(found, rows)
+    as_calls = {place for place, (results, _group) in pairs.items() if results and place not in demoted}
+    answered = {result for place in as_calls for result in pairs[place][0]}
+    as_user = {record for _chunk, record, raw in rows if raw.get("role") == "tool" and record not in answered}
+    stats["calls_as_json"] = len(pairs) - len(as_calls)
+    stats["results_as_user"] = len(as_user)
     for _chunk, record, raw in rows:
         if callable(check):
             check()
         given = Given(values=[], problems=[])
-        message = strict_message(raw, record, wire, withheld, given, found.calls.get(record), legs=legs, check=check)
+        message = strict_message(raw, record, wire, withheld, given, found.calls.get(record), legs=legs, check=check,
+                                 calls_given={position for place_record, position in as_calls if place_record == record},
+                                 as_user=record in as_user)
         found.given[record] = given
         stats["reasoning_parts"] += given.reasoning_parts
         problems.extend(f"{record}: {problem}" for problem in given.problems)
@@ -938,7 +982,7 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
                 said = _joined_tool_content(entry.record, entry.message, raw_of[entry.record], entry.given)
                 if said is not None:
                     joined[entry.record] = said
-    labels = _labels(found, rows, joined)
+    labels = _labels(found, joined, pairs, as_calls, as_user)
     for entry in sent:
         if entry.record in labels:
             # No label of the plugin's inside a tool result (OD-D).
@@ -1161,6 +1205,38 @@ def _leg_values(leg: _Leg, messages: list[dict]) -> list[tuple[bool, Optional[bo
                                     if isinstance(message.get("content"), list)):
         prepass = prepass[:1]
     return [(value, oauth) for value in prepass for oauth in (leg.oauth or (None,))]
+
+
+def _stripped(route: Any, messages: list[dict], sent: list[_Sent], legs: list, check: Any = None) -> set:
+    """The calls given as calls that the host's Anthropic converter would strip (M-PAIR, PLAN-19 §2.4): on every leg
+    on the Anthropic wire, under every value of its inputs, the query's messages are converted by the host's own
+    converter (``_payload_for_leg``, whose ``convert_messages_to_anthropic`` runs ``_strip_orphaned_tool_blocks``,
+    anthropic_message_convert.py 481-517, 730), and a given call survives where a ``tool_use`` block with its id
+    through the host's own ``_sanitize_tool_id`` (118-120) stands in the result; two given ids that sanitise alike are
+    taken as not surviving (the converter cannot tell them apart). Returns their places (record, position)."""
+    anthropic = [leg for leg in legs if leg.wire == "anthropic_messages"]
+    given = [(entry.record, position, call.get("id"))
+             for entry in sent
+             for position, call in zip(entry.given.call_positions, entry.message.get("tool_calls") or [])]
+    if not anthropic or not given:
+        return set()
+    sanitize = _strict_import("tool-id sanitiser", "agent.anthropic_message_convert", "_sanitize_tool_id",
+                              so="which calls the host's Anthropic converter keeps is not known")
+    counts: dict = {}
+    for _record, _position, ident in given:
+        counts[sanitize(ident)] = counts.get(sanitize(ident), 0) + 1
+    stripped: set = set()
+    for leg in anthropic:
+        for prepass, is_oauth in _leg_values(leg, messages):
+            if callable(check):
+                check()
+            payload, _namer = _payload_for_leg(route, messages, leg, prepass, is_oauth)
+            surviving = {block.get("id") for message in payload.get("messages") or []
+                         for block in (message.get("content") if isinstance(message.get("content"), list) else [])
+                         if isinstance(block, dict) and block.get("type") == "tool_use"}
+            stripped.update((record, position) for record, position, ident in given
+                            if sanitize(ident) not in surviving or counts[sanitize(ident)] > 1)
+    return stripped
 
 
 def _leg_value_text(leg: _Leg, prepass: bool, is_oauth: Optional[bool]) -> str:
@@ -1575,12 +1651,20 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
         step()
         found = _resolve(records, session, handles, interrupted)
         step()
-        withheld: dict[str, int] = {}
-        stats: dict = {}
-        messages_in, sent = _input(found, question, wire, withheld, stats,
-                                   joins="anthropic_messages" in route_facts.wires, legs=tuple(route_facts.legs),
-                                   check=step)
-        step()
+        # M-PAIR's rounds (PLAN-19 §2.4): each round only takes calls away from those given as calls, so there are at
+        # most as many rounds as calls given, and one more.
+        demoted: set = set()
+        while True:
+            withheld: dict[str, int] = {}
+            stats: dict = {}
+            messages_in, sent = _input(found, question, wire, withheld, stats,
+                                       joins="anthropic_messages" in route_facts.wires, legs=tuple(route_facts.legs),
+                                       check=step, demoted=frozenset(demoted))
+            step()
+            stripped = _stripped(route, messages_in, sent, route_facts.legs, step) - demoted
+            if not stripped:
+                break
+            demoted |= stripped
 
         # The checks before the call; each a refusal, no call made.
         images = sum(image_count(m) for m in messages_in[1:-1])
@@ -1692,7 +1776,12 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                                                 f"field than the message's reasoning, and contained verbatim neither in "
                                                 f"it nor in an earlier part of the message, were given as labelled "
                                                 f"parts of their own; one that differs from those only in its "
-                                                f"separators is given twice")},
+                                                f"separators is given twice"),
+                      "calls_not_given_as_calls": (
+                          f"{stats['calls_as_json']} tool call(s) are given as JSON and {stats['results_as_user']} tool "
+                          f"result(s) as user messages because their partner lies in records the query does not give, "
+                          f"or the host's Anthropic converter would strip them; each such message's label or part says "
+                          f"so")},
             "call": {
                 "timeout": timeout,
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",
