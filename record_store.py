@@ -1117,16 +1117,19 @@ class RecordStore:
         return not taken
 
     def write_event_fenced(self, kind: str, *, session: Optional[str], detail: Any,
-                           fence: Callable[[], bool]) -> None:
+                           fence: Callable[[], bool], compaction: Optional[int] = None) -> None:
         """One store event written in a fenced transaction (``_fenced_tx``; the query's failure
-        to store its result, ruling OD-P4b): once ``fence()`` is true nothing is written and
+        to store its result, ruling OD-P4b; a fenced settle's failures and its duplicated
+        position, M-BOUNDARY-FENCE): once ``fence()`` is true nothing is written and
         ``WriteFenced`` is raised. A failure raises; the event is never kept pending, since a
-        pending event would be written by another writer after the host stopped waiting."""
+        pending event would be written by another writer after the host stopped waiting. The row
+        has the shape ``event`` writes for its kind: ``compaction`` in its column where the event
+        is about one, ``detail`` as the string or the JSON of the value."""
         text = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=repr)
         try:
             with self._fenced_tx(fence) as conn:
                 conn.execute("INSERT INTO store_events(at, kind, session, compaction, detail) VALUES (?, ?, ?, ?, ?)",
-                             (time.time(), kind, session, None, text))
+                             (time.time(), kind, session, compaction, text))
         except CommittedButNotRestored as exc:
             # Written: the log says so, and the failure after the COMMIT beside it (PLAN-83g §7).
             logger.error("LCM store event %s (session=%s) written; %s: %s", kind, session, exc, text)
