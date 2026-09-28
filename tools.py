@@ -195,7 +195,7 @@ def lcm_query(args: Dict[str, Any], **kwargs) -> Any:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
     try:
-        return query_tool.query(engine, args, messages=kwargs.get("messages"))
+        return query_tool.query(engine, args, messages=kwargs.get("messages"), interrupted=kwargs.get("interrupted"))
     except expansion.ExpansionError as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
     except Exception as exc:

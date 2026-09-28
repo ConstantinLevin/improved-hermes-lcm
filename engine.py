@@ -57,6 +57,7 @@ from .record_store import RecordStore
 from .record_write import RecordWriteMixin
 from .store import MessageStore
 from .results import final_result
+from .stop import stop_latch
 from .tokens import Estimator, count_messages_tokens
 from . import tools as lcm_tools
 
@@ -1056,15 +1057,23 @@ class LCMEngine(
         # The handlers' own errors, which name a better cause, stay as they are. Only a
         # BaseException passes, the host's cancellation (``AuxiliaryExplicitCancellation``,
         # agent/auxiliary_client.py:212 at Hermes d0288be5b3) and the interpreter's own.
+        #
+        # The host's stop of this dispatched call is read here, before anything else of the
+        # call (``stop.stop_latch``; PLAN-19 re-derived, M-BOUNDARY-FENCE): the store commits
+        # nothing once the host has asked the call to stop, and that reaches every write the
+        # call makes, the settling of the host's list included, which runs in a fenced
+        # transaction and flushes no event of other work. Every handler receives the latch.
         step = "checking the engine"
         try:
             if self._closed_reason is not None:
                 return json.dumps({"error": f"LCM's store connections of this engine were closed "
                                             f"({self._closed_reason}); a closed engine is never reused"})
+            step = "reading the host's stop"
+            interrupted = stop_latch()
             messages = kwargs.get("messages")
             if messages:
                 step = "settling the list the host handed over"
-                self._bind_from_list(messages)
+                self._bind_from_list(messages, fence=interrupted)
             handlers = {
                 "lcm_grep": lcm_tools.lcm_grep,
                 "lcm_expand": lcm_tools.lcm_expand,
@@ -1077,9 +1086,9 @@ class LCMEngine(
             if not handler:
                 return json.dumps({"error": f"Unknown LCM tool: {name}"})
             # The live list goes with the call: a page's size depends on the tool calls of
-            # the message being answered (``expansion.host_page_limit``).
+            # the message being answered (``expansion.host_page_limit``); the stop latch too.
             step = f"running {name}"
-            result = handler(args, engine=self, messages=messages)
+            result = handler(args, engine=self, messages=messages, interrupted=interrupted)
             # The final string (or the _multimodal envelope, as it is): what a page was
             # measured as (``results.final_result``, #18).
             step = f"finishing the result of {name}"

@@ -61,13 +61,16 @@ error passes through one scope (``_Refusals``) that says once whether the model 
 
 **How the call is made** (rulings OD-A, OD-B, OD-C). The host is entered once per dispatch: no
 failure is retried by the plugin. The call runs inside the host's ``aux_interrupt_protection``
-with the query's stop latch as its cancel source (``_stop_latch``: this worker's interrupt bit, and
-the host's own sequential tool timeout counted from the query's entry, PLAN-19 §2.7): once it has
-seen the stop, ``call_llm`` raises ``AuxiliaryExplicitCancellation`` and the query stops reading;
-the latch cannot see a stop the host sets and clears again between two of its reads, nor the host's
-deadline before its own; what the host's thread does with
-the provider's request then is said per wire in every result's ``call``. The ``timeout`` passed
-is an interim value (#22): the host's configured sequential tool timeout, else 420 s.
+with the call's stop latch as its cancel source (``stop.stop_latch``, created by the engine's
+boundary before the host's list is settled and handed to the query, M-BOUNDARY-FENCE: this
+worker's interrupt bit, and the host's own sequential tool timeout counted from the boundary): once
+it has seen the stop, ``call_llm`` raises ``AuxiliaryExplicitCancellation`` and the query stops
+reading; the latch cannot see a stop the host sets and clears again between two of its reads, nor
+the host's deadline before its own (set at the dispatch, before the host's own worker-side steps,
+and extended by an approval wait the plugin cannot read); what the host's thread does with the
+provider's request then is said per wire in every result's ``call``, and what the host can do to
+the returned page in ``after_the_return``. The ``timeout`` passed is an interim value (#22): the
+host's configured sequential tool timeout, else 420 s.
 
 **The reply.** Its content must be exactly one JSON object ``{"report": str, "excerpts": [{"handle":
 str, "text": str}, ...]}``; nothing is stripped or recognised by pattern (#9 Decided). Each
@@ -100,8 +103,6 @@ import json
 import logging
 import secrets
 import sqlite3
-import threading
-import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -1792,13 +1793,18 @@ def _serve_stored(engine: Any, session: str, state: dict, limit: Any, interrupte
 
 # --- The tool ----------------------------------------------------------------------------
 
-def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
+def query(engine: Any, args: dict, *, messages: Any = None, interrupted: Any = None) -> Any:
     """The ``lcm_query`` tool (the module docstring). ``args`` is always a dict: the host refuses
     arguments that are not a JSON object before dispatch (agent/tool_executor.py 168-179,
     1852-1857 at Hermes 375930d089), and its hooks, Relay and middleware keep a dict. Every error
     it raises passes through one scope (``_Refusals``), entered before anything else once the
-    branch is known from the arguments."""
+    branch is known from the arguments. ``interrupted`` is the host's stop of this dispatched call
+    as the engine's boundary read it before settling the host's list (``stop.stop_latch``,
+    M-BOUNDARY-FENCE); without it the query does not run, since it could not know the stop."""
     with _Refusals(page=isinstance(args, dict) and "page" in args) as scope:
+        if interrupted is None:
+            raise ExpansionError("the engine's boundary handed the query no stop latch, so whether the host asked "
+                                 "this call to stop cannot be known")
         removed = [f"{name} ({why})" for name, why in _REMOVED.items() if name in args]
         if removed:
             raise ExpansionError("lcm_query no longer accepts " + "; ".join(removed) + ". It takes handles, question "
@@ -1809,7 +1815,6 @@ def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
         session = engine.current_session_id
         if not session:
             raise ExpansionError("this engine copy is bound to no session of the plugin, so no handle resolves")
-        interrupted = _stop_latch()
         if scope.page:
             if len(args) != 1:
                 raise ExpansionError("page continues a query's stored result: give page alone")
@@ -1825,49 +1830,6 @@ def query(engine: Any, args: dict, *, messages: Any = None) -> Any:
         if not isinstance(question, str) or not question.strip():
             raise ExpansionError("question is required: a non-empty question")
         return _ask(engine, session, handles, question, interrupted, scope, messages=messages)
-
-
-def _stop_latch() -> Any:
-    """The host's stop of this tool call, read from the query's entry, before any store access
-    (PLAN-83d §5; PLAN-19 §2.7, D-4). Two signals, both latched: once seen, the stop holds for the
-    rest of this call.
-
-    - The worker's interrupt bit. The host sets it on a sequential tool timeout only after it has
-      stopped waiting (agent/tool_executor.py 963-976), and on an interrupt while it still waits its
-      3 s grace (947-950); every ``clear_interrupt`` clears the bit of every tracked worker, an
-      abandoned one included: at the turn's end (agent/turn_finalizer.py 731) and at the clear sites
-      where a model-request redirect is pending (turn_api_call.py 152, 184; turn_api_error.py 154;
-      turn_recovery.py 1349; interrupt_control.py 231-232 returns without clearing otherwise), and at
-      turn_recovery.py 1327, codex_runtime.py 486, turn_facade_lease.py 376, tui_gateway/
-      prompt_turn.py 155, hermes_cli/cli_chat_turn_mixin.py 639 (at Hermes 375930d089, reader C of
-      PLAN-19). A redirect during tool execution sets no bit (it requests a yield, 285-295). The
-      check reads this thread by its id, because the host also calls it from the daemon thread that
-      runs the provider call (agent/auxiliary_client.py 476; tools/interrupt.py 61-71).
-    - The host's own sequential tool deadline (``_resolve_sequential_tool_timeout``), read at the
-      query's entry and counted from there. The host set its deadline when it dispatched the worker,
-      before the query's entry, so this deadline passes later than the host's by that latency: it
-      narrows the window in which the query can go on after the host stopped waiting to that
-      latency and does not close it; nothing on the worker's side marks it abandoned (ask A-D3.1).
-
-    The returned function has ``deadline_s``: the host's timeout it counts, or None where the host's
-    deadline is disabled."""
-    worker = threading.get_ident()
-    thread_interrupted = _strict_import("tool interrupt bit", "tools.interrupt", "is_thread_interrupted",
-                                        so="whether the host asked this call to stop cannot be known")
-    resolve = _strict_import("sequential tool timeout", "agent.tool_executor", "_resolve_sequential_tool_timeout",
-                             so="when the host stops waiting for this call is not known")
-    value = resolve()
-    deadline_s = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
-    deadline = time.monotonic() + deadline_s if deadline_s is not None else None
-    stopped = threading.Event()
-
-    def interrupted() -> bool:
-        if not stopped.is_set() and (thread_interrupted(worker)
-                                     or (deadline is not None and time.monotonic() >= deadline)):
-            stopped.set()
-        return stopped.is_set()
-    interrupted.deadline_s = deadline_s  # type: ignore[attr-defined]
-    return interrupted
 
 
 def _ask(engine: Any, session: str, handles: list, question: str, interrupted: Any, scope: _Refusals, *,
@@ -2067,17 +2029,25 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                 "timeout_is": f"the per-read timeout passed to the host: {timeout_source}",
                 "if_the_host_asks_this_call_to_stop": (
                     _stop_clauses(route_facts)
-                    + "; the query reads the host's stop from its first store read (this session's reasoning effort) "
-                      "on: the host's interrupt bit, and the host's own sequential tool timeout ("
-                    + (f"{interrupted.deadline_s:g} s, read at the query's entry and counted from there"
+                    + "; the query reads the host's stop at the engine's boundary, before the list the host handed "
+                      "over is settled (its confirmations, adoptions and bindings run in a transaction that commits "
+                      "nothing once the stop is seen and flushes no event of other work), on: the host's interrupt "
+                      "bit, and the host's own sequential tool timeout ("
+                    + (f"{interrupted.deadline_s:g} s, read at the boundary and counted from there"
                        if getattr(interrupted, "deadline_s", None) is not None else
                        "disabled on this host, so no deadline is counted")
-                    + "), while it waits for the store's locks as it reads the records and as it stores a result "
-                      "that needs more than one page, before each record, image and leg it checks, at each step "
-                      "before the call, while it waits for a call slot and throughout the call; once it has seen the "
-                      "stop it reads, sends and stores nothing more for this call; what it cannot see: the host "
-                      "started its deadline before the query's entry, so for that latency after the host stopped "
-                      "waiting the query can still call the model or store a result nobody reads, and an interrupt "
+                    + "), then while it waits for the store's locks as it reads the session's reasoning effort and "
+                      "the records and as it stores a result that needs more than one page, before each record, "
+                      "image and leg it checks, at each step before the call, while it waits for a call slot and "
+                      "throughout the call; once it has seen the stop nothing is settled, read, sent or stored for "
+                      "this call; what it cannot see: the host set its deadline when it dispatched the worker "
+                      "(agent/tool_executor.py 937), before the worker ran the host's own steps (a managed Relay "
+                      "pipeline where one is enabled, the tool_request and tool_execution middleware, the "
+                      "pre_tool_call hooks, an approval wait among them, the pruned-argument scan, the guardrails) "
+                      "and before the engine's boundary, so the query's count starts later than the host's by those "
+                      "steps, and the host extends its own deadline by the seconds an approval wait took "
+                      "(861-886), which the query cannot read: for that difference after the host stopped waiting "
+                      "the query can still call the model or store a result nobody reads; and an interrupt "
                       "the host sets and clears again while one host function of the check runs (a converter; an SVG "
                       "rasteriser, up to 30 s per image, per leg, per value) is not seen: every clear_interrupt clears "
                       "the bit of every tracked worker, an abandoned one included (at the turn's end, agent/"
@@ -2088,8 +2058,22 @@ def _ask(engine: Any, session: str, handles: list, question: str, interrupted: A
                       "query calls and stores as if no stop came (nothing on this side marks a worker the host "
                       "abandoned: ask A-D3.1); a result that fits one page is returned whatever the bit "
                       "(the host uses it within its 3 s grace after an interrupt and discards it after its own "
-                      "timeout); a failure to store the result is written as a store event only in a transaction "
-                      "that commits nothing once the stop is seen; the query writes no event of other work"),
+                      "timeout: a result the host receives after it stopped waiting is read by nobody, "
+                      "tool_executor.py 974-981); a failure to store the result is written as a store event only in "
+                      "a transaction that commits nothing once the stop is seen; no event of other work is written "
+                      "by this call"),
+                "after_the_return": (
+                    "the host may replace the returned page before it stands in the context: a "
+                    "transform_tool_result hook of any plugin (model_tools.py 849-866, the first string returned "
+                    "wins); its identical-result stub for a second byte-identical result of at least 512 characters "
+                    "in one turn (tool_guardrails.py 484-486, 528-543), a repeated page request among them; its "
+                    "spill to a file above the threshold the page was measured against (tool_result_storage.py "
+                    "293-334; expansion.host_page_limits reads that threshold), and its turn budget over every "
+                    "result of the same assistant message, applied in place after the result was flushed "
+                    "(enforce_turn_budget, 337-360; tool_executor.py 1182-1188); it appends its loop notices and "
+                    "guidance, within the margin the page keeps for them (host_guardrail_margin); a page whose first "
+                    "500 characters hold \"error\" or \"failed\", or that starts with \"Error\", is counted by the "
+                    "host's loop guard as a failure (display.py 1008-1012); all at Hermes 375930d089"),
                 "entered_the_host": ("once; the query retries no failure (the host's own recovery runs inside the "
                                      "call, and one entry can send several provider requests: its re-sends, rungs "
                                      "and fallbacks)"),
