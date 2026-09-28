@@ -14,15 +14,20 @@ effort (``_summariser_settings``), through the host's ``call_llm``: the query's 
 then every record as the query gives it (``query_input.strict_message``: the host's per-row
 rules, each host function called strictly; the message built from the stored role's domain; a
 content of text and image parts only, every other value given as a labelled rendering of its JSON
-with the image parts inside it faced; tool calls of the shape the host writes, on agent messages;
-readable reasoning from every field that holds it; the host's replay carriers not sent, every key
-of their blocks faced by one classification; nothing shown of a value that carries nothing; the
-host's fill of an empty message quoted, never given as the message's content), then the question. Every user and agent message carries a label naming its
-handle; a message's label also names its tool calls' handles and, where the stored ids establish
-it among the records given, the records that hold their results; every other tool result is
-named, with no claim about which call it answers, on the label before it. A tool result carries
-no label of the plugin's (#19 OD-D). No replay carrier of a message's text or reasoning is sent:
-its readable text is given, its opaque material withheld and counted (rulings OD-G, OD-P2a).
+with the image parts inside it faced, each image decided by the host's per-part functions on every
+leg; tool calls of the shape the host writes, on agent messages, given as calls where M-PAIR gives
+them (PLAN-19 §2.4), else as labelled JSON; readable reasoning from every field that holds it; the
+host's replay carriers not sent, every key of their blocks faced by one classification, a text or
+call only a carrier holds given as a labelled part; nothing shown of a value that carries nothing;
+the host's fill of an empty message quoted, never given as the message's content), then the
+question. Every user and agent message carries a label naming its handle; a message's label also
+names the handles of the calls it gives as calls and the records that hold their results (where the
+stored ids establish them among the records given and the host's Anthropic strip keeps them); a
+stored tool result that no call given as a call answers is sent as a user message under its own
+label; every stored tool result the labels do not name as a call's is named, with no claim about
+which call it answers, on the label before it. A record sent as a tool result carries no label of
+the plugin's (#19 OD-D). No replay carrier of a message's text or reasoning is sent: its readable
+text is given, its opaque material withheld and counted (rulings OD-G, OD-P2a).
 
 **Every leg the host can answer on** (#83 plan §3; PLAN-19 §2.1). Before the call the query computes,
 from the host's own functions at Hermes 375930d089, the legs of the host's recovery that can send
@@ -53,9 +58,11 @@ error passes through one scope (``_Refusals``) that says once whether the model 
 
 **How the call is made** (rulings OD-A, OD-B, OD-C). The host is entered once per dispatch: no
 failure is retried by the plugin. The call runs inside the host's ``aux_interrupt_protection``
-with this worker's interrupt bit as its cancel source, latched: once the host has asked this
-tool call to stop (its tool timeout, or an interrupt), ``call_llm`` raises
-``AuxiliaryExplicitCancellation`` and the query stops reading; what the host's thread does with
+with the query's stop latch as its cancel source (``_stop_latch``: this worker's interrupt bit, and
+the host's own sequential tool timeout counted from the query's entry, PLAN-19 §2.7): once it has
+seen the stop, ``call_llm`` raises ``AuxiliaryExplicitCancellation`` and the query stops reading;
+the latch cannot see a stop the host sets and clears again between two of its reads, nor the host's
+deadline before its own; what the host's thread does with
 the provider's request then is said per wire in every result's ``call``. The ``timeout`` passed
 is an interim value (#22): the host's configured sequential tool timeout, else 420 s.
 
@@ -900,7 +907,7 @@ def _labels(found: _Read, joined: dict, pairs: dict, as_calls: set, as_user: set
 @dataclass
 class _Sent:
     """What the query gives its model of one record: the message, the label the query put on
-    it (None on a tool result), and what it gave of the record (``Given``)."""
+    it (None on a record sent as a tool result), and what it gave of the record (``Given``)."""
 
     record: str
     message: dict
@@ -981,7 +988,8 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     # Every part of every message has one recorded origin (PLAN-83d §2's property), asserted at one
     # site, before the join reads the origins of a tool result's parts (PLAN-83g §4.3). The labels
     # added after it make only parts they record (``label_message``: the label, and a string content
-    # as one stored part), and a tool result carries none (OD-D).
+    # as one stored part), and a record sent as a tool result carries none (OD-D); a stored tool
+    # result sent as a user message (M-PAIR) carries its own.
     unrecorded = [entry.record for entry in sent if unrecorded_parts(entry.message, entry.given)]
     if unrecorded:
         raise ExpansionError(f"a part the query gives of {', '.join(unrecorded)} has no recorded origin, so the query "
@@ -996,7 +1004,7 @@ def _input(found: _Read, question: str, wire: Any, withheld: dict, stats: dict,
     labels = _labels(found, joined, pairs, as_calls, as_user)
     for entry in sent:
         if entry.record in labels:
-            # No label of the plugin's inside a tool result (OD-D).
+            # No label of the plugin's inside a record sent as a tool result (OD-D; ``_labels`` gives none).
             label_message(entry.message, labels[entry.record], entry.given)
             entry.label = labels[entry.record]
     for entry in sent:

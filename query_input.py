@@ -28,9 +28,12 @@ passes through, never by a sentence applied at each site by hand:
   stored tool call (PLAN-83e §4); a field stored on a role whose domain lacks it is walked by its
   own walker, its outputs given as parts (M4);
 - the message sent is built positively from the stored role's domain (``strict_message``,
-  PLAN-83e §5): role, content, tool calls on an agent message, the call id on a tool result, and
-  ``reasoning_content`` as the host's echo policy leaves it; every other stored key is given as
-  a part, withheld and counted, or the host's bookkeeping;
+  PLAN-83e §5): role, content, the calls an agent message gives as calls (M-PAIR, PLAN-19 §2.4;
+  every other call of the host's shape given as labelled JSON), the call id on a record sent as a
+  tool result (a stored tool result no call given as a call answers is sent as a user message,
+  without it, its id on its label), and ``reasoning_content`` as the host's echo policy leaves it;
+  every other stored key is given as a part, withheld and counted, or the host's bookkeeping; the
+  standing of what is given is the stored role's (PLAN-19 §2.8);
 - every part of the content is recorded with its origin where it is made (``Given``), so that
   what a label says about a part comes from how the part was made, and the query asserts that
   every part has one (``unrecorded_parts``); a stored place and a stored role are each written one
@@ -666,7 +669,9 @@ def _canonical_content(content: Any, standing: str, given: Given, face: "_Record
         rendered, withheld = _render("[The rest of this stored multimodal envelope (every key but its content), shown "
                                      "as its JSON by the query:]", rest, base, CONTENT, standing, given, RENDERED,
                                      lift=True)
-        face.withheld_content += 1 if withheld else 0          # the envelope's other keys, one unit
+        # The envelope's keys beside its content, rendered as one object, count as one unit; its content's members
+        # were counted each above (ruling D-6).
+        face.withheld_content += 1 if withheld else 0
         return (shown + rendered) or ""
     rendered, withheld = _render(f"[The stored content is a JSON {json_kind(content)}, shown as its JSON by the "
                                  f"query:]", content, base, CONTENT, standing, given, RENDERED, lift=True)
