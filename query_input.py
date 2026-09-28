@@ -784,6 +784,7 @@ class _Record:
     withheld_content: bool = False
     compares_calls: bool = False
     role_text: str = ""
+    stash_site: bool = False      # the host's Anthropic converter sends this tool result's stash (``stash_sent``)
 
     def json(self, label: str, value: Any, path: tuple, kind: str, standing: Optional[str] = None) -> bool:
         parts, withheld = _render(label, value, path, kind, standing or self.standing, self.given)
@@ -976,6 +977,22 @@ def _codex_reasoning_items(value: Any, face: _Record) -> None:
             face.count("codex_reasoning_items")
 
 
+def stash_sent(content: Any) -> bool:
+    """Whether the host's Anthropic converter sends a tool result's ``_anthropic_content_blocks`` stash for this
+    content (M-STASH, PLAN-19 §2.6): not for a ``_multimodal`` envelope, not where the host's own
+    ``_content_parts_to_anthropic_blocks`` makes an image block of the content (anthropic_message_convert.py 431-447
+    at Hermes 375930d089, called here on a copy of the content as the host's row carries it)."""
+    if isinstance(content, dict) and content.get("_multimodal"):
+        return False
+    if isinstance(content, list):
+        blocks = _strict_import("tool-result block conversion", "agent.anthropic_message_convert",
+                                "_content_parts_to_anthropic_blocks",
+                                so="whether the host sends this tool result's stash is not known")(copy.deepcopy(content))
+        if any(isinstance(block, dict) and block.get("type") == "image" for block in blocks):
+            return False
+    return True
+
+
 def _anthropic_blocks(key: str, value: Any, face: _Record) -> None:
     """``anthropic_content_blocks`` of an agent message, or the stash of a tool result, block by
     block and key by key (T3-T6); an image block is given as an image (the host's converter
@@ -986,6 +1003,16 @@ def _anthropic_blocks(key: str, value: Any, face: _Record) -> None:
         table = _CLASSES.get((key if key == STASH else "anthropic_content_blocks", kind)) if isinstance(kind, str) \
             else None
         standing = GIVEN_RESULT if key == STASH else face.standing
+        if image_part(block) and key == STASH and not (face.stash_site and kind == "image"):
+            # M-STASH (PLAN-19 §2.6): the host's Anthropic converter sends the stash only for a tool result whose
+            # content is no _multimodal envelope and yields no image block of its own, and replays its blocks as they
+            # are, so only an ``image`` block is an image there (anthropic_message_convert.py 431-450): any other
+            # image block of the stash, and every one where the stash is not sent, is named where it stood.
+            if face.json(f"[{_path_text(path)} holds an image block that the host's Anthropic converter does not send "
+                         f"as an image from this field here; shown as its JSON by the query:]", block, path, CARRIER,
+                         standing):
+                face.count(key)
+            continue
         if image_part(block) and (key == STASH or kind == "image"):
             # T6: an image site. An image_url/input_image block of anthropic_content_blocks is not
             # (the host's replay whitelist has no such type): it falls to the block of no type below.
@@ -1285,6 +1312,7 @@ def strict_message(raw: dict, record: str, facts: WireFacts, withheld: dict, giv
         _bedrock_blocks(raw.get("bedrock_content_blocks"), face)
         _codex_message_items(raw.get("codex_message_items"), face)
     if STASH in domain:
+        face.stash_site = stash_sent(row.get("content"))
         _anthropic_blocks(STASH, raw.get(STASH), face)
     if "api_content" in domain and not sidecar_sent(raw):
         # T13: a sidecar that is not a string is content, given as its JSON.
