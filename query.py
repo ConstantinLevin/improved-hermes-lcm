@@ -83,7 +83,11 @@ the NOTE saying what each is. One that fails is named and withheld, without its 
 that needs a second page is stored once (``query_reports``) before page 1 is returned, in a
 transaction that commits nothing once the host has asked this call to stop
 (``RecordStore._fenced_tx``); every page is cut from that stored body; a result on one page is
-not stored.
+not stored. The meaning of a stored body (its excerpts' standings, its note, its header) is the
+token version's (``expansion.TOKEN_VERSION``, M-VERSION): a body a head of another meaning
+stored is reached only through a token of that version, which ``decode_token`` refuses with
+"ask the question again"; a body that is not of the query's shape at all is refused by name
+(``_target``). The store format carries the tables, which did not move.
 
 The words the model and the agent read are interim until #10.
 """
@@ -1688,9 +1692,34 @@ def _body(header: dict, items: list[Item]) -> str:
                       ensure_ascii=False)
 
 
-def _target(body: str) -> Target:
-    value = json.loads(body)
-    return Target(value["header"], [Item(dict(entry["a"]), plugin=dict(entry["p"])) for entry in value["items"]])
+def _target(body: str, report_id: str = "") -> Target:
+    """The stored body as a target, or a refusal by name where the body is not of the query's shape
+    (``_body``: an object with ``header`` an object and ``items`` a list of objects each with ``a`` and
+    ``p`` objects; M-VERSION): a row hand-edited or written by no head of this query (a ``{}`` body)
+    is told as that on a page request, never as a KeyError of the wrapper. A body of the query's shape
+    written under another meaning is refused before this by its token's version (``decode_token``)."""
+    def refuse(what: str) -> ExpansionError:
+        which = f"stored query result {report_id}" if report_id else "the stored query result"
+        return ExpansionError(f"{which} is not of the query's shape ({what}); ask the question again")
+    try:
+        value = json.loads(body)
+    except ValueError as exc:
+        raise refuse(f"not JSON: {exc}") from None
+    if not isinstance(value, dict):
+        raise refuse(f"a JSON {json_kind(value)}, not an object")
+    if not isinstance(value.get("header"), dict):
+        raise refuse("no header object")
+    if not isinstance(value.get("items"), list):
+        raise refuse("no items list")
+    items = []
+    for index, entry in enumerate(value["items"]):
+        if not (isinstance(entry, dict) and isinstance(entry.get("a"), dict) and isinstance(entry.get("p"), dict)):
+            raise refuse(f"item {index} is not an object with the objects a and p")
+        try:
+            items.append(Item(dict(entry["a"]), plugin=dict(entry["p"])))
+        except ValueError as exc:
+            raise refuse(f"item {index}: {exc}") from None
+    return Target(value["header"], items)
 
 
 def _token_state(store_uuid: str, report_id: str, target: Target) -> dict:
@@ -1753,7 +1782,7 @@ def _serve_stored(engine: Any, session: str, state: dict, limit: Any, interrupte
     owner, body = stored
     if owner != session:
         raise ExpansionError("page is a token of another session's query")
-    target = _target(body)
+    target = _target(body, state["k"])
     if expansion.target_identity(target) != state["r"]:
         raise ExpansionError("the stored query result renders differently than when page 1 was served; ask the "
                              "question again")

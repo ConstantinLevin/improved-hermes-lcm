@@ -106,7 +106,13 @@ from .summariser_input import (
 # version is refused with its own text.
 # 4: an item's plugin side and host side are two objects (``lcm``, ``message``), a path is a
 # tuple of structural steps (PR P): the fields and the pages moved.
-TOKEN_VERSION = 4
+# 5: the query's excerpt standings (``from``/``is``: sidecar, carrier and stored beside content,
+# result, call and reasoning), its note and its header moved (#19, M-VERSION): a query result a
+# head before this one stored is a page of another meaning, reached only through a token, so the
+# token's version carries the meaning of what a page shows (the store format carries the tables,
+# which did not move). A v4 token of lcm_query is refused with "ask the question again", one of
+# lcm_expand or lcm_grep with "start again from the handle".
+TOKEN_VERSION = 5
 
 # What each status of ``RecordStore.resolve`` tells the agent; "inactive" is told by its
 # cause (``_inactive_text``).
