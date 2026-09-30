@@ -364,8 +364,8 @@ class LCMEngine(
         self._close_storage(reason)
 
 
-    def _reset_profile_runtime_state(self) -> None:
-        """Clear process-local session state that cannot cross profile homes."""
+    def _reset_session_binding(self) -> None:
+        """Clear the live binding and the pending work owned by its session."""
         self._unregister_active_engine_binding()
         self._session_id = ""
         self._session_platform = ""
@@ -395,7 +395,7 @@ class LCMEngine(
             store = getattr(self, "_store", None)
             if store is not None:
                 store._hermes_home = hermes_home
-            self._reset_profile_runtime_state()
+            self._reset_session_binding()
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
@@ -411,7 +411,7 @@ class LCMEngine(
         self._close_storage(f"the engine was rebound to the store of {hermes_home}")
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
-        self._reset_profile_runtime_state()
+        self._reset_session_binding()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 
@@ -935,14 +935,14 @@ class LCMEngine(
             ):
                 self._reset_session_counters()
             self._last_overflow_recovery_failed = False
-        self._apply_session_start_metadata(session_id, kwargs)
-        self._conversation_id = requested_conversation_id or session_id
-        self._register_active_engine_binding()
         self._name_plugin_session(
             session_id,
             signal="on_session_start",
             platform=str(kwargs.get("platform") or "") or None,
         )
+        self._apply_session_start_metadata(session_id, kwargs)
+        self._conversation_id = requested_conversation_id or session_id
+        self._register_active_engine_binding()
         self._start_daily_backup()
 
     def _start_daily_backup(self) -> None:
@@ -958,11 +958,19 @@ class LCMEngine(
         """
         if not host_session_id:
             return
-        handle, _created = self._sessions.name_session(host_session_id, signal=signal)
+        try:
+            handle, _created = self._sessions.name_session(host_session_id, signal=signal)
+            if platform:
+                self._sessions.note_platform(handle, platform, signal=signal,
+                                             host_session_id=host_session_id)
+        except BaseException:
+            # The host has already signalled this binding. The preceding session
+            # cannot remain usable when the requested binding could not complete.
+            self._reset_session_binding()
+            raise
+        if handle != self._plugin_session:
+            self._reset_session_binding()
         self._plugin_session = handle
-        if platform:
-            self._sessions.note_platform(handle, platform, signal=signal,
-                                         host_session_id=host_session_id)
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """The host's binding of this engine copy to a session id.
@@ -985,6 +993,7 @@ class LCMEngine(
         """
         if session_id:
             previous = str(self._session_id or "")
+            conversation_id = self._conversation_id
             if previous and previous != session_id:
                 if not self._review_fork:
                     if turn_signals.turn_ended(previous, None):
@@ -992,10 +1001,11 @@ class LCMEngine(
                                     session_id)
                     turn_signals.drop_request_list(previous)
                 self._reset_session_scoped_runtime_state()
-                if not self._conversation_id or self._conversation_id == previous:
-                    self._conversation_id = session_id
-            self._session_id = session_id
+                if not conversation_id or conversation_id == previous:
+                    conversation_id = session_id
             self._name_plugin_session(session_id, signal="bind_session_state", platform=None)
+            self._session_id = session_id
+            self._conversation_id = conversation_id
             self._register_active_engine_binding()
             return
         # This copy is the review fork's: its turn end never touches the hook state of
