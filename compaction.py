@@ -104,6 +104,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from . import turn_signals
+from .config import summary_timeout_seconds
 from .escalation import (
     OWN_FAILURE_KINDS,
     REASONING_EFFORTS,
@@ -1176,10 +1177,14 @@ class CompactionMixin:
         return route, ""
 
     def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
-        """The summariser's route, effort and output cap, or the reason there is none
+        """The summariser's route, effort, output cap and requested timeout, or why not
         (#9). No part of the route is guessed: it is what the host handed
         ``update_model``."""
         config = self._config
+        try:
+            timeout_seconds = summary_timeout_seconds(config.summary_timeout_ms)
+        except ValueError as exc:
+            return None, str(exc)
         route, problem = self._summariser_route()
         if route is None:
             return None, problem
@@ -1198,6 +1203,7 @@ class CompactionMixin:
         return CallSettings(
             route=route,
             effort=effort,
+            timeout_seconds=timeout_seconds,
             max_tokens=facts.output_cap if facts is not None else None,
             secrets=secrets,
         ), ""
