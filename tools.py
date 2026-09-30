@@ -1358,6 +1358,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_reasoning_effort_default": engine._config.summary_reasoning_effort,
             "summary_calls_in_flight": engine._config.summary_calls_in_flight,
             "summary_calls_per_endpoint": dict(engine._config.summary_calls_per_endpoint or {}),
+            "summary_timeout_ms": full_status.get("summary_timeout_ms"),
+            "summary_timeout_error": full_status.get("summary_timeout_error"),
+            "summary_timeout_note": full_status.get("summary_timeout_note"),
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "config_sources": config_sources,
@@ -1485,6 +1488,11 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 4. Configuration validation
     config_warnings = []
     c = engine._config
+    from .config import summary_timeout_seconds
+    try:
+        summary_timeout_seconds(c.summary_timeout_ms)
+    except ValueError as exc:
+        config_warnings.append(str(exc))
     if engine.context_length and engine._geometry is None:
         config_warnings.append(f"no compaction: {engine._geometry_error}")
     if engine._native_compaction_refusal:

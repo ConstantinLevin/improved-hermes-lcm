@@ -50,6 +50,26 @@ messages, and a request whose system prompt lacks the section is logged as that 
 re-insertion inside a turn (#14) and the rest of the issues in this repository's tracker are
 still to come.
 
+`LCM_SUMMARY_TIMEOUT_MS` sets the plugin's requested transport timeout for each host
+invocation, including retries and the second summary level. Its default is 300,000 ms:
+a conservative policy hypothesis, constant across session windows because one call
+summarises one bounded chunk. The earlier measurements in #33 report DeepSeek calls up
+to 57.2 s and Claude Code whole compactions up to 191 s; these are endpoint-specific
+elapsed times, not an idle-time percentile. Five minutes leaves generous headroom;
+it is configurable and is not a guarantee for every model. Invalid environment values
+use this plugin default with a warning and recorded source; invalid manual configuration
+refuses a call. Status and doctor expose the value and any problem.
+
+The plugin always passes the requested timeout to the host. On the current OpenRouter
+route it limits individual connect/read/write/pool operations, not total call time or
+absence of model output. The host's Anthropic and native Bedrock Converse adapters
+ignore this request parameter. Host stream limits, retries and recovery still apply;
+there is no uniform physical request lifetime bound. A caller's absolute deadline only
+governs new plugin dispatches and retries. An existing call keeps its initiating worker's
+settings and limiter slot until its synchronous host invocation ends, even if an attempt
+ends or another joins. A valid late summary can be stored without replacing that attempt's
+context.
+
 ## Working on it
 
 This is a development path, not an install for use. `scripts/install.sh` links the checkout into

@@ -27,16 +27,15 @@ that is decided, so no later attempt joins a call being given up.
 **What the worker carries (D10, R4).** The host's progress hook, read on the
 ``compress()`` thread, ticks on the worker for every streamed payload of the call
 (``aux_progress_hook``); with a joined call the worker ticks every subscribed attempt's
-hook. The host's deadline, read on the ``compress()`` thread and captured with the call
-when an attempt subscribes (``aux_stream_deadline``), bounds each call: its ``timeout``
-is the deadline less the time of dispatch (#33: no
-per-call timeout of the plugin's own), and the host's stream consumer stops there. The
-worker marks its calls interrupt-protected (``aux_interrupt_protection``) without a
-cancellation source: installing the attempt's cancellation check there would make the
-host raise inside the worker on a cancel and lose a summary already in flight, which
-D13 and Q17a keep. So a user's /stop does not stop a call in flight before the host's
-deadline; it stops the attempt, whose ``compress()`` returns at once (the caller polls
-the captured check), and no further call is started for it.
+hook. The host's deadline, read on the ``compress()`` thread and captured when an
+attempt subscribes, governs plugin admission and retries. It is not installed in the
+host's stream consumer: expiry of a caller's wait is not a transport failure. Each
+invocation receives the plugin's own requested transport timeout; host/provider
+enforcement varies and does not establish a total lifetime bound. The worker marks
+its calls interrupt-protected (``aux_interrupt_protection``) without a cancellation
+source, retaining synchronous ownership until the host invocation ends. A user's
+/stop ends the attempt, whose caller polls the captured check, and no further call
+is started for it; an in-flight call runs on and may write a late summary fact.
 
 **Summaries are written by the worker as they arrive** (#33 Q17a), each as a derivation
 of every subscribed attempt's chunk: a summary of a chunk is a fact about that chunk's
@@ -73,14 +72,12 @@ try:  # host internals (#33 D10, ask A-33.1)
         _current_aux_stream_deadline as _host_current_deadline,
         aux_interrupt_protection as _host_interrupt_protection,
         aux_progress_hook as _host_progress_hook,
-        aux_stream_deadline as _host_stream_deadline,
     )
 except Exception:  # pragma: no cover - older or absent host
     _HOST_PROGRESS = None
     _host_current_deadline = None
     _host_interrupt_protection = None
     _host_progress_hook = None
-    _host_stream_deadline = None
 
 DEFAULT_CALLS_PER_ENDPOINT = 8
 # How often a waiting thread asks whether its call is still wanted.
@@ -271,8 +268,8 @@ class ChunkCall:
 
         The host's deadline is captured here, as each attempt subscribes, and held with
         the call: the latest of the subscribers' deadlines, or none where one of them
-        has none. It does not change when an attempt leaves, so a dispatched call always
-        carries it."""
+        has none. It does not tighten when an attempt leaves; it is an eligibility
+        bound, not a transport parameter of a dispatched call."""
         if self.closed:
             return False
         with self._lock:
@@ -351,9 +348,9 @@ class ChunkCall:
     @contextlib.contextmanager
     def dispatch(self) -> Iterator[Optional[float]]:
         """One provider call: a slot of the endpoint's limiter, held for the call only,
-        and the call's captured deadline installed for the host's stream consumer.
-        Yields that deadline. Where every attempt left while the slot was being granted,
-        nothing is dispatched: the slot is given back and the call is abandoned. A
+        yielding its captured deadline for the plugin's admission check. It is never
+        installed in the host's stream consumer. Where every attempt left while the slot
+        was being granted, nothing is dispatched: the slot is given back and the call is abandoned. A
         ``Retry-After`` is to be passed to ``hold`` inside this scope, before the slot is
         given back, so that no queued call dispatches in between."""
         if not self.limiter.acquire(self.limit, self.still_needed):
@@ -361,9 +358,7 @@ class ChunkCall:
         try:
             if not self.still_needed():
                 raise CallAbandoned()
-            deadline = self.deadline()
-            with _scope(_host_stream_deadline, deadline):
-                yield deadline
+            yield self.deadline()
         finally:
             self.limiter.release()
 

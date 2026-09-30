@@ -63,8 +63,8 @@ the same level after the longer of the provider's ``Retry-After`` and 2 s doubli
 with jitter, while the host's deadline allows (#33). With no host deadline the retries
 stop once the backoff has reached its 30 s cap a second time. A ``Retry-After`` also
 holds the endpoint for every other call to it. How each call reaches the provider (the
-limiter, the deadline it is bounded by, the wait that gives up when no attempt wants
-the call any more) is the caller's ``CallPath`` (``inflight``).
+limiter, the deadline for admission and retries, the wait that gives up when no attempt
+wants the call any more) is the caller's ``CallPath`` (``inflight``).
 
 The reply's text is taken as the provider returned it in ``content``; nothing in it is
 recognised by pattern (#9, Decided).
@@ -443,6 +443,9 @@ class CallSettings:
 
     route: SummariserRoute
     effort: str
+    # The plugin-owned request parameter, held unchanged at both levels and every
+    # retry. Host/provider transport semantics vary; this is not a total call bound.
+    timeout_seconds: float
     max_tokens: Optional[int] = None
     # Every secret the plugin knows by value (the route's key when it is a string):
     # removed from any text that is logged, stored or shown.
@@ -552,13 +555,12 @@ def ending_failure(finish_reason: Optional[str]) -> Optional[tuple[str, str]]:
     return _ENDINGS.get(finish_reason) or ("other", f"the reply ended {finish_reason!r}, not 'stop'")
 
 
-def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
-               timeout: Optional[float] = None) -> tuple[str, str]:
+def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[str, str]:
     """One call on the session's route through the host's ``call_llm``, as its
     ``main_runtime``. Returns (content, finish_reason); raises on any failure of the call,
-    a reply from another model, or a reply of the wrong shape. ``timeout`` is what is left
-    of the host's deadline at dispatch; with no host deadline none is passed, and the
-    host's own applies (#33: no per-call timeout of the plugin's own)."""
+    a reply from another model, or a reply of the wrong shape. The plugin's requested
+    transport timeout is always passed; the caller's absolute eligibility deadline
+    does not shorten it. Its enforcement is the host/provider's, not a total bound."""
     from agent.auxiliary_client import call_llm
 
     route = settings.route
@@ -570,11 +572,10 @@ def _call_once(messages: list[dict[str, Any]], settings: CallSettings,
         "reasoning_config": {"enabled": settings.effort != "none", "effort": settings.effort},
         "route_info": route_info,
         "main_runtime": route.main_runtime(),
+        "timeout": settings.timeout_seconds,
     }
     if settings.max_tokens:
         call_kwargs["max_tokens"] = settings.max_tokens
-    if timeout is not None:
-        call_kwargs["timeout"] = timeout
     response = call_llm(**call_kwargs)
     # The authority on the route is what the host records in route_info; the response's
     # own model field is not read: a snapshot or deployment id (Azure's gpt-4o answers
@@ -672,8 +673,8 @@ def _no_hold(seconds: float) -> None:
 @dataclass(frozen=True)
 class CallPath:
     """How the calls of one chunk reach the provider: ``dispatch`` wraps each provider
-    call (a limiter slot, the host's deadline installed) and yields the deadline it is
-    bounded by; ``hold`` passes a provider's ``Retry-After`` on to the endpoint;
+    call (a limiter slot held until the host invocation ends) and yields the deadline
+    for admission; ``hold`` passes a provider's ``Retry-After`` on to the endpoint;
     ``deadline`` is the host's deadline for the decision to retry; ``wait`` is the wait
     between retries, which may give up. The defaults call directly on this thread."""
 
@@ -697,14 +698,11 @@ def _call_with_retries(
     while True:
         try:
             with path.dispatch() as bound:
-                timeout = None
-                if bound is not None:
-                    timeout = bound - time.monotonic()
-                    if timeout <= 0:
-                        raise SummaryFailure("summariser call not made, no time left before the host's deadline",
-                                             transient=True, kind="endpoint")
+                if bound is not None and time.monotonic() >= bound:
+                    raise SummaryFailure("summariser call not made, no time left before the host's deadline",
+                                         transient=True, kind="endpoint")
                 try:
-                    content, finish_reason = _call_once(messages, settings, timeout)
+                    content, finish_reason = _call_once(messages, settings)
                 except SummaryFailure:
                     raise
                 except Exception as exc:

@@ -1,5 +1,6 @@
 """LCM configuration with defaults and env var overrides."""
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +11,26 @@ try:
 except Exception:  # pragma: no cover - optional fallback for minimal installs
     yaml = None
 
+DEFAULT_SUMMARY_TIMEOUT_MS = 300_000
+_SUMMARY_TIMEOUT_SOURCE = "default: #77 requested transport timeout policy, 300 seconds"
+
+
+def summary_timeout_seconds(value: Any) -> float:
+    """Validate the plugin's requested timeout in milliseconds and return seconds.
+
+    This is a request parameter, not a promise that every host transport enforces it
+    or that the complete call finishes within it.
+    """
+    problem = "the summariser's requested timeout must be finite and positive in milliseconds"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(problem)
+    try:
+        seconds = value / 1000.0
+    except OverflowError:
+        raise ValueError(problem) from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(problem)
+    return seconds
 
 def _parse_int_env(key: str, default: int) -> int:
     raw = os.environ.get(key)
@@ -235,6 +256,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
     _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
     _EnvFieldSpec("summary_calls_in_flight", "LCM_SUMMARY_CALLS_IN_FLIGHT", int),
+    _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
 )
@@ -260,6 +282,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fixed_prefix_hypothesis_tokens",
     "estimate_ratio_p99",
     "estimate_ratio_max",
+    "summary_timeout_ms",
 })
 
 # The geometry's weights (#31, Decided; R14): field, env var, parse type, default, and
@@ -353,12 +376,17 @@ class LCMConfig:
     # -- Summariser calls in flight (#33) ---
     # The most summariser calls at once to one endpoint, process-wide; per endpoint
     # where summary_calls_per_endpoint names it (the base URL a summariser route names,
-    # or "provider:<name>" where it names none). There is no per-call timeout of the
-    # plugin's own: each call is bounded by the host's deadline at its dispatch.
+    # or "provider:<name>" where it names none). A slot stays held until the synchronous
+    # host invocation returns or raises, even if its subscribing attempt has ended.
     summary_calls_in_flight: int = 8
     summary_calls_per_endpoint: dict[str, int] = field(default_factory=dict)
 
     # -- Timeouts ---
+    # Requested transport timeout per host invocation, independent of the caller's
+    # absolute attempt deadline. A conservative policy hypothesis, not a measured idle
+    # percentile or a total lifetime bound; the host/provider may enforce it differently
+    # or ignore it (#77, README). One bounded chunk does not scale with session window.
+    summary_timeout_ms: int = DEFAULT_SUMMARY_TIMEOUT_MS
     expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
@@ -426,6 +454,17 @@ class LCMConfig:
         _record("summary_calls_per_endpoint",
                 "env:LCM_SUMMARY_CALLS_PER_ENDPOINT" if os.environ.get("LCM_SUMMARY_CALLS_PER_ENDPOINT") else "default",
                 warning)
+
+        c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
+            "LCM_SUMMARY_TIMEOUT_MS", DEFAULT_SUMMARY_TIMEOUT_MS,
+            default_source=_SUMMARY_TIMEOUT_SOURCE,
+        )
+        try:
+            summary_timeout_seconds(c.summary_timeout_ms)
+        except ValueError:
+            warning = "LCM_SUMMARY_TIMEOUT_MS is not finite and positive; the plugin's default applies"
+            c.summary_timeout_ms, source = DEFAULT_SUMMARY_TIMEOUT_MS, _SUMMARY_TIMEOUT_SOURCE
+        _record("summary_timeout_ms", source, warning)
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:

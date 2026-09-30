@@ -16,7 +16,7 @@ from agent.context_engine import ContextEngine
 
 from . import turn_signals
 from .codex_routing import _codex_oauth_context_cap
-from .config import LCMConfig, _host_native_compaction_configured
+from .config import LCMConfig, _host_native_compaction_configured, summary_timeout_seconds
 from .geometry import Geometry, geometry
 from .dag import SummaryDAG
 from .db_bootstrap import (
@@ -1136,6 +1136,11 @@ class LCMEngine(
     def get_status(self) -> Dict[str, Any]:
         self._check_host_native_compaction()  # the current value of the host's switch
         status = super().get_status()
+        try:
+            summary_timeout_seconds(self._config.summary_timeout_ms)
+            summary_timeout_error = None
+        except ValueError as exc:
+            summary_timeout_error = str(exc)
         status.update({
             "compression_count": self.compression_count,
             "last_prompt_tokens": self.last_prompt_tokens,
@@ -1168,6 +1173,10 @@ class LCMEngine(
             "fixed_prefix": self._fixed_prefix_label(),
             "host_native_compaction": self._native_compaction_on,
             "native_compaction_refused": self._native_compaction_refusal or None,
+            "summary_timeout_ms": self._config.summary_timeout_ms if summary_timeout_error is None else None,
+            "summary_timeout_error": summary_timeout_error,
+            "summary_timeout_note": ("Requested transport timeout per host invocation; host/provider enforcement "
+                                     "and recovery vary. This is not a total call bound."),
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
