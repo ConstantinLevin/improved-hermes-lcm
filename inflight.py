@@ -439,14 +439,20 @@ def join_or_start(
 
     ``key`` holds everything two attempts must share to share a call: the session, the
     chunk's member records in order, the summariser route and the effort (the rule a
-    reuse applies too)."""
+    reuse applies too). ``reuse`` may block on the store and runs outside the registry
+    lock. After a miss, the registry is checked again before another call is started."""
     start_failure: Optional[str] = None
     with _REGISTRY_LOCK:
         call = _REGISTRY.get(key)
         if call is not None and call.add(subscriber):
             return "joined"
-        reused = reuse()
-        if reused is None:
+    reused = reuse()
+    if reused is None:
+        with _REGISTRY_LOCK:
+            # Another attempt may have started a call while the store was being read.
+            call = _REGISTRY.get(key)
+            if call is not None and call.add(subscriber):
+                return "joined"
             call = ChunkCall(key, limiter, limit)
             call.add(subscriber)
             context = contextvars.copy_context()
