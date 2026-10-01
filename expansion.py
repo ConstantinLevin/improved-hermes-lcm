@@ -139,7 +139,7 @@ _FILL_UNREAD = ("whether the host sends its stand-in {content} for this empty me
 
 def _group_note(group: host_pairing.Group) -> str:
     """Rule 2's note: one id, or the overlapping ids of the group's calls."""
-    ids = [str(i) for i in group.ids]
+    ids = [repr(i) for i in group.ids]
     said = ids[0] if len(ids) == 1 else ", ".join(ids[:-1]) + " or " + ids[-1] + " (overlapping)"
     return _GROUP.format(k=len(group.calls), j=len(group.results), id=said)
 

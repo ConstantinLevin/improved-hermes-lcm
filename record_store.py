@@ -1308,13 +1308,13 @@ class RecordStore:
             previous_first = ranks[0]
 
         # The call handles (round 5 of #71): each names (record, position) of an assistant
-        # record of this session, the host's id beside it is the one the record holds at
-        # that position, and every assistant record has exactly one handle per call.
+        # record of this session, and every assistant record has exactly one handle per
+        # call position. Provider ids remain only in the original raw, never identity columns.
         raws = {str(h): json.loads(r) for h, r in self._q(
             "SELECT handle, raw FROM records WHERE session = ? AND role = 'assistant'", (session,))}
-        rows_of: dict[str, dict[int, Optional[str]]] = {}
-        for handle, record, position, call_id in self._q(
-                "SELECT t.handle, t.record, t.position, t.tool_call_id FROM tool_calls t JOIN records r "
+        rows_of: dict[str, set[int]] = {}
+        for handle, record, position in self._q(
+                "SELECT t.handle, t.record, t.position FROM tool_calls t JOIN records r "
                 "ON r.handle = t.record WHERE r.session = ?", (session,)):
             record, position = str(record), int(position)
             raw = raws.get(record)
@@ -1324,16 +1324,11 @@ class RecordStore:
                 problem(f"call handle {handle} names record {record}, which is not an assistant record "
                         f"with tool calls")
                 continue
-            if position >= len(calls):
+            if not 0 <= position < len(calls):
                 problem(f"call handle {handle} names position {position} of record {record}, "
                         f"which has {len(calls)} calls")
                 continue
-            held = calls[position].get("id") if isinstance(calls[position], dict) else None
-            held = str(held) if held not in (None, "") else None
-            if held != call_id:
-                problem(f"call handle {handle} keeps the host id {call_id!r}; record {record} holds {held!r} "
-                        f"at position {position}")
-            rows_of.setdefault(record, {})[position] = call_id
+            rows_of.setdefault(record, set()).add(position)
         for record, raw in raws.items():
             calls = raw.get("tool_calls") if isinstance(raw.get("tool_calls"), list) else []
             if sorted(rows_of.get(record, {})) != list(range(len(calls))):
@@ -1415,8 +1410,8 @@ class RecordStore:
                         conn,
                         MESSAGE,
                         "INSERT INTO records(handle, session, predecessor, compaction, kind, raw, "
-                        "role, tool_call_id, text, est_tokens, est_uncounted_images) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "role, text, est_tokens, est_uncounted_images) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             session,
                             predecessor,
@@ -1424,7 +1419,6 @@ class RecordStore:
                             entry.klass,
                             raw_json(message),
                             message.get("role"),
-                            message.get("tool_call_id"),
                             grep_text(message),
                             estimate.tokens,
                             estimate.uncounted_images,
@@ -1482,20 +1476,20 @@ class RecordStore:
         """One handle per tool call of every assistant record written, named by (record,
         position in its ``tool_calls``) and minted here, with the record (#29 W5; the
         orchestrator's ruling on round 5 of #71): never inherited from a record this one
-        revises, never carried by the host's id, never re-pointed. The host's id is kept
-        beside it as the record holds it. Which result answers a call is not stored: it is
-        read, in the active order, by the host's own pairing rule (``pairing``)."""
+        revises, never carried by the host's id, never re-pointed. Provider ids stay in
+        the original raw. Which result answers a call is not stored: it is read, in
+        the active order, by the common relation (``pairing``). Legacy nullable ID
+        columns remain physically present; new writes do not populate them."""
         for handle, message in written:
             calls = message.get("tool_calls")
             if message.get("role") != "assistant" or not isinstance(calls, list):
                 continue
-            for index, call in enumerate(calls):
-                call_id = call.get("id") if isinstance(call, dict) else None
+            for index in range(len(calls)):
                 self._insert_with_handle(
                     conn,
                     TOOL_CALL,
-                    "INSERT INTO tool_calls(handle, record, position, tool_call_id) VALUES (?, ?, ?, ?)",
-                    (handle, index, str(call_id) if call_id not in (None, "") else None),
+                    "INSERT INTO tool_calls(handle, record, position) VALUES (?, ?, ?)",
+                    (handle, index),
                 )
 
     def write_derivation(

@@ -1,41 +1,45 @@
-"""The rule the tail and the cut share: a tool call is never separated from its
-results (#13), and a result that names no call of the list is an error.
+"""Validate the common pairing before compaction assembles any context.
 
-The tail is sized in tokens from the target (``CompactionMixin._tail_plan``, #31) and
-placed at the boundaries of the same groups the cut uses (``CompactionMixin._groups``).
-Both rest on the pairing this module checks once over the whole list, before any
-boundary is chosen: every tool row names, by its ``tool_call_id``, a call an assistant
-row before it made.
+Calls and results are never invented or dropped to make the list pass. An ambiguity
+group preserves its actual members without claiming individual attribution.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, Sequence
 
-from .message_analysis import _tool_call_id
+from .pairing import Pairing, pair
 
 
 class ToolPairingError(Exception):
-    """A tool row no boundary can be placed around: its ``tool_call_id`` is empty, or
-    no assistant row before it in the list made that call (#13)."""
+    """A missing side or a cut that would split a call/result unit (#13)."""
 
 
-def check_tool_pairing(messages: Sequence[Dict[str, Any]]) -> None:
-    """Every tool row of the list, wherever it stands (the material, the tail, between
-    the summaries), answers a call an assistant row before it made; otherwise
-    ``ToolPairingError``. Nothing is guessed: a result without its call cannot be
-    grouped, cut or kept in the tail as the model requires."""
-    made: set = set()
+def check_tool_pairing(messages: Sequence[Dict[str, Any]]) -> Pairing:
+    """Validate both sides everywhere in the full given order, including the tail.
+
+    A nonempty ambiguity group is kept unattributed; it does not prove a distinct
+    execution result for each call. An empty group cannot stand for a missing result.
+    """
+    found = pair(list(enumerate(messages)))
+    for position, (why, result_id) in found.stray.items():
+        raise ToolPairingError(
+            f"the tool row at position {position} has no call in its assistant/user block "
+            f"({why}: {result_id!r})")
     for position, message in enumerate(messages):
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        role = message.get("role")
-        if role == "assistant":
-            made |= {_tool_call_id(call) for call in (message.get("tool_calls") or [])} - {""}
-        elif role == "tool":
-            result_id = str(message.get("tool_call_id") or "").strip()
-            if not result_id:
-                raise ToolPairingError(f"the tool row at position {position} carries no tool_call_id")
-            if result_id not in made:
-                raise ToolPairingError(f"the tool row at position {position} answers the call {result_id!r}, "
-                                       f"which no assistant row before it in the list made")
+        calls = message.get("tool_calls")
+        if calls is None:
+            continue
+        if not isinstance(calls, list):
+            raise ToolPairingError(f"the assistant row at position {position} has tool_calls that is not a list")
+        for slot, call in enumerate(calls):
+            key = (position, slot)
+            group = found.group.get(key)
+            if key not in found.answer and (group is None or not group.results):
+                call_id = call.get("id") if isinstance(call, dict) else None
+                raise ToolPairingError(
+                    f"the call at position {position}, tool_calls[{slot}], has no result in its "
+                    f"assistant/user block (id: {call_id!r})")
+    return found
