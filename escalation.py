@@ -3,23 +3,19 @@
 The summariser reads the chunk's records as the messages they were, between its
 instructions (today's text) and a closing request; ``summariser_input`` builds that.
 
-The summariser is the session's model on the session's route (#9, the manifesto's
-default): the route the host handed ``update_model``, called through the host's
-``call_llm`` as its ``main_runtime``, which the host resolves the way it resolves the
-main agent's route. A summariser configured for the plugin (``LCM_SUMMARY_*``) is not
-supported in this build and is refused when the configuration is loaded (#68). The call
-is made with no host task name (R8), so none of the host's ``auxiliary.<task>`` settings
-reach it, with the reasoning effort passed through the host's ``reasoning_config``, and
-with ``route_info``, which the host fills with the route that answered. A reply from any
-other model than the summariser is a failure (#33 D9): the host's fallback ladder answers
-a timeout, a rate limit or another capacity error with the main agent's model or a
-configured fallback, and says so only there. After a fallback, only the session route's
-own provider and model are accepted, and only a provider that names its endpoint, since
-``route_info`` carries no base URL (the orchestrator's ruling on D9). A gap stays: where
-the host's ``_resolve_auto_route`` picks a fallback provider before its first
-``route_info`` record and that provider serves the same model id, the one record cannot
-tell it from the session's route (ask A-33.3).
+The summariser and query share one deliberate selection policy: by default the
+observed session route, or the five configured summary route fields. Selection
+retains the host's actual native client, endpoint, credential and create owner.
+Calls use the existing host planner and protected one-attempt callback with no
+host task name, so auxiliary compression policy cannot select their model or
+effort. The plugin-session effort override wins over the configured plugin effort,
+whose default is medium. Each purpose keeps its own prompt and call controls.
 
+The current native contract is a nonstream OpenAI Chat completion with an observed
+successful ending. Unsupported native owners, lost endpoint context, a host
+substitution or an unestablished credential owner are refused visibly. This is a
+step toward #68; it does not establish every endpoint or wire. No selected client
+fact is presented as an SDK/network delivery receipt.
 Two levels, each one call to the summariser with today's prompt text (#10 owns the
 texts): level 1 asks for a summary near the target budget; level 2, with today's
 bullet-point text, is the one retry after a non-transient failure of level 1. There
@@ -74,6 +70,7 @@ from __future__ import annotations
 
 import contextlib
 import email.utils
+import hashlib
 import logging
 import random
 import time
@@ -107,8 +104,7 @@ REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhig
 
 @dataclass(frozen=True)
 class SummariserRoute:
-    """The summariser's whole route, explicit at every call (#9): the session's, as the
-    host's ``update_model`` named it, called through the host as its ``main_runtime``."""
+    """A deliberate prospective route and the actual native owner selected for it."""
 
     provider: str
     model: str
@@ -119,7 +115,7 @@ class SummariserRoute:
     api_key: Any = field(default="", repr=False)
     api_mode: str = ""
     source: str = "session"
-    # The provider as the host (``update_model``) named it.
+    # The observed or deliberately configured provider name.
     named_provider: str = ""
     # The route the host routes the session to, resolved once, from the host's final
     # client resolution (``_resolve_route_target``): the provider label and model it
@@ -138,6 +134,59 @@ class SummariserRoute:
     target_api_mode: str = ""
     target_client: str = ""
     target_problem: str = ""
+    exact_model: bool = False
+    # Native objects and credentials are transient. The retained client also owns
+    # its factory's default header/query context; neither is reconstructed here.
+    target_owner: Any = field(default=None, repr=False, compare=False)
+    target_resource: Any = field(default=None, repr=False, compare=False)
+    target_api_key: Any = field(default=None, repr=False, compare=False)
+
+    def plan_kwargs(self) -> dict[str, Any]:
+        """Explicit selection through the existing host planner, with no task policy."""
+        from agent.auxiliary_client import _normalize_main_runtime, _preserve_provider_with_base_url
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        provider, base = self.provider, self.base_url or None
+        named = _get_named_custom_provider(provider)
+        if base and named and not _preserve_provider_with_base_url(provider):
+            # Passing both would erase the named owner. Assert the endpoint against
+            # the selected native client instead of surrendering that promise.
+            base = None
+        elif base and provider.startswith("custom:") and not named and self.source == "session":
+            provider = "custom"
+        return {
+            "provider": provider, "model": self.model, "base_url": base,
+            "api_key": self.api_key or None, "api_mode": self.api_mode or None,
+            "main_runtime": _normalize_main_runtime(self.main_runtime()) if self.source == "session" else {},
+        }
+
+    def pending_identity(self) -> tuple:
+        """Identity of prospective work; never a requirement on an authored summary."""
+        key = self.target_api_key
+        credential = ("callable", id(key)) if callable(key) else (
+            "value", hashlib.sha256((key or "").encode()).digest())
+        return (self.target_provider, self.target_model, self.target_base_url,
+                self.target_api_mode, id(self.target_owner), credential)
+
+    def require_selected_client(self, client: Any) -> None:
+        """Revalidate only established native bindings, without evaluating credentials."""
+        from openai.resources.chat.completions import Completions
+
+        if client is not self.target_owner:
+            raise AuthoringUnavailable("dispatch selected invocation", "the host selected another native client owner")
+        if str(getattr(client, "base_url", "") or "").rstrip("/") != self.target_base_url.rstrip("/"):
+            raise AuthoringUnavailable("dispatch selected invocation", "the selected native endpoint changed")
+        if not _same_credential(getattr(client, "api_key", None), self.target_api_key):
+            raise AuthoringUnavailable("dispatch selected invocation", "the selected native credential owner changed")
+        resource = client.chat.completions
+        if (resource is not self.target_resource or type(resource) is not Completions
+                or getattr(resource, "_client", None) is not client
+                or getattr(resource.create, "__func__", None) is not Completions.create):
+            raise AuthoringUnavailable("dispatch selected invocation", "the retained native create operation changed")
+
+    def known_secrets(self) -> tuple[str, ...]:
+        return tuple(value for value in (self.api_key, self.target_api_key)
+                     if isinstance(value, str) and value)
 
     def table_provider(self) -> str:
         """The provider the model table's route rows are keyed on: the target's."""
@@ -147,8 +196,7 @@ class SummariserRoute:
         return self.target_provider
 
     def main_runtime(self) -> dict[str, Any]:
-        """The session's route as the host's ``main_runtime``: as ``update_model`` named it,
-        which the host resolves itself."""
+        """The observed session fields; configured destinations use no session context."""
         fields = {"provider": self.provider, "model": self.model, "base_url": self.base_url,
                   "api_key": self.api_key, "api_mode": self.api_mode}
         return {key: value for key, value in fields.items() if value}
@@ -169,20 +217,41 @@ def _host_provider(provider: str) -> Optional[str]:
         return None
 
 
-def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mode: str) -> SummariserRoute:
-    """The session's own route as the summariser's (the orchestrator's ruling on #54):
-    the session's model on the route the host named in ``update_model``, handed to the
-    host's ``call_llm`` as its ``main_runtime``, which the host resolves the way it
-    resolves the main agent's own route (``_resolve_auto_route``, agent/auxiliary_client.py
-    at Hermes 9fc7f17906). Its target is resolved here, once (``_resolve_route_target``)."""
+def _same_credential(left: Any, right: Any) -> bool:
+    if callable(left) or callable(right):
+        return left is right
+    return isinstance(left, str) and isinstance(right, str) and left == right
+
+
+def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mode: str,
+                  *, source: str = "session", exact_model: bool = False) -> SummariserRoute:
+    """Retain the actual host-selected native owner for this prospective route."""
+    provider = provider.strip().lower()
     route = SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
-                            api_mode=api_mode, source="session", named_provider=provider)
+                            api_mode=api_mode, source=source, named_provider=provider,
+                            exact_model=exact_model)
     target, problem = _resolve_route_target(route)
-    if target is None:
-        return replace(route, target_problem=problem)
-    target_provider, target_model, target_base_url, target_api_mode, target_client = target
-    return replace(route, target_provider=target_provider, target_model=target_model,
-                   target_base_url=target_base_url, target_api_mode=target_api_mode, target_client=target_client)
+    return replace(route, **target) if target is not None else replace(route, target_problem=problem)
+
+
+def configured_route(config: Any, provider: str, model: str, base_url: str,
+                     api_key: Any, api_mode: str) -> SummariserRoute:
+    """Apply the five deliberate fields; destination changes never borrow session auth."""
+    configured_provider = config.summary_provider.strip()
+    configured_base = config.summary_base_url.strip()
+    configured_model = config.summary_model.strip()
+    destination = bool(configured_provider or configured_base)
+    if destination:
+        provider = configured_provider or "custom"
+        base_url = configured_base
+        api_key = config.summary_api_key.strip()
+        api_mode = config.summary_api_mode.strip()
+    else:
+        api_key = config.summary_api_key.strip() or api_key
+        api_mode = config.summary_api_mode.strip() or api_mode
+    return session_route(provider, configured_model or model, base_url, api_key, api_mode,
+                         source="configured" if destination else "session",
+                         exact_model=bool(configured_model))
 
 
 def _client_wire(client: Any) -> str:
@@ -205,68 +274,82 @@ def _client_wire(client: Any) -> str:
     return ""
 
 
-def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[tuple[str, str, str, str, str]], str]:
-    """The route the host takes for the session's own route: (provider label, model,
-    endpoint, wire, client class), from the host's final client resolution, the same
-    ``call_llm`` performs, without a request (the orchestrator's ruling on the Codex
-    review of e229fd0), read at Hermes origin/main d0288be5b3 (agent/auxiliary_client.py):
-    ``call_llm`` → ``_prepare_aux_request`` (7305) → ``_resolve_task_provider_model`` (6072;
-    "auto" with no task and no provider) → ``_resolve_call_client`` (7237), called here
-    with the same arguments, which builds the client (``_get_cached_client`` →
-    ``_resolve_auto_branch``, 4967 → ``_resolve_auto_route``, 4647: MoA unwrapped to its
-    aggregator, a named provider's config entry applied, the provider's normalisation of
-    the model). From its result, as ``_prepare_aux_request`` records it (7343-7345): the
-    label ``_fallback_provider_from_label(effective_provider or resolved_provider)``, the
-    final model; and the client's ``base_url`` and class (``_client_wire``). Returns
-    (None, why) where the host cannot resolve it (no credentials, no provider).
+def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[dict[str, Any]], str]:
+    """Select through the host factory and retain its established native bindings."""
+    try:
+        from agent.auxiliary_client import (
+            _canonical_api_mode, _fallback_provider_from_label, _normalize_api_key,
+            _normalize_aux_provider, _resolve_call_client, _resolve_task_provider_model,
+            _to_openai_base_url,
+        )
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+        from openai.resources.chat.completions import Completions
+        from .summariser_authoring import native_client_problem
+        from urllib.parse import urlsplit
 
-    A fallback never becomes the target (the orchestrator's ruling on the Codex review of
-    903281e): the provider label the host resolves must be the session route's own, the
-    label the host's main-route target carries (``_normalize_main_runtime``, 3080, and
-    ``_main_route_target``, 4534: the provider as ``update_model`` named it, lower-cased,
-    a MoA preset's aggregator; a ``custom:<name>`` without a config entry and with a base
-    URL labelled ``custom``, 4583-4587). Only the label is compared, host value with host
-    value; the target's model is the one the host's resolution returned, never a
-    prediction of the plugin's (the orchestrator's ruling on the Codex review of a8608a2).
-    Where the host would take another provider (its main provider unhealthy, a fallback
-    configured), the route is refused: "the session route is not available; the host
-    would fall back to …"."""
-    try:
-        from agent.auxiliary_client import (  # type: ignore
-            _fallback_provider_from_label, _main_route_target, _normalize_main_runtime, _resolve_call_client)
+        if not route.provider or not route.model:
+            return None, "the selected provider and model are not known; configure a model or supply the session route"
+        if route.provider.strip().lower() in {"auto", "moa"}:
+            return None, "the virtual session/provider does not expose an exact native destination and credential owner"
+        named = _get_named_custom_provider(route.provider)
+        if route.source == "configured" and route.provider.startswith("custom:") and not named:
+            return None, "the configured named custom provider has no host-owned profile"
+        if route.provider == "custom" and not route.base_url:
+            return None, "an anonymous custom route requires an explicit endpoint and credential"
+        if route.source == "session" and not route.api_key:
+            return None, "the session credential owner was not supplied through update_model"
+        options = route.plan_kwargs()
+        resolved_provider, resolved_model, resolved_base, resolved_key, resolved_mode = _resolve_task_provider_model(
+            None, options["provider"], options["model"], options["base_url"], options["api_key"])
+        mode = _canonical_api_mode(route.api_mode).lower() if route.api_mode else resolved_mode
+        client, final_model, actual_provider, effective_provider = _resolve_call_client(
+            None, provider=options["provider"], model=options["model"], base_url=options["base_url"],
+            api_key=options["api_key"], resolved_provider=resolved_provider,
+            resolved_model=resolved_model, resolved_base_url=resolved_base,
+            resolved_api_key=resolved_key, resolved_api_mode=mode,
+            main_runtime=options["main_runtime"], async_mode=False)
+        label = str(_fallback_provider_from_label(effective_provider or actual_provider) or "").strip().lower()
+        expected = str(_fallback_provider_from_label(resolved_provider) or "").strip().lower()
+        if not label or not final_model or _normalize_aux_provider(label) != _normalize_aux_provider(expected):
+            return None, "the host substituted another provider for the selected route"
+        if route.exact_model and final_model != route.model:
+            return None, "the host substituted or normalized the exact configured model"
+        wire = _client_wire(client)
+        if mode and mode != wire:
+            return None, "the actual native owner does not preserve the selected API mode"
+        problem = native_client_problem(client)
+        if problem:
+            return None, problem
+        endpoint = str(getattr(client, "base_url", "") or "")
+        parsed = urlsplit(endpoint)
+        if (not endpoint or parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password):
+            return None, "the selected native endpoint is unavailable or contains URL credentials"
+        if route.base_url:
+            requested = urlsplit(route.base_url)
+            if requested.query or requested.fragment or requested.username or requested.password:
+                return None, "the explicit endpoint contains context not exposed by the established native endpoint binding"
+            if named and urlsplit(str(named.get("base_url") or "")).query:
+                return None, "the named profile's full endpoint context cannot be asserted through the established native endpoint binding"
+            expected_endpoint = _to_openai_base_url(route.base_url)
+            if endpoint.rstrip("/") != expected_endpoint.rstrip("/"):
+                return None, "the selected native endpoint differs from the observed or configured endpoint; named-profile endpoint overrides are unsupported"
+        credential = getattr(client, "api_key", None)
+        if not isinstance(credential, str) and not callable(credential):
+            return None, "the selected native credential owner is not exposed by an established binding"
+        if route.api_key and not _same_credential(credential, _normalize_api_key(route.api_key)):
+            return None, "the actual native credential owner differs from the observed or configured credential"
+        resource = client.chat.completions
+        if (type(resource) is not Completions or getattr(resource, "_client", None) is not client
+                or getattr(resource.create, "__func__", None) is not Completions.create):
+            return None, "the actual native create operation is unavailable"
+        return {"target_provider": label, "target_model": str(final_model),
+                "target_base_url": endpoint, "target_api_mode": wire,
+                "target_client": type(client).__name__, "target_owner": client,
+                "target_resource": resource, "target_api_key": credential}, ""
     except Exception as exc:
-        return None, f"the host's client resolution cannot be read ({type(exc).__name__}: {exc})"
-    try:
-        main_provider, main_model, main_base_url, _key, _mode = _main_route_target(
-            _normalize_main_runtime(route.main_runtime()), None)
-    except Exception as exc:
-        return None, f"the host's main-route target cannot be read ({type(exc).__name__}: {exc})"
-    own_label = str(main_provider or "").strip().lower()
-    if own_label.startswith("custom:") and main_base_url:
-        try:
-            from hermes_cli.runtime_provider import _get_named_custom_provider  # type: ignore
-            if _get_named_custom_provider(own_label) is None:
-                own_label = "custom"
-        except Exception as exc:
-            return None, f"the host's custom-provider entries cannot be read ({type(exc).__name__}: {exc})"
-    try:
-        resolved = _resolve_call_client(
-            None, provider=None, model=None, base_url=None, api_key=None, resolved_provider="auto",
-            resolved_model=None, resolved_base_url=None, resolved_api_key=None, resolved_api_mode=None,
-            main_runtime=route.main_runtime(), async_mode=False)
-        client, final_model, resolved_provider, effective_provider = resolved
-    except Exception as exc:
-        return None, f"the host cannot route the session's summariser ({type(exc).__name__}: {exc})"
-    label = str(_fallback_provider_from_label(effective_provider or resolved_provider) or "").strip().lower()
-    model = str(final_model or "").strip()
-    if not label or label == "auto" or not model:
-        return None, (f"the host's client resolution names no provider and model for the session's route "
-                      f"({label or '?'}/{model or '?'})")
-    if label != own_label:
-        return None, (f"the session route is not available; the host would fall back to {label}/{model} (the "
-                      f"session's route is on {own_label})")
-    return (label, model, str(getattr(client, "base_url", "") or ""), _client_wire(client),
-            type(client).__name__), ""
+        # Factory errors can contain credentials; their text is not a route fact.
+        return None, f"the host's selected native route cannot be established ({type(exc).__name__})"
 
 
 def _host_local_server_aliases() -> Optional[frozenset]:
@@ -282,27 +365,33 @@ def _host_local_server_aliases() -> Optional[frozenset]:
 
 
 def configured_route_problem(config: Any) -> Optional[str]:
-    """Why the plugin's summariser settings cannot be used, or None (#9). Checked when
-    the configuration is loaded; every compaction then aborts with this cause.
-
-    The summariser is the session's model on the session's route. A summariser other
-    than that (any of ``LCM_SUMMARY_MODEL``, ``_PROVIDER``, ``_BASE_URL``, ``_API_KEY``,
-    ``_API_MODE`` set) is not supported in this build and is refused visibly (the
-    orchestrator's ruling on the Codex review of 40eda93; #68 carries what was learned
-    building it). The effort is checked because the session's route uses it."""
-    effort = str(getattr(config, "summary_reasoning_effort", "") or "").strip().lower()
+    """Validate deliberate selection fields, including obsolete independent query intent."""
+    fields = (("summary_model", "LCM_SUMMARY_MODEL"), ("summary_provider", "LCM_SUMMARY_PROVIDER"),
+              ("summary_base_url", "LCM_SUMMARY_BASE_URL"), ("summary_api_key", "LCM_SUMMARY_API_KEY"),
+              ("summary_api_mode", "LCM_SUMMARY_API_MODE"),
+              ("summary_reasoning_effort", "LCM_SUMMARY_REASONING_EFFORT"),
+              ("expansion_model", "LCM_EXPANSION_MODEL"))
+    for attribute, name in fields:
+        if not isinstance(getattr(config, attribute, None), str):
+            return f"{name} must be a string"
+    if config.expansion_model.strip():
+        return ("LCM_EXPANSION_MODEL cannot select a separate query model: query shares the summariser "
+                "selection; unset it and configure LCM_SUMMARY_* instead")
+    if config.summary_model.strip().lower() == "auto" or config.summary_provider.strip().lower() == "auto":
+        return "LCM_SUMMARY_MODEL and LCM_SUMMARY_PROVIDER require exact choices, not the host's auto sentinel"
+    effort = config.summary_reasoning_effort.strip().lower()
     if effort not in REASONING_EFFORTS:
-        return (f"LCM_SUMMARY_REASONING_EFFORT {effort!r} is not one of the host's levels "
-                f"({', '.join(sorted(REASONING_EFFORTS))})")
-    named = [env for attribute, env in (("summary_model", "LCM_SUMMARY_MODEL"),
-                                        ("summary_provider", "LCM_SUMMARY_PROVIDER"),
-                                        ("summary_base_url", "LCM_SUMMARY_BASE_URL"),
-                                        ("summary_api_key", "LCM_SUMMARY_API_KEY"),
-                                        ("summary_api_mode", "LCM_SUMMARY_API_MODE"))
-             if str(getattr(config, attribute, "") or "").strip()]
-    if named:
-        return (f"a summariser other than the session's model is not supported in this build (issue #68); "
-                f"unset {', '.join(named)}")
+        return "LCM_SUMMARY_REASONING_EFFORT is not one of the host's supported levels"
+    if config.summary_base_url.strip() and config.summary_provider.strip().lower() in {"", "custom"} and not config.summary_api_key.strip():
+        return "an anonymous LCM_SUMMARY_BASE_URL requires an explicit LCM_SUMMARY_API_KEY; no credential is borrowed"
+    if config.summary_api_mode.strip():
+        try:
+            from agent.auxiliary_client import _canonical_api_mode
+            mode = _canonical_api_mode(config.summary_api_mode.strip()).lower()
+        except Exception:
+            return "the host's API-mode normalization is unavailable"
+        if mode not in {"chat_completions", "codex_responses", "anthropic_messages"}:
+            return "LCM_SUMMARY_API_MODE is not an established native operation"
     return None
 
 
@@ -564,9 +653,9 @@ def _call_once(reader: ReaderInput, settings: CallSettings) -> AuthoredSummary:
     route_info = _RouteRecord()
     try:
         result = invoke_reader(
-            reader, main_runtime=settings.route.main_runtime(), effort=settings.effort,
+            reader, route=settings.route, effort=settings.effort,
             timeout=settings.timeout_seconds, max_tokens=settings.max_tokens,
-            route_info=route_info, session_model=settings.route.target_model,
+            route_info=route_info,
             image_capability=lambda provider, model: lookup(str(model or ""), provider),
         )
     except AuthoringUnavailable as error:

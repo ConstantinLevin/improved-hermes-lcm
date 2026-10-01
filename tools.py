@@ -13,7 +13,6 @@ from . import grep as grep_tool
 from .diagnostics import doctor_guidance_for_checks
 from .db_bootstrap import inspect_lcm_schema_health
 from .message_content import content_parts, is_image_part
-from .model_routing import apply_lcm_model_route
 from .prompt_boundary import build_untrusted_data_messages
 
 if TYPE_CHECKING:
@@ -623,11 +622,13 @@ def _synthesize_expansion_answer(
     *,
     prompt: str,
     context_blocks: list[dict[str, Any]],
-    model: str,
+    route: Any,
+    effort: str,
     max_tokens: int,
     timeout: float,
 ) -> str:
-    from agent.auxiliary_client import call_llm
+    from .escalation import _RouteRecord, check_route_records
+    from .summariser_authoring import invoke_selected
 
     system_prompt = (
         "Answer request.question using only facts supported by the retrieved sources. "
@@ -649,14 +650,11 @@ def _synthesize_expansion_answer(
             }
         ],
     )
-    call_kwargs = {
-        "task": "compression",
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "timeout": timeout,
-    }
-    apply_lcm_model_route(call_kwargs, model)
-    response = call_llm(**call_kwargs)
+    route_info = _RouteRecord()
+    response = invoke_selected(messages, route=route, effort=effort,
+                               max_tokens=max_tokens, timeout=timeout, route_info=route_info,
+                               temperature=None)
+    check_route_records(route, route_info.routes)
     content = response.choices[0].message.content
     if not isinstance(content, str):
         content = str(content) if content else ""
@@ -968,13 +966,28 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
             payload["timeout_seconds"] = timeout
         return json.dumps(payload)
 
-    model = engine._config.expansion_model or engine._config.summary_model or ""
-    timeout = engine._config.expansion_timeout_ms / 1000
+    selection, selection_problem = engine._summariser_selection()
+    model = selection[0].target_model if selection is not None else ""
+    if selection is None:
+        return _degraded_payload(selection_problem)
+    route, effort, secrets = selection
+    from math import isfinite
+
+    timeout_ms = engine._config.expansion_timeout_ms
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, (int, float)):
+        return _degraded_payload("the query timeout must be a finite positive number")
+    try:
+        timeout = timeout_ms / 1000
+    except OverflowError:
+        return _degraded_payload("the query timeout must be a finite positive number")
+    if not isfinite(timeout) or timeout <= 0:
+        return _degraded_payload("the query timeout must be a finite positive number")
     try:
         answer = _synthesize_expansion_answer(
             prompt=prompt,
             context_blocks=context_blocks,
-            model=model,
+            route=route,
+            effort=effort,
             max_tokens=max_tokens,
             timeout=timeout,
         )
@@ -984,6 +997,14 @@ def _lcm_expand_query_by_ids(args: Dict[str, Any], engine: "LCMEngine") -> str:
             f"lcm_expand_query synthesis timed out after {timeout:.3g}s",
             include_timeout=True,
         )
+
+    except Exception as exc:
+        from .escalation import SummaryFailure, scrub
+        from .summariser_authoring import AuthoringUnavailable
+
+        reason = scrub(str(exc), secrets) if isinstance(exc, (SummaryFailure, AuthoringUnavailable)) else (
+            f"the selected query invocation failed ({type(exc).__name__})")
+        return _degraded_payload(reason)
 
     answer = str(answer).strip() if answer is not None else ""
     if not answer:

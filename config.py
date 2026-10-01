@@ -369,7 +369,7 @@ class LCMConfig:
     # The summariser's reasoning effort, the host's levels; a session's own value, set
     # by the owner's command, is a session fact and wins (#9, #26).
     summary_reasoning_effort: str = "medium"
-    expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
+    expansion_model: str = ""     # obsolete compatibility detector; nonempty intent is refused
     # Serialized summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
 
