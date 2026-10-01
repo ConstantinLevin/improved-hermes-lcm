@@ -256,6 +256,7 @@ class RecordWriteMixin:
         only an identified row is compared with what the store holds for it. An error
         is recorded as an event, its cause is kept on the attempt for the host's
         message, and nothing is written for this compaction (None).
+        The host's summary flag does not identify a plugin return.
         """
         store = self._records
         effective = store.effective_compaction(attempt.session)
@@ -272,7 +273,6 @@ class RecordWriteMixin:
             "bound_summary_missing": "a summary the plugin returned is missing from the list",
             "bound_record_missing_interior": "a row the plugin returned is missing from the middle of the list "
                                              "and was merged into no other row",
-            "unbound_summary_row": "a row flagged as a compaction summary is not one the plugin returned",
         }
 
         def fail(kind: str, detail: Any) -> None:
@@ -339,13 +339,7 @@ class RecordWriteMixin:
                 return None
         reverted = [p for p in missing if returned[p][0] == "record"]
 
-        # 4. A row flagged as a summary that is not the plugin's bound return.
-        for index, message in enumerate(messages):
-            if index not in found and message.get("_compressed_summary") is True:
-                fail("unbound_summary_row", {"index": index, "host_row_id": message.get("_row_id")})
-                return None
-
-        # 5. Facts about the records the comparisons and predecessors need, and which
+        # 4. Facts about the records the comparisons and predecessors need, and which
         # of them stand beside the chain (F8: a host insertion never becomes a
         # predecessor, whenever it is met again).
         wanted = [returned[p][1] for p in returned if returned[p][1]] + list(reusable.values())
@@ -385,7 +379,7 @@ class RecordWriteMixin:
         else:
             fallback = None
 
-        # 6. The entries, in list order. Chain-bearing entries (records on the active
+        # 5. The entries, in list order. Chain-bearing entries (records on the active
         # branch) move the chain; host insertions and summary revisions stand beside it.
         entries: List[InputEntry] = []
         chain: Optional[tuple] = None
