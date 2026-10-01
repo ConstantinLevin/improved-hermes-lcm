@@ -22,10 +22,9 @@ stored records alone:
 3. A call with no result of its exact id in the block has none; a result whose id no call
    of the block carries, or that carries no id, belongs to none. Both are store facts.
 
-No host function is called here. What the provider received of a stretch depends on the
-host's pre-call sanitizer and on the session's route, and those differ from one another
-exactly where rule 2 applies (the re-plan of #71, section A); this plugin does not
-reproduce them.
+No host function is called here. The host owns request sanitization and transport
+projection. This relation does not replay those operations or infer a direct execution
+binding from persistence UID metadata.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ from typing import Any, Callable, Sequence
 class Group:
     """Calls and results of one block that the store cannot pair (rule 2)."""
 
-    ids: list                                 # the distinct ``id`` values of its calls, in order
+    ids: list                                 # raw call IDs, in order; comparable scalar duplicates once
     calls: list                               # (assistant record, position), in order
     results: list                             # result records, in order
 
