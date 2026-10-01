@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
     "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id, "
-    "ingested_at, observed_at, observed_at_source, seq, revises_node_id, uncounted_images, content_type"
+    "ingested_at, observed_at, observed_at_source, seq, revises_node_id, uncounted_images, content_type, "
+    "(SELECT r.raw FROM records r WHERE r.record_id = messages.store_id)"
 )
 _UNKNOWN_SOURCE = "unknown"
 
@@ -254,9 +255,12 @@ class MessageStore:
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
             "ingested_at", "observed_at", "observed_at_source", "seq", "revises_node_id",
-            "uncounted_images", "content_type",
+            "uncounted_images", "content_type", "_raw",
         ]
         d = dict(zip(cols, row[:len(cols)]))
+        # The legacy TEXT projection loses JSON types. Read the original field instead,
+        # for historical rows as well as new rows whose auxiliary ID column is unused.
+        d["tool_call_id"] = json.loads(d.pop("_raw")).get("tool_call_id")
         d["source"] = _normalize_source_value(d.get("source"))
         d["conversation_id"] = _normalize_conversation_id_value(d.get("conversation_id"))
         # Deserialize tool_calls JSON

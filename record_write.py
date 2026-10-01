@@ -79,7 +79,9 @@ def rewritten(message: Dict[str, Any], raw: str) -> bool:
     """Whether an identified row differs from what the store holds for it, as JSON
     values. Only ever asked of a row already identified by key or _row_id."""
     current = json.loads(json.dumps(_comparable(message), ensure_ascii=False, allow_nan=False))
-    return current != _comparable(json.loads(raw))
+    current = json.dumps(current, ensure_ascii=False, allow_nan=False, sort_keys=True)
+    previous = json.dumps(_comparable(json.loads(raw)), ensure_ascii=False, allow_nan=False, sort_keys=True)
+    return current != previous
 
 
 _ATTEMPT: contextvars.ContextVar = contextvars.ContextVar("lcm_compress_attempt", default=None)

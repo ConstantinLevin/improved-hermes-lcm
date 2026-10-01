@@ -1,19 +1,20 @@
-"""Which result belongs to which tool call: a fact of the store, never a prediction of
-what the host sends (the orchestrator's ruling on the re-plan of #71, 2026-09-26).
+"""The relation compaction and retrieval share, read from the given order.
 
 The store keeps no pairing. A call's handle names (record, position) and nothing else
 (``RecordStore._write_tool_calls``). Which stored result belongs to it is read off the
 stored records alone:
 
 1. **Within the block**, a result belongs to a call iff the result's ``tool_call_id``
-   equals the call's ``id`` exactly. The block of a record is the nearest assistant or user
+   equals the call's ``id`` as a JSON scalar: booleans are distinct from numbers,
+   numbers compare by value, and strings are exact. Null and compound values do not
+   establish identity. The block of a record is the nearest assistant or user
    record at or before it, up to the next assistant or user record: records of every other
-   role lie inside. This is what the store's own write check guarantees for every result it
-   takes (``fresh_tail.check_tool_pairing``: a result names an earlier call's exact id).
+   role lie inside. Compaction validates both sides of this same relation over the full
+   given list before choosing a boundary (``fresh_tail.check_tool_pairing``).
 2. **A degenerate id group is stated, never resolved.** Where two or more calls of a
-   block carry one ``id``, or a call's aliases (its ``call_id``, its ``response_item_id``,
-   and each part of a composite ``a|b`` of any of them) include another call's ``id``, those
-   calls form one group, with every result of the block whose id is one of the group's
+   block carry one ``id``, or their aliases (``id``, ``call_id``, ``response_item_id``,
+   and each part of a composite ``a|b`` of any of them) overlap, those
+   calls form one group, with every result of the block whose scalar id is one of the group's
    spellings; so does a single call that two or more results of the block name. Every call
    and every result of the group carries one note saying that the store cannot tell which
    result answered which call; every result of the group is listed under each of its
@@ -21,23 +22,23 @@ stored records alone:
 3. A call with no result of its exact id in the block has none; a result whose id no call
    of the block carries, or that carries no id, belongs to none. Both are store facts.
 
-No host function is called here. What the provider received of a stretch depends on the
-host's pre-call sanitizer and on the session's route, and those differ from one another
-exactly where rule 2 applies (the re-plan of #71, section A); this plugin does not
-reproduce them.
+No host function is called here. The host owns request sanitization and transport
+projection. This relation does not replay those operations or infer a direct execution
+binding from persistence UID metadata.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from math import isfinite
+from typing import Any, Callable, Sequence
 
 
 @dataclass
 class Group:
     """Calls and results of one block that the store cannot pair (rule 2)."""
 
-    ids: list                                 # the distinct ``id`` values of its calls, in order
+    ids: list                                 # raw call IDs, in order; comparable scalar duplicates once
     calls: list                               # (assistant record, position), in order
     results: list                             # result records, in order
 
@@ -54,6 +55,28 @@ class Pairing:
     group: dict = field(default_factory=dict)
     # result record -> ("unknown", its id) or ("no_id", None): a result that belongs to no call
     stray: dict = field(default_factory=dict)
+
+    def units(self) -> list[list]:
+        """Record members that must stay together, without attributing group results."""
+        units = [[call[0], result] for call, result in self.answer.items()]
+        seen: set[int] = set()
+        for group in self.group.values():
+            if id(group) not in seen:
+                seen.add(id(group))
+                units.append(list(dict.fromkeys([record for record, _position in group.calls] + group.results)))
+        return units
+
+
+def same_id(left: Any, right: Any) -> bool:
+    """Literal JSON scalar equality; no coercion, trimming or truthiness fallback."""
+    if type(left) is bool or type(right) is bool:
+        return type(left) is bool and type(right) is bool and left == right
+    if type(left) is str or type(right) is str:
+        return type(left) is str and type(right) is str and left == right
+    if type(left) in (int, float) and type(right) in (int, float):
+        return ((type(left) is int or isfinite(left)) and (type(right) is int or isfinite(right))
+                and left == right)
+    return False
 
 
 def _id_of(call: Any) -> Any:
@@ -75,13 +98,12 @@ def _aliases(call: Any) -> set:
 
 
 def _joined(ci: Any, cj: Any) -> bool:
-    """Rule 2: two calls of one block share an ``id``, or one's aliases hold the other's."""
+    """Rule 2: shared literal IDs or overlapping aliases leave attribution unknown."""
     id_i, id_j = _id_of(ci), _id_of(cj)
-    return ((id_i is not None and id_i == id_j) or (isinstance(id_j, str) and id_j in _aliases(ci))
-            or (isinstance(id_i, str) and id_i in _aliases(cj)))
+    return same_id(id_i, id_j) or bool(_aliases(ci) & _aliases(cj))
 
 
-def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
+def _pair_block(block: list[tuple[str | int, Any]], found: Pairing) -> None:
     head_record, head = block[0]
     calls: list = []
     if isinstance(head, dict) and head.get("role") == "assistant" and isinstance(head.get("tool_calls"), list):
@@ -110,7 +132,7 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
             position, call = calls[indexes[0]]
             call_id = _id_of(call)
             mine = [record for record, raw in results
-                    if call_id is not None and raw.get("tool_call_id") == call_id]
+                    if same_id(raw.get("tool_call_id"), call_id)]
             if len(mine) <= 1:
                 if mine:
                     found.answer[(head_record, position)] = mine[0]
@@ -122,11 +144,13 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
             for i in indexes:
                 spellings |= _aliases(calls[i][1])
             mine = [record for record, raw in results
-                    if isinstance(raw.get("tool_call_id"), str) and raw["tool_call_id"] in spellings]
+                    if any(same_id(raw.get("tool_call_id"), _id_of(calls[i][1])) for i in indexes)
+                    or (isinstance(raw.get("tool_call_id"), str) and raw["tool_call_id"] in spellings)]
         ids: list = []
         for i in indexes:
-            if _id_of(calls[i][1]) not in ids:
-                ids.append(_id_of(calls[i][1]))
+            call_id = _id_of(calls[i][1])
+            if not any(same_id(call_id, held) for held in ids):
+                ids.append(call_id)
         group = Group(ids, [(head_record, calls[i][0]) for i in indexes], mine)
         for key in group.calls:
             found.group[key] = group
@@ -138,7 +162,7 @@ def _pair_block(block: list[tuple[str, Any]], found: Pairing) -> None:
         if record in claimed:
             continue
         call_id = raw.get("tool_call_id")
-        if call_id is None or (isinstance(call_id, str) and not call_id.strip()):
+        if call_id is None:
             found.stray[record] = ("no_id", None)
         else:
             found.stray[record] = ("unknown", call_id)
@@ -148,7 +172,7 @@ def _opens_block(message: Any) -> bool:
     return isinstance(message, dict) and message.get("role") in ("assistant", "user")
 
 
-def pair(sequence: list[tuple[str, Any]]) -> Pairing:
+def pair(sequence: Sequence[tuple[str | int, Any]]) -> Pairing:
     """The store's pairing of ``sequence`` ((record, the host's dict as stored), in the
     active order), block by block (the module docstring)."""
     found = Pairing()

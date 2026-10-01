@@ -123,7 +123,6 @@ from .escalation import (
 from .model_table import lookup as lookup_model
 from .handles import MESSAGE
 from .summariser_input import image_count, summariser_message, wire_facts, wire_image_limit
-from .message_analysis import _tool_call_id
 from .record_store import RET_KEY, parse_ret_key, raw_json
 from .fresh_tail import ToolPairingError, check_tool_pairing
 from .inflight import (
@@ -310,46 +309,6 @@ def _ends_with_tool_results(messages: List[Dict[str, Any]]) -> bool:
     while at >= 0 and _is_steer(messages[at]):
         at -= 1
     return at >= 0 and isinstance(messages[at], dict) and messages[at].get("role") == "tool"
-
-
-def _unanswered_calls_at(messages: List[Dict[str, Any]], boundary: int) -> Optional[tuple]:
-    """(position, call ids) of an assistant row at the boundary, the last row before it
-    or the first row after it, whose tool calls have no result anywhere in the list;
-    None where there is none."""
-    answered = {str(m.get("tool_call_id") or "").strip()
-                for m in messages if isinstance(m, dict) and m.get("role") == "tool"}
-    for position in (boundary - 1, boundary):
-        if position < 0 or position >= len(messages) or not isinstance(messages[position], dict):
-            continue
-        message = messages[position]
-        if message.get("role") != "assistant":
-            continue
-        missing = sorted({_tool_call_id(call) for call in (message.get("tool_calls") or [])} - {""} - answered)
-        if missing:
-            return position, missing
-    return None
-
-
-def _pairs_crossing(messages: List[Dict[str, Any]], boundary: int) -> Optional[tuple]:
-    """(call id, position of its call, position of its result) of a pair the boundary
-    separates: a call outside (before the boundary) whose result stands inside, or a
-    result outside whose call stands inside; None where there is none. Matched by
-    ``tool_call_id``, whether or not the result of a call outside is anywhere else."""
-    made: Dict[str, int] = {}
-    for position, message in enumerate(messages):
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            for call in message.get("tool_calls") or []:
-                call_id = _tool_call_id(call)
-                if call_id:
-                    made.setdefault(call_id, position)
-    for position, message in enumerate(messages):
-        if not isinstance(message, dict) or message.get("role") != "tool":
-            continue
-        call_id = str(message.get("tool_call_id") or "").strip()
-        call_at = made.get(call_id)
-        if call_at is not None and (call_at < boundary) != (position < boundary):
-            return call_id, call_at, position
-    return None
 
 
 def _fewest_chunks(sizes: List[int], limit: int, images: Optional[List[int]] = None,
@@ -878,8 +837,8 @@ class CompactionMixin:
         already holds, F per R10, R_in 0 until #14 re-inserts the instruction.
 
         Every boundary is the start of a group of one grouping, the cut's
-        (``_groups``), taken once over every entry outside the mechanism's layer, after
-        the pairing is checked over the whole list (``check_tool_pairing``). The walk
+        (``_groups``), projected onto every entry outside the mechanism's layer after
+        validating the common relation on the whole list. The walk
         goes back from the floor, whole groups only, while the sum stays within t. The
         floor is D1's; the ceiling leaves the oldest group outside, so that something
         is chunked. The floor wins over the ceiling. The room for #34: condensation
@@ -901,7 +860,6 @@ class CompactionMixin:
         is one departure from "a recorded chunk is frozen"; a multi-group one above B is
         the other (ruled on #33). A summarised
         one is kept whatever its size: it is not sent again, its summary is reused."""
-        check_tool_pairing(messages)
         first = max(mechanism) + 1 if mechanism else 0
         outside = [i for i in range(len(messages)) if i not in mechanism]
         groups = self._groups(messages, outside)
@@ -1515,41 +1473,32 @@ class CompactionMixin:
 
     @staticmethod
     def _groups(messages: List[Dict[str, Any]], material: List[int]) -> List[List[int]]:
-        """The material in list order as groups a cut may not enter: an assistant row
-        that carries tool calls, with every result of those calls in the material and
-        whatever stands between them; every other entry alone. Calls and results are
-        matched by their ``tool_call_id``, the host's identity for the pair. The span
-        closes over every assistant inside it: a group runs from the first call to the
-        last result of any call it holds, so interleaved calls stay in one group. A tool
-        row that no group of the material opened (an empty or unknown
-        ``tool_call_id``, or a call outside the material) is a ``ToolPairingError``."""
+        """Project the full order's common relation into indivisible material spans.
 
-        def calls(index: int) -> set:
-            message = messages[material[index]]
-            if message.get("role") != "assistant":
-                return set()
-            return {_tool_call_id(call) for call in (message.get("tool_calls") or [])} - {""}
-
+        Omission never reconnects assistant/user blocks or drops a protected member.
+        Each definite pair and each unattributed group stays whole, with everything
+        between its members. The existing tail and chunk budgets walk these spans.
+        """
+        found = check_tool_pairing(messages)
+        place = {position: index for index, position in enumerate(material)}
+        end_at: Dict[int, int] = {}
+        for unit in found.units():
+            if not any(position in place for position in range(min(unit), max(unit) + 1)):
+                continue
+            held = [position for position in unit if position in place]
+            if len(held) != len(unit):
+                raise ToolPairingError(
+                    f"the material holds only part of the tool unit at positions {unit!r}")
+            start, end = min(place[position] for position in unit), max(place[position] for position in unit)
+            end_at[start] = max(end_at.get(start, start), end)
         groups: List[List[int]] = []
         at = 0
         while at < len(material):
-            if messages[material[at]].get("role") == "tool":
-                raise ToolPairingError(
-                    f"the tool row at position {material[at]} answers "
-                    f"{str(messages[material[at]].get('tool_call_id') or '').strip() or 'no call'!r}, a call no "
-                    f"assistant row of the material before it made")
-            end = at
-            call_ids = calls(at)
-            while call_ids:
-                last = end
-                for later in range(end + 1, len(material)):
-                    other = messages[material[later]]
-                    if other.get("role") == "tool" and str(other.get("tool_call_id") or "").strip() in call_ids:
-                        last = later
-                widened = set().union(*(calls(k) for k in range(at, last + 1)))
-                if last == end and widened <= call_ids:
-                    break
-                end, call_ids = last, call_ids | widened
+            end = end_at.get(at, at)
+            scan = at
+            while scan <= end:
+                end = max(end, end_at.get(scan, scan))
+                scan += 1
             groups.append(material[at:end + 1])
             at = end + 1
         return groups
@@ -2101,27 +2050,6 @@ class CompactionMixin:
                 logger.info("LCM leaves %d rows below c/4 at the end of the material raw (from position %d): the "
                             "tail begins at them, and they join material at a later compaction",
                             len(waiting), tail_start)
-        step.at = "checking the tail's boundary"
-        unanswered = _unanswered_calls_at(messages, tail_start)
-        if unanswered:
-            # The forward check: a call at the boundary whose result is not in the list
-            # would be split from it (#13). The host never asks with an open call (#32
-            # §3); if it does, that is a defect to see, not to guess around.
-            self._record_event(attempt, "tool_result_missing_at_boundary",
-                               {"position": unanswered[0], "tool_call_ids": unanswered[1]})
-            return self._abort(
-                messages, f"the assistant row at position {unanswered[0]}, at the tail's boundary, made tool calls "
-                          f"whose results are not in the list ({', '.join(unanswered[1])})")
-        crossing = _pairs_crossing(messages, tail_start)
-        if crossing:
-            # The boundary would separate a call from its result (#13): the grouping
-            # rules it out, so this is a defect to see.
-            self._record_event(attempt, "tool_pair_across_boundary",
-                               {"tool_call_id": crossing[0], "call": crossing[1], "result": crossing[2],
-                                "boundary": tail_start})
-            return self._abort(
-                messages, f"the tail's boundary at position {tail_start} would separate the call {crossing[0]!r} "
-                          f"at position {crossing[1]} from its result at position {crossing[2]}")
         if not material and waiting and not (force_overflow or provider_rejected):
             # Only a rest below c/4 stands outside the tail: nothing to compact yet, not a
             # failure (ruling on #61, 1), as the preflight says for the same list.
