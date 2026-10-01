@@ -531,6 +531,22 @@ class LCMEngine(
         self._refuse_host_write("threshold_tokens", value)
 
     @property
+    def summary_target_ratio(self) -> int:
+        """Identity multiplier for the host's idle-eligibility calculation.
+
+        The host multiplies its already-read ``threshold_tokens`` by this value.
+        Returning the integer 1 preserves LCM's advertised threshold, including its
+        raised turn margin, without another threshold or turn-state read. This
+        borrowed host attribute leaves LCM's post-compaction target G
+        (``Geometry.target``) and individual summary budgets with their own policy.
+        """
+        return 1
+
+    @summary_target_ratio.setter
+    def summary_target_ratio(self, value: Any) -> None:
+        self._refuse_host_write("summary_target_ratio", value)
+
+    @property
     def protect_first_n(self) -> int:
         """0: the host's turn-start skip never decides for the plugin (#32 D2)."""
         return 0
@@ -1181,6 +1197,11 @@ class LCMEngine(
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
         })
+        status["host_idle_compaction_floor_tokens"] = status["threshold_tokens"]
+        status["host_idle_compaction_floor_source"] = (
+            "LCM's reported threshold_tokens (host idle identity multiplier 1); "
+            "the post-compaction target G remains geometry.target"
+        )
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
         # The compactions of this plugin session that took effect, from the store.
