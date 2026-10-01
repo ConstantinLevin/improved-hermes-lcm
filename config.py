@@ -357,9 +357,9 @@ class LCMConfig:
     custom_instructions: str = ""
 
     # -- Models ---
-    # The summariser (#9): the model running the session, on the route the host hands
-    # update_model. Any of the five summary_* route fields set is refused at load: a
-    # summariser other than the session's model is not supported in this build (#68,
+    # The summariser and query share the observed session route by default, or the
+    # deliberate five summary_* route fields. Selection preserves those choices or
+    # refuses unsupported native ownership/context visibly (#68,
     # escalation.configured_route_problem).
     summary_model: str = ""
     summary_provider: str = ""
