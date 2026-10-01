@@ -17,17 +17,18 @@ between retries gives the slot back.
 **The registry.** Calls are registered process-wide by (plugin session, the chunk's
 member records in order, the summariser route, the effort). A second attempt that cuts
 the same chunk with the same summariser and effort joins the call in flight instead of
-making another, and its hook receives the call's progress; where no call is in flight,
-a summary of the same records already written by the same summariser route and effort
-is reused (#33 D12). Joining and reuse apply the one rule. A registry is per process:
+making another; where no call is in flight, an eligible summary of the same ordered
+records is reused under the selector's route rule (#33 D12). Authoring observations
+belong to the selected result, whether saved or in flight. A registry is per process:
 another process never joins, but reuses a summary once written. An entry exists only
 with a live worker; a call nobody wants any more leaves the registry at the moment
 that is decided, so no later attempt joins a call being given up.
 
-**What the worker carries (D10, R4).** The host's progress hook, read on the
-``compress()`` thread, ticks on the worker for every streamed payload of the call
-(``aux_progress_hook``); with a joined call the worker ticks every subscribed attempt's
-hook. The host's deadline, read on the ``compress()`` thread and captured when an
+**What the worker carries (D10, R4).** This fresh thread does not install a host
+progress hook: that opt-in would force streamed aggregation and lose genuine response
+completion facts. Nonstream calls produce no interim progress for the host's idle
+timer; a healthy call may therefore outlast that wait. The host's deadline, read on
+the ``compress()`` thread and captured when an
 attempt subscribes, governs plugin admission and retries. It is not installed in the
 host's stream consumer: expiry of a caller's wait is not a transport failure. Each
 invocation receives the plugin's own requested transport timeout; host/provider
@@ -64,6 +65,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
+from .summariser_authoring import AuthoringEvidence
+
 logger = logging.getLogger(__name__)
 
 try:  # host internals (#33 D10, ask A-33.1)
@@ -71,13 +74,11 @@ try:  # host internals (#33 D10, ask A-33.1)
         _aux_progress as _HOST_PROGRESS,
         _current_aux_stream_deadline as _host_current_deadline,
         aux_interrupt_protection as _host_interrupt_protection,
-        aux_progress_hook as _host_progress_hook,
     )
 except Exception:  # pragma: no cover - older or absent host
     _HOST_PROGRESS = None
     _host_current_deadline = None
     _host_interrupt_protection = None
-    _host_progress_hook = None
 
 DEFAULT_CALLS_PER_ENDPOINT = 8
 # How often a waiting thread asks whether its call is still wanted.
@@ -181,8 +182,9 @@ class ChunkSummary:
     model: Optional[str]
     provider: Optional[str]
     effort: Optional[str]
-    # The encrypted reasoning withheld from the summariser's input, as JSON (#8), or None.
+    # The exact opaque fields withheld from the summariser's input, as JSON (#8), or None.
     withheld: Optional[str] = None
+    authoring: Optional[AuthoringEvidence] = None
 
 
 @dataclass
@@ -396,7 +398,11 @@ def _worker(call: ChunkCall, run: Callable[[ChunkCall], ChunkSummary],
     failure: Optional[str] = None
     kind: Optional[str] = None
     abandoned = False
-    with _scope(_host_interrupt_protection, active=True), _scope(_host_progress_hook, call.tick):
+    # This fresh thread has no inherited host progress hook. Installing call.tick
+    # would force streamed aggregation and discard the genuine completion facts.
+    # A nonstream call sends no interim ticks: the host's idle/total fences still
+    # apply, and a late result can be recorded but cannot publish a stale context.
+    with _scope(_host_interrupt_protection, active=True):
         try:
             summary = run(call)
         except BaseException as exc:  # a SummaryFailure, an abandonment, or anything else: never swallowed

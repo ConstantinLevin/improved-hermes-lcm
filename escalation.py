@@ -80,7 +80,8 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Iterator, Optional
 
-from .summariser_input import WireFacts, summariser_messages
+from .summariser_input import ReaderInput, WireFacts, summariser_messages
+from .summariser_authoring import AuthoringEvidence, AuthoredSummary, AuthoringUnavailable
 from .tokens import Estimate, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -555,55 +556,24 @@ def ending_failure(finish_reason: Optional[str]) -> Optional[tuple[str, str]]:
     return _ENDINGS.get(finish_reason) or ("other", f"the reply ended {finish_reason!r}, not 'stop'")
 
 
-def _call_once(messages: list[dict[str, Any]], settings: CallSettings) -> tuple[str, str]:
-    """One call on the session's route through the host's ``call_llm``, as its
-    ``main_runtime``. Returns (content, finish_reason); raises on any failure of the call,
-    a reply from another model, or a reply of the wrong shape. The plugin's requested
-    transport timeout is always passed; the caller's absolute eligibility deadline
-    does not shorten it. Its enforcement is the host/provider's, not a total bound."""
-    from agent.auxiliary_client import call_llm
+def _call_once(reader: ReaderInput, settings: CallSettings) -> AuthoredSummary:
+    """One retained host plan, its actual reader invocation, and the chosen reply."""
+    from .model_table import lookup
+    from .summariser_authoring import AuthoringUnavailable, invoke_reader
 
-    route = settings.route
     route_info = _RouteRecord()
-    call_kwargs: dict[str, Any] = {
-        "task": None,
-        "messages": messages,
-        "temperature": 0.3,
-        "reasoning_config": {"enabled": settings.effort != "none", "effort": settings.effort},
-        "route_info": route_info,
-        "main_runtime": route.main_runtime(),
-        "timeout": settings.timeout_seconds,
-    }
-    if settings.max_tokens:
-        call_kwargs["max_tokens"] = settings.max_tokens
-    response = call_llm(**call_kwargs)
-    # The authority on the route is what the host records in route_info; the response's
-    # own model field is not read: a snapshot or deployment id (Azure's gpt-4o answers
-    # gpt-4o-2024-08-06) cannot be mapped onto the host's ids without predicting another
-    # system by pattern (the orchestrator's ruling on the Codex review of ad21393). A route
-    # switch that leaves no record is the host's defect (#70).
-    check_route_records(route, route_info.routes)
     try:
-        choice = response.choices[0]
-        message = choice.message
-    except Exception as exc:
-        # The endpoint's fault, not the chunk's (orchestrator ruling on a3f2505): the
-        # response has no shape to read. A well-formed reply with no summary in it is the
-        # chunk's ("reply carries no summary" below): the model answered and wrote nothing.
-        raise SummaryFailure("malformed reply", transient=False, kind="endpoint",
-                             detail=f"no choices[0].message ({type(exc).__name__})") from None
-    finish_reason = getattr(choice, "finish_reason", None)
-    # Only ``stop`` is a complete ending (the ruling on the Codex review of 188fb8b).
-    failed = ending_failure(str(finish_reason) if finish_reason else None)
-    if failed is not None:
-        kind, why = failed
-        raise SummaryFailure("reply not complete", transient=False, kind=kind,
-                             detail=f"{why} (finish_reason {finish_reason!r})")
-    content = getattr(message, "content", None)
-    if not isinstance(content, str) or not content.strip():
-        raise SummaryFailure("reply carries no summary", transient=False, kind="reply",
-                             detail=f"content is {type(content).__name__}, finish_reason {finish_reason!r}")
-    return content, str(finish_reason)
+        result = invoke_reader(
+            reader, main_runtime=settings.route.main_runtime(), effort=settings.effort,
+            timeout=settings.timeout_seconds, max_tokens=settings.max_tokens,
+            route_info=route_info, session_model=settings.route.target_model,
+            image_capability=lambda provider, model: lookup(str(model or ""), provider),
+        )
+    except AuthoringUnavailable as error:
+        raise SummaryFailure("summariser authoring facts unavailable", transient=False,
+                             kind="endpoint", detail=settings.scrub(str(error))) from error
+    check_route_records(settings.route, route_info.routes)
+    return result
 
 
 def check_route_records(route: SummariserRoute, routes: list[tuple[str, str]]) -> None:
@@ -685,12 +655,12 @@ class CallPath:
 
 
 def _call_with_retries(
-    messages: list[dict[str, Any]],
+    reader: ReaderInput,
     *,
     source: Estimate,
     settings: CallSettings,
     path: CallPath,
-) -> tuple[str, str]:
+) -> AuthoredSummary:
     """One level: transient failures retried while the deadline allows; a reply that
     does not shrink its source is a non-transient failure."""
     backoff = _BACKOFF_FIRST_S
@@ -702,7 +672,7 @@ def _call_with_retries(
                     raise SummaryFailure("summariser call not made, no time left before the host's deadline",
                                          transient=True, kind="endpoint")
                 try:
-                    content, finish_reason = _call_once(messages, settings)
+                    summary = _call_once(reader, settings)
                 except SummaryFailure:
                     raise
                 except Exception as exc:
@@ -741,11 +711,11 @@ def _call_with_retries(
             continue
         # Both sides by the plugin's estimate (R6); the reply is text, the source may
         # hold images the estimate could not count, and the numbers say so.
-        reply_tokens = count_tokens(content)
+        reply_tokens = count_tokens(summary.text)
         if reply_tokens >= source.tokens:
             raise SummaryFailure("reply not shorter than its source", transient=False, kind="reply",
                                  detail=f"{reply_tokens} >= {source.tokens} tokens, {source.label()}")
-        return content, finish_reason
+        return summary
 
 
 def level_one_input(
@@ -768,7 +738,7 @@ def level_one_input(
         request=_summary_request(focus_topic=focus_topic, custom_instructions=custom_instructions),
         facts=facts,
         withheld=withheld,
-    )
+    ).messages
 
 
 def prompt_inputs(
@@ -789,7 +759,7 @@ def prompt_inputs(
         summariser_messages([], instructions=_l2_instructions(int(largest_budget * _L2_BUDGET_RATIO),
                                                                focus_topic=focus_topic,
                                                                custom_instructions=custom_instructions),
-                            request=request, facts=facts),
+                            request=request, facts=facts).messages,
     ]
 
 
@@ -805,30 +775,34 @@ def summarize_chunk(
     custom_instructions: str = "",
     path: CallPath = CallPath(),
     level_one: Optional[list[dict[str, Any]]] = None,
-) -> tuple[str, int, str]:
-    """Summarise one chunk: (summary, level, finish_reason), or ``SummaryFailure``.
+) -> tuple[str, int, str, AuthoringEvidence]:
+    """Summarise one chunk, retaining the actual author's input and complete reply.
 
     ``records`` are the chunk's records as (handle, the host's dict as stored); the
     summariser reads them as the messages they were (#8, ``summariser_input``).
     ``source`` is their estimate, what the summary replaces in the context; a reply
-    must come in below it, by the same counter (R6). ``level_one`` is the level-1
-    input where the caller built it already (``level_one_input``, the input its window
-    check estimated).
+    must come in below it, by the same counter (R6). ``level_one`` is retained for
+    callers whose window check prepared that list. This run owns a fresh reader
+    projection of the same recorded originals and carries its actual observations.
 
     Level 1; after a non-transient failure of level 1, level 2 once (today's texts,
     until #10). A transient failure that outlasts the deadline is not retried at
     level 2: the next level would meet the same provider with no time left.
     """
     request = _summary_request(focus_topic=focus_topic, custom_instructions=custom_instructions)
-    l1 = level_one if level_one is not None else level_one_input(
-        records, token_budget, facts=facts, depth=depth, focus_topic=focus_topic,
-        custom_instructions=custom_instructions)
+    # Own the sources of the run that is actually dispatched. A planning-only list
+    # does not certify this call or another saved/in-flight authoring operation.
+    l1 = summariser_messages(
+        records,
+        instructions=_l1_instructions(token_budget, depth, focus_topic=focus_topic,
+                                      custom_instructions=custom_instructions),
+        request=request, facts=facts,
+    )
     try:
-        content, finish_reason = _call_with_retries(
-            l1, source=source, settings=settings, path=path)
-        return content, 1, finish_reason
+        summary = _call_with_retries(l1, source=source, settings=settings, path=path)
+        return summary.text, 1, summary.finish_reason, summary.authoring
     except SummaryFailure as first:
-        if first.transient:
+        if first.transient or isinstance(first.__cause__, AuthoringUnavailable):
             raise
         logger.warning("LCM level-1 summary failed (%s); trying level 2", first)
         try:
@@ -839,8 +813,7 @@ def summarize_chunk(
                 request=request,
                 facts=facts,
             )
-            content, finish_reason = _call_with_retries(
-                l2, source=source, settings=settings, path=path)
+            summary = _call_with_retries(l2, source=source, settings=settings, path=path)
         except SummaryFailure as second:
             # The chunk's own failure is not lost to what level 2 met (orchestrator ruling
             # on a3f2505): where either level failed by the chunk's own kind, the combined
@@ -871,7 +844,7 @@ def summarize_chunk(
                     logger.warning("LCM could not carry the level-1 failure (%s) past %s", first,
                                    type(exc).__name__)
             raise
-        return content, 2, finish_reason
+        return summary.text, 2, summary.finish_reason, summary.authoring
 
 
 def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:

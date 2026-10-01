@@ -252,6 +252,7 @@ INSERT_ONLY_TABLES = (
     "chunk_failures",
     "derivations",
     "derivation_sources",
+    "derivation_authoring",
     "compaction_returns",
     "revision_sources",
     "confirmations",
@@ -607,7 +608,15 @@ JOIN derivation_sources s ON s.derivation = d.handle AND s.ordinal = 0
 JOIN chunks ch ON ch.handle = s.chunk;
 """
 
-_SCHEMA_SQL = _RECORD_SQL + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + "\n" + _VIEWS_SQL
+_DERIVATION_AUTHORING_SQL = """
+CREATE TABLE derivation_authoring (
+    derivation TEXT PRIMARY KEY REFERENCES derivations(handle),
+    observation_json TEXT NOT NULL
+);
+"""
+
+_SCHEMA_SQL = (_RECORD_SQL + _DERIVATION_AUTHORING_SQL
+               + _insert_only_triggers_sql(INSERT_ONLY_TABLES) + "\n" + _VIEWS_SQL)
 
 
 # --- Journal mode -------------------------------------------------------------
@@ -766,6 +775,20 @@ def _create_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
     logger.info("LCM created a new store at %s (format %s)", db_path, STORE_FORMAT)
 
 
+def _ensure_derivation_authoring(conn: sqlite3.Connection) -> None:
+    """Add authoring observations beside an existing store's immutable history."""
+    table = "derivation_authoring"
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_DERIVATION_AUTHORING_SQL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+        for statement in _split_sql(_insert_only_triggers_sql((table,))):
+            conn.execute(statement.replace("CREATE TRIGGER", "CREATE TRIGGER IF NOT EXISTS", 1))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def open_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
     """Bind a fresh connection to the store at ``db_path``.
 
@@ -779,6 +802,8 @@ def open_store(conn: sqlite3.Connection, db_path: str | Path) -> None:
     configure_connection(conn, db_path)
     if state == "empty":
         _create_store(conn, db_path)
+    else:
+        _ensure_derivation_authoring(conn)
 
 
 def _refuse_foreign_empty_file(db_path: str | Path) -> None:
