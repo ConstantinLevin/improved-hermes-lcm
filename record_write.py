@@ -78,7 +78,8 @@ def _comparable(message: Dict[str, Any]) -> Dict[str, Any]:
 def rewritten(message: Dict[str, Any], raw: str) -> bool:
     """Whether an identified row differs from what the store holds for it, as JSON
     values. Only ever asked of a row already identified by key or _row_id."""
-    current = json.dumps(_comparable(message), ensure_ascii=False, allow_nan=False, sort_keys=True)
+    current = json.loads(json.dumps(_comparable(message), ensure_ascii=False, allow_nan=False))
+    current = json.dumps(current, ensure_ascii=False, allow_nan=False, sort_keys=True)
     previous = json.dumps(_comparable(json.loads(raw)), ensure_ascii=False, allow_nan=False, sort_keys=True)
     return current != previous
 
