@@ -357,9 +357,9 @@ class LCMConfig:
     custom_instructions: str = ""
 
     # -- Models ---
-    # The summariser (#9): the model running the session, on the route the host hands
-    # update_model. Any of the five summary_* route fields set is refused at load: a
-    # summariser other than the session's model is not supported in this build (#68,
+    # The summariser and query share the observed session route by default, or the
+    # deliberate five summary_* route fields. Selection preserves those choices or
+    # refuses unsupported native ownership/context visibly (#68,
     # escalation.configured_route_problem).
     summary_model: str = ""
     summary_provider: str = ""
@@ -369,7 +369,7 @@ class LCMConfig:
     # The summariser's reasoning effort, the host's levels; a session's own value, set
     # by the owner's command, is a session fact and wins (#9, #26).
     summary_reasoning_effort: str = "medium"
-    expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
+    expansion_model: str = ""     # obsolete compatibility detector; nonempty intent is refused
     # Serialized summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
 

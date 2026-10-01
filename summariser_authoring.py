@@ -283,105 +283,155 @@ def _validate_invocation(reader: ReaderInput, request: dict[str, Any], *,
     return effective, tuple(sorted(removed))
 
 
-def invoke_reader(reader: ReaderInput, *, main_runtime: dict[str, Any], effort: str,
-                  timeout: float, max_tokens: int | None, route_info: Any,
-                  session_model: str,
-                  image_capability: Any = None) -> AuthoredSummary:
-    """Prepare once; retain that client through the host's physical executor."""
-    from agent import auxiliary_client as host
+def native_client_problem(client: Any) -> str:
+    """Native completion contracts established by source, never by provider labels."""
     from openai import OpenAI
-    from openai.resources.chat.completions import Completions
 
-    owner = reader.sources[0].record if reader.sources else None
-    if not isinstance(session_model, str) or not session_model:
-        raise AuthoringUnavailable("dispatch summariser on session model", "the expected session model is unavailable", owner)
+    if type(client) is OpenAI:
+        return ""
+    unavailable = {
+        "CodexAuxiliaryClient": "native terminal-event observation, status and incomplete/error details are discarded before create returns",
+        "AnthropicAuxiliaryClient": "native stop_reason is discarded and missing/unknown reasons can be normalized to stop",
+        "BedrockAuxiliaryClient": "native stopReason is discarded and missing/unknown reasons can be normalized to stop",
+        "GeminiNativeClient": "native finishReason is discarded and missing/unknown reasons can be normalized to stop",
+    }.get(type(client).__name__, "the actual create operation exposes no established original-carriage and native-ending contract")
+    return f"{type(client).__module__}.{type(client).__name__}.create: {unavailable}"
+
+
+def _effective_body(request: dict[str, Any]) -> dict[str, Any]:
+    """Body controls after the host's plain-JSON extra_body carriage."""
+    body = {key: value for key, value in request.items()
+            if key not in {"extra_body", "extra_headers", "timeout"}}
+    extra = request.get("extra_body")
+    if extra is not None and not isinstance(extra, dict):
+        raise AuthoringUnavailable("dispatch selected invocation", "the effective request body is unavailable")
+    body.update(extra or {})
+    body.setdefault("stream", False)
+    return body
+
+
+def invoke_selected(messages: list[dict], *, route: Any, effort: str,
+                    timeout: float, max_tokens: int | None, route_info: Any,
+                    temperature: float | None = 0.3,
+                    validate: Any = None, observe: Any = None,
+                    owner: str | None = None) -> Any:
+    """One retained host plan and protected callback, shared by both purposes."""
+    from agent import auxiliary_client as host
+    from openai.types.chat import ChatCompletion
+
     required = ("_plan_aux_call", "_relay_sync_completion", "_relay_aux_call_scope",
                 "scoped_runtime_main", "_create_with_progress_once", "_provider_requires_stream",
                 "_aux_progress_active", "_validate_llm_response", "_acquire_sync_aux_semaphore")
     for name in required:
         if not callable(getattr(host, name, None)):
-            raise AuthoringUnavailable("dispatch original reader", f"host capability agent.auxiliary_client.{name} is unavailable", owner)
+            raise AuthoringUnavailable("dispatch selected invocation", f"host capability agent.auxiliary_client.{name} is unavailable", owner)
+    options = route.plan_kwargs()
     semaphore = host._acquire_sync_aux_semaphore(None)
     if semaphore is not None:
         semaphore.acquire()
     try:
-        with host._relay_aux_call_scope((), {"task": None}), host.scoped_runtime_main(main_runtime):
+        with host._relay_aux_call_scope((), {"task": None}), host.scoped_runtime_main(options["main_runtime"]):
             req, _retry, _candidate = host._plan_aux_call(
-                None, async_mode=False, provider=None, model=None, base_url=None,
-                api_key=None, main_runtime=main_runtime, messages=reader.messages,
-                temperature=0.3, max_tokens=max_tokens or None, tools=None,
+                None, async_mode=False, **options, messages=messages,
+                temperature=temperature, max_tokens=max_tokens or None, tools=None,
                 timeout=timeout, extra_body=None,
                 reasoning_config={"enabled": effort != "none", "effort": effort},
-                extra_headers=None, api_mode=None, route_info=route_info,
+                extra_headers=None, route_info=route_info,
             )
-            if req.final_model != session_model:
-                raise AuthoringUnavailable("dispatch summariser on session model",
-                    f"selected host model {req.final_model!r} differs from expected session model {session_model!r}; alias identity is not established", owner)
-            captured: list[tuple[Any, AuthoredSummary]] = []
+            route.require_selected_client(req.client)
+            if req.final_model != route.target_model:
+                raise AuthoringUnavailable("dispatch selected model", "the host replaced the retained selected model", owner)
+            provider = str(host._fallback_provider_from_label(req.request_provider) or "").strip().lower()
+            if provider != route.target_provider:
+                raise AuthoringUnavailable("dispatch selected provider", "the host replaced the retained selected provider", owner)
+            captured: list[tuple[Any, Any]] = []
+            expected_body = _effective_body(req.kwargs)
 
             def create(actual_request: dict[str, Any]) -> Any:
-                # This callback sees Relay's actual physical request. The initial
-                # prepared request is not used to certify a later rewritten input.
-                if type(req.client) is not OpenAI:
-                    client_name = f"{type(req.client).__module__}.{type(req.client).__name__}"
-                    unavailable = {
-                        "CodexAuxiliaryClient": "the native terminal-event observation, status and incomplete/error details are discarded before create returns",
-                        "AnthropicAuxiliaryClient": "the native stop_reason is discarded and missing/unknown reasons can be normalized to stop",
-                        "BedrockAuxiliaryClient": "the native stopReason is discarded and missing/unknown reasons can be normalized to stop",
-                        "GeminiNativeClient": "the native finishReason is discarded and missing/unknown reasons can be normalized to stop",
-                    }.get(type(req.client).__name__, "the actual create operation exposes no established original-carriage and provider-ending contract")
-                    raise AuthoringUnavailable("observe original conversion and native completion ending",
-                        f"{client_name}.create: {unavailable}", owner)
-                resource = req.client.chat.completions
-                create_method = resource.create
-                if (type(resource) is not Completions
-                        or getattr(create_method, "__func__", None) is not Completions.create
-                        or getattr(resource, "_client", None) is not req.client):
-                    raise AuthoringUnavailable("observe actual summariser operation", "the selected create callable is not an established native Chat operation on the retained client", owner)
+                # Relay may rewrite the request. These are the actual physical
+                # callback facts, rather than a certificate for the initial plan.
+                route.require_selected_client(req.client)
+                problem = native_client_problem(req.client)
+                if problem:
+                    raise AuthoringUnavailable("observe native completion", problem, owner)
                 if host._aux_progress_active():
-                    raise AuthoringUnavailable("observe complete summariser reply", "an active host progress hook selects aggregation without an observed ending witness", owner)
+                    raise AuthoringUnavailable("observe native completion", "an active host progress hook aggregates without an observed native ending", owner)
                 if host._provider_requires_stream(req.request_provider, req.base_info or req.resolved_base_url):
-                    raise AuthoringUnavailable("observe complete summariser reply", "the selected operation requires streaming; the host aggregation does not expose the observed native ending", owner)
-                model = actual_request.get("model")
-                extra = actual_request.get("extra_body")
-                if isinstance(extra, dict) and "model" in extra:
-                    model = extra["model"]
-                if model != session_model:
-                    raise AuthoringUnavailable("dispatch summariser on session model",
-                        f"actual effective request model {model!r} differs from expected session model {session_model!r}; alias identity is not established", owner)
-                capability = image_capability(req.request_provider, model) if image_capability else None
-                reads_images = getattr(capability, "reads_images", None)
-                image_facts = None if capability is None else {
-                    "provider": req.request_provider, "model_id": model,
-                    "reads_images": reads_images, "source": capability.source,
-                    "basis": capability.basis, "route": capability.route,
-                    "vendor": capability.vendor, "model": capability.model,
-                    "ids": list(capability.ids),
-                }
-                effective, removed = _validate_invocation(reader, actual_request, reads_images=reads_images)
-                # Keep one physical attempt inside the existing host executor.
-                # The ordinary nonstream branch returns the client's raw value;
-                # the outer helper's affordable-cap retry could change kwargs
-                # without exposing that later request to this callback.
+                    raise AuthoringUnavailable("observe native completion", "the selected operation requires streaming without an observed native ending", owner)
+                body = _effective_body(actual_request)
+                if body.get("model") != route.target_model or body.get("stream") is not False:
+                    raise AuthoringUnavailable("dispatch selected invocation", "the actual model or nonstream operation differs from the selected one", owner)
+                if ({key: value for key, value in body.items() if key != "messages"}
+                        != {key: value for key, value in expected_body.items() if key != "messages"}):
+                    raise AuthoringUnavailable("dispatch selected invocation", "the actual request changed the selected effort or purpose controls", owner)
+                if (actual_request.get("extra_headers") != req.kwargs.get("extra_headers")
+                        or actual_request.get("timeout") != req.kwargs.get("timeout")):
+                    raise AuthoringUnavailable("dispatch selected invocation", "the actual request changed the selected header or timeout controls", owner)
+                if validate is not None:
+                    context = validate(req, actual_request)
+                else:
+                    expected = [{key: value for key, value in row.items() if not key.startswith("_")}
+                                for row in messages]
+                    if body.get("messages") != expected:
+                        raise AuthoringUnavailable("dispatch query input", "the actual request changed the query's prepared messages", owner)
+                    context = None
                 response = host._create_with_progress_once(req.client, actual_request, None, force_stream=False)
-                authored = observe_reply(reader, effective, response, req.client,
-                                         removed_fields=removed, session_model=session_model,
-                                         image_facts=image_facts)
-                captured.append((response, authored))
+                if type(response) is not ChatCompletion or response.model != route.target_model:
+                    raise AuthoringUnavailable("observe native completion", "the actual native reply type or model differs from the selected contract", owner)
+                try:
+                    choice = response.choices[0]
+                    content = choice.message.content
+                    complete = response.object == "chat.completion" and choice.finish_reason == "stop"
+                except (AttributeError, IndexError):
+                    raise AuthoringUnavailable("observe native completion", "the native reply has no established ending and text", owner) from None
+                if not complete or not isinstance(content, str) or not content.strip():
+                    raise AuthoringUnavailable("observe native completion", "the native reply has no genuine successful stop and nonblank text", owner)
+                result = observe(req, actual_request, response, context) if observe is not None else response
+                captured.append((response, result))
                 return response
 
             response = host._relay_sync_completion(
                 req.client, req.kwargs, provider=req.request_provider,
                 api_mode=req.resolved_api_mode, create=create,
             )
-            for raw, authored in reversed(captured):
+            for raw, result in reversed(captured):
                 if response is raw:
                     validated = host._validate_llm_response(
                         response, None, provider=req.request_provider, base_url=req.base_info)
                     if validated is not raw:
-                        raise AuthoringUnavailable("select summariser reply", "host validation replaced the actual authoring response", owner)
-                    return authored
-            raise AuthoringUnavailable("select summariser reply", "host reply assembly returned a candidate with no captured authoring invocation and complete native reply", owner)
+                        raise AuthoringUnavailable("select native reply", "host validation replaced the captured native response", owner)
+                    return result
+            raise AuthoringUnavailable("select native reply", "host reply assembly returned no captured native invocation and complete reply", owner)
     finally:
         if semaphore is not None:
             semaphore.release()
+
+
+def invoke_reader(reader: ReaderInput, *, route: Any, effort: str,
+                  timeout: float, max_tokens: int | None, route_info: Any,
+                  image_capability: Any = None) -> AuthoredSummary:
+    """Summary-only original-source ownership over the shared native invocation."""
+    owner = reader.sources[0].record if reader.sources else None
+
+    def validate(req: Any, actual_request: dict[str, Any]) -> tuple:
+        capability = image_capability(req.request_provider, route.target_model) if image_capability else None
+        reads_images = getattr(capability, "reads_images", None)
+        image_facts = None if capability is None else {
+            "provider": req.request_provider, "model_id": route.target_model,
+            "reads_images": reads_images, "source": capability.source,
+            "basis": capability.basis, "route": capability.route,
+            "vendor": capability.vendor, "model": capability.model,
+            "ids": list(capability.ids),
+        }
+        effective, removed = _validate_invocation(reader, actual_request, reads_images=reads_images)
+        return effective, removed, image_facts
+
+    def observe(req: Any, actual_request: dict[str, Any], response: Any, context: tuple) -> AuthoredSummary:
+        effective, removed, image_facts = context
+        return observe_reply(reader, effective, response, req.client,
+                             removed_fields=removed, session_model=route.target_model,
+                             image_facts=image_facts)
+
+    return invoke_selected(reader.messages, route=route, effort=effort, timeout=timeout,
+                           max_tokens=max_tokens, route_info=route_info,
+                           validate=validate, observe=observe, owner=owner)

@@ -439,8 +439,9 @@ def join_or_start(
     told of the failure, visibly.
 
     ``key`` holds everything two attempts must share to share a call: the session, the
-    chunk's member records in order, the summariser route and the effort (the rule a
-    reuse applies too). ``reuse`` may block on the store and runs outside the registry
+    chunk's member records in order, the prospective selected route/owner and effort.
+    Authored reuse is judged by its own source evidence. ``reuse`` may block on the
+    store and runs outside the registry
     lock. After a miss, the registry is checked again before another call is started."""
     start_failure: Optional[str] = None
     with _REGISTRY_LOCK:

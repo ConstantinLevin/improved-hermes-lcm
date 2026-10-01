@@ -112,12 +112,10 @@ from .escalation import (
     CallSettings,
     SummariserRoute,
     SummaryFailure,
-    _host_provider,
     configured_route_problem,
     failure_text,
     level_one_input,
     prompt_inputs,
-    session_route,
     summarize_chunk,
 )
 from .model_table import lookup as lookup_model
@@ -1117,55 +1115,49 @@ class CompactionMixin:
             _ROUTE_SCOPE.reset(token)
 
     def _resolve_summariser_route(self) -> tuple[Optional[SummariserRoute], str]:
-        config = self._config
-        problem = configured_route_problem(config)
+        from .escalation import configured_route
+
+        problem = configured_route_problem(self._config)
         if problem is not None:
-            # Refused when the configuration was loaded (a summariser other than the
-            # session's model, #68), and every compaction says why.
             return None, problem
-        if not (self.model and self.provider):
-            return None, ("the session's model is not known: the host has not named its route "
-                          "through update_model")
-        if not self.base_url and _host_provider(self.provider) == "custom":
-            return None, ("the session's route names provider custom without a base URL: the host "
-                          "would borrow an endpoint of its own, which the session did not name")
-        route = session_route(self.provider, self.model, self.base_url, self.api_key, self.api_mode)
+        route = configured_route(self._config, self.provider, self.model, self.base_url,
+                                 self.api_key, self.api_mode)
         if not route.target_provider:
-            return None, (f"the route the host takes for the session's {self.provider}/{self.model} is not known: "
-                          f"{route.target_problem}")
+            return None, route.target_problem
         return route, ""
 
-    def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
-        """The summariser's route, effort, output cap and requested timeout, or why not
-        (#9). No part of the route is guessed: it is what the host handed
-        ``update_model``."""
-        config = self._config
-        try:
-            timeout_seconds = summary_timeout_seconds(config.summary_timeout_ms)
-        except ValueError as exc:
-            return None, str(exc)
+    def _summariser_selection(self) -> tuple[Optional[tuple], str]:
+        """One route/effort policy; each purpose supplies its own call controls."""
         route, problem = self._summariser_route()
         if route is None:
             return None, problem
-        secrets = tuple(s for s in (self.api_key,) if isinstance(s, str) and s)
         effort = None
         if self._plugin_session:
             try:
                 effort = self._sessions.latest_fact(self._plugin_session, "effort")
             except Exception as exc:
-                return None, f"the session's reasoning effort could not be read ({type(exc).__name__})"
-        effort = (effort or config.summary_reasoning_effort or "").strip().lower()
+                return None, f"the plugin session's reasoning effort could not be read ({type(exc).__name__})"
+        if effort is not None and not isinstance(effort, str):
+            return None, "the plugin session's reasoning effort is not a string"
+        effort = (effort or self._config.summary_reasoning_effort).strip().lower()
         if effort not in REASONING_EFFORTS:
-            return None, (f"the summariser's reasoning effort {effort!r} is not one of the host's levels "
-                          f"({', '.join(sorted(REASONING_EFFORTS))})")
+            return None, "the summariser's reasoning effort is not one of the host's supported levels"
+        return (route, effort, route.known_secrets()), ""
+
+    def _summariser_settings(self) -> tuple[Optional[CallSettings], str]:
+        """Shared selection with the summary's own timeout and model output cap."""
+        selection, problem = self._summariser_selection()
+        if selection is None:
+            return None, problem
+        try:
+            timeout_seconds = summary_timeout_seconds(self._config.summary_timeout_ms)
+        except ValueError as exc:
+            return None, str(exc)
+        route, effort, secrets = selection
         facts = lookup_model(route.target_model, route.target_provider)
-        return CallSettings(
-            route=route,
-            effort=effort,
-            timeout_seconds=timeout_seconds,
-            max_tokens=facts.output_cap if facts is not None else None,
-            secrets=secrets,
-        ), ""
+        return CallSettings(route=route, effort=effort, timeout_seconds=timeout_seconds,
+                            max_tokens=facts.output_cap if facts is not None else None,
+                            secrets=secrets), ""
 
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
@@ -2304,7 +2296,7 @@ class CompactionMixin:
         """Steps 4 and 5, after the planning boundary: from the dispatch of the first call
         on, the calls, the wait and the return, each failure with its own handler (#7,
         #33). Everything a call needs was prepared inside the boundary."""
-        route, chunks, kept_state = planned.route, planned.chunks, planned.kept_state
+        route, chunks = planned.route, planned.chunks
         mechanism, tail_start = planned.mechanism, planned.tail_start
         endpoint, limiter, limit = planned.endpoint, planned.limiter, planned.limit
         still_wanted, describe, finished = planned.still_wanted, planned.describe, planned.finished
@@ -2318,19 +2310,17 @@ class CompactionMixin:
             # A cancelled or no longer current attempt starts no further call (#29 W2 step 2).
             if not still_wanted():
                 raise AttemptCancelled()
-            # Attempts share a call only with the same summariser route and effort, the
-            # rule a reuse applies (``summary_of_records``). The reuse reads the store; a
+            # Pending calls share the frozen prospective route/owner and effort.
+            # Authored summaries reuse their own source-valid evidence. A
             # read that fails aborts the compaction (#7). Calls already started for
             # earlier chunks run on and write their summaries (#33 D13).
             try:
                 way = join_or_start(
-                    (attempt.session, tuple(records), route.target_model, route.provenance_provider(),
-                     settings.effort),
+                    (attempt.session, tuple(records), route.pending_identity(), settings.effort),
                     subscriber, limiter=limiter, limit=limit,
-                    reuse=lambda records=records, chunk_handle=chunk_handle, frozen_summary=(
-                        kept_state.get(tuple(chunk)) == "summarised"): self._records.summary_of_records(
+                    reuse=lambda records=records, chunk_handle=chunk_handle: self._records.summary_of_records(
                         attempt.session, records, exclude_chunk=chunk_handle, model=route.target_model,
-                        provider=route.provenance_provider(), effort=settings.effort, any_route=frozen_summary),
+                        provider=route.provenance_provider(), effort=settings.effort, any_route=True),
                     run=run,
                     describe=describe,
                 )
