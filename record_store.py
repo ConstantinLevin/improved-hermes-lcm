@@ -37,6 +37,7 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 from .db_bootstrap import close_connection, open_store
 from .handles import CHUNK, DERIVATION, MESSAGE, TOOL_CALL, new_handle
 from .inflight import ChunkSummary
+from .summariser_authoring import AuthoringEvidence, AuthoringUnavailable
 from .message_content import base64_like_strings, describe_image_part, grep_text, image_parts
 from .tokens import Estimator
 
@@ -376,17 +377,56 @@ class RecordStore:
             args = (chunk,) if any_route else (chunk, model or None, provider or None, effort or None)
             rows = self._q(
                 "SELECT d.text, d.level, d.budget, d.finish_reason, d.model, d.provider, d.effort, "
-                "d.withheld_reasoning "
+                "d.withheld_reasoning, d.handle "
                 "FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
                 "WHERE s.chunk = ? AND s.ordinal = 0 AND d.kind = 'summary' "
-                + route_clause + "ORDER BY d.derivation_id DESC LIMIT 1",
+                + route_clause + "ORDER BY d.derivation_id DESC",
                 args,
             )
-            if rows:
-                text, level, budget, finish_reason, model_, provider_, effort_, withheld = rows[0]
+            for row in rows:
+                text, level, budget, finish_reason, model_, provider_, effort_, withheld, derivation = row
+                try:
+                    authoring = self.require_derivation_authoring(str(derivation), operation="reuse derivation")
+                    authoring.require_records(records, operation=f"reuse derivation {derivation}")
+                except AuthoringUnavailable as exc:
+                    logger.warning("LCM cannot reuse derivation %s: %s", derivation, exc)
+                    continue
                 return ChunkSummary(text=str(text), level=level, budget=budget, finish_reason=finish_reason,
-                                    model=model_, provider=provider_, effort=effort_, withheld=withheld)
+                                    model=model_, provider=provider_, effort=effort_, withheld=withheld,
+                                    authoring=authoring)
         return None
+
+    def require_derivation_authoring(self, derivation: str, *,
+                                    operation: str = "admit derivation") -> AuthoringEvidence:
+        """Require this selected derivation's authoring of its own ordered source stretch."""
+        rows = self._q(
+            "SELECT d.text, a.observation_json FROM derivations d "
+            "LEFT JOIN derivation_authoring a ON a.derivation = d.handle WHERE d.handle = ?",
+            (derivation,),
+        )
+        if not rows:
+            raise AuthoringUnavailable(f"{operation} {derivation}", "the derivation is absent")
+        sources = self.derivation_sources(derivation)
+        if len(sources) != 1 or sources[0][0] is None or sources[0][1] is not None:
+            raise AuthoringUnavailable(
+                f"{operation} {derivation}", "its source is not one recorded chunk"
+            )
+        originals = self._q(
+            "SELECT m.record, r.raw FROM chunk_members m "
+            "LEFT JOIN records r ON r.handle = m.record WHERE m.chunk = ? ORDER BY m.ordinal",
+            (sources[0][0],),
+        )
+        records = [str(record) for record, _raw in originals]
+        context = f"{operation} {derivation} of records {', '.join(records)}"
+        try:
+            authoring = AuthoringEvidence.from_json(rows[0][1])
+        except AuthoringUnavailable as exc:
+            raise AuthoringUnavailable(context, exc.reason, exc.record) from exc
+        authoring.require_records(records, operation=context)
+        for record, raw in originals:
+            authoring.require_original(str(record), raw, operation=context)
+        authoring.require_text(str(rows[0][0]), operation=context)
+        return authoring
 
     def _chunks_with_members(self, session: str, records: Sequence[str]) -> list[tuple[str, int]]:
         """(chunk, compaction) of every chunk of the session with exactly these member
@@ -407,9 +447,16 @@ class RecordStore:
         return found
 
     def _summarised(self, chunk: str) -> bool:
-        return bool(self._q(
-            "SELECT 1 FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
-            "WHERE s.chunk = ? AND d.kind = 'summary' LIMIT 1", (chunk,)))
+        for (derivation,) in self._q(
+            "SELECT d.handle FROM derivation_sources s JOIN derivations d ON d.handle = s.derivation "
+            "WHERE s.chunk = ? AND d.kind = 'summary'", (chunk,)
+        ):
+            try:
+                self.require_derivation_authoring(str(derivation), operation="count summary")
+            except AuthoringUnavailable:
+                continue
+            return True
+        return False
 
     def _failed_by_itself(self, chunk: str) -> bool:
         """A failure of the chunk's own kind: its reply rejected, or its request
@@ -418,26 +465,15 @@ class RecordStore:
                             "LIMIT 1", (chunk,)))
 
     def chunk_state(self, session: str, records: Sequence[str]) -> str:
-        """The state of a set of members over every chunk of the session that held
-        exactly them (#33 D14, revised): "summarised" where one of them has a summary,
-        which a retry reuses, else "cut": a recorded chunk, retried as the same chunk
-        whether or not its call was ever sent. Only chunks that have a summary and the
-        same first member are compared member by member, so the cost does not grow with
-        the attempts that cut the same chunk."""
-        wanted = [str(r) for r in records]
-        if not wanted:
-            return "cut"
-        for (chunk,) in self._q(
-            "SELECT DISTINCT m.chunk FROM chunk_members m JOIN chunks ch ON ch.handle = m.chunk "
-            "JOIN derivation_sources s ON s.chunk = m.chunk JOIN derivations d ON d.handle = s.derivation "
-            "WHERE ch.session = ? AND m.ordinal = 0 AND m.record = ? AND d.kind = 'summary'",
-            (session, wanted[0]),
-        ):
-            members = [str(r) for (r,) in self._q(
-                "SELECT record FROM chunk_members WHERE chunk = ? ORDER BY ordinal", (chunk,))]
-            if members == wanted:
-                return "summarised"
-        return "cut"
+        """Whether an eligible summary already authors this exact ordered stretch.
+
+        Unknown saved summaries remain recorded but leave this chunk cut, so a retry
+        can obtain the authoring facts required to replace the originals.
+        """
+        summary = self.summary_of_records(
+            session, records, exclude_chunk=None, model=None, provider=None, effort=None, any_route=True,
+        )
+        return "summarised" if summary is not None else "cut"
 
     def frozen_chunks(self, session: str, after: Optional[int]
                       ) -> tuple[list[FrozenChunk], list[tuple[str, int, tuple[str, ...]]]]:
@@ -517,7 +553,7 @@ class RecordStore:
 
     def failure_streak(self, session: str, records: Sequence[str]) -> int:
         """In how many consecutive attempts, the newest first, a chunk of exactly these
-        members failed by its own fault (#7, #33; ruling on #61, 2): a summary ends the
+        members failed by its own fault (#7, #33; ruling on #61, 2): an eligible summary ends the
         streak; an attempt that reached no outcome for it (cancelled, abandoned), or
         whose failure was the route's, the endpoint's or another's, neither counts nor
         ends it."""
@@ -1476,8 +1512,21 @@ class RecordStore:
         finish_reason: Optional[str] = None,
         effort: Optional[str] = None,
         withheld_reasoning: Optional[str] = None,
+        authoring: Optional[AuthoringEvidence] = None,
     ) -> str:
         with self._tx() as conn:
+            originals = conn.execute(
+                "SELECT m.record, r.raw FROM chunk_members m "
+                "LEFT JOIN records r ON r.handle = m.record WHERE m.chunk = ? ORDER BY m.ordinal",
+                (chunk,),
+            ).fetchall()
+            records = [str(record) for record, _raw in originals]
+            if authoring is None:
+                raise AuthoringUnavailable(f"write summary of chunk {chunk}", "authoring facts are absent")
+            authoring.require_records(records, operation=f"write summary of chunk {chunk}")
+            for record, raw in originals:
+                authoring.require_original(str(record), raw, operation=f"write summary of chunk {chunk}")
+            authoring.require_text(text, operation=f"write summary of chunk {chunk}")
             handle = self._insert_with_handle(
                 conn,
                 DERIVATION,
@@ -1490,6 +1539,10 @@ class RecordStore:
             conn.execute(
                 "INSERT INTO derivation_sources(derivation, ordinal, chunk, source_derivation) VALUES (?, 0, ?, NULL)",
                 (handle, chunk),
+            )
+            conn.execute(
+                "INSERT INTO derivation_authoring(derivation, observation_json) VALUES (?, ?)",
+                (handle, authoring.to_json()),
             )
         return handle
 

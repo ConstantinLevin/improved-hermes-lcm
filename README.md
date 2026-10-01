@@ -70,6 +70,24 @@ settings and limiter slot until its synchronous host invocation ends, even if an
 ends or another joins. A valid late summary can be stored without replacing that attempt's
 context.
 
+Saved and in-flight summaries need authoring observations for their own ordered
+original records, the actual submitted request and a genuinely complete reply before
+they can replace context. The observations are stored atomically beside the selected
+derivation in an append-only table. Existing format-13 stores keep their identity,
+originals and history; older summaries without these facts remain addressable but are
+not reused, so a retry can generate a new summary. Eligible recorded summaries remain
+available across route or reasoning-effort changes.
+
+Fresh chunk workers do not install the host's auxiliary progress hook: on the checked
+host path that opt-in forces streamed aggregation, which can lose genuine completion
+facts. An ordinary nonstream call supplies no interim progress ticks, so even a healthy
+long call may exceed the host's idle wait; the total ceiling and context-publication
+fences still apply. A late eligible summary can be recorded without replacing the
+departed attempt's context. If the actual native, forced-stream or registered-client
+invocation does not expose the request and genuine completion facts needed for its
+records, the summary is refused with the missing fact named. Support depends on the
+facts returned by that invocation; not every host response path is established.
+
 ## Working on it
 
 This is a development path, not an install for use. `scripts/install.sh` links the checkout into

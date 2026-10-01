@@ -139,6 +139,7 @@ from .inflight import (
     limiter_for,
 )
 from .record_write import _ATTEMPT, AttemptCancelled
+from .summariser_authoring import AuthoringUnavailable
 from .tokens import Estimator, count_message_tokens, count_messages_tokens
 
 logger = logging.getLogger(__name__)
@@ -1335,7 +1336,7 @@ class CompactionMixin:
                                        withheld["items_text"], chunk_handle, withheld["text"])
                     yield deadline
 
-            text, level, finish_reason = summarize_chunk(
+            text, level, finish_reason, authoring = summarize_chunk(
                 prepared.records,
                 prepared.budget,
                 source=prepared.source,
@@ -1350,7 +1351,8 @@ class CompactionMixin:
             )
             return ChunkSummary(text=text, level=level, budget=prepared.budget, finish_reason=finish_reason,
                                 model=route.target_model, provider=route.provenance_provider(), effort=settings.effort,
-                                withheld=json.dumps(withheld["record"]) if withheld is not None else None)
+                                withheld=json.dumps(withheld["record"]) if withheld is not None else None,
+                                authoring=authoring)
 
         return run
 
@@ -1468,12 +1470,24 @@ class CompactionMixin:
                     kind: Optional[str] = None, record: bool = True) -> Outcome:
             if summary is not None:
                 try:
+                    if summary.authoring is None:
+                        raise AuthoringUnavailable(f"deliver summary of chunk {chunk_handle}",
+                                                   "the selected summary has no authoring observations")
+                    summary.authoring.require_records(records, operation=f"deliver summary of chunk {chunk_handle}")
+                    summary.authoring.require_text(summary.text, operation=f"deliver summary of chunk {chunk_handle}")
                     derivation = self._write_summary(
                         attempt, chunk_handle, text=summary.text, level=summary.level, budget=summary.budget,
                         finish_reason=summary.finish_reason,
                         model=summary.model, provider=summary.provider, effort=summary.effort,
                         withheld_reasoning=summary.withheld,
+                        authoring=summary.authoring,
                     )
+                except AuthoringUnavailable as exc:
+                    cause = f"cannot deliver summary of chunk {chunk_handle}: {exc}"
+                    logger.warning("LCM %s", cause)
+                    self._record_event(attempt, "summary_authoring_unavailable",
+                                       {"chunk": chunk_handle, "records": records, "error": str(exc)})
+                    return Outcome(failure=cause, cause=cause)
                 except Exception as exc:
                     logger.warning("LCM could not write the summary of chunk %d of %d (%s: %s)",
                                    number, total, type(exc).__name__, exc)
@@ -2440,6 +2454,15 @@ class CompactionMixin:
             # A summary the return stands on is not in the store: the chain would lose it.
             self._record_event(attempt, "cover_derivation_missing", {"derivations": absent})
             return self._abort(messages, f"the store holds no summary {', '.join(map(str, absent))} of the return")
+        try:
+            for derivation in cover:
+                self._records.require_derivation_authoring(derivation)
+        except AuthoringUnavailable as exc:
+            self._record_event(attempt, "cover_authoring_unavailable", str(exc))
+            return self._abort(messages, f"a summary of the return has no established authoring ({exc})")
+        except Exception as exc:
+            return self._store_read_failed(attempt, messages, "cover_authoring_unreadable",
+                                           "the authoring observations of the selected summaries", exc)
         result: List[Dict[str, Any]] = []
         returns: List[tuple] = []
         if 0 in mechanism and messages[0].get("role") == "system":

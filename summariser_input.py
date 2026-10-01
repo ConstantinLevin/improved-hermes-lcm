@@ -1,63 +1,13 @@
-"""What the summariser reads for a chunk (#8): the chunk's records as the messages the
-provider saw, never a serialisation of them (R1).
+"""Prepare recorded originals for an original reader, without replaying the main agent.
 
-Each record's ``raw`` (the host's dict as it came) is made into the message the host
-would send for it, by the host's own rules, and then the plugin's own rules are
-applied on top. Nothing stored changes.
+Source snapshots and row ownership are explicit. Original content is retained;
+labelled annotations expose the other recorded values, including readable reasoning
+and metadata. Only identified opaque fields are withheld, with their paths named.
+Ambiguous sidecar purpose and unsupported native carriers refuse that record.
 
-**The host's rules** are those of ``build_api_messages`` (agent/turn_context.py at
-Hermes 7b761da, lines 1216-1268), which cannot be called here because it needs a live
-agent. Its field rules are reproduced exactly, calling the host's own functions where
-they take a message:
-
-1. a structural clone (``agent.conversation_loop._clone_message_for_send``);
-2. ``api_content`` popped, and for a user or assistant row a non-empty string sidecar
-   becomes ``content`` (the exact bytes sent);
-3. the host's ``PERSISTENCE_ONLY_MESSAGE_FIELDS`` popped;
-4. the reasoning field the summariser's provider needs, decided by the host:
-   ``apply_reasoning_content_policy`` with ``needs_reasoning_echo`` for the
-   summariser's route (agent/message_sanitization.py): DeepSeek, Kimi and MiMo get
-   ``reasoning_content`` on every assistant turn exactly as the host would send it,
-   every other provider gets none;
-5. ``reasoning`` and ``finish_reason`` popped;
-6. an empty non-final user or assistant message filled by the host's
-   ``fill_empty_non_final_wire_payload``;
-7. ``_length_continuation_fragment`` and ``_length_continuation_nudge`` popped.
-
-``build_api_messages`` keeps every other field (underscore keys and
-``reasoning_details`` included); so does this input. The host's own adapter on the way
-to the provider then applies its rules, as on the main request path: the Chat
-Completions transport strips underscore keys, native carriers and, except on
-OpenRouter and Nous, ``reasoning_details``; the Anthropic and Bedrock converters
-rebuild the message from their carriers. Not reproduced: the host's
-``canonicalize_replay_history``, which rewrites old rows by the time of the request
-(a dangerous-command confirmation older than a minute becomes a sentinel); the
-summariser reads what the row said. And the strict-API tool-call scrub, which the Chat
-Completions transport repeats on the way.
-
-**The plugin's rules** on top:
-
-- R2: readable reasoning (the host's merged ``reasoning``, else a non-blank
-  ``reasoning_content``) is also given as a labelled text part of its message, so that
-  the summariser reads it whatever the provider does with the reasoning field; where
-  the message is rebuilt from a native carrier, the part goes into the carrier too;
-- R3: encrypted items are withheld, and only those: signed or encrypted
-  ``reasoning_details`` entries, ``codex_reasoning_items`` carrying encrypted content,
-  and the signed or redacted thinking blocks of ``anthropic_content_blocks`` and
-  ``bedrock_content_blocks``, whose other blocks stay in their order (ask A-P);
-- an image, found by structure, goes in only where the model table says the
-  summariser reads images, else a placeholder naming its media type and record; where
-  the summariser's wire is the host's Anthropic converter, the images the converter
-  would evict for its per-request limit are replaced the same way, oldest first as the
-  host picks them (ask A-8.2); the placeholder is the mechanism's layer, never stored;
-- a tool call whose arguments are not valid JSON, which the host's Anthropic and
-  Bedrock converters replace with ``{}``, gets a labelled text part carrying the stored
-  string verbatim (ask A-8.3).
-
-The chunk stands between the summariser's instructions (the system message, today's
-text) and a closing user message that asks for the summary. A user turn inside the
-chunk can read to the summariser as an instruction; how the chunk is framed so that
-it is summarised and not continued is #10's.
+This is preparation evidence, not evidence of dispatch or provider receipt. The
+actual invocation must establish whether its selected conversion preserves this
+input. The strict host helpers below remain for expansion's separate replay view.
 """
 
 from __future__ import annotations
@@ -67,26 +17,51 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from .message_content import content_parts, image_media_type, is_image_part, readable_reasoning, sent_content, \
-    sidecar_sent
+from .message_content import content_parts, is_image_part, readable_reasoning, sent_content, sidecar_sent
 
-try:  # the host's own set of bookkeeping fields no provider receives
-    from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS as _PERSISTENCE_ONLY  # type: ignore
-except Exception:  # pragma: no cover - as at Hermes 7b761da, agent/message_metadata.py:14
-    _PERSISTENCE_ONLY = frozenset({"timestamp", "display_kind", "display_metadata", "_row_id"})
-
-# Labels of the mechanism's layer in the input (the words are #10's).
-READABLE_REASONING_LABEL = "[Reasoning the provider returned with this message, as it returned it]"
+# The closing request belongs to the mechanism, never to a recorded original.
 CLOSING_REQUEST = "Summarize the conversation above, as the system instructions say."
-_ONLY_WITHHELD_REASONING = ("[This message carried only reasoning the summariser is not given: "
-                            "encrypted, and its producer is not known]")
+# Expansion's existing display view selects reasoning, then reasoning_content.
+# Original-reader preparation below exposes every recorded field independently.
+_readable_reasoning = readable_reasoning
+
+SourcePath = tuple[str | int, ...]
+
+
+@dataclass(frozen=True)
+class WithheldField:
+    source_path: SourcePath
+    kind: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReaderSource:
+    record: str
+    request_index: int
+    original_json: str
+    prepared_json: str
+    readable_paths: tuple[SourcePath, ...]
+    withheld: tuple[WithheldField, ...]
+
+
+@dataclass(frozen=True)
+class ReaderInput:
+    # Request rows are owned mutable copies; the evidence uses immutable snapshots.
+    messages: list[dict]
+    sources: tuple[ReaderSource, ...]
+
+
+class ReaderUnavailable(Exception):
+    def __init__(self, record: str, source_path: SourcePath, reason: str):
+        self.record, self.source_path, self.reason = record, source_path, reason
+        super().__init__(f"record {record}, field {source_path!r}: {reason}")
 
 
 @dataclass(frozen=True)
 class WireFacts:
-    """What the summariser's route means for its input, from the host's own rules.
-    ``reads_images`` is None where the model table has no row for the summariser: its
-    images are then not sent either, and their placeholder says it is not known."""
+    """Prospective route hints for planning, not evidence of an actual invocation.
+    Original-reader preparation retains images independently of these hints."""
 
     reads_images: Optional[bool]
     needs_reasoning_echo: bool
@@ -94,8 +69,7 @@ class WireFacts:
 
 
 class HostUnavailable(Exception):
-    """A host function the strict projection needs cannot be read (expansion refuses the
-    call; the summariser's own path keeps its fallbacks, which are not D1's)."""
+    """A host function expansion's strict replay projection needs cannot be read."""
 
 
 def _strict_import(what: str, module: str, name: str) -> Any:
@@ -129,12 +103,6 @@ def _host_reasoning_policy(source: dict, message: dict, needs_echo: bool, strict
     apply_reasoning_content_policy(source, message, needs_echo)
 
 
-def _host_fill_empty(message: dict) -> None:
-    try:
-        from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload  # type: ignore
-    except Exception:
-        return
-    fill_empty_non_final_wire_payload(message, is_final=False)
 
 
 def host_fill_text(row: dict) -> Optional[str]:
@@ -191,37 +159,30 @@ def wire_facts(provider: str, model: str, base_url: str, api_mode: str,
 
 # --- The host's build_api_messages, field by field (see the module docstring) -------------
 
-def _row_before_fill(raw: dict, *, needs_echo: bool, strict: bool) -> dict:
+def _row_before_fill(raw: dict, *, needs_echo: bool) -> dict:
     """``build_api_messages``' per-row steps up to the fill (agent/turn_context.py:1221-1260):
     the clone, the sidecar, the persistence fields, the reasoning copy, the pops."""
-    message = _host_clone(raw, strict)
-    persistence_only = (_strict_import("persistence fields", "agent.message_metadata",
-                                       "PERSISTENCE_ONLY_MESSAGE_FIELDS") if strict else _PERSISTENCE_ONLY)
+    message = _host_clone(raw, True)
+    persistence_only = _strict_import("persistence fields", "agent.message_metadata",
+                                     "PERSISTENCE_ONLY_MESSAGE_FIELDS")
     message.pop("api_content", None)
     for key in persistence_only:
         message.pop(key, None)
     if sidecar_sent(raw):                     # one rule with what grep searches (#18 D2)
         message["content"] = sent_content(raw)
-    _host_reasoning_policy(raw, message, needs_echo, strict)
+    _host_reasoning_policy(raw, message, needs_echo, True)
     message.pop("reasoning", None)
     message.pop("finish_reason", None)
     return message
 
 
-def _as_the_host_sends_it(raw: dict, *, needs_echo: bool, strict: bool = False, fill: bool = True) -> dict:
-    message = _row_before_fill(raw, needs_echo=needs_echo, strict=strict)
-    if fill:
-        _host_fill_empty(message)
-    message.pop("_length_continuation_fragment", None)
-    message.pop("_length_continuation_nudge", None)
-    return message
 
 
 def host_row_before_fill(raw: dict, *, pad: bool) -> dict:
     """The record's row as the host builds it for a request up to its fill, with the host's
     reasoning pad for the route (``host_reasoning_pad``), every host function called
     strictly: the host's own input to ``fill_empty_non_final_wire_payload``."""
-    return _row_before_fill(raw, needs_echo=pad, strict=True)
+    return _row_before_fill(raw, needs_echo=pad)
 
 
 def item_message(row: dict) -> dict:
@@ -308,30 +269,14 @@ def _withhold_encrypted(message: dict) -> dict[str, int]:
 
 # --- Images ----------------------------------------------------------------------------------
 
-_NOT_READ = "not shown to this summariser, which does not read images"
 # The orchestrator's ruling on #8b: a summariser the model table has no row for is not
 # said not to read images; its images are not sent, and it is said that it is not known.
-_NOT_KNOWN = "image not sent: whether this summariser reads images is unknown"
-_EVICTED = "left out of this call: the host's Anthropic converter drops it for its per-request image limit"
 
 
-def _image_placeholder(part: dict, record: str, why: str) -> dict:
-    return {"type": "text", "text": f"[An image ({image_media_type(part)}) of record {record}, {why}]"}
 
 
-def _replace_images(parts: list, record: str, why: str) -> list:
-    return [_image_placeholder(p, record, why) if is_image_part(p) else p for p in parts]
 
 
-def _replace_images_in_message(message: dict, record: str, why: str) -> None:
-    content = message.get("content")
-    if isinstance(content, dict) and content.get("_multimodal") is True and isinstance(content.get("content"), list):
-        message["content"] = dict(content, content=_replace_images(content["content"], record, why))
-    elif isinstance(content, list):
-        message["content"] = _replace_images(content, record, why)
-    stashed = message.get("_anthropic_content_blocks")
-    if isinstance(stashed, list):
-        message["_anthropic_content_blocks"] = _replace_images(stashed, record, why)
 
 
 def _image_count(message: dict) -> int:
@@ -343,8 +288,7 @@ def _image_count(message: dict) -> int:
 
 
 def image_count(message: dict) -> int:
-    """The images one message as the summariser receives it carries (placeholders are
-    text and do not count)."""
+    """Count image parts structurally in one prepared message."""
     return _image_count(message)
 
 
@@ -372,95 +316,195 @@ def wire_image_limit(facts: WireFacts) -> Optional[int]:
     return int(OUTBOUND_IMAGE_LIMIT)
 
 
-def _evict_as_the_host_would(messages: list[dict], records: list[str]) -> None:
-    """The host's Anthropic converter retires the images of the oldest image-bearing tool
-    results once a request crosses its limit, counting every image, user uploads
-    included, and never touching uploads (``_evict_old_screenshots``,
-    agent/anthropic_message_convert.py:605; ``outbound_image_retire_count`` with
-    ``OUTBOUND_IMAGE_LIMIT`` 20, agent/image_eviction_policy.py at 7b761da). The same
-    count, from the host's own function, picks the same carriers here."""
+# --- The original reader --------------------------------------------------------------
+
+_NATIVE_CARRIERS = frozenset({
+    "reasoning_details", "codex_reasoning_items", "codex_message_items",
+    "anthropic_content_blocks", "_anthropic_content_blocks", "bedrock_content_blocks",
+})
+_CARRIER_TYPES = {
+    "reasoning_details": frozenset({"reasoning.text", "reasoning.summary", "reasoning.encrypted",
+                                  "thinking", "redacted_thinking"}),
+    "codex_reasoning_items": frozenset({"reasoning"}),
+    "codex_message_items": frozenset({"reasoning", "message", "function_call", "function_call_output"}),
+    "anthropic_content_blocks": frozenset({"text", "thinking", "redacted_thinking", "tool_use", "tool_result"}),
+    "_anthropic_content_blocks": frozenset({"text", "thinking", "redacted_thinking", "tool_use", "tool_result"}),
+}
+
+
+def _reader_json(value: Any, record: str, path: SourcePath) -> str:
+    def check(node: Any, where: SourcePath) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if not isinstance(key, str):
+                    raise ReaderUnavailable(record, where, "the original object has a non-string field name")
+                check(child, (*where, key))
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                check(child, (*where, index))
+        elif node is not None and not isinstance(node, (str, bool, int, float)):
+            raise ReaderUnavailable(record, where, "unsupported original JSON value")
+
     try:
-        from agent.image_eviction_policy import outbound_image_retire_count  # type: ignore
-    except Exception:
-        return
-    carriers = [i for i, m in enumerate(messages) if m.get("role") == "tool" and _image_count(m)]
-    reserved = sum(_image_count(m) for m in messages if m.get("role") != "tool")
-    newest_first = list(reversed(carriers))
-    retire = outbound_image_retire_count([_image_count(messages[i]) for i in newest_first], reserved)
-    for index in (newest_first[len(newest_first) - retire:] if retire else []):
-        _replace_images_in_message(messages[index], records[index], _EVICTED)
+        check(value, path)
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ReaderUnavailable(record, path, f"the original JSON value cannot be represented ({exc})") from None
 
 
-# --- Labelled parts ---------------------------------------------------------------------------
+def _field_parts(value: Any, path: SourcePath, readable: list[SourcePath]) -> list[dict]:
+    """Expose recorded field values with their types; string values remain verbatim."""
+    label = f"[Recorded original field {json.dumps(path, ensure_ascii=False)}"
+    readable.append(path)
+    if isinstance(value, dict):
+        parts = [{"type": "text", "text": label + "; retained object keys]\n"
+                  + json.dumps(list(value), ensure_ascii=False)}]
+        for key, child in value.items():
+            parts.extend(_field_parts(child, (*path, key), readable))
+        return parts
+    if isinstance(value, list):
+        parts = [{"type": "text", "text": label + f"; array length {len(value)}]"}]
+        for index, child in enumerate(value):
+            parts.extend(_field_parts(child, (*path, index), readable))
+        return parts
+    if isinstance(value, str):
+        text = label + f"; string length {len(value)}]\n" + value
+    else:
+        text = label + "; JSON value]\n" + json.dumps(value, ensure_ascii=False, allow_nan=False)
+    return [{"type": "text", "text": text}]
 
-# The one rule for readable reasoning, shared with expansion and grep (message_content).
-_readable_reasoning = readable_reasoning
 
-
-def _malformed_argument_parts(message: dict) -> list[dict]:
-    parts = []
-    for call in message.get("tool_calls") or []:
-        if not isinstance(call, dict):
+def _carrier_projection(value: Any, path: SourcePath, kind: str, record: str,
+                        omitted: list[WithheldField], *, native: bool = True) -> Any:
+    """Copy known native fields, omitting opaque fields rather than their neighboring text."""
+    if isinstance(value, list):
+        return [_carrier_projection(child, (*path, index), kind, record, omitted, native=native)
+                for index, child in enumerate(value)]
+    if not isinstance(value, dict):
+        return value
+    block_type = value.get("type") if native else None
+    if native and "type" in value and not isinstance(block_type, str):
+        raise ReaderUnavailable(record, (*path, "type"), "unsupported native-carrier type value")
+    if native and (block_type in {"image", "image_url", "input_image", "input_audio", "audio", "video"}
+                   or (kind == "bedrock_content_blocks" and "image" in value)):
+        raise ReaderUnavailable(record, path, "native multimedia has no established original-reader carriage")
+    result = {}
+    for key, child in value.items():
+        reason = None
+        if native and key == "signature" and (
+            block_type in {"thinking", "reasoning.text", "reasoning.summary"}
+            or (kind == "bedrock_content_blocks" and path[-1] in {"reasoningContent", "reasoningText"})
+        ):
+            reason = "opaque replay signature"
+        elif native and key == "data" and block_type in {"reasoning.encrypted", "redacted_thinking"}:
+            reason = "declared encrypted reasoning payload"
+        elif native and key == "encrypted_content" and block_type == "reasoning":
+            reason = "declared encrypted reasoning payload"
+        elif native and kind == "bedrock_content_blocks" and key in {"redactedContent", "redactedContentBase64"}:
+            reason = "declared redacted reasoning payload"
+        if reason is not None and child not in (None, ""):
+            if not isinstance(child, str):
+                raise ReaderUnavailable(record, (*path, key), "unsupported opaque-field value")
+            omitted.append(WithheldField((*path, key), kind, reason))
             continue
-        function = call.get("function") if isinstance(call.get("function"), dict) else {}
-        arguments = function.get("arguments")
-        if not isinstance(arguments, str):
-            continue
-        try:
-            json.loads(arguments)
-        except (json.JSONDecodeError, ValueError):
-            parts.append({"type": "text", "text": (
-                f"[The arguments of tool call {call.get('id') or '?'} ({function.get('name') or '?'}) as stored; "
-                f"they are not valid JSON:]\n{arguments}")})
-    return parts
+        # Tool arguments are ordinary recorded values, even when their keys resemble native fields.
+        child_native = native and key in {"content", "summary", "reasoningContent", "reasoningText"}
+        result[key] = _carrier_projection(child, (*path, key), kind, record, omitted, native=child_native)
+    return result
 
 
-def _content_as_parts(content: Any) -> list:
-    if isinstance(content, list):
-        return list(content)
-    if isinstance(content, str) and content:
-        return [{"type": "text", "text": content}]
-    return []
+def _reader_carrier(value: Any, key: str, record: str, omitted: list[WithheldField]) -> Any:
+    if value is None or value == []:
+        return copy.deepcopy(value)
+    if not isinstance(value, list):
+        raise ReaderUnavailable(record, (key,), "unsupported native-carrier container")
+    for index, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise ReaderUnavailable(record, (key, index), "unsupported native-carrier item")
+        if key in _CARRIER_TYPES and (
+            not isinstance(entry.get("type"), str) or entry["type"] not in _CARRIER_TYPES[key]
+        ):
+            raise ReaderUnavailable(record, (key, index, "type"), "native-carrier meaning is not established")
+        if key == "bedrock_content_blocks" and not any(
+            field in entry for field in ("text", "reasoningContent", "toolUse", "toolResult")
+        ):
+            raise ReaderUnavailable(record, (key, index), "Bedrock carrier meaning is not established")
+    return _carrier_projection(value, (key,), key, record, omitted)
 
 
-def _add_parts(message: dict, before: list[dict], after: list[dict]) -> None:
-    if not before and not after:
-        return
-    message["content"] = before + _content_as_parts(message.get("content")) + after
-    blocks = message.get("anthropic_content_blocks")
-    if isinstance(blocks, list):
-        message["anthropic_content_blocks"] = [{"type": "text", "text": p["text"]} for p in before] + blocks
-    blocks = message.get("bedrock_content_blocks")
-    if isinstance(blocks, list):
-        message["bedrock_content_blocks"] = [{"text": p["text"]} for p in before] + blocks
-
-
-def _has_payload(message: dict) -> bool:
-    content = message.get("content")
-    return bool((isinstance(content, str) and content.strip()) or (isinstance(content, list) and content)
-                or message.get("tool_calls") or message.get("anthropic_content_blocks")
-                or message.get("bedrock_content_blocks") or message.get("codex_message_items")
-                or (isinstance(message.get("reasoning_content"), str) and message["reasoning_content"].strip()))
+def _reader_content(raw: dict, record: str, readable: list[SourcePath]) -> list[dict]:
+    if "content" not in raw:
+        return [{"type": "text", "text": "[The recorded original has no content field]"}]
+    value = raw["content"]
+    if isinstance(value, str) and value:
+        readable.append(("content",))
+        return [{"type": "text", "text": value}]
+    parts = content_parts(value)
+    if parts is not None:
+        for index, part in enumerate(parts):
+            if not isinstance(part, dict) or not isinstance(part.get("type"), str) or part["type"] not in {
+                "text", "input_text", "output_text", "image_url", "image", "input_image",
+            }:
+                raise ReaderUnavailable(record, ("content", index), "unsupported original content part")
+            if part.get("type") in {"text", "input_text", "output_text"} and not isinstance(part.get("text"), str):
+                raise ReaderUnavailable(record, ("content", index, "text"), "unsupported original text-part value")
+        path = ("content", "content") if isinstance(value, dict) else ("content",)
+        readable.append(path)
+        result = copy.deepcopy(parts)
+        if isinstance(value, dict):
+            result.append({"type": "text", "text": "[Recorded original content envelope; object keys]\n"
+                           + json.dumps(list(value), ensure_ascii=False)})
+            for key, child in value.items():
+                if key != "content":
+                    result.extend(_field_parts(child, ("content", key), readable))
+        if not parts:
+            result.extend(_field_parts([], path, readable))
+        return result
+    if isinstance(value, dict):
+        raise ReaderUnavailable(record, ("content",), "original content-object meaning is not established")
+    # Empty strings, null, numbers and booleans are source values, never invented utterances.
+    return _field_parts(value, ("content",), readable)
 
 
 def summariser_message(raw: dict, record: str, facts: WireFacts,
-                       withheld: Optional[dict[str, int]] = None) -> dict:
-    """One record's message as the summariser receives it (see the module docstring).
-    The encrypted items withheld from it are added to ``withheld`` by kind."""
-    message = _as_the_host_sends_it(raw, needs_echo=facts.needs_reasoning_echo)
-    for kind, count in _withhold_encrypted(message).items():
+                       withheld: Optional[dict[str, int]] = None, *,
+                       _sources: Optional[list[ReaderSource]] = None, _request_index: int = 0) -> dict:
+    """Own one original and expose its values; actual transport eligibility is the caller's."""
+    original = copy.deepcopy(raw)
+    if not isinstance(original, dict):
+        raise ReaderUnavailable(record, (), "the recorded original is not an object")
+    original_json = _reader_json(original, record, ())
+    role = original.get("role")
+    if not isinstance(role, str) or not role:
+        raise ReaderUnavailable(record, ("role",), "the original role is not a nonempty string")
+    sidecar = original.get("api_content")
+    if sidecar not in (None, "") and sidecar != original.get("content"):
+        raise ReaderUnavailable(record, ("api_content",),
+                                "the differing replay sidecar's event/mechanism purpose is not established")
+    readable: list[SourcePath] = [("role",)]
+    omitted: list[WithheldField] = []
+    message = {"role": role, "content": _reader_content(original, record, readable)}
+    for key, value in original.items():
+        if key in {"role", "content"}:
+            continue
+        projected = _reader_carrier(value, key, record, omitted) if key in _NATIVE_CARRIERS else value
+        message["content"].extend(_field_parts(projected, (key,), readable))
+        if key in {"tool_calls", "tool_call_id", "name"}:
+            message[key] = copy.deepcopy(value)
+    for field in omitted:
+        message["content"].append({"type": "text", "text":
+            f"[Recorded original field {json.dumps(field.source_path, ensure_ascii=False)} withheld: {field.reason}]"})
         if withheld is not None:
-            withheld[kind] = withheld.get(kind, 0) + count
-    if facts.reads_images is None:
-        _replace_images_in_message(message, record, _NOT_KNOWN)
-    elif not facts.reads_images:
-        _replace_images_in_message(message, record, _NOT_READ)
-    if message.get("role") == "assistant":
-        readable = _readable_reasoning(raw)
-        before = [{"type": "text", "text": f"{READABLE_REASONING_LABEL}\n{readable}"}] if readable else []
-        _add_parts(message, before, _malformed_argument_parts(message))
-        if not _has_payload(message):
-            message["content"] = [{"type": "text", "text": _ONLY_WITHHELD_REASONING}]
+            withheld[field.kind] = withheld.get(field.kind, 0) + 1
+    # A container containing an omitted field is not a wholly readable original value.
+    readable = [path for path in readable if not any(
+        field.source_path[:len(path)] == path for field in omitted
+    )]
+    if _sources is not None:
+        _sources.append(ReaderSource(
+            record, _request_index, original_json, _reader_json(message, record, ()),
+            tuple(readable), tuple(omitted),
+        ))
     return message
 
 
@@ -471,16 +515,13 @@ def summariser_messages(
     request: dict,
     facts: WireFacts,
     withheld: Optional[dict[str, int]] = None,
-) -> list[dict]:
-    """The whole input of one summariser call: the instructions, the chunk's records
-    as messages, and the closing request with its fields (focus topic, custom
-    instructions) where there are any. ``withheld`` receives the count of encrypted
-    items withheld, by kind."""
-    pairs = list(records)
-    body = [summariser_message(raw, record, facts, withheld) for record, raw in pairs]
-    if facts.reads_images and facts.anthropic_converter:
-        _evict_as_the_host_would(body, [record for record, _raw in pairs])
+) -> ReaderInput:
+    """Prepare owned messages and explicit original/row evidence for one invocation."""
+    sources: list[ReaderSource] = []
+    body = [summariser_message(raw, record, facts, withheld, _sources=sources, _request_index=index)
+            for index, (record, raw) in enumerate(records, start=1)]
     closing = CLOSING_REQUEST
     if request:
         closing += "\nrequest: " + json.dumps(request, ensure_ascii=False)
-    return [{"role": "system", "content": instructions}] + body + [{"role": "user", "content": closing}]
+    messages = [{"role": "system", "content": instructions}] + body + [{"role": "user", "content": closing}]
+    return ReaderInput(messages, tuple(sources))

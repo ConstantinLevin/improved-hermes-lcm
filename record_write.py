@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional
 
 from . import turn_signals
 from .record_store import RET_KEY, InputEntry, parse_ret_key
+from .summariser_authoring import AuthoringEvidence
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -476,12 +477,11 @@ class RecordWriteMixin:
         provider: Optional[str] = None,
         effort: Optional[str] = None,
         withheld_reasoning: Optional[str] = None,
+        authoring: Optional[AuthoringEvidence] = None,
     ) -> str:
         """A summary as a derivation of its chunk, in its own transaction; raises when
-        the write fails. Its provenance: the model and provider that wrote it (the
-        summariser's route, which the host's ``route_info`` confirmed), the reasoning
-        effort asked for, the provider's ``finish_reason`` as the host reported it, and the
-        encrypted reasoning withheld from its input (#8)."""
+        the write fails. The selected summary's authoring observations are recorded
+        atomically with it; route and finish metadata alone do not establish them."""
         return self._records.write_derivation(
             compaction=attempt.compaction,
             chunk=chunk,
@@ -494,6 +494,7 @@ class RecordWriteMixin:
             est_tokens=count_tokens(text),
             finish_reason=finish_reason,
             withheld_reasoning=withheld_reasoning,
+            authoring=authoring,
         )
 
     def _write_return(
