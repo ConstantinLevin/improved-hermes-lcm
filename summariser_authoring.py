@@ -748,6 +748,9 @@ def _require_controls(prepared: dict, effort: str) -> None:
                 raise ValueError("final native assembly replaced a selected policy control")
         if not applies:
             continue
+        basis = projection.get("omission_basis")
+        if effort != "none" and isinstance(basis, str) and basis:
+            raise ValueError(f"the actual native policy cannot apply selected effort {effort!r}: {basis}")
         supported = projection.get("supported_efforts")
         if supported is not None:
             for location, expected in values:
@@ -755,7 +758,6 @@ def _require_controls(prepared: dict, effort: str) -> None:
                         and isinstance(expected, str) and expected not in supported):
                     raise ValueError("the projected native effort is outside this owner's established supported values")
         if not values:
-            basis = projection.get("omission_basis")
             if not isinstance(basis, str) or not basis:
                 raise ValueError("native effort omission has no actual policy basis")
             if effort != "none":
