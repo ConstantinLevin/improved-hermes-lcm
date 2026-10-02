@@ -655,7 +655,7 @@ def _synthesize_expansion_answer(
                                max_tokens=max_tokens, timeout=timeout, route_info=route_info,
                                temperature=None)
     check_route_records(route, route_info.routes)
-    content = response.choices[0].message.content
+    content = response.text
     if not isinstance(content, str):
         content = str(content) if content else ""
     return _QUERY_THINK_BLOCK_RE.sub("", content).strip() if "<" in content else content.strip()
