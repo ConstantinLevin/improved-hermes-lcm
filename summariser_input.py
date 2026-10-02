@@ -36,6 +36,16 @@ class WithheldField:
 
 
 @dataclass(frozen=True)
+class ReaderWitness:
+    """One typed original value and its occurrence in the owned reader request."""
+
+    source_path: SourcePath
+    kind: str
+    value_json: str
+    prepared_path: SourcePath
+
+
+@dataclass(frozen=True)
 class ReaderSource:
     record: str
     request_index: int
@@ -43,6 +53,7 @@ class ReaderSource:
     prepared_json: str
     readable_paths: tuple[SourcePath, ...]
     withheld: tuple[WithheldField, ...]
+    witnesses: tuple[ReaderWitness, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -352,26 +363,40 @@ def _reader_json(value: Any, record: str, path: SourcePath) -> str:
         raise ReaderUnavailable(record, path, f"the original JSON value cannot be represented ({exc})") from None
 
 
-def _field_parts(value: Any, path: SourcePath, readable: list[SourcePath]) -> list[dict]:
+def _field_parts(value: Any, path: SourcePath, readable: list[SourcePath],
+                 witnesses: Optional[list[tuple[SourcePath, str, str, dict]]] = None,
+                 native_fields: Optional[dict[SourcePath, dict]] = None) -> list[dict]:
     """Expose recorded field values with their types; string values remain verbatim."""
     label = f"[Recorded original field {json.dumps(path, ensure_ascii=False)}"
     readable.append(path)
+    if native_fields is not None and path in native_fields:
+        if witnesses is not None:
+            witnesses.append((path, "image", json.dumps(value, ensure_ascii=False), native_fields[path]))
+        return []
     if isinstance(value, dict):
         parts = [{"type": "text", "text": label + "; retained object keys]\n"
                   + json.dumps(list(value), ensure_ascii=False)}]
+        if witnesses is not None:
+            witnesses.append((path, "object", json.dumps(list(value), ensure_ascii=False), parts[0]))
         for key, child in value.items():
-            parts.extend(_field_parts(child, (*path, key), readable))
+            parts.extend(_field_parts(child, (*path, key), readable, witnesses, native_fields))
         return parts
     if isinstance(value, list):
         parts = [{"type": "text", "text": label + f"; array length {len(value)}]"}]
+        if witnesses is not None:
+            witnesses.append((path, "array", str(len(value)), parts[0]))
         for index, child in enumerate(value):
-            parts.extend(_field_parts(child, (*path, index), readable))
+            parts.extend(_field_parts(child, (*path, index), readable, witnesses, native_fields))
         return parts
     if isinstance(value, str):
         text = label + f"; string length {len(value)}]\n" + value
     else:
         text = label + "; JSON value]\n" + json.dumps(value, ensure_ascii=False, allow_nan=False)
-    return [{"type": "text", "text": text}]
+    part = {"type": "text", "text": text}
+    if witnesses is not None:
+        kind = "string" if isinstance(value, str) else "scalar"
+        witnesses.append((path, kind, json.dumps(value, ensure_ascii=False, allow_nan=False), part))
+    return [part]
 
 
 def _carrier_projection(value: Any, path: SourcePath, kind: str, record: str,
@@ -432,13 +457,13 @@ def _reader_carrier(value: Any, key: str, record: str, omitted: list[WithheldFie
     return _carrier_projection(value, (key,), key, record, omitted)
 
 
-def _reader_content(raw: dict, record: str, readable: list[SourcePath]) -> list[dict]:
+def _reader_content(raw: dict, record: str, readable: list[SourcePath],
+                    witnesses: list[tuple[SourcePath, str, str, dict]]) -> list[dict]:
     if "content" not in raw:
         return [{"type": "text", "text": "[The recorded original has no content field]"}]
     value = raw["content"]
     if isinstance(value, str) and value:
-        readable.append(("content",))
-        return [{"type": "text", "text": value}]
+        return _field_parts(value, ("content",), readable, witnesses)
     parts = content_parts(value)
     if parts is not None:
         for index, part in enumerate(parts):
@@ -449,21 +474,34 @@ def _reader_content(raw: dict, record: str, readable: list[SourcePath]) -> list[
             if part.get("type") in {"text", "input_text", "output_text"} and not isinstance(part.get("text"), str):
                 raise ReaderUnavailable(record, ("content", index, "text"), "unsupported original text-part value")
         path = ("content", "content") if isinstance(value, dict) else ("content",)
-        readable.append(path)
         result = copy.deepcopy(parts)
-        if isinstance(value, dict):
-            result.append({"type": "text", "text": "[Recorded original content envelope; object keys]\n"
-                           + json.dumps(list(value), ensure_ascii=False)})
-            for key, child in value.items():
-                if key != "content":
-                    result.extend(_field_parts(child, ("content", key), readable))
-        if not parts:
-            result.extend(_field_parts([], path, readable))
+        native_fields: dict[SourcePath, dict] = {}
+
+        def image_fields(node: Any, where: SourcePath, part: dict) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    child_path = (*where, key)
+                    if key in {"url", "data", "bytes", "base64", "image_url"} and isinstance(child, str):
+                        native_fields[child_path] = part
+                    else:
+                        image_fields(child, child_path, part)
+            elif isinstance(node, list):
+                for index, child in enumerate(node):
+                    image_fields(child, (*where, index), part)
+
+        for index, part in enumerate(result):
+            if part["type"] in {"text", "input_text", "output_text"}:
+                part["type"] = "text"
+            else:
+                image_fields(parts[index], (*path, index), part)
+        # The same recursive renderer exposes every content key, type and container.
+        # Image payloads retain their native carrier instead of becoming base64 text.
+        result.extend(_field_parts(value, ("content",), readable, witnesses, native_fields))
         return result
     if isinstance(value, dict):
         raise ReaderUnavailable(record, ("content",), "original content-object meaning is not established")
     # Empty strings, null, numbers and booleans are source values, never invented utterances.
-    return _field_parts(value, ("content",), readable)
+    return _field_parts(value, ("content",), readable, witnesses)
 
 
 def summariser_message(raw: dict, record: str, facts: WireFacts,
@@ -481,14 +519,22 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
     if sidecar not in (None, "") and sidecar != original.get("content"):
         raise ReaderUnavailable(record, ("api_content",),
                                 "the differing replay sidecar's event/mechanism purpose is not established")
-    readable: list[SourcePath] = [("role",)]
+    readable: list[SourcePath] = []
+    witnesses: list[tuple[SourcePath, str, str, dict]] = []
     omitted: list[WithheldField] = []
-    message = {"role": role, "content": _reader_content(original, record, readable)}
+    message = {"role": role, "content": _reader_content(original, record, readable, witnesses)}
+    boundary = {"type": "text", "text": f"[Recorded original {record}; request row {_request_index}]"}
+    message["content"].insert(0, boundary)
+    message["content"].extend(_field_parts(role, ("role",), readable, witnesses))
+    root_part = {"type": "text", "text": "[Recorded original object keys]\n"
+                 + json.dumps(list(original), ensure_ascii=False)}
+    message["content"].append(root_part)
+    witnesses.append(((), "object", json.dumps(list(original), ensure_ascii=False), root_part))
     for key, value in original.items():
         if key in {"role", "content"}:
             continue
         projected = _reader_carrier(value, key, record, omitted) if key in _NATIVE_CARRIERS else value
-        message["content"].extend(_field_parts(projected, (key,), readable))
+        message["content"].extend(_field_parts(projected, (key,), readable, witnesses))
         if key in {"tool_calls", "tool_call_id", "name"}:
             message[key] = copy.deepcopy(value)
     for field in omitted:
@@ -504,6 +550,10 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
         _sources.append(ReaderSource(
             record, _request_index, original_json, _reader_json(message, record, ()),
             tuple(readable), tuple(omitted),
+            tuple(ReaderWitness(path, kind, value_json,
+                                ("content", next(index for index, candidate in enumerate(message["content"])
+                                                 if candidate is part), *(() if kind == "image" else ("text",))))
+                  for path, kind, value_json, part in witnesses),
         ))
     return message
 
