@@ -11,11 +11,11 @@ host task name, so auxiliary compression policy cannot select their model or
 effort. The plugin-session effort override wins over the configured plugin effort,
 whose default is medium. Each purpose keeps its own prompt and call controls.
 
-The current native contract is a nonstream OpenAI Chat completion with an observed
-successful ending. Unsupported native owners, lost endpoint context, a host
-substitution or an unestablished credential owner are refused visibly. This is a
-step toward #68; it does not establish every endpoint or wire. No selected client
-fact is presented as an SDK/network delivery receipt.
+The retained native owner observes the prepared request before dispatch and the
+original result before compatibility conversion. Its causal input locations and
+actual effort projection are checked against that final request. Missing ownership,
+lost input, changed controls and an unestablished native ending fail visibly. These
+observations describe the actual SDK invocation, not remote network delivery.
 Two levels, each one call to the summariser with today's prompt text (#10 owns the
 texts): level 1 asks for a summary near the target budget; level 2, with today's
 bullet-point text, is the one retry after a non-transient failure of level 1. There
@@ -27,11 +27,11 @@ What counts as a failure, each raised as ``SummaryFailure`` and never swallowed:
 
 - the call raises (a rate limit, a timeout, a connection or provider error);
 - another model answered (``route_info`` names another provider or model);
-- the reply has no ``choices[0].message`` (malformed), or its text is empty;
+- the original native reply has no readable text, or its text is empty;
 - the reply ended otherwise than complete (``ending_failure``): only ``finish_reason``
-  ``stop`` is a summary, read in the Chat Completions shape the host hands every wire's
-  reply in; the output limit, a content filter, a tool call, an error, no ending at all
-  and every ending not known each fail with their kind;
+  successful native stop/end_turn/completed/STOP is a summary, observed before host
+  compatibility conversion; the output limit, a content filter, a tool call, an
+  error, no ending at all and every ending not known each fail with their kind;
 - the reply is not shorter than the chunk's records, what the summary replaces in the
   context, both counted by the same counter (the interim acceptance until #10).
 
@@ -50,9 +50,7 @@ attribute guessed per provider.
 The budget is a target in the prompt text only. ``max_tokens`` is the summariser
 model's own output cap where the model table knows it (R5 b), and absent otherwise, so
 the plugin never cuts a summary at an output limit of its own; a reply stopped at the
-limit reports ``length`` and fails (#7). Where the host rewrites a missing finish reason
-to "stop" (its Codex adapter always; its streamed collector when no chunk carried one),
-a cut reply can still pass: that is the host's, and asked of Hermes (A-7.1).
+limit fails (#7). Compatibility defaults cannot establish a missing native ending.
 
 Transient failures (HTTP 408/409/429/5xx, connection errors, timeouts) are retried at
 the same level after the longer of the provider's ``Retry-After`` and 2 s doubling to 30 s
@@ -135,11 +133,15 @@ class SummariserRoute:
     target_client: str = ""
     target_problem: str = ""
     exact_model: bool = False
+    exact_credential: bool = False
     # Native objects and credentials are transient. The retained client also owns
     # its factory's default header/query context; neither is reconstructed here.
     target_owner: Any = field(default=None, repr=False, compare=False)
     target_resource: Any = field(default=None, repr=False, compare=False)
     target_api_key: Any = field(default=None, repr=False, compare=False)
+    target_binding: Any = field(default=None, repr=False, compare=False)
+    target_selection_binding: Any = field(default=None, repr=False, compare=False)
+    target_call_owner: Any = field(default=None, repr=False, compare=False)
 
     def plan_kwargs(self) -> dict[str, Any]:
         """Explicit selection through the existing host planner, with no task policy."""
@@ -163,26 +165,20 @@ class SummariserRoute:
     def pending_identity(self) -> tuple:
         """Identity of prospective work; never a requirement on an authored summary."""
         key = self.target_api_key
-        credential = ("callable", id(key)) if callable(key) else (
-            "value", hashlib.sha256((key or "").encode()).digest())
+        credential = ("binding", id(self.target_binding)) if self.target_binding is not None else (
+            ("callable", id(key)) if callable(key) else
+            ("value", hashlib.sha256((key or "").encode()).digest()))
         return (self.target_provider, self.target_model, self.target_base_url,
                 self.target_api_mode, id(self.target_owner), credential)
 
     def require_selected_client(self, client: Any) -> None:
         """Revalidate only established native bindings, without evaluating credentials."""
-        from openai.resources.chat.completions import Completions
+        from agent.native_invocation import require_native_owner_binding
 
         if client is not self.target_owner:
             raise AuthoringUnavailable("dispatch selected invocation", "the host selected another native client owner")
-        if str(getattr(client, "base_url", "") or "").rstrip("/") != self.target_base_url.rstrip("/"):
-            raise AuthoringUnavailable("dispatch selected invocation", "the selected native endpoint changed")
-        if not _same_credential(getattr(client, "api_key", None), self.target_api_key):
-            raise AuthoringUnavailable("dispatch selected invocation", "the selected native credential owner changed")
-        resource = client.chat.completions
-        if (resource is not self.target_resource or type(resource) is not Completions
-                or getattr(resource, "_client", None) is not client
-                or getattr(resource.create, "__func__", None) is not Completions.create):
-            raise AuthoringUnavailable("dispatch selected invocation", "the retained native create operation changed")
+        require_native_owner_binding(client, self.target_selection_binding)
+        require_native_owner_binding(self.target_call_owner, self.target_binding)
 
     def known_secrets(self) -> tuple[str, ...]:
         return tuple(value for value in (self.api_key, self.target_api_key)
@@ -224,12 +220,13 @@ def _same_credential(left: Any, right: Any) -> bool:
 
 
 def session_route(provider: str, model: str, base_url: str, api_key: Any, api_mode: str,
-                  *, source: str = "session", exact_model: bool = False) -> SummariserRoute:
+                  *, source: str = "session", exact_model: bool = False,
+                  exact_credential: bool = False) -> SummariserRoute:
     """Retain the actual host-selected native owner for this prospective route."""
     provider = provider.strip().lower()
     route = SummariserRoute(provider=provider, model=model, base_url=base_url, api_key=api_key,
                             api_mode=api_mode, source=source, named_provider=provider,
-                            exact_model=exact_model)
+                            exact_model=exact_model, exact_credential=exact_credential)
     target, problem = _resolve_route_target(route)
     return replace(route, **target) if target is not None else replace(route, target_problem=problem)
 
@@ -251,27 +248,16 @@ def configured_route(config: Any, provider: str, model: str, base_url: str,
         api_mode = config.summary_api_mode.strip() or api_mode
     return session_route(provider, configured_model or model, base_url, api_key, api_mode,
                          source="configured" if destination else "session",
-                         exact_model=bool(configured_model))
+                         exact_model=bool(configured_model),
+                         exact_credential=bool(config.summary_api_key.strip()))
 
 
 def _client_wire(client: Any) -> str:
-    """The wire of a client the host built, by its class (agent/auxiliary_client.py at
-    origin/main d0288be5b3): ``AnthropicAuxiliaryClient`` (1814) is the Anthropic
-    Messages converter, ``CodexAuxiliaryClient`` (1660) the Responses API, a plain
-    ``openai.OpenAI`` client Chat Completions; any other (Bedrock, Gemini native, …) is a
-    wire the plugin has not established: ""."""
-    try:
-        from agent.auxiliary_client import AnthropicAuxiliaryClient, CodexAuxiliaryClient  # type: ignore
-        import openai
-    except Exception:
-        return ""
-    if isinstance(client, AnthropicAuxiliaryClient):
-        return "anthropic_messages"
-    if isinstance(client, CodexAuxiliaryClient):
-        return "codex_responses"
-    if type(client) is openai.OpenAI:
-        return "chat_completions"
-    return ""
+    """Observed wire from the retained native owner, not its provider label."""
+    from agent.native_invocation import get_native_owner_binding
+
+    binding = get_native_owner_binding(client)
+    return str(binding.api_mode) if binding is not None else ""
 
 
 def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[dict[str, Any]], str]:
@@ -280,10 +266,10 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[dict[str, An
         from agent.auxiliary_client import (
             _canonical_api_mode, _fallback_provider_from_label, _normalize_api_key,
             _normalize_aux_provider, _resolve_call_client, _resolve_task_provider_model,
-            _to_openai_base_url,
+            native_owner_client,
         )
         from hermes_cli.runtime_provider import _get_named_custom_provider
-        from openai.resources.chat.completions import Completions
+        from agent.native_invocation import get_native_owner_binding
         from .summariser_authoring import native_client_problem
         from urllib.parse import urlsplit
 
@@ -296,8 +282,6 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[dict[str, An
             return None, "the configured named custom provider has no host-owned profile"
         if route.provider == "custom" and not route.base_url:
             return None, "an anonymous custom route requires an explicit endpoint and credential"
-        if route.source == "session" and not route.api_key:
-            return None, "the session credential owner was not supplied through update_model"
         options = route.plan_kwargs()
         resolved_provider, resolved_model, resolved_base, resolved_key, resolved_mode = _resolve_task_provider_model(
             None, options["provider"], options["model"], options["base_url"], options["api_key"])
@@ -314,39 +298,34 @@ def _resolve_route_target(route: SummariserRoute) -> tuple[Optional[dict[str, An
             return None, "the host substituted another provider for the selected route"
         if route.exact_model and final_model != route.model:
             return None, "the host substituted or normalized the exact configured model"
-        wire = _client_wire(client)
-        if mode and mode != wire:
-            return None, "the actual native owner does not preserve the selected API mode"
-        problem = native_client_problem(client)
+        call_owner = native_owner_client(client, str(final_model), mode)
+        wire = _client_wire(call_owner)
+        problem = native_client_problem(call_owner)
         if problem:
             return None, problem
-        endpoint = str(getattr(client, "base_url", "") or "")
+        selection_binding = get_native_owner_binding(client)
+        binding = get_native_owner_binding(call_owner)
+        if binding is None:
+            return None, "the selected native owner has no retained constructor binding"
+        endpoint = str(binding.endpoint or "")
         parsed = urlsplit(endpoint)
-        if (not endpoint or parsed.scheme not in {"http", "https"} or not parsed.hostname
-                or parsed.username or parsed.password):
-            return None, "the selected native endpoint is unavailable or contains URL credentials"
+        if parsed.username or parsed.password:
+            return None, "the selected native endpoint contains URL credentials"
         if route.base_url:
             requested = urlsplit(route.base_url)
-            if requested.query or requested.fragment or requested.username or requested.password:
-                return None, "the explicit endpoint contains context not exposed by the established native endpoint binding"
-            if named and urlsplit(str(named.get("base_url") or "")).query:
-                return None, "the named profile's full endpoint context cannot be asserted through the established native endpoint binding"
-            expected_endpoint = _to_openai_base_url(route.base_url)
-            if endpoint.rstrip("/") != expected_endpoint.rstrip("/"):
+            if requested.username or requested.password:
+                return None, "the explicit endpoint contains URL credentials"
+            if not binding.matches_endpoint(route.base_url):
                 return None, "the selected native endpoint differs from the observed or configured endpoint; named-profile endpoint overrides are unsupported"
-        credential = getattr(client, "api_key", None)
-        if not isinstance(credential, str) and not callable(credential):
-            return None, "the selected native credential owner is not exposed by an established binding"
-        if route.api_key and not _same_credential(credential, _normalize_api_key(route.api_key)):
+        sdk_marker = (label == "bedrock" and route.source == "session"
+                      and not route.exact_credential and route.api_key == "aws-sdk")
+        if route.api_key and not sdk_marker and not binding.matches_credential(_normalize_api_key(route.api_key)):
             return None, "the actual native credential owner differs from the observed or configured credential"
-        resource = client.chat.completions
-        if (type(resource) is not Completions or getattr(resource, "_client", None) is not client
-                or getattr(resource.create, "__func__", None) is not Completions.create):
-            return None, "the actual native create operation is unavailable"
         return {"target_provider": label, "target_model": str(final_model),
                 "target_base_url": endpoint, "target_api_mode": wire,
                 "target_client": type(client).__name__, "target_owner": client,
-                "target_resource": resource, "target_api_key": credential}, ""
+                "target_binding": binding, "target_selection_binding": selection_binding,
+                "target_call_owner": call_owner}, ""
     except Exception as exc:
         # Factory errors can contain credentials; their text is not a route fact.
         return None, f"the host's selected native route cannot be established ({type(exc).__name__})"
