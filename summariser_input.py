@@ -478,16 +478,20 @@ def _reader_content(raw: dict, record: str, readable: list[SourcePath],
         native_fields: dict[SourcePath, dict] = {}
 
         def image_fields(node: Any, where: SourcePath, part: dict) -> None:
-            if isinstance(node, dict):
-                for key, child in node.items():
-                    child_path = (*where, key)
-                    if key in {"url", "data", "bytes", "base64", "image_url"} and isinstance(child, str):
-                        native_fields[child_path] = part
-                    else:
-                        image_fields(child, child_path, part)
-            elif isinstance(node, list):
-                for index, child in enumerate(node):
-                    image_fields(child, (*where, index), part)
+            # Only native payload locations are media. A metadata object can
+            # independently contain a field named url or data and stays readable.
+            image = node.get("image_url")
+            if isinstance(image, str):
+                native_fields[(*where, "image_url")] = part
+            elif isinstance(image, dict) and isinstance(image.get("url"), str):
+                native_fields[(*where, "image_url", "url")] = part
+            source = node.get("source")
+            if isinstance(source, dict):
+                for key in ("url", "data"):
+                    if isinstance(source.get(key), str):
+                        native_fields[(*where, "source", key)] = part
+            if isinstance(node.get("url"), str):
+                native_fields[(*where, "url")] = part
 
         for index, part in enumerate(result):
             if part["type"] in {"text", "input_text", "output_text"}:
