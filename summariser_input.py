@@ -365,7 +365,8 @@ def _reader_json(value: Any, record: str, path: SourcePath) -> str:
 
 def _field_parts(value: Any, path: SourcePath, readable: list[SourcePath],
                  witnesses: Optional[list[tuple[SourcePath, str, str, dict]]] = None,
-                 native_fields: Optional[dict[SourcePath, dict]] = None) -> list[dict]:
+                 native_fields: Optional[dict[SourcePath, dict]] = None,
+                 original_keys: Optional[dict[SourcePath, list[str]]] = None) -> list[dict]:
     """Expose recorded field values with their types; string values remain verbatim."""
     label = f"[Recorded original field {json.dumps(path, ensure_ascii=False)}"
     readable.append(path)
@@ -374,19 +375,20 @@ def _field_parts(value: Any, path: SourcePath, readable: list[SourcePath],
             witnesses.append((path, "image", json.dumps(value, ensure_ascii=False), native_fields[path]))
         return []
     if isinstance(value, dict):
+        keys = original_keys.get(path, list(value)) if original_keys is not None else list(value)
         parts = [{"type": "text", "text": label + "; retained object keys]\n"
-                  + json.dumps(list(value), ensure_ascii=False)}]
+                  + json.dumps(keys, ensure_ascii=False)}]
         if witnesses is not None:
-            witnesses.append((path, "object", json.dumps(list(value), ensure_ascii=False), parts[0]))
+            witnesses.append((path, "object", json.dumps(keys, ensure_ascii=False), parts[0]))
         for key, child in value.items():
-            parts.extend(_field_parts(child, (*path, key), readable, witnesses, native_fields))
+            parts.extend(_field_parts(child, (*path, key), readable, witnesses, native_fields, original_keys))
         return parts
     if isinstance(value, list):
         parts = [{"type": "text", "text": label + f"; array length {len(value)}]"}]
         if witnesses is not None:
             witnesses.append((path, "array", str(len(value)), parts[0]))
         for index, child in enumerate(value):
-            parts.extend(_field_parts(child, (*path, index), readable, witnesses, native_fields))
+            parts.extend(_field_parts(child, (*path, index), readable, witnesses, native_fields, original_keys))
         return parts
     if isinstance(value, str):
         text = label + f"; string length {len(value)}]\n" + value
@@ -478,20 +480,25 @@ def _reader_content(raw: dict, record: str, readable: list[SourcePath],
         native_fields: dict[SourcePath, dict] = {}
 
         def image_fields(node: Any, where: SourcePath, part: dict) -> None:
-            # Only native payload locations are media. A metadata object can
-            # independently contain a field named url or data and stays readable.
-            image = node.get("image_url")
-            if isinstance(image, str):
-                native_fields[(*where, "image_url")] = part
-            elif isinstance(image, dict) and isinstance(image.get("url"), str):
-                native_fields[(*where, "image_url", "url")] = part
-            source = node.get("source")
-            if isinstance(source, dict):
-                for key in ("url", "data"):
-                    if isinstance(source.get(key), str):
-                        native_fields[(*where, "source", key)] = part
-            if isinstance(node.get("url"), str):
-                native_fields[(*where, "url")] = part
+            # content_parts retains the whole original dict; it chooses no URL.
+            # Follow the actual native emitters' declared carrier grammar, and
+            # expose every complementary field through the recursive renderer.
+            if node["type"] in {"image_url", "input_image"}:
+                image = node.get("image_url")
+                if isinstance(image, str):
+                    origin = (*where, "image_url")
+                elif isinstance(image, dict) and isinstance(image.get("url"), str):
+                    origin = (*where, "image_url", "url")
+                else:
+                    return  # Unknown fields remain typed data and in the native copy.
+            else:
+                source = node.get("source")
+                source_type = source.get("type") if isinstance(source, dict) else None
+                key = {"url": "url", "base64": "data"}.get(source_type) if isinstance(source_type, str) else None
+                if key is None or not isinstance(source.get(key), str):
+                    return  # Its actual selected owner must establish media carriage.
+                origin = (*where, "source", key)
+            native_fields[origin] = part
 
         for index, part in enumerate(result):
             if part["type"] in {"text", "input_text", "output_text"}:
@@ -534,11 +541,24 @@ def summariser_message(raw: dict, record: str, facts: WireFacts,
                  + json.dumps(list(original), ensure_ascii=False)}
     message["content"].append(root_part)
     witnesses.append(((), "object", json.dumps(list(original), ensure_ascii=False), root_part))
+    original_keys: dict[SourcePath, list[str]] = {}
+
+    def containers(value: Any, path: SourcePath) -> None:
+        if isinstance(value, dict):
+            original_keys[path] = list(value)
+            for key, child in value.items():
+                containers(child, (*path, key))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                containers(child, (*path, index))
+
+    containers(original, ())
     for key, value in original.items():
         if key in {"role", "content"}:
             continue
         projected = _reader_carrier(value, key, record, omitted) if key in _NATIVE_CARRIERS else value
-        message["content"].extend(_field_parts(projected, (key,), readable, witnesses))
+        message["content"].extend(_field_parts(projected, (key,), readable, witnesses,
+                                               original_keys=original_keys))
         if key in {"tool_calls", "tool_call_id", "name"}:
             message[key] = copy.deepcopy(value)
     for field in omitted:
